@@ -123,9 +123,15 @@ export class PiNativeRuntime {
   }
 
   async routingPath(): Promise<string> {
-    // Read the recorded destination of the session-to-account routing file.
-    // A guessed path would lose the account assignments preserved by migration.
-    await this.service()
+    const runtime = await this.service()
+    const snapshot = await runtime.read()
+    if (snapshot.mode === 'claustrum') {
+      if (!snapshot.routingPath)
+        throw new Error('Vault routing storage is unavailable')
+      return snapshot.routingPath
+    }
+    // Keep local session-to-account assignments at the exact file destination
+    // recorded by migration; guessing a new path would lose those assignments.
     const journal = await readNativeMigrationJournal(await this.paths)
     if (
       !journal ||

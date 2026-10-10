@@ -59,6 +59,8 @@ export interface NativeAccountSnapshot {
   mode: 'local' | 'claustrum'
   settings: Record<string, unknown>
   accounts: NativeAccountView[]
+  /** Vault session-to-account assignments use this separate file. Local mode keeps the assignment file at the destination recorded by migration. */
+  routingPath?: string
   /** AccountStorage-shaped input for pure policy predicates, never a credential or persistence authority. */
   policyStorage: AccountStorage
 }
@@ -281,7 +283,7 @@ export interface NativeVaultPrimaryPin {
   accountIdentity: string
 }
 
-/** Offline setup records the primary account UUID and credential ID. Later vault discovery must not replace that selection. */
+/** Vault discovery saves the default credential ID, route ID and verified account UUID in vault settings. Readers compare that UUID to the current roster so a replaced default cannot inherit another account's metadata. */
 export function nativeVaultPrimaryPin(
   settings: Record<string, unknown>,
 ): NativeVaultPrimaryPin | undefined {

@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
 import { withLock } from '@cortexkit/common-auth/fs'
 import {
   fingerprintOf,
@@ -28,8 +27,6 @@ import {
   type NativeAccountView,
   nativeAccountReadError,
   nativeQuotaFailure,
-  nativeVaultPrimaryPin,
-  nativeVaultPrimaryRow,
   projectNativeAccountViews,
 } from './native-account-view.ts'
 import {
@@ -45,6 +42,7 @@ import {
   NativeCustodyError,
   type NativeCustodyReceipt,
 } from './native-custody.ts'
+import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
 import {
   createNativeLocalCredentialService,
   type NativeLocalCredentialServiceOptions,
@@ -63,6 +61,7 @@ import {
   readNativeRuntime,
   updateNativeRuntime,
 } from './native-runtime.ts'
+import { nativeVaultPaths } from './native-vault-paths.ts'
 import {
   acquireNativeVaultRuntime,
   type NativeDisplayProfile,
@@ -256,23 +255,37 @@ export function nativeAccountPolicy(
   return { status: 'allowed' }
 }
 
-/** The migration journal records the offline move from host auth and sidecars to the credential pool. Only its committed state permits this service to use the pool and separate runtime metadata. */
+/** The local migration journal records completed transfer from host credentials and sidecars to the credential pool. Local use refuses without that record. Host vault enrollment instead selects independent settings and metadata, leaving local credentials, journal and metadata untouched. */
 export function createNativeAccountRuntime(
   options: NativeAccountRuntimeOptions,
 ): NativeAccountRuntime {
   const paths = Object.freeze({ ...options.paths })
   const now = options.local?.now ?? options.vault?.now ?? Date.now
+  const env = { ...(options.vault?.env ?? process.env) }
+  const vaultPaths = nativeVaultPaths(paths)
+  const vaultStore = createNativePoolStore({
+    paths: vaultPaths,
+    quota: nativeQuotaCodec,
+    now,
+    onStep: async (point) => {
+      if (point === 'before-config-write' || point === 'before-state-write')
+        await requireMode('claustrum')
+    },
+  })
   const shutdown = new AbortController()
   const store = createNativePoolStore({
     paths,
     quota: nativeQuotaCodec,
     now,
-    onStep: options.beforePoolWrite
-      ? async (point) => {
-          if (point === 'before-config-write' || point === 'before-state-write')
-            await options.beforePoolWrite?.()
+    onStep: async (point) => {
+      if (point === 'before-config-write' || point === 'before-state-write') {
+        if (options.beforePoolWrite) {
+          await localAuthority()
+          await options.beforePoolWrite()
         }
-      : undefined,
+        await localAuthority()
+      }
+    },
   })
   const vault = acquireNativeVaultRuntime({
     ...options.vault,
@@ -285,8 +298,28 @@ export function createNativeAccountRuntime(
   }
   async function authority(signal?: AbortSignal) {
     check(signal)
-    await requireNativePoolAuthority(paths)
+    const mode = await readNativeEnrollmentMode(options.host, env)
+    if (mode === 'local') await requireNativePoolAuthority(paths)
     check(signal)
+    return mode
+  }
+  async function requireMode(
+    mode: 'local' | 'claustrum',
+    signal?: AbortSignal,
+  ) {
+    if ((await authority(signal)) !== mode)
+      throw new NativeCustodyError('route-unavailable')
+  }
+  async function localAuthority(signal?: AbortSignal) {
+    await requireMode('local', signal)
+  }
+  async function selectedStorage() {
+    const mode = await authority()
+    return {
+      mode,
+      paths: mode === 'claustrum' ? vaultPaths : paths,
+      store: mode === 'claustrum' ? vaultStore : store,
+    }
   }
   async function poolRow(id: string) {
     const read = await store.read()
@@ -312,7 +345,7 @@ export function createNativeAccountRuntime(
     ) => NativeRuntimeEntry,
     exactAccess: boolean | 'binding' = true,
   ): Promise<boolean> {
-    await authority()
+    if ((await authority()) !== 'local') return false
     const binding = subject.binding
     const matches = async () => {
       const row = await poolRow(binding.rowId)
@@ -372,7 +405,7 @@ export function createNativeAccountRuntime(
                 },
                 {
                   beforeRename: async () => {
-                    await authority()
+                    await localAuthority()
                     if (!(await matches()))
                       throw new NativeRuntimeError('publication-refused')
                     await configLease.assertOwned()
@@ -386,8 +419,10 @@ export function createNativeAccountRuntime(
       )
     } catch (error) {
       if (
-        error instanceof NativeRuntimeError &&
-        error.code === 'runtime-conflict'
+        (error instanceof NativeRuntimeError &&
+          error.code === 'runtime-conflict') ||
+        (error instanceof NativeCustodyError &&
+          error.code === 'route-unavailable')
       )
         return false
       throw error
@@ -466,7 +501,7 @@ export function createNativeAccountRuntime(
   const runtime: NativeAccountRuntime = {
     vault,
     async getRelayConfig() {
-      await authority()
+      const { mode, paths, store } = await selectedStorage()
       return withLock(
         paths.config,
         { ...POOL_LOCK_DEFAULTS, name: 'native-relay' },
@@ -478,7 +513,7 @@ export function createNativeAccountRuntime(
           const read = await readNativeRuntime(paths.runtime, paths.storageId)
           const token =
             read.status === 'ready' ? read.state.relay?.token : undefined
-          await authority()
+          await requireMode(mode)
           await lease.assertOwned()
           if (!flags.enabled || !flags.url || !token) return null
           return { ...flags, token }
@@ -521,7 +556,7 @@ export function createNativeAccountRuntime(
           /\p{Cc}/u.test(patch.token))
       )
         throw new NativeRuntimeError('publication-refused')
-      await authority()
+      const { mode, paths, store } = await selectedStorage()
       await withLock(
         paths.config,
         { ...POOL_LOCK_DEFAULTS, name: 'native-relay' },
@@ -552,16 +587,16 @@ export function createNativeAccountRuntime(
             throw new NativeRuntimeError('publication-refused')
           async function writeFlags(flags: Omit<RelayConfig, 'token'>) {
             await store.updateSettings(async (settings) => {
-              await authority()
+              await requireMode(mode)
               await lease.assertOwned()
               settings.relay = flags
             })
           }
           // Relay flags and its token live in separate files. Disable first so a crash
-          // cannot send the new token to the old endpoint. PoolStore checks its
-          // config/state locks; immediately before replacing the token file,
-          // also verify the lock that serializes relay readers and writers, and that
-          // the journal still authorizes using the pool instead of host credentials.
+          // cannot send the new token to the old endpoint. Credential-store locks
+          // protect the flags, and the relay lock ties them to the private token.
+          // Before publishing that token, recheck both relay ownership and that
+          // the selected local or vault credential source has not changed.
           await writeFlags({ ...previous, enabled: false })
           if (patch.token !== undefined)
             await updateNativeRuntime(
@@ -574,7 +609,7 @@ export function createNativeAccountRuntime(
               },
               {
                 beforeRename: async () => {
-                  await authority()
+                  await requireMode(mode)
                   await lease.assertOwned()
                 },
               },
@@ -584,30 +619,39 @@ export function createNativeAccountRuntime(
       )
     },
     async read() {
-      await authority()
+      const mode = await authority()
+      const selectedPaths = mode === 'claustrum' ? vaultPaths : paths
+      const selectedStore = mode === 'claustrum' ? vaultStore : store
       const [read, settings, metadata] = await Promise.all([
-        store.read(),
-        store.readSettings(),
-        readNativeRuntime(paths.runtime, paths.storageId),
+        selectedStore.read(),
+        selectedStore.readSettings(),
+        readNativeRuntime(selectedPaths.runtime, selectedPaths.storageId),
       ])
       if (read.status !== 'ready' || settings.status !== 'ready')
         throw new NativeRuntimeError('publication-refused')
-      const mode = (
-        settings.settings.claustrum as { mode?: unknown } | undefined
-      )?.mode
       // Status reads use stored account metadata without fetching tokens or
       // requesting vault access. Refresh, or first authorization with no stored
       // account list, discovers authorized vault accounts. Only offline setup
       // may enroll the host and request its grant.
       const roster = mode === 'claustrum' ? await vault.read() : undefined
       check()
-      return projectNativeAccountViews({
-        paths,
+      const snapshot = projectNativeAccountViews({
+        paths: { ...paths, ...selectedPaths },
         rows: read.rows,
-        settings: settings.settings,
+        settings: {
+          ...settings.settings,
+          claustrum: {
+            ...(settings.settings.claustrum as
+              | Record<string, unknown>
+              | undefined),
+            mode,
+          },
+        },
         runtime: metadata.status === 'ready' ? metadata.state : undefined,
         roster,
       })
+      if (mode === 'claustrum') snapshot.routingPath = vaultPaths.routing
+      return snapshot
     },
     async authorizeLocal(routeId, request = {}) {
       await authority(request.signal)
@@ -763,19 +807,7 @@ export function createNativeAccountRuntime(
       return result
     },
     async authorizeApi(routeId, signal) {
-      await authority(signal)
-      const requireLocalMode = async () => {
-        const settings = await store.readSettings()
-        check(signal)
-        if (settings.status !== 'ready')
-          throw new NativeRuntimeError('publication-refused')
-        if (
-          (settings.settings.claustrum as { mode?: unknown } | undefined)
-            ?.mode === 'claustrum'
-        )
-          throw new NativeCustodyError('route-unavailable')
-      }
-      await requireLocalMode()
+      await localAuthority(signal)
       const row = await poolRow(await physicalId(routeId))
       check(signal)
       if (
@@ -787,7 +819,7 @@ export function createNativeAccountRuntime(
         throw new NativeCustodyError('route-unavailable')
       // Reading the credential yields to other processes. Recheck custody
       // before returning a local key that vault mode would exclude.
-      await requireLocalMode()
+      await localAuthority(signal)
       return {
         ...row.credential,
         subject: {
@@ -835,9 +867,9 @@ export function createNativeAccountRuntime(
       })
     },
     async putAccount(input) {
-      await authority()
+      await localAuthority()
       const snapshot = await runtime.read()
-      if (input.credential.type === 'oauth' && snapshot.mode !== 'local')
+      if (snapshot.mode !== 'local')
         throw new NativeCustodyError('route-unavailable')
       const id =
         input.routeId === 'main'
@@ -903,11 +935,11 @@ export function createNativeAccountRuntime(
         },
       }),
     async updateSettings(mutator) {
-      await authority()
+      const selected = await selectedStorage()
       // Filled from the copy the committed attempt started from; effects run
       // only after the write has been committed and changed the settings.
       const captured: { before?: NativeSettingsEffectFields } = {}
-      const result = await store.updateSettings(async (settings) => {
+      const result = await selected.store.updateSettings(async (settings) => {
         function activation(value: Record<string, unknown>) {
           const custody = value.claustrum as Record<string, unknown> | undefined
           return [
@@ -957,11 +989,14 @@ export function createNativeAccountRuntime(
       const row = current.accounts.find((row) => row.id === routeId)
       const account = { id: routeId, label: row?.label }
       const change = enabled ? 'account enabled' : 'account disabled'
-      if (row?.source === 'vault') {
+      if (current.mode === 'claustrum') {
+        if (row?.source !== 'vault')
+          throw new NativeCustodyError('route-unavailable')
         if (await vault.setEnabled(routeId, enabled))
           logCommittedNativeAccountChange(change, account)
         return
       }
+      await localAuthority()
       const id = await physicalId(routeId)
       const operation = enabled ? 'enable' : 'disable'
       // Credential-pool enable/disable results identify the account but omit whether
@@ -977,6 +1012,8 @@ export function createNativeAccountRuntime(
         quota: nativeQuotaCodec,
         now,
         onStep: async (step, info) => {
+          if (step === 'before-config-write' || step === 'before-state-write')
+            await localAuthority()
           if (
             step !== 'before-config-write' ||
             info.operation !== operation ||
@@ -991,6 +1028,7 @@ export function createNativeAccountRuntime(
           } catch {
             // An unreadable pool leaves the change unknown, so nothing is logged.
           }
+          await localAuthority()
         },
       })
       if (enabled) await transition.enable(id)
@@ -999,103 +1037,41 @@ export function createNativeAccountRuntime(
         logCommittedNativeAccountChange(change, account)
     },
     async remove(routeId) {
+      await localAuthority()
       const current = await runtime.read()
+      if (current.mode !== 'local')
+        throw new NativeCustodyError('route-unavailable')
       const row = current.accounts.find((row) => row.id === routeId)
-      const account = { id: routeId, label: row?.label }
-      if (row?.source === 'vault') {
-        // This call cannot remove an account from the vault. Disable its use
-        // by this plugin instead, and log only that committed change.
-        if (await vault.setEnabled(routeId, false))
-          logCommittedNativeAccountChange('account disabled', account)
-        return
-      }
-      // 'removed' means this call dropped the account's roster row.
       const removed = await store.remove(await physicalId(routeId))
       if (removed.outcome === 'removed')
-        logCommittedNativeAccountChange('account removed', account)
+        logCommittedNativeAccountChange('account removed', {
+          id: routeId,
+          label: row?.label,
+        })
     },
     async reorder(routeIds, movedRouteId) {
-      await authority()
+      await localAuthority()
       const snapshot = await runtime.read()
+      if (snapshot.mode !== 'local')
+        throw new NativeCustodyError('route-unavailable')
       const read = await store.read()
       if (read.status !== 'ready')
         throw new NativeRuntimeError('publication-refused')
-      const logReordered = () =>
+      const ids = await Promise.all(routeIds.map(physicalId))
+      const main = read.rows.find(
+        (row) => row.id === snapshot.settings.mainAccountId,
+      )
+      if (main && !ids.includes(main.id)) ids.unshift(main.id)
+      if ((await store.reorder(ids)).outcome === 'reordered')
         logCommittedNativeAccountChange(
           'account reordered',
           snapshot.accounts.find((row) => row.id === movedRouteId) ?? {
             id: movedRouteId,
           },
         )
-      if (snapshot.mode === 'claustrum') {
-        const order = [...routeIds]
-        if (
-          snapshot.accounts.some((row) => row.id === 'main') &&
-          !order.includes('main')
-        )
-          order.unshift('main')
-        if (
-          new Set(order).size !== order.length ||
-          order.length !== snapshot.accounts.length ||
-          order.some((id) => !snapshot.accounts.some((row) => row.id === id))
-        )
-          throw new NativeCustodyError('invalid-state')
-        const rosterReordered = await mutateVaultRoster(
-          paths.roster,
-          (roster) => {
-            if (!roster) throw new NativeCustodyError('route-unavailable')
-            const primary = nativeVaultPrimaryRow(
-              roster,
-              nativeVaultPrimaryPin(snapshot.settings),
-            )
-            const ids = order
-              .filter(
-                (id) =>
-                  snapshot.accounts.find((row) => row.id === id)?.source ===
-                  'vault',
-              )
-              .map((id) => (id === 'main' ? primary?.routeId : id))
-            if (
-              ids.length !== roster.rows.length ||
-              ids.some((id) => !roster.rows.some((row) => row.routeId === id))
-            )
-              throw new NativeCustodyError('identity-changed')
-            return {
-              next: {
-                ...roster,
-                rows: ids.map((id) => {
-                  const row = roster.rows.find((row) => row.routeId === id)
-                  if (!row) throw new NativeCustodyError('identity-changed')
-                  return row
-                }),
-              },
-              // Compare the requested order with the account rows read under
-              // the roster lock, so an unchanged order produces no change log.
-              result: ids.some(
-                (id, index) => roster.rows[index]?.routeId !== id,
-              ),
-            }
-          },
-        )
-        // Ordering spans the pool account config and the native vault roster.
-        // Their writes are not a two-file atomic transaction: an interruption
-        // can leave mixed presentation order, but neither roster loses a member.
-        const settingsWrite = await store.updateSettings((settings) => {
-          settings.nativeAccountOrder = order
-        })
-        if (rosterReordered || settingsWrite.outcome === 'updated')
-          logReordered()
-        return
-      }
-      const ids = await Promise.all(routeIds.map(physicalId))
-      const main = read.rows.find(
-        (row) => row.id === snapshot.settings.mainAccountId,
-      )
-      if (main && !ids.includes(main.id)) ids.unshift(main.id)
-      if ((await store.reorder(ids)).outcome === 'reordered') logReordered()
     },
     async captureLocalSubject(routeId) {
-      await authority()
+      await localAuthority()
       const row = await poolRow(await physicalId(routeId))
       if (row?.credential?.type !== 'oauth' || row.stamp !== 'bound')
         throw new NativeCustodyError('route-unavailable')
@@ -1127,7 +1103,7 @@ export function createNativeAccountRuntime(
     },
     async publishLocal(subject, rawPatch) {
       const patch = captureNativeMetadataPatch(rawPatch)
-      await authority()
+      if ((await authority()) !== 'local') return false
       const { quota, ...metadata } = patch
       const quotaOnly =
         quota !== undefined && Object.keys(metadata).length === 0
@@ -1173,6 +1149,7 @@ export function createNativeAccountRuntime(
       })),
     async resetBackoff(routeId, fence, kind = 'all') {
       if ('accessToken' in fence) return vault.resetBackoff(fence, kind)
+      if ((await authority()) !== 'local') return false
       if ((await physicalId(routeId)) !== fence.binding.rowId) return false
       return localWrite(
         fence,
@@ -1202,6 +1179,7 @@ export function createNativeAccountRuntime(
     },
     async getOrCreateAuthLineage(routeId, fence) {
       if ('accessToken' in fence) return vault.getOrCreateAuthLineage(fence)
+      if ((await authority()) !== 'local') return undefined
       if ((await physicalId(routeId)) !== fence.binding.rowId) return undefined
       let lineage: string | undefined
       const kept = await localWrite(fence, (old) => {
@@ -1217,6 +1195,7 @@ export function createNativeAccountRuntime(
     },
     async incrementPrimeUsage(routeId, fence, delta = {}) {
       if ('accessToken' in fence) return vault.incrementPrimeUsage(fence, delta)
+      if ((await authority()) !== 'local') return false
       if ((await physicalId(routeId)) !== fence.binding.rowId) return false
       const captured = primeDelta(delta)
       return localWrite(fence, (old) => ({

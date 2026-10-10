@@ -2,8 +2,10 @@ import { expect, spyOn } from 'bun:test'
 import * as filesystem from 'node:fs/promises'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { disconnectClaustrumEnrollment } from '@cortexkit/common-auth/claustrum'
 import { ClaudeOAuthRefreshError } from '../auth.ts'
 import type { ProviderAccountUuid } from '../claude-code.ts'
+import { getHostClaustrumEnrollmentPaths } from '../claustrum-enrollment.ts'
 import {
   __setLogTestSink,
   getLogLevel,
@@ -61,9 +63,16 @@ async function fixture(
     settings.mainAccountId = 'imported-main'
   })
   const counts = { lookups: 0, refresh: 0 }
+  const env = {
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+      root,
+      'opencode-enrollment.json',
+    ),
+  }
   const runtime = createNativeAccountRuntime({
     paths,
     host: 'opencode',
+    vault: { env },
     local: {
       now: () => now,
       resolveIdentity: async () => {
@@ -87,7 +96,7 @@ async function fixture(
     },
   })
   deferCleanup(() => runtime.close())
-  return { paths, runtime, store, counts }
+  return { paths, runtime, store, counts, env }
 }
 
 test('native facade reads no legacy authority and does not import legacy persistence', async () => {
@@ -1089,7 +1098,11 @@ test('two writers enabling the same disabled account log one change, judged by t
   await f.runtime.setEnabled('fallback-a', false)
   // A second account runtime shares the same credential/configuration files,
   // representing another process.
-  const other = createNativeAccountRuntime({ paths: f.paths, host: 'opencode' })
+  const other = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    vault: { env: f.env },
+  })
   deferCleanup(() => other.close())
   const logs = captureCommandLogs()
 
@@ -1391,9 +1404,12 @@ test('vault mode refuses direct local API authorization without changing stored 
     routeId: 'local-api',
     apiKey: 'synthetic-local-api-secret',
   })
-  await f.store.updateSettings((settings) => {
-    settings.claustrum = { mode: 'claustrum' }
-  })
+  const enrollment = getHostClaustrumEnrollmentPaths('opencode', f.env)
+  await writeFile(
+    enrollment.tokenPath,
+    JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
   const before = await Promise.all([
     readFile(f.paths.config, 'utf8'),
     readFile(f.paths.state, 'utf8'),
@@ -1408,9 +1424,9 @@ test('vault mode refuses direct local API authorization without changing stored 
     ]),
   ).toEqual(before)
   expect(f.counts.lookups + f.counts.refresh).toBe(0)
-  await f.store.updateSettings((settings) => {
-    settings.claustrum = { mode: 'local' }
-  })
+  expect(
+    await disconnectClaustrumEnrollment(enrollment, 'anthropic-auth-opencode'),
+  ).toBe('disconnected')
   expect((await f.runtime.authorizeApi('local-api')).apiKey).toBe(
     'synthetic-local-api-secret',
   )
@@ -1531,4 +1547,40 @@ test('OAuth login rechecks migration authority after delayed identity validation
     throw new Error('Revoked migration authority still allowed login')
   expect(result.error).toHaveProperty('code', 'migration-required')
   expect(await loginStoredBytes(f.paths)).toEqual(before)
+})
+
+test('enrollment rejects captured local metadata and Prime writes before reopening local recovery files', async () => {
+  const f = await fixture()
+  const prior = await f.runtime.authorizeLocal('main')
+  if (prior.status !== 'usable')
+    throw new Error('Local subject was not admitted')
+  await writeFile(
+    getHostClaustrumEnrollmentPaths('opencode', f.env).tokenPath,
+    JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  const files = [
+    f.paths.config,
+    f.paths.state,
+    f.paths.runtime,
+    f.paths.journal,
+  ]
+  for (const file of files)
+    await writeFile(file, 'synthetic-unreadable-local-state', { mode: 0o600 })
+  const before = await Promise.all(files.map((path) => readFile(path)))
+  expect(
+    await f.runtime.publishLocal(prior.subject, {
+      quota: {
+        accountIdentity: uuid,
+        checkedAt: now,
+        five_hour: { usedPercent: 99, remainingPercent: 1, checkedAt: now },
+      },
+    }),
+  ).toBe(false)
+  expect(await f.runtime.resetBackoff('main', prior.subject)).toBe(false)
+  expect(
+    await f.runtime.getOrCreateAuthLineage('main', prior.subject),
+  ).toBeUndefined()
+  expect(await f.runtime.incrementPrimeUsage('main', prior.subject)).toBe(false)
+  expect(await Promise.all(files.map((path) => readFile(path)))).toEqual(before)
 })

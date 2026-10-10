@@ -1,12 +1,14 @@
 import { expect, spyOn } from 'bun:test'
 import * as filesystem from 'node:fs/promises'
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   mutateVaultRoster,
   projectVaultRoster,
   readVaultRoster,
 } from '@cortexkit/common-auth/claustrum'
+import { getHostClaustrumEnrollmentPaths } from '../claustrum-enrollment.ts'
 import {
   __setLogTestSink,
   getLogLevel,
@@ -17,6 +19,7 @@ import { createNativeAccountRuntime } from '../native-account-runtime.ts'
 import type { NativeCustodyClient } from '../native-custody.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { readNativeRuntime, updateNativeRuntime } from '../native-runtime.ts'
+import { nativeVaultPaths } from '../native-vault-paths.ts'
 import {
   acquireNativeVaultRuntime,
   createNativeVaultRuntime,
@@ -51,16 +54,26 @@ const listed: Row = {
 }
 
 async function fixture() {
-  const parent = new URL(
-    '../../../../node_modules/.cache/native-vault-runtime/',
-    import.meta.url,
-  ).pathname
-  await mkdir(parent, { recursive: true })
-  const root = await mkdtemp(join(parent, 'fixture-'))
+  const root = await mkdtemp(join(tmpdir(), 'native-vault-runtime-'))
   deferCleanup(() => rm(root, { recursive: true, force: true }))
   const paths = await resolveNativePoolPaths(join(root, 'anthropic-auth.json'))
   await initializeNativeTestAuthority(paths)
-  const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+  const vaultPaths = nativeVaultPaths(paths)
+  const env = {
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+      root,
+      'opencode-enrollment.json',
+    ),
+  }
+  await writeFile(
+    env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
+    JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  const store = createNativePoolStore({
+    paths: vaultPaths,
+    quota: nativeQuotaCodec,
+  })
   await store.initialize()
   const projected = projectVaultRoster(
     undefined,
@@ -83,7 +96,6 @@ async function fixture() {
   await store.updateSettings((settings) => {
     settings.mainAccountId = primaryRouteId
     settings.claustrum = {
-      mode: 'claustrum',
       primaryAccount: { credentialId: id, accountId: uuid, state: 'active' },
     }
   })
@@ -119,6 +131,7 @@ async function fixture() {
   const options = {
     paths,
     host: 'opencode' as const,
+    env,
     now: () => now,
     connect: async () => {
       counts.connects++
@@ -130,6 +143,8 @@ async function fixture() {
   deferCleanup(() => runtime.close())
   return {
     paths,
+    vaultPaths,
+    env,
     options,
     runtime,
     counts,
@@ -192,7 +207,7 @@ test('delayed vault fallback GET rejects a newly expired or revoked roster row b
   }
 })
 
-test('vault main authorization preserves offline primary credential UUID and seeded route pin', async () => {
+test('vault main follows the verified default but rejects a tampered current route binding', async () => {
   const f = await fixture()
   await f.runtime.refresh()
   f.rows([{ ...listed, accountId: uuid2 }])
@@ -202,12 +217,12 @@ test('vault main authorization preserves offline primary credential UUID and see
     http++
     return receipt
   })
-  await expect(pending).rejects.toMatchObject({ code: 'route-unavailable' })
-  expect(f.counts.gets).toBe(0)
-  expect(http).toBe(0)
-  // Reusing the setup-selected primary route must not authorize a different
-  // account UUID or vault credential than setup recorded.
-  await mutateVaultRoster(f.paths.roster, (roster) => {
+  expect((await pending).accountIdentity).toBe(uuid2)
+  expect(f.counts.gets).toBe(1)
+  expect(http).toBe(1)
+  // Once discovery pins the verified default, changing its route, UUID or
+  // credential in the roster must not authorize a different account.
+  await mutateVaultRoster(f.vaultPaths.roster, (roster) => {
     if (!roster?.rows[0]) throw new Error('Missing fixture roster')
     roster.rows[0].routeId = f.primaryRouteId
     return { next: roster, result: undefined }
@@ -215,7 +230,7 @@ test('vault main authorization preserves offline primary credential UUID and see
   await expect(f.runtime.authorize('main')).rejects.toMatchObject({
     code: 'route-unavailable',
   })
-  await mutateVaultRoster(f.paths.roster, (roster) => {
+  await mutateVaultRoster(f.vaultPaths.roster, (roster) => {
     if (!roster?.rows[0]) throw new Error('Missing fixture roster')
     roster.rows[0].accountIdentity = uuid
     roster.rows[0].credentialId = 'oauth:anthropic:other'
@@ -224,7 +239,7 @@ test('vault main authorization preserves offline primary credential UUID and see
   await expect(f.runtime.authorize('main')).rejects.toMatchObject({
     code: 'route-unavailable',
   })
-  expect(f.counts.gets).toBe(0)
+  expect(f.counts.gets).toBe(1)
 })
 
 test('persisted vault read never connects while first authorization discovers and every attempt gets a fresh receipt', async () => {
@@ -330,7 +345,7 @@ test('closing a pending vault list cannot publish its late result', async () => 
   await expect(pending).rejects.toMatchObject({ code: 'closed' })
   release.open()
   await settled.wait
-  expect(await readVaultRoster(f.paths.roster)).toBeUndefined()
+  expect(await readVaultRoster(f.vaultPaths.roster)).toBeUndefined()
 })
 
 test('vault background 401 reports only the final rejected receipt and retries only once on strict newer version', async () => {
@@ -496,7 +511,10 @@ test('vault receipt ownership and version fences reject copied, replaced and del
   await expect(
     f.runtime.publish({ ...second }, { lastUsed: now }),
   ).rejects.toMatchObject({ code: 'no-receipt' })
-  const quota = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  const quota = await readNativeRuntime(
+    f.vaultPaths.runtime,
+    f.vaultPaths.storageId,
+  )
   expect(
     quota.status === 'ready'
       ? quota.state.accounts[(await f.runtime.read())!.rows[0]!.routeId]
@@ -540,13 +558,16 @@ test('vault quota/profile and atomic Prime lineage remain secret-free in durable
   expect(
     await f.runtime.incrementPrimeUsage(receipt, { outputTokens: 3 }),
   ).toBe(true)
-  const state = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  const state = await readNativeRuntime(
+    f.vaultPaths.runtime,
+    f.vaultPaths.storageId,
+  )
   expect(
     state.status === 'ready'
       ? Object.values(state.state.accounts)[0]?.prime
       : undefined,
   ).toEqual({ count: 2, inputTokens: 2, outputTokens: 3, since: now })
-  expect(await readFile(f.paths.runtime, 'utf8')).not.toContain(
+  expect(await readFile(f.vaultPaths.runtime, 'utf8')).not.toContain(
     'synthetic-bearer',
   )
 })
@@ -574,7 +595,7 @@ test('seed publication outer ownership is checked again at actual producer renam
   }
   let assertions = 0
   await expect(
-    publishNativeVaultRosterSeed(f.paths, input, {
+    publishNativeVaultRosterSeed(f.vaultPaths, input, {
       assertOwned: async () => {
         if (++assertions === 2)
           throw new Error('synthetic outer lease lost at rename')
@@ -582,8 +603,8 @@ test('seed publication outer ownership is checked again at actual producer renam
     }),
   ).rejects.toThrow('synthetic outer lease lost at rename')
   expect(assertions).toBe(2)
-  expect(await readVaultRoster(f.paths.roster)).toBeUndefined()
-  const seed = await publishNativeVaultRosterSeed(f.paths, input)
+  expect(await readVaultRoster(f.vaultPaths.roster)).toBeUndefined()
+  const seed = await publishNativeVaultRosterSeed(f.vaultPaths, input)
   expect(seed.rows[0]?.routeId).toBe('imported-main')
 })
 
@@ -591,15 +612,20 @@ test('custody runtime seed rejects unowned publication and descriptor callbacks 
   const f = await fixture()
   const roster = await f.runtime.refresh()
   const routeId = roster!.rows[0]!.routeId
-  const before = await readFile(f.paths.runtime)
+  await updateNativeRuntime(
+    f.vaultPaths.runtime,
+    f.vaultPaths.storageId,
+    (current) => current,
+  )
+  const before = await readFile(f.vaultPaths.runtime)
   const state = {
     version: 1 as const,
-    storageId: f.paths.storageId,
+    storageId: f.vaultPaths.storageId,
     accounts: {
       [routeId]: {
         binding: {
           kind: 'custody' as const,
-          storageId: f.paths.storageId,
+          storageId: f.vaultPaths.storageId,
           routeId,
           credentialId: id,
           accountIdentity: uuid,
@@ -610,13 +636,13 @@ test('custody runtime seed rejects unowned publication and descriptor callbacks 
     },
   }
   await expect(
-    publishNativeVaultRuntimeSeed(f.paths, state, {
+    publishNativeVaultRuntimeSeed(f.vaultPaths, state, {
       assertOwned: async () => {
         throw new Error('lost outer lease')
       },
     }),
   ).rejects.toMatchObject({ code: 'publication-refused' })
-  expect(await readFile(f.paths.runtime)).toEqual(before)
+  expect(await readFile(f.vaultPaths.runtime)).toEqual(before)
   let reads = 0
   Object.defineProperty(state.accounts[routeId], 'lastUsed', {
     get: () => {
@@ -626,10 +652,10 @@ test('custody runtime seed rejects unowned publication and descriptor callbacks 
     enumerable: true,
   })
   await expect(
-    publishNativeVaultRuntimeSeed(f.paths, state),
+    publishNativeVaultRuntimeSeed(f.vaultPaths, state),
   ).rejects.toMatchObject({ code: 'publication-refused' })
   expect(reads).toBe(0)
-  expect(await readFile(f.paths.runtime)).toEqual(before)
+  expect(await readFile(f.vaultPaths.runtime)).toEqual(before)
 })
 
 test('vault route disable persists decline and a held roster prevents replaced-account runtime publication', async () => {
@@ -640,7 +666,7 @@ test('vault route disable persists decline and a held roster prevents replaced-a
   await expect(f.runtime.authorize('main')).rejects.toMatchObject({
     code: 'route-declined',
   })
-  await mutateVaultRoster(f.paths.roster, (current) => {
+  await mutateVaultRoster(f.vaultPaths.roster, (current) => {
     if (!current) throw new Error('Missing fixture roster')
     current.rows[0]!.accountIdentity = uuid2
     return { next: current, result: undefined }
@@ -658,7 +684,10 @@ test('vault quota auth failures never arm quota backoff while 429 still does', a
     await expect(f.runtime.fetchQuota('main', transport)).rejects.toMatchObject(
       { status },
     )
-    const state = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+    const state = await readNativeRuntime(
+      f.vaultPaths.runtime,
+      f.vaultPaths.storageId,
+    )
     const error =
       state.status === 'ready'
         ? state.state.accounts[f.primaryRouteId]?.lastQuotaRefreshError
@@ -734,20 +763,24 @@ test('vault quota success and failure cannot inherit another account runtime cle
   for (const status of [200, 429]) {
     const f = await fixture()
     await f.runtime.refresh()
-    await updateNativeRuntime(f.paths.runtime, f.paths.storageId, (current) => {
-      current.accounts[f.primaryRouteId] = {
-        binding: {
-          kind: 'custody',
-          storageId: f.paths.storageId,
-          routeId: f.primaryRouteId,
-          credentialId: id,
-          accountIdentity: uuid2,
-          recordVersion: 7,
-        },
-        quotaErrorClearedAt: now + 1_000_000,
-      }
-      return current
-    })
+    await updateNativeRuntime(
+      f.vaultPaths.runtime,
+      f.vaultPaths.storageId,
+      (current) => {
+        current.accounts[f.primaryRouteId] = {
+          binding: {
+            kind: 'custody',
+            storageId: f.vaultPaths.storageId,
+            routeId: f.primaryRouteId,
+            credentialId: id,
+            accountIdentity: uuid2,
+            recordVersion: 7,
+          },
+          quotaErrorClearedAt: now + 1_000_000,
+        }
+        return current
+      },
+    )
     const transport: typeof fetch = Object.assign(
       async () => new Response('{}', { status }),
       { preconnect: fetch.preconnect },
@@ -757,7 +790,10 @@ test('vault quota success and failure cannot inherit another account runtime cle
       await expect(
         f.runtime.fetchQuota('main', transport),
       ).rejects.toMatchObject({ status: 429 })
-    const state = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+    const state = await readNativeRuntime(
+      f.vaultPaths.runtime,
+      f.vaultPaths.storageId,
+    )
     const entry =
       state.status === 'ready'
         ? state.state.accounts[f.primaryRouteId]
@@ -803,11 +839,7 @@ function accountRuntime(f: Awaited<ReturnType<typeof fixture>>) {
   const runtime = createNativeAccountRuntime({
     paths: f.paths,
     host: 'opencode',
-    vault: {
-      now: f.options.now,
-      connect: f.options.connect,
-      readToken: f.options.readToken,
-    },
+    vault: f.options,
   })
   deferCleanup(() => runtime.close())
   return runtime
@@ -816,19 +848,19 @@ function accountRuntime(f: Awaited<ReturnType<typeof fixture>>) {
 test('vault setEnabled reports whether the route flag changed, judged on the roster under its lock', async () => {
   const f = await fixture()
   await f.runtime.refresh()
-  const row = async () => (await readVaultRoster(f.paths.roster))?.rows[0]
+  const row = async () => (await readVaultRoster(f.vaultPaths.roster))?.rows[0]
 
   expect(await f.runtime.setEnabled('main', false)).toBe(true)
   expect(await f.runtime.setEnabled('main', false)).toBe(false)
   expect((await row())?.enabled).toBe(false)
-  expect((await readVaultRoster(f.paths.roster))?.declined).toEqual([
+  expect((await readVaultRoster(f.vaultPaths.roster))?.declined).toEqual([
     { credentialId: id, accountIdentity: uuid },
   ])
 
   expect(await f.runtime.setEnabled('main', true)).toBe(true)
   expect(await f.runtime.setEnabled('main', true)).toBe(false)
   expect((await row())?.enabled).toBe(true)
-  expect((await readVaultRoster(f.paths.roster))?.declined).toEqual([])
+  expect((await readVaultRoster(f.vaultPaths.roster))?.declined).toEqual([])
 
   await expect(
     f.runtime.setEnabled('missing-route', false),
@@ -869,11 +901,14 @@ test('two native runtimes disabling the same vault account log one change, judge
     },
   ])
 
-  // Removing a vault account declines it: the change is logged as a disable,
-  // once, and removing it again changes nothing.
+  // Explicit enable/disable changes only this plugin's use of the vault account.
+  // Removing credentials is not a substitute for declining their use.
   await a.setEnabled('main', true)
-  await a.remove('main')
-  await a.remove('main')
+  await expect(a.remove('main')).rejects.toMatchObject({
+    code: 'route-unavailable',
+  })
+  await a.setEnabled('main', false)
+  await a.setEnabled('main', false)
   expect(logs.take()).toEqual([
     {
       message: 'account enabled',
@@ -886,7 +921,7 @@ test('two native runtimes disabling the same vault account log one change, judge
   ])
 })
 
-test('vault account reorder logs once when the locked roster or stored order changes', async () => {
+test('vault account reorder refuses without changing roster, settings, or local state', async () => {
   const f = await fixture()
   f.rows([
     listed,
@@ -907,29 +942,46 @@ test('vault account reorder logs once when the locked roster or stored order cha
   if (!first || !second) throw new Error('Missing fixture fallback routes')
   const logs = captureCommandLogs()
 
-  await a.reorder([second, first], second)
-  expect(await fallbacks()).toEqual([second, first])
-  // Asking for the order already stored writes nothing new, so only the
-  // reorder above is logged.
-  await a.reorder([second, first], second)
-  expect(logs.take()).toEqual([
-    {
-      message: 'account reordered',
-      payload: expect.objectContaining({ id: second }),
-    },
-  ])
+  const files = [
+    f.vaultPaths.roster,
+    f.vaultPaths.config,
+    f.paths.config,
+    f.paths.state,
+    f.paths.journal,
+  ]
+  const readBytes = async (path: string) =>
+    readFile(path).catch((error: unknown) => {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'ENOENT'
+      )
+        return undefined
+      throw error
+    })
+  const before = await Promise.all(files.map(readBytes))
+  await expect(a.reorder([second, first], second)).rejects.toMatchObject({
+    code: 'route-unavailable',
+  })
+  expect(await fallbacks()).toEqual([first, second])
+  await expect(a.reorder([first, second], first)).rejects.toMatchObject({
+    code: 'route-unavailable',
+  })
+  expect(await Promise.all(files.map(readBytes))).toEqual(before)
+  expect(logs.take()).toEqual([])
 })
 
 test('vault profile I/O failure rechecks non-secret provenance without another GET', async () => {
   const f = await fixture()
   const initial = await f.runtime.authorize('main')
   expect(await f.runtime.publish(initial, { lastUsed: now })).toBe(true)
-  const before = await readFile(f.paths.runtime)
+  const before = await readFile(f.vaultPaths.runtime)
   const originalRename = filesystem.rename
   let failedWrites = 0
   const writer = spyOn(filesystem, 'rename').mockImplementation(
     async (from, to) => {
-      if (to === f.paths.runtime) {
+      if (to === f.vaultPaths.runtime) {
         failedWrites++
         throw Object.assign(
           new Error('Synthetic vault profile rename failure'),
@@ -953,7 +1005,7 @@ test('vault profile I/O failure rechecks non-secret provenance without another G
   const result = await f.runtime.fetchProfileForDisplay('main', transport)
   expect(await result.persisted).toBe('failed')
   expect(failedWrites).toBe(1)
-  expect(await readFile(f.paths.runtime)).toEqual(before)
+  expect(await readFile(f.vaultPaths.runtime)).toEqual(before)
   const gets = f.counts.gets
   expect(await result.isCurrent()).toBe(true)
   expect(f.counts.gets).toBe(gets)
@@ -1004,4 +1056,218 @@ test('a newer vault receipt refuses stale profile publication and display', asyn
   const result = await f.runtime.fetchProfileForDisplay('main', transport)
   expect(await result.persisted).toBe('refused')
   expect(await result.isCurrent()).toBe(false)
+})
+
+async function preservedLocalFiles(f: Awaited<ReturnType<typeof fixture>>) {
+  const files = [
+    f.paths.legacyConfig,
+    f.paths.legacyState,
+    f.paths.config,
+    f.paths.state,
+    f.paths.runtime,
+    f.paths.journal,
+    f.paths.roster,
+  ]
+  for (const file of files)
+    await writeFile(file, 'synthetic-unreadable-local-state', { mode: 0o600 })
+  const before = await Promise.all(files.map((file) => readFile(file)))
+  return async () =>
+    expect(await Promise.all(files.map((file) => readFile(file)))).toEqual(
+      before,
+    )
+}
+
+test('approved vault recovery discovers its own main without reading local credentials or migration authority', async () => {
+  const f = await fixture()
+  const unchanged = await preservedLocalFiles(f)
+  await f.store.updateSettings((settings) => {
+    delete settings.mainAccountId
+    delete settings.claustrum
+  })
+  const facade = accountRuntime(f)
+  await facade.vault.refresh()
+  const snapshot = await facade.read()
+  expect(snapshot.mode).toBe('claustrum')
+  expect(snapshot.routingPath).toBe(f.vaultPaths.routing)
+  expect(snapshot.accounts).toHaveLength(1)
+  expect(snapshot.accounts[0]).toMatchObject({
+    id: 'main',
+    source: 'vault',
+    accountIdentity: uuid,
+  })
+  const saved = await f.store.readSettings()
+  if (saved.status !== 'ready') throw new Error('Vault settings are missing')
+  expect(saved.settings.mainAccountId).toBe(f.primaryRouteId)
+  expect(saved.settings.claustrum).toEqual({
+    primaryAccount: { credentialId: id, accountId: uuid },
+  })
+  expect(f.counts.gets).toBe(0)
+  await unchanged()
+})
+
+test('vault-only settings, relay and account controls preserve every local file', async () => {
+  const f = await fixture()
+  const unchanged = await preservedLocalFiles(f)
+  const facade = accountRuntime(f)
+  await facade.vault.refresh()
+  await facade.updateSettings((settings) => {
+    settings.routing = { mode: 'fallback-first' }
+  })
+  await facade.updateRelay({
+    enabled: true,
+    url: 'https://relay.example.invalid',
+    token: 'synthetic-private-relay',
+    transport: 'http',
+  })
+  expect(await facade.getRelayConfig()).toMatchObject({
+    enabled: true,
+    token: 'synthetic-private-relay',
+  })
+  const receipt = await facade.authorizeVault('main')
+  expect(
+    await facade.vault.publish(receipt, {
+      lastQuotaRefreshError: {
+        message: 'synthetic quota failure',
+        checkedAt: now,
+        accountIdentity: uuid,
+      },
+    }),
+  ).toBe(true)
+  expect(await facade.resetBackoff('main', receipt, 'quota')).toBe(true)
+  await facade.setEnabled('main', false)
+  expect((await facade.read()).accounts[0]?.enabled).toBe(false)
+  await facade.setEnabled('main', true)
+  expect((await facade.read()).accounts[0]?.enabled).toBe(true)
+  const saved = await f.store.readSettings()
+  if (saved.status !== 'ready') throw new Error('Vault settings are missing')
+  expect(saved.settings.routing).toEqual({ mode: 'fallback-first' })
+  expect(JSON.stringify(saved.settings)).not.toContain(
+    'synthetic-private-relay',
+  )
+  const metadata = await readNativeRuntime(
+    f.vaultPaths.runtime,
+    f.vaultPaths.storageId,
+  )
+  if (metadata.status !== 'ready') throw new Error('Vault metadata is missing')
+  expect(metadata.state.relay?.token).toBe('synthetic-private-relay')
+  expect(
+    metadata.state.accounts[f.primaryRouteId]?.lastQuotaRefreshError,
+  ).toBeUndefined()
+  await unchanged()
+})
+
+test('stale local account actions refuse in vault mode before reading or writing the local pool', async () => {
+  const f = await fixture()
+  const unchanged = await preservedLocalFiles(f)
+  const facade = accountRuntime(f)
+  await expect(
+    facade.addApi({
+      routeId: 'stale',
+      apiKey: 'synthetic-private-key',
+      baseURL: 'https://api.example.invalid',
+    }),
+  ).rejects.toMatchObject({ code: 'route-unavailable' })
+  await expect(facade.remove('stale')).rejects.toMatchObject({
+    code: 'route-unavailable',
+  })
+  await expect(facade.reorder(['stale'])).rejects.toMatchObject({
+    code: 'route-unavailable',
+  })
+  await expect(facade.captureLocalSubject('main')).rejects.toMatchObject({
+    code: 'route-unavailable',
+  })
+  await expect(
+    facade.loginOAuth({
+      routeId: 'stale',
+      credential: {
+        access: 'sk-ant-oat01-synthetic-local',
+        refresh: 'synthetic-local-refresh',
+        expires: now + 3_600_000,
+      },
+    }),
+  ).rejects.toMatchObject({ code: 'route-unavailable' })
+  expect(f.counts.gets).toBe(0)
+  await unchanged()
+})
+
+test('replacing the verified vault default re-pins a new account without quota or Prime inheritance', async () => {
+  const f = await fixture()
+  const unchanged = await preservedLocalFiles(f)
+  const facade = accountRuntime(f)
+  await facade.vault.refresh()
+  const old = await facade.authorizeVault('main')
+  expect(
+    await facade.vault.publish(old, {
+      quota: {
+        accountIdentity: uuid,
+        checkedAt: now,
+        five_hour: { usedPercent: 99, remainingPercent: 1, checkedAt: now },
+      },
+    }),
+  ).toBe(true)
+  const oldLineage = await facade.getOrCreateAuthLineage('main', old)
+  expect(oldLineage).toMatch(/^[a-f0-9-]{36}$/)
+  expect(
+    await facade.incrementPrimeUsage('main', old, { inputTokens: 2 }),
+  ).toBe(true)
+  f.rows([{ ...listed, accountId: uuid2 }])
+  await facade.vault.refresh()
+  const snapshot = await facade.read()
+  const main = snapshot.accounts.find((row) => row.id === 'main')
+  expect(main?.accountIdentity).toBe(uuid2)
+  expect(main?.quota).toBeUndefined()
+  expect(main?.prime).toBeUndefined()
+  expect(snapshot.settings.mainAccountId).not.toBe(f.primaryRouteId)
+  expect(await facade.vault.publish(old, { lastUsed: now })).toBe(false)
+  const current = await facade.authorizeVault('main')
+  expect(current.accountIdentity).toBe(uuid2)
+  expect(await facade.getOrCreateAuthLineage('main', current)).not.toBe(
+    oldLineage,
+  )
+  await unchanged()
+})
+
+test('approved enrollment missing its token refuses vault credentials and never opens local recovery files', async () => {
+  const f = await fixture()
+  const unchanged = await preservedLocalFiles(f)
+  const enrollment = getHostClaustrumEnrollmentPaths('opencode', f.env)
+  await writeFile(
+    enrollment.statePath,
+    JSON.stringify({
+      version: 1,
+      phase: 'approved',
+      proposedName: 'anthropic-auth-opencode',
+      tokenGeneration: 1,
+      updatedAt: now,
+    }),
+    { mode: 0o600 },
+  )
+  await rm(enrollment.tokenPath)
+  const facade = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    vault: { ...f.options, readToken: undefined },
+  })
+  deferCleanup(() => facade.close())
+  expect((await facade.read()).mode).toBe('claustrum')
+  await expect(facade.authorizeVault('main')).rejects.toBeInstanceOf(Error)
+  expect(f.counts.gets).toBe(0)
+  await unchanged()
+})
+
+test('unverified default discovery removes main admission without inheriting a local account identity', async () => {
+  const f = await fixture()
+  const unchanged = await preservedLocalFiles(f)
+  const facade = accountRuntime(f)
+  await facade.vault.refresh()
+  f.rows([{ ...listed, accountId: undefined }])
+  await facade.vault.refresh()
+  const snapshot = await facade.read()
+  expect(snapshot.mode).toBe('claustrum')
+  expect(snapshot.accounts.find((row) => row.id === 'main')).toBeUndefined()
+  await expect(facade.authorizeVault('main')).rejects.toMatchObject({
+    code: 'route-unavailable',
+  })
+  expect(f.counts.gets).toBe(0)
+  await unchanged()
 })

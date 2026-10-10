@@ -21,6 +21,7 @@ import {
   applyNativeMetadataPatch,
   captureNativeMetadataPatch,
   captureNativePlainData,
+  NATIVE_PRIMARY_CREDENTIAL_ID,
   type NativeAccountMetadataPatch,
   nativeAccountReadError,
   nativeQuotaFailure,
@@ -36,6 +37,7 @@ import {
   type NativeCustodyReporterSource,
   type NativeCustodyRetry,
 } from './native-custody.ts'
+import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
 import { nativeQuotaCodec } from './native-quota-codec.ts'
 import {
   buildNativeVaultRosterSeed,
@@ -52,11 +54,10 @@ import {
   readNativeRuntime,
   updateNativeRuntime,
 } from './native-runtime.ts'
+import type { NativeVaultPaths } from './native-vault-paths.ts'
+import { nativeVaultPaths } from './native-vault-paths.ts'
 import { fetchOAuthAccountProfile } from './oauth-profile.ts'
-import {
-  NativeAuthorityError,
-  requireNativePoolAuthority,
-} from './pool-authority.ts'
+import { NativeAuthorityError } from './pool-authority.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 import { createNativePoolStore } from './pool-store.ts'
 
@@ -207,7 +208,7 @@ export interface NativeVaultRuntime {
 
 /** Publish initial account metadata only while the migration controller holds its journal lock and verifies that the host is stopped. */
 export async function publishNativeVaultRosterSeed(
-  paths: NativePoolPaths,
+  paths: Pick<NativeVaultPaths, 'roster'>,
   input: NativeRosterSeedInput,
   options: { assertOwned?: () => Promise<void> } = {},
 ): Promise<NativeVaultRosterSeed> {
@@ -230,7 +231,7 @@ export async function publishNativeVaultRosterSeed(
 
 /** Bind imported metadata to the vault account list. The migration controller supplies journal-lock and stopped-host checks; this writer owns neither. */
 export async function publishNativeVaultRuntimeSeed(
-  paths: NativePoolPaths,
+  paths: Pick<NativeVaultPaths, 'roster' | 'runtime' | 'storageId'>,
   state: NativeRuntimeState,
   options: { assertOwned?: () => Promise<void> } = {},
 ): Promise<void> {
@@ -290,7 +291,7 @@ export async function discoverNativeVaultInventory(
 export function createNativeVaultRuntime(
   options: NativeVaultRuntimeOptions,
 ): NativeVaultRuntime {
-  const paths = Object.freeze({ ...options.paths })
+  const paths = Object.freeze(nativeVaultPaths(options.paths))
   const env = { ...(options.env ?? process.env) }
   const shutdown = new AbortController()
   const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
@@ -312,7 +313,7 @@ export function createNativeVaultRuntime(
   >()
   const retryUsed = new WeakSet<NativeCustodyReceipt>()
   const versions = new Map<string, number>()
-  let reservedRouteIds = new Set<string>(['main'])
+  const reservedRouteIds = new Set<string>(['main'])
   let refreshing: Promise<NativeVaultRosterDocument | undefined> | undefined
 
   function check(signal?: AbortSignal) {
@@ -325,22 +326,72 @@ export function createNativeVaultRuntime(
   }
   async function active() {
     check()
-    await requireNativePoolAuthority(paths)
-    const read = await store.readSettings()
-    if (read.status !== 'ready') throw new NativeCustodyError('invalid-state')
-    const rows = await store.read()
-    if (rows.status !== 'ready') throw new NativeCustodyError('invalid-state')
-    reservedRouteIds = new Set(['main', ...rows.rows.map((row) => row.id)])
-    return (
-      (read.settings.claustrum as { mode?: unknown } | undefined)?.mode ===
-      'claustrum'
-    )
+    const mode = await readNativeEnrollmentMode(options.host, env)
+    check()
+    return mode === 'claustrum'
   }
   async function requireActive(signal?: AbortSignal) {
     check(signal)
     if (!(await active())) throw new NativeCustodyError('route-unavailable')
     check(signal)
   }
+  async function publishPrimaryPin(signal?: AbortSignal) {
+    await requireActive(signal)
+    await mutateVaultRoster(paths.roster, async (roster, lease) => {
+      const primary = roster?.rows.find(
+        (row) =>
+          (row.credentialId === NATIVE_PRIMARY_CREDENTIAL_ID ||
+            row.aliases?.includes(NATIVE_PRIMARY_CREDENTIAL_ID)) &&
+          row.credentialType === 'oauth' &&
+          row.state === 'active' &&
+          !row.stale &&
+          !row.unclaimed &&
+          typeof row.accountIdentity === 'string' &&
+          row.accountIdentity.length > 0,
+      )
+      const read = await store.readSettings()
+      if (read.status !== 'ready') throw new NativeCustodyError('invalid-state')
+      const previous = nativeVaultPrimaryPin(read.settings)
+      if (
+        (!primary && !previous) ||
+        (primary &&
+          previous?.routeId === primary.routeId &&
+          previous.credentialId === NATIVE_PRIMARY_CREDENTIAL_ID &&
+          previous.accountIdentity === primary.accountIdentity)
+      )
+        return { result: undefined }
+      const writer = createNativePoolStore({
+        paths,
+        quota: nativeQuotaCodec,
+        onStep: async (point) => {
+          if (
+            point === 'before-config-write' ||
+            point === 'before-state-write'
+          ) {
+            await requireActive(signal)
+            await lease.assertOwned()
+          }
+        },
+      })
+      await writer.updateSettings((settings) => {
+        if (primary) {
+          settings.mainAccountId = primary.routeId
+          settings.claustrum = {
+            primaryAccount: {
+              credentialId: NATIVE_PRIMARY_CREDENTIAL_ID,
+              accountId: primary.accountIdentity,
+            },
+          }
+        } else {
+          delete settings.mainAccountId
+          delete settings.claustrum
+        }
+        return settings
+      })
+      return { result: undefined }
+    })
+  }
+
   async function rowFor(
     roster: NativeVaultRosterDocument | undefined,
     routeId: string,
@@ -366,7 +417,9 @@ export function createNativeVaultRuntime(
       check()
       return roster
     },
-    refresh(signal) {
+    async refresh(signal) {
+      check(signal)
+      if (!(await active())) return undefined
       check(signal)
       // Cancellation belongs to this waiter, not to a peer using shared discovery.
       refreshing ??= refreshVaultRoster({
@@ -378,7 +431,9 @@ export function createNativeVaultRuntime(
       }).finally(() => {
         refreshing = undefined
       })
-      return waitFor(refreshing, signalFor(signal))
+      const roster = await waitFor(refreshing, signalFor(signal))
+      await publishPrimaryPin(signal)
+      return roster
     },
     async authorize(logicalId, signal) {
       const combined = signalFor(signal)
