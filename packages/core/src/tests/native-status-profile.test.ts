@@ -9,6 +9,7 @@ import type { ProviderAccountUuid } from '../claude-code.ts'
 import { createNativeAccountRuntime } from '../native-account-runtime.ts'
 import type { NativeCustodyClient } from '../native-custody.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
+import { nativeVaultPaths } from '../native-vault-paths.ts'
 import { createNativeVaultRuntime } from '../native-vault-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
@@ -61,6 +62,14 @@ async function localFixture() {
   const runtime = createNativeAccountRuntime({
     paths,
     host: 'opencode',
+    vault: {
+      env: {
+        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+          dirname(paths.config),
+          'opencode-enrollment.json',
+        ),
+      },
+    },
     local: {
       now: () => now,
       resolveIdentity: async () => ({
@@ -80,7 +89,22 @@ async function localFixture() {
 async function vaultFixture() {
   const paths = await fixtureRoot('native-status-profile-vault')
   await initializeNativeTestAuthority(paths)
-  const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+  const vaultPaths = nativeVaultPaths(paths)
+  const env = {
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+      dirname(paths.config),
+      'opencode-enrollment.json',
+    ),
+  }
+  await writeFile(
+    env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
+    JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  const store = createNativePoolStore({
+    paths: vaultPaths,
+    quota: nativeQuotaCodec,
+  })
   await store.initialize()
   const credentialId = 'oauth:anthropic'
   const projected = projectVaultRoster(
@@ -104,7 +128,6 @@ async function vaultFixture() {
   await store.updateSettings((settings) => {
     settings.mainAccountId = primaryRouteId
     settings.claustrum = {
-      mode: 'claustrum',
       primaryAccount: { credentialId, accountId: uuid, state: 'active' },
     }
   })
@@ -140,12 +163,13 @@ async function vaultFixture() {
   const runtime = createNativeVaultRuntime({
     paths,
     host: 'opencode',
+    env,
     now: () => now,
     connect: async () => client,
     readToken: async () => ({ token: '01'.repeat(32), token_generation: 1 }),
   })
   deferCleanup(() => runtime.close())
-  return { paths, runtime }
+  return { paths: { ...paths, ...vaultPaths }, runtime }
 }
 
 function profileTransport(
