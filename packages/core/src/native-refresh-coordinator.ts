@@ -68,8 +68,9 @@ export type NativeRefreshRestriction =
       status: 'blocked'
       reason: 'refresh-backoff' | 'invalid-grant'
       /**
-       * Identifies the stored credential through fingerprintOf; never put a
-       * bearer token or an access-token hash here.
+       * A one-way refresh-credential fingerprint ties this backoff to the stored
+       * OAuth lineage. Bearer values are secret, and an access-token fingerprint
+       * would identify a rotating access token rather than the failed refresh credential.
        */
       credentialFingerprint: string
     }
@@ -264,6 +265,7 @@ export interface NativeRefreshHooks {
 export interface NativeRefreshCoordinatorOptions
   extends NativePoolStoreOptions,
     NativeRefreshHooks {
+  paths: NativePoolPaths
   refreshToken?: typeof refreshClaudeOAuthToken
   resolveIdentity?: typeof resolveClaudeCodeIdentity
 }

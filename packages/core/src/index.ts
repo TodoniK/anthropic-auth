@@ -64,6 +64,7 @@ export {
   NativeCustodyActivationError,
   runNativeCustodyActivation,
 } from './native-custody-activation.ts'
+export { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
 export {
   inspectNativeHostAuthEntry,
   NativeHostAuthError,

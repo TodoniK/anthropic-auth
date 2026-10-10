@@ -16,21 +16,23 @@ interface NativeQuotaCodec {
   merge(stored: unknown | undefined, observation: unknown): unknown
 }
 
+export type NativePoolStorePaths = Pick<NativePoolPaths, 'config' | 'state'>
+
 export interface NativePoolStoreOptions
   extends Pick<
     OpenPoolStoreOptions,
     'now' | 'onStep' | 'hold' | 'logger' | 'onLockStep'
   > {
-  paths: NativePoolPaths
+  paths: NativePoolStorePaths
   quota: NativeQuotaCodec
   onLockEvent?: (event: NativeLockEvent) => void
 }
 
 /**
- * Pool and native-runtime writers share these locks when they reconcile an
- * account binding. The new namespace has no legacy credential writer.
+ * These config/state locks also fence local account metadata against concurrent
+ * credential changes. Legacy sidecar writers use different files and locks.
  */
-export function nativePoolStoreLocks(paths: NativePoolPaths) {
+export function nativePoolStoreLocks(paths: NativePoolStorePaths) {
   return [
     { path: paths.config, name: 'pool-config' },
     { path: paths.state, name: 'pool-state' },
@@ -38,8 +40,8 @@ export function nativePoolStoreLocks(paths: NativePoolPaths) {
 }
 
 /**
- * Internal storage machinery, not a startup or migration authorization. Native
- * dispatch also requires the offline migration's committed authority journal.
+ * Storage machinery only. Callers must separately establish local migration
+ * authority or vault enrollment authority before using these files.
  */
 export function createNativePoolStore(options: NativePoolStoreOptions) {
   return openPoolStore({
