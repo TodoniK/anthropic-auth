@@ -390,3 +390,19 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
 broad_report = "tmp/mutations/pi.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "host-auth-reader-rejects-shared-permissions"
+guards = "A readable auth file with unsafe permissions cannot be mistaken for a safe empty login slot."
+file = "packages/core/src/native-host-auth-read.ts"
+old = "(snapshot.metadata.mode & 0o077) !== 0"
+new = "false /* NON-VACUITY BREAK: admit shared host authentication */"
+test_file = "packages/core/src/tests/native-host-auth-read.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-host-auth-read.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["group-readable authentication refuses even when the process can physically read it"]
+expect_message = "Expected promise that rejects"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

@@ -70,6 +70,7 @@ export {
   NativeHostAuthError,
   requireNoSupervisedAuthContentSnapshot,
 } from './native-host-auth.ts'
+export { readNativeHostAuthKind } from './native-host-auth-read.ts'
 export type {
   NativeLocalAttributedFailure,
   NativeLocalCredentialService,
