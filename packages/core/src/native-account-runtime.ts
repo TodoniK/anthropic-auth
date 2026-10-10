@@ -17,6 +17,7 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
 } from './accounts.ts'
+import { resolveClaudeCodeIdentity } from './claude-code.ts'
 import type { LogLevel } from './logger.ts'
 import {
   applyNativeMetadataPatch,
@@ -90,7 +91,7 @@ export type {
 export interface NativeAccountRuntimeOptions {
   paths: NativePoolPaths
   host: 'opencode' | 'pi'
-  /** The setup CLI checks that OpenCode and Pi are still stopped before locked credential-file writes. */
+  /** The opencode-anthropic-auth setup command rechecks that hosts are stopped before credential-file writes, so migration cannot change credentials used by a running host. */
   beforePoolWrite?: () => Promise<void>
   local?: Partial<
     Pick<
@@ -428,15 +429,21 @@ export function createNativeAccountRuntime(
         )
           return entry
         // A new credentialEpoch identifies replacement credentials, not an ordinary
-        // token refresh. Drop old validation, token backoff and the key that deduplicates
-        // Prime requests, so replacement credentials cannot inherit old permission
-        // or claims. Retain counters and profile only for the same account UUID.
+        // token refresh. Discard old identity validation and token backoff. Give OAuth
+        // a new Prime deduplication key so a previous credential's quota-start claim
+        // cannot suppress the replacement's request. Retain counters and profile
+        // only for the same account UUID.
         const sameAccount =
           old?.kind === 'local' &&
           old.rowId === binding.rowId &&
           binding.identity !== undefined &&
           old.identity === binding.identity
-        const next: NativeRuntimeEntry = { binding }
+        const next: NativeRuntimeEntry = {
+          binding,
+          ...(row.credential?.type === 'oauth'
+            ? { authLineageId: randomUUID() }
+            : {}),
+        }
         if (sameAccount && previous) {
           for (const key of [
             'prime',
@@ -757,6 +764,18 @@ export function createNativeAccountRuntime(
     },
     async authorizeApi(routeId, signal) {
       await authority(signal)
+      const requireLocalMode = async () => {
+        const settings = await store.readSettings()
+        check(signal)
+        if (settings.status !== 'ready')
+          throw new NativeRuntimeError('publication-refused')
+        if (
+          (settings.settings.claustrum as { mode?: unknown } | undefined)
+            ?.mode === 'claustrum'
+        )
+          throw new NativeCustodyError('route-unavailable')
+      }
+      await requireLocalMode()
       const row = await poolRow(await physicalId(routeId))
       check(signal)
       if (
@@ -766,6 +785,9 @@ export function createNativeAccountRuntime(
         row.credential?.type !== 'api'
       )
         throw new NativeCustodyError('route-unavailable')
+      // Reading the credential yields to other processes. Recheck custody
+      // before returning a local key that vault mode would exclude.
+      await requireLocalMode()
       return {
         ...row.credential,
         subject: {
@@ -781,12 +803,37 @@ export function createNativeAccountRuntime(
       check(signal)
       return vault.authorize(id, signal)
     },
-    loginOAuth: (input) =>
-      runtime.putAccount({
+    async loginOAuth(input) {
+      const snapshot = await runtime.read()
+      if (snapshot.mode !== 'local')
+        throw new NativeCustodyError('route-unavailable')
+      let accountIdentity: string | undefined
+      try {
+        if (!input.credential.access.startsWith('sk-ant-oat'))
+          throw new Error('Unsupported OAuth credential')
+        accountIdentity = (
+          await (options.local?.resolveIdentity ?? resolveClaudeCodeIdentity)(
+            input.credential.access,
+            undefined,
+            undefined,
+          )
+        ).accountUuid
+        if (!accountIdentity?.trim())
+          throw new Error('Missing account identity')
+      } catch {
+        throw new Error(
+          'Claude account identity could not be verified; retry sign-in. No account changes were saved.',
+        )
+      }
+      // Verify the exchanged token before replacing any stored credential.
+      // putAccount checks authority and custody again after the lookup awaits.
+      return runtime.putAccount({
         ...input,
+        accountIdentity,
         replace: input.replace ?? true,
         credential: { type: 'oauth', ...input.credential },
-      }),
+      })
+    },
     async putAccount(input) {
       await authority()
       const snapshot = await runtime.read()
@@ -917,8 +964,8 @@ export function createNativeAccountRuntime(
       }
       const id = await physicalId(routeId)
       const operation = enabled ? 'enable' : 'disable'
-      // common-auth does not report whether enable or disable changed the
-      // account's enabled flag. Capture that flag immediately before each
+      // Credential-pool enable/disable results identify the account but omit whether
+      // its enabled flag changed. Capture that flag immediately before each
       // credential-pool configuration write, while its locks are held.
       // An interrupted credential replacement may need repair before the
       // requested toggle. Use the last captured flag, which the pure reader

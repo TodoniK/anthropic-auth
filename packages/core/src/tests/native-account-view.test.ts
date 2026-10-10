@@ -324,3 +324,49 @@ for (const access of ['sk-ant-oat01-synthetic', 'synthetic-api-key', '']) {
     expect(JSON.stringify(snapshot)).not.toContain('synthetic-refresh')
   })
 }
+
+for (const roster of [
+  undefined,
+  { version: 1 as const, complete: false, rows: [], declined: [] },
+  { version: 1 as const, complete: true, rows: [], declined: [] },
+]) {
+  test(`vault projection excludes every local account with ${roster === undefined ? 'missing' : roster.complete ? 'empty' : 'incomplete'} roster and restores them in local mode`, () => {
+    const rows: PoolRow[] = [
+      row,
+      {
+        ...row,
+        id: 'local-api',
+        type: 'api',
+        credential: {
+          type: 'api',
+          apiKey: 'synthetic-local-api-secret',
+          baseURL: 'https://example.test',
+        },
+      },
+    ]
+    const before = JSON.stringify(rows)
+    const settings = { mainAccountId: row.id, claustrum: { mode: 'claustrum' } }
+    const snapshot = projectNativeAccountViews({
+      paths,
+      rows,
+      settings,
+      runtime,
+      roster,
+    })
+    expect(snapshot.accounts).toEqual([])
+    expect(snapshot.policyStorage.accounts).toEqual([])
+    expect(JSON.stringify(snapshot)).not.toContain('local-api')
+    expect(JSON.stringify(rows)).toBe(before)
+    const disconnected = projectNativeAccountViews({
+      paths,
+      rows,
+      settings: { ...settings, claustrum: { mode: 'local' } },
+      runtime,
+    })
+    expect(disconnected.accounts.map((account) => account.id)).toEqual([
+      'main',
+      'local-api',
+    ])
+    expect(JSON.stringify(rows)).toBe(before)
+  })
+}

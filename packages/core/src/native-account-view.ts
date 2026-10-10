@@ -472,7 +472,9 @@ export function projectNativeAccountViews(input: {
       : 'local'
   const accounts: NativeAccountView[] = []
   for (const row of input.rows) {
-    if (mode === 'claustrum' && row.type === 'oauth') continue
+    // Vault mode owns the entire usable account set, including paid routes.
+    // Keep local rows stored, but exclude them until the host disconnects.
+    if (mode === 'claustrum') continue
     const proposed: NativeLocalPoolBinding | undefined =
       row.credentialEpoch !== undefined
         ? {

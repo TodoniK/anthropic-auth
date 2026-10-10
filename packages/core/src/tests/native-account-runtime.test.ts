@@ -405,15 +405,21 @@ test('normal local refresh preserves Prime lineage and counters but relogin star
       expires: now + 4_000_000,
     },
   })
+  const afterLogin = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  if (afterLogin.status !== 'ready')
+    throw new Error('Login metadata is missing')
+  const nextLineage = afterLogin.state.accounts['imported-main']?.authLineageId
+  expect(nextLineage).toMatch(/^[a-f0-9-]{36}$/)
+  expect(nextLineage).not.toBe(lineage)
   const replaced = await f.runtime.authorizeLocal('main')
   if (replaced.status !== 'usable')
     throw new Error('Fixture relogin not admitted')
   expect(replaced.binding.credentialEpoch).toBeGreaterThan(
     first.binding.credentialEpoch,
   )
-  expect(
-    await f.runtime.getOrCreateAuthLineage('main', replaced.subject),
-  ).not.toBe(lineage)
+  expect(await f.runtime.getOrCreateAuthLineage('main', replaced.subject)).toBe(
+    nextLineage,
+  )
   expect((await f.runtime.read()).accounts[0]?.prime?.count).toBe(1)
 })
 
@@ -670,7 +676,9 @@ test('cross-process remove and readd same native route and UUID creates new Prim
     identity: uuid,
   })
   expect(entry?.credentialValidation).toBeUndefined()
-  expect(f.counts.lookups).toBe(1)
+  // Login verifies the successor before saving it. Serving still requires a
+  // positive proof bound to the newly committed epoch, not the parent's proof.
+  expect(f.counts.lookups).toBe(2)
   let staleCalls = 0
   const service = createNativeLocalCredentialService({
     paths: f.paths,
@@ -716,7 +724,7 @@ test('cross-process remove and readd same native route and UUID creates new Prim
   expect(readded.binding.credentialEpoch).toBeGreaterThan(
     first.binding.credentialEpoch,
   )
-  expect(f.counts.lookups).toBe(2)
+  expect(f.counts.lookups).toBe(3)
   expect(
     await f.runtime.getOrCreateAuthLineage('main', readded.subject),
   ).not.toBe(lineage)
@@ -1178,14 +1186,15 @@ test('local enable and disable log only a flag change made by their own write', 
   }
   const logs = captureCommandLogs()
 
-  // Repairing a torn, already-enabled row is the only config write; the
-  // enable itself changes nothing.
+  // The interrupted replacement saved credentials but not the matching config.
+  // Repair writes that config; the account was already enabled, so no toggle occurs.
   await tear('fallback-a')
   await f.runtime.setEnabled('fallback-a', true)
   expect((await poolRow('fallback-a')).torn).toBeUndefined()
   expect(logs.take()).toEqual([])
 
-  // A torn, disabled row is repaired and then enabled: one change.
+  // After repairing the interrupted replacement, enabling a disabled account
+  // changes its flag once and must produce exactly one change log.
   await f.runtime.setEnabled('fallback-a', false)
   logs.take()
   await tear('fallback-a')
@@ -1199,9 +1208,8 @@ test('local enable and disable log only a flag change made by their own write', 
     },
   ])
 
-  // An enabled row that still carries a disabled reason: the enable writes
-  // the config to clear the reason, but the enabled flag does not change.
-  // The reason lives in the row's pool entry beside the roster row.
+  // Enabling clears a leftover disabled reason so it no longer describes the
+  // active account. This maintenance write does not change the enabled flag.
   const config = JSON.parse(await readFile(f.paths.config, 'utf8'))
   config.commonAuthPool.rows['fallback-a'].disabledReason = 'synthetic-reason'
   await writeFile(f.paths.config, JSON.stringify(config))
@@ -1210,8 +1218,8 @@ test('local enable and disable log only a flag change made by their own write', 
   expect((await poolRow('fallback-a')).disabledReason).toBeUndefined()
   expect(logs.take()).toEqual([])
 
-  // An OAuth row holding the main account's identity is stored disabled, and
-  // the store refuses to enable it: nothing is logged.
+  // Duplicate OAuth identities cannot be active twice in the pool. A fallback
+  // matching the active main account stays disabled and produces no change log.
   await f.store.add({
     id: 'fallback-dup',
     identity: uuid,
@@ -1234,9 +1242,9 @@ for (const rotate of [false, true]) {
     const before = await readFile(f.paths.runtime)
     const original = filesystem.rename
     let failedWrites = 0
-    // Fail the rename after the account, token and write locks are checked.
-    // Failing those checks would mean changed credentials or lost ownership,
-    // not a storage error.
+    // Account/token checks reject superseded credentials, and lock checks reject
+    // a superseded writer. Inject a failed rename only after those checks pass
+    // to isolate a storage failure from a refused publication.
     const writer = spyOn(filesystem, 'rename').mockImplementation(
       async (from, to) => {
         if (to === f.paths.runtime) {
@@ -1375,4 +1383,152 @@ test('native network refresh failure permits one retry and clears its transient 
     (await f.runtime.read()).accounts.find((row) => row.id === 'main')
       ?.lastRefreshError,
   ).toBeUndefined()
+})
+
+test('vault mode refuses direct local API authorization without changing stored rows and disconnect restores it', async () => {
+  const f = await fixture()
+  await f.runtime.addApi({
+    routeId: 'local-api',
+    apiKey: 'synthetic-local-api-secret',
+  })
+  await f.store.updateSettings((settings) => {
+    settings.claustrum = { mode: 'claustrum' }
+  })
+  const before = await Promise.all([
+    readFile(f.paths.config, 'utf8'),
+    readFile(f.paths.state, 'utf8'),
+  ])
+  await expect(f.runtime.authorizeApi('local-api')).rejects.toMatchObject({
+    code: 'route-unavailable',
+  })
+  expect(
+    await Promise.all([
+      readFile(f.paths.config, 'utf8'),
+      readFile(f.paths.state, 'utf8'),
+    ]),
+  ).toEqual(before)
+  expect(f.counts.lookups + f.counts.refresh).toBe(0)
+  await f.store.updateSettings((settings) => {
+    settings.claustrum = { mode: 'local' }
+  })
+  expect((await f.runtime.authorizeApi('local-api')).apiKey).toBe(
+    'synthetic-local-api-secret',
+  )
+})
+
+test('OAuth login validates fresh identity before replacing the pool credential', async () => {
+  const presented: string[] = []
+  const f = await fixture({
+    resolveIdentity: async (access) => {
+      presented.push(access)
+      return {
+        deviceId: 'login-device',
+        sessionId: 'login-session',
+        accountUuid: uuid,
+      }
+    },
+  })
+  await f.runtime.loginOAuth({
+    routeId: 'main',
+    credential: {
+      access: 'sk-ant-oat01-login-successor',
+      refresh: 'login-successor-refresh',
+      expires: now + 18_000_000,
+    },
+  })
+  expect(presented).toEqual(['sk-ant-oat01-login-successor'])
+  const saved = await f.store.read()
+  if (saved.status !== 'ready') throw new Error('Login pool was not readable')
+  expect(saved.rows.find((row) => row.id === 'imported-main')).toMatchObject({
+    identity: uuid,
+    credential: {
+      type: 'oauth',
+      access: 'sk-ant-oat01-login-successor',
+      refresh: 'login-successor-refresh',
+    },
+  })
+})
+
+async function loginStoredBytes(
+  paths: Awaited<ReturnType<typeof fixture>>['paths'],
+) {
+  return Promise.all(
+    [paths.config, paths.state, paths.runtime].map(async (path) => {
+      try {
+        return await readFile(path)
+      } catch (error) {
+        if (
+          typeof error === 'object' &&
+          error !== null &&
+          'code' in error &&
+          error.code === 'ENOENT'
+        )
+          return undefined
+        throw error
+      }
+    }),
+  )
+}
+
+for (const failure of ['missing-identity', 'lookup-error'] as const) {
+  test(`OAuth login leaves existing pool and metadata byte-identical on ${failure}`, async () => {
+    const f = await fixture({
+      resolveIdentity: async () => {
+        if (failure === 'lookup-error')
+          throw new Error('synthetic-login-secret-must-not-escape')
+        return { deviceId: 'login-device', sessionId: 'login-session' }
+      },
+    })
+    const before = await loginStoredBytes(f.paths)
+    await expect(
+      f.runtime.loginOAuth({
+        routeId: 'main',
+        credential: {
+          access: 'sk-ant-oat01-login-successor',
+          refresh: 'login-successor-refresh',
+          expires: now + 18_000_000,
+        },
+      }),
+    ).rejects.toThrow('Claude account identity could not be verified')
+    expect(await loginStoredBytes(f.paths)).toEqual(before)
+  })
+}
+
+test('OAuth login rechecks migration authority after delayed identity validation', async () => {
+  const started = gate()
+  const release = gate()
+  const f = await fixture({
+    resolveIdentity: async () => {
+      started.open()
+      await release.wait
+      return {
+        deviceId: 'login-device',
+        sessionId: 'login-session',
+        accountUuid: uuid,
+      }
+    },
+  })
+  const before = await loginStoredBytes(f.paths)
+  const login = f.runtime.loginOAuth({
+    routeId: 'main',
+    credential: {
+      access: 'sk-ant-oat01-login-successor',
+      refresh: 'login-successor-refresh',
+      expires: now + 18_000_000,
+    },
+  })
+  const outcome = login.then(
+    () => ({ status: 'resolved' as const }),
+    (error: unknown) => ({ status: 'rejected' as const, error }),
+  )
+  trackDetached(outcome)
+  await started.wait
+  await rm(f.paths.journal)
+  release.open()
+  const result = await outcome
+  expect(result.status).toBe('rejected')
+  if (result.status !== 'rejected')
+    throw new Error('Revoked migration authority still allowed login')
+  expect(result.error).toHaveProperty('code', 'migration-required')
+  expect(await loginStoredBytes(f.paths)).toEqual(before)
 })
