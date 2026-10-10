@@ -170,6 +170,20 @@ export {
   runPiCommandMenu,
 } from './native-ui.ts'
 export type {
+  NativePiAuthSlot,
+  NativePiAuthSlotErrorCode,
+  NativePiAuthSlotInspection,
+  NativePiAuthSlotOptions,
+  NativeVaultDisconnectOptions,
+  NativeVaultDisconnectResult,
+} from './native-vault-connection.ts'
+export {
+  disconnectNativeVaultForHost,
+  NativePiAuthSlotError,
+  nativePiAuthSlotPaths,
+  openNativePiAuthSlot,
+} from './native-vault-connection.ts'
+export type {
   NativeVaultRuntime,
   NativeVaultRuntimeOptions,
 } from './native-vault-runtime.ts'

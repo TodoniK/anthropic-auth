@@ -37,7 +37,17 @@ export function getPiAgentDir(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 export function getPiAuthPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(getPiAgentDir(env), 'auth.json')
+  // Match Pi's SDK directory rule, not the extension's optional storage override.
+  const configured = env.PI_CODING_AGENT_DIR
+  let agentDir = configured || join(homedir(), '.pi', 'agent')
+  if (agentDir === '~') agentDir = homedir()
+  else if (
+    agentDir.startsWith('~/') ||
+    (process.platform === 'win32' && agentDir.startsWith('~\\'))
+  )
+    agentDir = join(homedir(), agentDir.slice(2))
+  if (agentDir.startsWith('file://')) agentDir = fileURLToPath(agentDir)
+  return join(agentDir, 'auth.json')
 }
 
 export function opencodePluginEntry(version: string): string {

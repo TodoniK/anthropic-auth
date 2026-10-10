@@ -358,3 +358,19 @@ expect_message = "error: expect(received).toBeNull()"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "pi-auth-slot-uses-sdk-directory"
+guards = "Offline vault setup protects Pi's actual auth file, not an extension-only directory override."
+file = "packages/opencode/src/setup/paths.ts"
+old = "const configured = env.PI_CODING_AGENT_DIR\n"
+new = "const configured = env.PI_CODING_AGENT_DIR || env.PI_AGENT_DIR\n"
+test_file = "packages/opencode/src/tests/pi-auth-path-contract.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/pi-auth-path-contract.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["offline Pi auth path matches @earendil-works/pi-coding-agent with directory undefined"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"

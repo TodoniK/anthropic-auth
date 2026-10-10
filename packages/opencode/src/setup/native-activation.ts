@@ -5,6 +5,8 @@ import {
   inspectNativeHostAuthEntry,
   type NativeCustodyActivationHooks,
   type NativeCustodyInventory,
+  NativePiAuthSlotError,
+  openNativePiAuthSlot,
   readNativeEnrollmentMode,
   requireNoSupervisedAuthContentSnapshot,
 } from '@cortexkit/anthropic-auth-core'
@@ -27,7 +29,6 @@ export class NativeVaultActivationError extends Error {
       | 'host-auth-invalid'
       | 'primary-conflict'
       | 'consent-required'
-      | 'pi-slot-helper-required'
       | 'primary-unverified',
   ) {
     super(
@@ -39,8 +40,6 @@ export class NativeVaultActivationError extends Error {
           'Pi has a stored Anthropic API key, which would take precedence over the vault account. Remove it in Pi, then rerun setup.',
         'consent-required':
           'Pi has stored Anthropic authentication. Explicit consent is required to move it aside for vault use.',
-        'pi-slot-helper-required':
-          'Pi stored authentication requires the shared vault move-aside helper. No stored authentication was changed.',
         'primary-unverified':
           'The vault has no verified default Claude account. Sign in through the vault and rerun setup.',
       }[code],
@@ -104,13 +103,18 @@ export async function activateNativeVaultForHost(
       'pi',
       await readHostAuth(plan.hostAuthPath),
     )
-    if (entry.kind !== 'absent') {
-      if (!options.removePiAnthropicAuth)
-        throw new NativeVaultActivationError('consent-required')
-      // Pi's stored authentication must remain restorable after disconnect.
-      // Refuse before enrollment until its private move-aside support is available.
-      throw new NativeVaultActivationError('pi-slot-helper-required')
-    }
+    const slot = await openNativePiAuthSlot({
+      env,
+      authPath: plan.hostAuthPath,
+    }).inspect()
+    if (slot.slot === 'placeholder' && slot.stash === 'missing')
+      throw new NativePiAuthSlotError('missing-stash')
+    if (
+      entry.kind !== 'absent' &&
+      slot.slot !== 'placeholder' &&
+      !options.removePiAnthropicAuth
+    )
+      throw new NativeVaultActivationError('consent-required')
   }
   const priorMode = await readNativeEnrollmentMode(host, env)
   await enrollNativeVaultForHost(host, {
@@ -151,6 +155,11 @@ export async function activateNativeVaultForHost(
     )
       throw new NativeVaultActivationError('primary-unverified')
     await processFence()
+    if (host === 'pi')
+      await openNativePiAuthSlot({
+        env,
+        authPath: plan.hostAuthPath,
+      }).enterVault()
     return priorMode === 'claustrum' ? 'already-vault' : 'committed'
   } finally {
     runtime.close()

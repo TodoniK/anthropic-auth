@@ -11,8 +11,12 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   createNativeAccountRuntime,
+  disconnectNativeVaultForHost,
   type NativeCustodyInventory,
   nativeMigrationAuthorityPhase,
+  nativePiAuthSlotPaths,
+  openNativePiAuthSlot,
+  readNativeEnrollmentMode,
   readNativeMigrationJournal,
   runNativeMigration,
 } from '@cortexkit/anthropic-auth-core'
@@ -226,8 +230,7 @@ test('environment, running-host and Pi consent fences refuse before enrollment o
     {
       host: 'pi',
       anthropic: { type: 'api_key', key: 'synthetic-pi-api-key' },
-      consent: true,
-      error: { code: 'pi-slot-helper-required' },
+      error: { code: 'consent-required' },
     },
     {
       host: 'pi',
@@ -404,3 +407,84 @@ test('an enrolled host refuses local recovery before reading files or starting l
   expect(logins).toBe(0)
   expect(f.calls).toEqual([])
 })
+
+for (const anthropic of [
+  {
+    type: 'oauth',
+    access: 'synthetic-host-access',
+    refresh: 'synthetic-host-refresh',
+    expires: 1,
+  },
+  { type: 'api_key', key: 'synthetic-host-key' },
+]) {
+  test(`Pi vault setup preserves a consented stored ${anthropic.type} login privately and disconnect restores its exact bytes`, async () => {
+    const f = await fixture('pi')
+    await writeHostAuth(f.paths.hostAuthPath, anthropic)
+    const hostBytes = await readFile(f.paths.hostAuthPath)
+    const files = [
+      ...new Set([
+        f.paths.legacyConfigPath,
+        f.paths.legacyStatePath,
+        f.paths.paths.config,
+        f.paths.paths.state,
+        f.paths.paths.runtime,
+        f.paths.paths.journal,
+        f.paths.paths.roster,
+        f.paths.routingDestinationPath,
+      ]),
+    ]
+    for (const path of files) {
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+      await writeFile(path, 'synthetic-invalid-local-recovery-data', {
+        mode: 0o600,
+      })
+    }
+    const bytes = () => Promise.all(files.map((path) => readFile(path)))
+    const before = await bytes()
+    expect(
+      await activateNativeVaultForHost('pi', {
+        ...f.options,
+        removePiAnthropicAuth: true,
+      }),
+    ).toBe('committed')
+    expect(await bytes()).toEqual(before)
+    const paths = nativePiAuthSlotPaths({
+      env: f.options.env,
+      authPath: f.paths.hostAuthPath,
+    })
+    expect(paths.authPath).toBe(f.paths.hostAuthPath)
+    expect(JSON.parse(await readFile(paths.authPath, 'utf8'))).toEqual({
+      anthropic: { type: 'api_key', key: paths.placeholderKey },
+      other: OTHER_PROVIDER,
+    })
+    const slot = openNativePiAuthSlot({
+      env: f.options.env,
+      authPath: f.paths.hostAuthPath,
+    })
+    expect(await slot.inspect()).toEqual({
+      slot: 'placeholder',
+      stash: 'valid',
+    })
+    const activeHost = await readFile(paths.authPath)
+    const activeStash = await readFile(paths.stashPath)
+    expect(await activateNativeVaultForHost('pi', f.options)).toBe(
+      'already-vault',
+    )
+    expect(await readFile(paths.authPath)).toEqual(activeHost)
+    expect(await readFile(paths.stashPath)).toEqual(activeStash)
+    expect(await bytes()).toEqual(before)
+    expect(await readNativeEnrollmentMode('pi', f.options.env)).toBe(
+      'claustrum',
+    )
+    expect(
+      await disconnectNativeVaultForHost({
+        host: 'pi',
+        env: f.options.env,
+        slot,
+      }),
+    ).toBe('disconnected')
+    expect(await readFile(f.paths.hostAuthPath)).toEqual(hostBytes)
+    expect(await bytes()).toEqual(before)
+    expect(await readNativeEnrollmentMode('pi', f.options.env)).toBe('local')
+  })
+}
