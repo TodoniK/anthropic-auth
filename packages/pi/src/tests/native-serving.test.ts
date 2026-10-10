@@ -58,7 +58,7 @@ beforeEach(async () => {
       ],
     },
     storagePath,
-    { mainAccess: 'synthetic-native-main-access' },
+    { mainAccess: 'sk-ant-oat01-synthetic-native-main-access' },
   )
 })
 afterEach(async () => {
@@ -107,7 +107,7 @@ test('native Pi serving ignores host and legacy OAuth material after committed m
           }).result()
         ).stopReason,
       ).toBe('stop')
-      expect(sent).toEqual(['Bearer synthetic-native-main-access'])
+      expect(sent).toEqual(['Bearer sk-ant-oat01-synthetic-native-main-access'])
       expect(await readFile(storagePath, 'utf8')).toContain(
         'synthetic-legacy-access',
       )
@@ -249,10 +249,10 @@ test.each([
         expect(modelRequests).toEqual(
           scenario.paid
             ? [
-                'Bearer synthetic-native-main-access',
+                'Bearer sk-ant-oat01-synthetic-native-main-access',
                 'Bearer synthetic-native-paid-key',
               ]
-            : ['Bearer synthetic-native-main-access'],
+            : ['Bearer sk-ant-oat01-synthetic-native-main-access'],
         )
       })(),
     ),
@@ -277,7 +277,7 @@ test('offline controller imports synthetic Pi host OAuth with consent before nat
         JSON.stringify({
           anthropic: {
             type: 'oauth',
-            access: 'synthetic-imported-host-access',
+            access: 'sk-ant-oat01-synthetic-imported-host-access',
             refresh: 'synthetic-imported-host-refresh',
             expires: Date.now() + 3_600_000,
           },
@@ -309,7 +309,7 @@ test('offline controller imports synthetic Pi host OAuth with consent before nat
         host: 'pi',
         local: {
           refreshToken: async () => ({
-            access: 'synthetic-imported-native-access',
+            access: 'sk-ant-oat01-synthetic-imported-native-access',
             refresh: 'synthetic-imported-native-refresh',
             expires: Date.now() + 3_600_000,
             expiresIn: 3600,
@@ -340,10 +340,12 @@ test('offline controller imports synthetic Pi host OAuth with consent before nat
       expect(
         (
           await streamCortexKitAnthropic(model, context, {
-            apiKey: 'synthetic-imported-host-access',
+            apiKey: 'sk-ant-oat01-synthetic-imported-host-access',
           }).result()
         ).stopReason,
       ).toBe('stop')
-      expect(sent).toEqual(['Bearer synthetic-imported-native-access'])
+      expect(sent).toEqual([
+        'Bearer sk-ant-oat01-synthetic-imported-native-access',
+      ])
     })(),
   ))

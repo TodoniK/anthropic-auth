@@ -140,7 +140,7 @@ export async function saveNativePiFixture(
     }))
     if (relay) await runtime.updateRelay(relay)
     if (options.primary !== false) {
-      const access = options.mainAccess ?? 'main-access'
+      const access = options.mainAccess ?? 'sk-ant-oat01-main-access'
       identityByToken.set(access, fixtureAccountIdentity('main'))
       await runtime.loginOAuth({
         routeId: 'main',
@@ -199,7 +199,8 @@ export async function saveNativePiFixture(
           ),
         })
       } else {
-        const access = account.access ?? `synthetic-${account.id}-access`
+        const access =
+          account.access ?? `sk-ant-oat01-synthetic-${account.id}-access`
         identityByToken.set(access, fixtureAccountIdentity(account.id))
         await runtime.loginOAuth({
           routeId: account.id,

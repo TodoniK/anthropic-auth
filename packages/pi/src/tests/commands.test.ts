@@ -41,7 +41,7 @@ beforeEach(async () => {
           id: 'fallback',
           type: 'oauth',
           refresh: 'fixture-fallback-refresh',
-          access: 'fixture-fallback-access',
+          access: 'sk-ant-oat01-fixture-fallback-access',
           expires: Date.now() + 3_600_000,
         },
       ],
@@ -193,7 +193,7 @@ describe('native account command persistence', () => {
     const before = await bytes()
     const text = await controller().backend.readStatus('account', {})
     expect(text).toContain('fallback')
-    expect(text).not.toContain('fixture-fallback-access')
+    expect(text).not.toContain('sk-ant-oat01-fixture-fallback-access')
     expect(text).not.toContain('fixture-fallback-refresh')
     expect(await bytes()).toEqual(before)
   })
@@ -325,7 +325,9 @@ describe('single /claude menu and Pi Prime status', () => {
     const { commands, ctx, notified } = registration()
     await commands.get('claude')?.handler('', ctx)
     expect(notified.join('\n')).toContain('Prime')
-    expect(notified.join('\n')).not.toContain('fixture-fallback-access')
+    expect(notified.join('\n')).not.toContain(
+      'sk-ant-oat01-fixture-fallback-access',
+    )
     expect(await bytes()).toEqual(before)
   })
 })
