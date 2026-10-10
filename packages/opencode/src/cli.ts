@@ -10,6 +10,7 @@ import {
   getAccountStoragePath,
   isValidApiBaseURL,
   type NativeAccountRuntime,
+  readNativeEnrollmentMode,
   resolveNativePoolPaths,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
@@ -29,6 +30,19 @@ async function withNativeAccounts<T>(
   } finally {
     runtime.close()
   }
+}
+
+/**
+ * This host's Claustrum enrollment files, not account settings, decide whether
+ * credentials come from the vault. In vault mode the local account pool must
+ * not gain accounts, so commands that add local credentials refuse before
+ * reading the pool or asking for anything, and check again right before
+ * writing in case setup enrolled the host while a prompt was open. Unreadable
+ * enrollment state throws as well: it never counts as local mode.
+ */
+async function requireLocalCustody() {
+  if ((await readNativeEnrollmentMode('opencode', process.env)) !== 'local')
+    throw new Error('Disconnect from the vault first.')
 }
 
 function usage() {
@@ -297,12 +311,9 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   const ask = deps.prompt ?? prompt
   const authorizeImpl = deps.authorize ?? authorize
   const exchangeImpl = deps.exchange ?? exchange
+  await requireLocalCustody()
   await withNativeAccounts(async (runtime) => {
     const snapshot = await runtime.read()
-    if (snapshot.mode !== 'local')
-      throw new Error(
-        'Exit vault custody with offline setup before local login',
-      )
     const label =
       labelArg?.trim() || (await ask('Fallback account label (optional): '))
     const authorization = await authorizeImpl('max')
@@ -324,6 +335,8 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
       throw new Error(
         'Local login cannot be verified while OPENCODE_AUTH_CONTENT is set',
       )
+    // Sign-in can take minutes; refuse if setup enrolled the host meanwhile.
+    await requireLocalCustody()
     const routeId = label && label !== 'main' ? label : crypto.randomUUID()
     const replace = snapshot.accounts.some(
       (account) => account.id === routeId && account.source === 'local',
@@ -352,6 +365,7 @@ export interface ApiAddDeps {
 }
 
 export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
+  await requireLocalCustody()
   await withNativeAccounts((runtime) => runtime.read())
   const ask = deps.prompt ?? prompt
   const label =
@@ -383,6 +397,8 @@ export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
     authHeaderInput === 'x-api-key' ? 'x-api-key' : 'authorization-bearer'
 
   await withNativeAccounts(async (runtime) => {
+    // The prompts above can take minutes; refuse if setup enrolled the host.
+    await requireLocalCustody()
     const snapshot = await runtime.read()
     const routeId = label && label !== 'main' ? label : crypto.randomUUID()
     const existing = snapshot.accounts.find((account) => account.id === routeId)

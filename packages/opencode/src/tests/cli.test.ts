@@ -1,14 +1,22 @@
 import { describe, expect } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  addAccountPersistent,
   createNativeAccountRuntime,
   createNativePoolStore,
   getAccountStatePath,
-  loadAccounts,
-  saveAccounts,
+  getHostClaustrumEnrollmentPaths,
+  readNativeEnrollmentMode,
+  resetClaudeCodeIdentityCachesForTest,
 } from '@cortexkit/anthropic-auth-core'
 
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
@@ -52,12 +60,108 @@ async function readNativeRows(
   return view.rows
 }
 
-async function nativeFixture(root: string) {
+const cliAccountUuid = '00000000-0000-4000-8000-000000000111'
+
+function interceptBootstrap() {
+  const original = globalThis.fetch
+  const tokens: string[] = []
+  resetClaudeCodeIdentityCachesForTest()
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = new URL(
+        input instanceof Request ? input.url : input.toString(),
+      )
+      if (
+        url.origin !== 'https://api.anthropic.com' ||
+        url.pathname !== '/api/claude_cli/bootstrap'
+      )
+        throw new Error(`Unexpected CLI test request: ${url.pathname}`)
+      const authorization = new Headers(init?.headers).get('authorization')
+      if (!authorization?.startsWith('Bearer sk-ant-oat01-'))
+        throw new Error('CLI bootstrap did not use OAuth credentials')
+      tokens.push(authorization)
+      return Response.json({ oauth_account: { account_uuid: cliAccountUuid } })
+    },
+    { preconnect: original.preconnect },
+  )
+  lifetime.deferCleanup(() => {
+    globalThis.fetch = original
+    resetClaudeCodeIdentityCachesForTest()
+  })
+  return tokens
+}
+
+async function nativeFixture(
+  root: string,
+  legacyConfig: Parameters<
+    typeof migrateNativeOpencodeFixture
+  >[0]['legacyConfig'] = { version: 1, accounts: [] },
+  legacyState?: Parameters<
+    typeof migrateNativeOpencodeFixture
+  >[0]['legacyState'],
+) {
   return migrateNativeOpencodeFixture({
     root,
     lifetime,
-    legacyConfig: { version: 1, accounts: [] },
+    legacyConfig,
+    legacyState,
   })
+}
+
+/**
+ * Put this host's Claustrum enrollment files in a state setup leaves after
+ * enrollment: an owner-only token file, or an approved enrollment record whose
+ * token file is missing. Core's readNativeEnrollmentMode reports vault
+ * ('claustrum') mode for both, and the CLI must then use the vault for
+ * credentials; the local account pool holds no mode flag.
+ */
+async function enrollVault(
+  env: Record<string, string>,
+  kind: 'token' | 'approved-without-token' = 'token',
+) {
+  const paths = getHostClaustrumEnrollmentPaths('opencode', env)
+  if (kind === 'token')
+    await writeFile(
+      paths.tokenPath,
+      JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+      { mode: 0o600, flag: 'wx' },
+    )
+  else
+    await writeFile(
+      paths.statePath,
+      JSON.stringify({
+        version: 1,
+        phase: 'approved',
+        proposedName: 'anthropic-auth-opencode',
+        tokenGeneration: 1,
+        updatedAt: 1,
+      }),
+      { mode: 0o600, flag: 'wx' },
+    )
+  const written = kind === 'token' ? paths.tokenPath : paths.statePath
+  expect((await stat(written)).mode & 0o777).toBe(0o600)
+  expect(await readNativeEnrollmentMode('opencode', env)).toBe('claustrum')
+}
+
+const enrollmentKinds = ['token', 'approved-without-token'] as const
+/**
+ * Every file under the fixture root with its bytes and permission bits, so a
+ * refused command can be shown to have created, changed or removed nothing.
+ */
+async function rootFiles(root: string) {
+  const files: Record<string, { mode: number; bytes: string }> = {}
+  for (const entry of await readdir(root, {
+    recursive: true,
+    withFileTypes: true,
+  })) {
+    const path = join(entry.parentPath, entry.name)
+    const info = await stat(path)
+    files[path] = {
+      mode: info.mode & 0o777,
+      bytes: entry.isFile() ? (await readFile(path)).toString('base64') : '',
+    }
+  }
+  return files
 }
 
 // Inject prompts and OAuth responses so command tests never open a browser
@@ -166,24 +270,143 @@ describe('CLI api add', () => {
     expect(await readNativeRows(fixture)).toEqual([])
     await expect(readFile(accountPath, 'utf8')).rejects.toThrow()
   })
+
+  for (const kind of enrollmentKinds) {
+    test(`refuses with a vault enrollment (${kind}) before asking for a key and writes nothing`, async () => {
+      const tempDir = await createRoot()
+      const fixture = await nativeFixture(tempDir)
+      const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
+      await enrollVault(fixture.env, kind)
+      const before = await rootFiles(fixture.root)
+      const asked: string[] = []
+
+      await expect(
+        withAccountEnv(
+          accountPath,
+          {
+            ...fixture.env,
+            OPENCODE_ANTHROPIC_AUTH_API_BASE_URL: undefined,
+            OPENCODE_ANTHROPIC_AUTH_API_KEY: undefined,
+            OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER: undefined,
+          },
+          () =>
+            addApiRoute(undefined, {
+              prompt: async (message) => {
+                asked.push(message)
+                return 'vault-mode-key'
+              },
+            }),
+        ),
+      ).rejects.toThrow('Disconnect from the vault first.')
+      expect(asked).toEqual([])
+      expect(await rootFiles(fixture.root)).toEqual(before)
+    })
+  }
+
+  test('writes nothing when setup enrolls the host while the key is entered', async () => {
+    const tempDir = await createRoot()
+    const fixture = await nativeFixture(tempDir)
+    const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    let enrolled: Awaited<ReturnType<typeof rootFiles>> | undefined
+
+    await expect(
+      withAccountEnv(
+        accountPath,
+        {
+          ...fixture.env,
+          OPENCODE_ANTHROPIC_AUTH_API_BASE_URL: 'https://api.kie.ai/claude',
+          OPENCODE_ANTHROPIC_AUTH_API_KEY: undefined,
+          OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER: 'x-api-key',
+        },
+        () =>
+          addApiRoute('late-api', {
+            // Offline setup enrolls this host with the Claustrum vault while
+            // the user is still typing the key.
+            prompt: async (message) => {
+              expect(message).toBe('API key: ')
+              await enrollVault(fixture.env)
+              enrolled = await rootFiles(fixture.root)
+              return 'late-api-key'
+            },
+          }),
+      ),
+    ).rejects.toThrow('Disconnect from the vault first.')
+    expect(enrolled).toBeDefined()
+    expect(await rootFiles(fixture.root)).toEqual(enrolled!)
+    expect(await readNativeRows(fixture)).toEqual([])
+    for (const file of Object.values(await rootFiles(fixture.root)))
+      expect(Buffer.from(file.bytes, 'base64').toString()).not.toContain(
+        'late-api-key',
+      )
+  })
 })
 
-describe('CLI login', () => {
-  test('refuses before authorization while global Claustrum custody is committed', async () => {
+describe('CLI vault refusal', () => {
+  test('refuses from enrollment alone, before the local account pool is read', async () => {
     const tempDir = await createRoot()
-    const accountPath = join(tempDir, 'anthropic-auth.json')
-    await saveAccounts(
-      {
-        version: 1,
-        accounts: [],
-        claustrum: { mode: 'claustrum' },
-      },
-      accountPath,
-    )
+    // Setup never migrated a local account pool into this directory, so a
+    // command that reads the pool fails with "Anthropic account migration is
+    // required". A vault refusal here shows the command refused before it
+    // read the pool.
+    const env = {
+      OPENCODE_ANTHROPIC_AUTH_FILE: join(tempDir, 'anthropic-auth.json'),
+      OPENCODE_ANTHROPIC_AUTH_STATE_FILE: join(
+        tempDir,
+        'anthropic-auth-state.json',
+      ),
+      OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+        tempDir,
+        'opencode-enrollment.json',
+      ),
+      OPENCODE_ANTHROPIC_AUTH_API_KEY: 'unused-api-key',
+    }
+    const commands = {
+      login: () =>
+        login('blocked', {
+          authorize: async () => {
+            throw new Error('authorization should not start')
+          },
+          prompt: async () => {
+            throw new Error('prompt should not run')
+          },
+        }),
+      api: () =>
+        addApiRoute('blocked', {
+          prompt: async () => {
+            throw new Error('prompt should not run')
+          },
+        }),
+    }
+
+    for (const run of Object.values(commands))
+      await expect(
+        withAccountEnv(env.OPENCODE_ANTHROPIC_AUTH_FILE, env, run),
+      ).rejects.toThrow('Anthropic account migration is required; run setup')
+
+    await enrollVault(env)
+    const before = await rootFiles(tempDir)
+    await expect(
+      withAccountEnv(env.OPENCODE_ANTHROPIC_AUTH_FILE, env, commands.login),
+    ).rejects.toThrow('Disconnect from the vault first.')
+    await expect(
+      withAccountEnv(env.OPENCODE_ANTHROPIC_AUTH_FILE, env, commands.api),
+    ).rejects.toThrow('Disconnect from the vault first.')
+    expect(await rootFiles(tempDir)).toEqual(before)
+  })
+
+  test('treats unreadable enrollment as a refusal, never as local mode', async () => {
+    const tempDir = await createRoot()
+    const fixture = await nativeFixture(tempDir)
+    const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    await writeFile(fixture.enrollmentPath, 'not-an-enrollment-token', {
+      mode: 0o600,
+      flag: 'wx',
+    })
+    const before = await rootFiles(fixture.root)
     let authorizeCalls = 0
 
     await expect(
-      withAccountEnv(accountPath, {}, () =>
+      withAccountEnv(accountPath, fixture.env, () =>
         login('blocked', {
           authorize: async () => {
             authorizeCalls += 1
@@ -194,16 +417,85 @@ describe('CLI login', () => {
           },
         }),
       ),
-    ).rejects.toThrow('Exit Claustrum mode first')
+    ).rejects.toThrow('Native custody refused: invalid-token')
     expect(authorizeCalls).toBe(0)
-    await expect(loadAccounts(accountPath)).resolves.toMatchObject({
-      accounts: [],
+    expect(await rootFiles(fixture.root)).toEqual(before)
+  })
+})
+
+describe('CLI login', () => {
+  for (const kind of enrollmentKinds) {
+    test(`refuses before authorization with a vault enrollment (${kind})`, async () => {
+      const tempDir = await createRoot()
+      const fixture = await nativeFixture(tempDir)
+      const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
+      const bootstraps = interceptBootstrap()
+      await enrollVault(fixture.env, kind)
+      const before = await rootFiles(fixture.root)
+      let authorizeCalls = 0
+      let exchangeCalls = 0
+
+      await expect(
+        withAccountEnv(accountPath, fixture.env, () =>
+          login('blocked', {
+            authorize: async () => {
+              authorizeCalls += 1
+              throw new Error('authorization should not start')
+            },
+            exchange: async () => {
+              exchangeCalls += 1
+              throw new Error('exchange should not run')
+            },
+            prompt: async () => {
+              throw new Error('prompt should not run')
+            },
+          }),
+        ),
+      ).rejects.toThrow('Disconnect from the vault first.')
+      expect(authorizeCalls).toBe(0)
+      expect(exchangeCalls).toBe(0)
+      expect(bootstraps).toEqual([])
+      expect(await rootFiles(fixture.root)).toEqual(before)
     })
+  }
+
+  test('writes nothing when setup enrolls the host during sign-in', async () => {
+    const tempDir = await createRoot()
+    const fixture = await nativeFixture(tempDir)
+    const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    const bootstraps = interceptBootstrap()
+    let enrolled: Awaited<ReturnType<typeof rootFiles>> | undefined
+
+    await expect(
+      withAccountEnv(accountPath, fixture.env, () =>
+        login('late', {
+          prompt: async () => 'cli-code',
+          // The browser sign-in is open while offline setup enrolls this host
+          // in vault custody; the exchanged tokens then arrive late.
+          exchange: async () => {
+            await enrollVault(fixture.env)
+            enrolled = await rootFiles(fixture.root)
+            return {
+              type: 'success' as const,
+              access: 'sk-ant-oat01-late-access',
+              refresh: 'late-refresh',
+              expires: Date.now() + 3_600_000,
+            }
+          },
+        }),
+      ),
+    ).rejects.toThrow('Disconnect from the vault first.')
+    expect(enrolled).toBeDefined()
+    expect(await rootFiles(fixture.root)).toEqual(enrolled!)
+    expect(bootstraps).toEqual([])
+    expect(await readNativeRows(fixture)).toEqual([])
   })
 
   test('continues from label prompt to OAuth callback prompt and saves account', async () => {
     const tempDir = await createRoot()
-    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const fixture = await nativeFixture(tempDir)
+    const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    const bootstraps = interceptBootstrap()
 
     // Real authorize() (exercises PKCE + state + the printed URL); exchange()
     // is the network boundary, stubbed to return canned tokens. The prompt
@@ -232,7 +524,7 @@ describe('CLI login', () => {
       exchangeArgs = { input, verifier }
       return {
         type: 'success',
-        access: 'cli-access',
+        access: 'sk-ant-oat01-cli-access',
         refresh: 'cli-refresh',
         expires: Date.now() + 3600 * 1000,
       }
@@ -244,7 +536,7 @@ describe('CLI login', () => {
       logs.push(args.map(String).join(' '))
     }
     try {
-      await withAccountEnv(accountPath, {}, () =>
+      await withAccountEnv(accountPath, fixture.env, () =>
         login(undefined, { prompt, exchange }),
       )
     } finally {
@@ -264,293 +556,248 @@ describe('CLI login', () => {
       'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
     )
     expect(exchangeArgs?.verifier).toBeString()
-    expect(stdout).toContain('Saved fallback account "cli-label"')
+    expect(stdout).toContain('Saved native fallback account "cli-label"')
 
-    const storage = JSON.parse(await readFile(accountPath, 'utf8'))
-    expect(storage.accounts).toHaveLength(1)
-    expect(storage.accounts[0]).toMatchObject({
+    const rows = await readNativeRows(fixture)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
       id: 'cli-label',
       label: 'cli-label',
       enabled: true,
+      stamp: 'bound',
+      identity: cliAccountUuid,
+      credential: {
+        type: 'oauth',
+        access: 'sk-ant-oat01-cli-access',
+        refresh: 'cli-refresh',
+      },
     })
-    expect(storage.accounts[0].access).toBeUndefined()
-    expect(storage.accounts[0].refresh).toBeUndefined()
-
-    const runtimeState = JSON.parse(
-      await readFile(getAccountStatePath(accountPath), 'utf8'),
-    )
-    expect(runtimeState.accounts['cli-label']).toMatchObject({
-      access: 'cli-access',
-      refresh: 'cli-refresh',
-    })
-    expect(runtimeState.accounts['cli-label'].authLineageId).toMatch(
-      /^[0-9a-f-]{36}$/,
-    )
+    const config = await readFile(fixture.paths.config, 'utf8')
+    expect(config).not.toContain('sk-ant-oat01-cli-access')
+    expect(config).not.toContain('cli-refresh')
+    const state = JSON.parse(await readFile(fixture.paths.runtime, 'utf8'))
+    expect(state.accounts['cli-label'].authLineageId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(bootstraps).toEqual(['Bearer sk-ant-oat01-cli-access'])
+    await expect(readFile(accountPath, 'utf8')).rejects.toThrow()
   })
 
   test('allows human-readable local OAuth labels without the obsolete manifest label restriction', async () => {
     const tempDir = await createRoot()
-    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const fixture = await nativeFixture(tempDir)
+    const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    const bootstraps = interceptBootstrap()
 
-    await withAccountEnv(accountPath, {}, () =>
+    await withAccountEnv(accountPath, fixture.env, () =>
       login('invalid label', {
         prompt: async () => 'cli-code',
         exchange: async () => ({
           type: 'success' as const,
-          access: 'cli-access',
+          access: 'sk-ant-oat01-cli-access',
           refresh: 'cli-refresh',
           expires: Date.now() + 3600 * 1000,
         }),
       }),
     )
-    expect((await loadAccounts(accountPath))?.accounts[0]).toMatchObject({
+    expect((await readNativeRows(fixture))[0]).toMatchObject({
       id: 'invalid label',
       label: 'invalid label',
-      access: 'cli-access',
+      stamp: 'bound',
+      credential: { type: 'oauth', access: 'sk-ant-oat01-cli-access' },
     })
+    expect(bootstraps).toEqual(['Bearer sk-ant-oat01-cli-access'])
   })
 
   test('preserves an account committed while the interactive OAuth flow is open', async () => {
     const tempDir = await createRoot()
-    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const fixture = await nativeFixture(tempDir)
+    const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    const bootstraps = interceptBootstrap()
     const now = Date.now()
-    const exchange = async (): Promise<{
-      type: 'success'
-      access: string
-      refresh: string
-      expires: number
-    }> => {
-      await addAccountPersistent(
-        {
-          id: 'umut',
+    const exchange = async () => {
+      const concurrent = createNativeAccountRuntime({
+        paths: fixture.paths,
+        host: 'opencode',
+      })
+      try {
+        await concurrent.putAccount({
+          routeId: 'umut',
           label: 'umut',
-          type: 'oauth',
-          access: 'umut-access',
-          refresh: 'umut-refresh',
-          expires: now + 3600 * 1000,
-          enabled: true,
-          addedAt: now,
-        },
-        accountPath,
-      )
+          accountIdentity: '00000000-0000-4000-8000-000000000112',
+          credential: {
+            type: 'oauth',
+            access: 'sk-ant-oat01-umut-access',
+            refresh: 'umut-refresh',
+            expires: now + 3_600_000,
+          },
+        })
+      } finally {
+        concurrent.close()
+      }
       return {
-        type: 'success',
-        access: 'yiyi-access',
+        type: 'success' as const,
+        access: 'sk-ant-oat01-yiyi-access',
         refresh: 'yiyi-refresh',
-        expires: now + 3600 * 1000,
+        expires: now + 3_600_000,
       }
     }
-
-    await withAccountEnv(accountPath, {}, () =>
-      login('yiyi', {
-        prompt: async () =>
-          'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
-        exchange,
-      }),
+    await withAccountEnv(accountPath, fixture.env, () =>
+      login('yiyi', { prompt: async () => 'cli-code', exchange }),
     )
-
-    const config = JSON.parse(await readFile(accountPath, 'utf8'))
-    expect(
-      config.accounts.map((account: { id: string }) => account.id),
-    ).toEqual(['umut', 'yiyi'])
-    const runtimeState = JSON.parse(
-      await readFile(getAccountStatePath(accountPath), 'utf8'),
-    )
-    expect(Object.keys(runtimeState.accounts)).toEqual(['umut', 'yiyi'])
-    expect(runtimeState.accounts.umut.refresh).toBe('umut-refresh')
-    expect(runtimeState.accounts.yiyi.refresh).toBe('yiyi-refresh')
+    const rows = await readNativeRows(fixture)
+    expect(rows.map((row) => row.id)).toEqual(['umut', 'yiyi'])
+    expect(rows[0]?.credential).toMatchObject({
+      type: 'oauth',
+      refresh: 'umut-refresh',
+    })
+    expect(rows[1]?.credential).toMatchObject({
+      type: 'oauth',
+      refresh: 'yiyi-refresh',
+    })
+    const metadata = JSON.parse(await readFile(fixture.paths.runtime, 'utf8'))
+    expect(Object.keys(metadata.accounts)).toEqual(['umut', 'yiyi'])
+    expect(bootstraps).toEqual(['Bearer sk-ant-oat01-yiyi-access'])
+    await expect(readFile(accountPath, 'utf8')).rejects.toThrow()
   })
 
-  test('re-login with same label clears stale errors and quota', async () => {
-    const tempDir = await createRoot()
-    const accountPath = join(tempDir, 'anthropic-auth.json')
-
-    await writeFile(
-      accountPath,
-      JSON.stringify({
-        version: 1,
-        main: { type: 'opencode', provider: 'anthropic' },
-        accounts: [
+  for (const splitState of [false, true]) {
+    test(
+      splitState
+        ? 're-login with same label replaces split runtime state and clears stale reauth'
+        : 're-login with same label clears stale errors and quota',
+      async () => {
+        const tempDir = await createRoot()
+        const oldRefreshedAt = Date.now() - 60_000
+        const oldIdentity = '00000000-0000-4000-8000-000000000110'
+        const stale = {
+          access: 'sk-ant-oat01-old-access',
+          refresh: 'old-refresh',
+          expires: 1,
+          lastRefreshedAt: oldRefreshedAt,
+          quota: {
+            accountIdentity: oldIdentity,
+            checkedAt: oldRefreshedAt,
+            five_hour: {
+              usedPercent: 99,
+              remainingPercent: 1,
+              checkedAt: oldRefreshedAt,
+            },
+          },
+          lastRefreshError: {
+            message: 'old invalid_grant',
+            checkedAt: oldRefreshedAt,
+            nextRetryAt: Date.now() + 3_600_000,
+            permanent: true,
+            tokenHash: createHash('sha256').update('old-refresh').digest('hex'),
+          },
+          lastQuotaRefreshError: {
+            message: 'old quota error',
+            accountIdentity: oldIdentity,
+            checkedAt: oldRefreshedAt,
+          },
+        }
+        const fixture = await nativeFixture(
+          tempDir,
           {
-            id: 'cli-label',
-            label: 'cli-label',
+            version: 1,
+            accounts: [
+              {
+                id: 'cli-label',
+                label: 'cli-label',
+                type: 'oauth',
+                anthropicAccountUuid: oldIdentity,
+                enabled: true,
+                addedAt: 123,
+                ...(splitState ? {} : stale),
+              },
+            ],
+          },
+          splitState
+            ? { version: 1, accounts: { 'cli-label': stale } }
+            : undefined,
+        )
+        const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
+        const before = (await readNativeRows(fixture))[0]
+        expect(before?.identity).toBe(oldIdentity)
+        const reader = createNativeAccountRuntime({
+          paths: fixture.paths,
+          host: 'opencode',
+        })
+        try {
+          const prior = (await reader.read()).accounts.find(
+            (row) => row.id === 'cli-label',
+          )
+          expect(prior?.quota?.five_hour?.usedPercent).toBe(99)
+        } finally {
+          reader.close()
+        }
+        const oldMetadata = JSON.parse(
+          await readFile(fixture.paths.runtime, 'utf8'),
+        ).accounts['cli-label']
+        expect(oldMetadata.lastRefreshError?.permanent).toBe(true)
+        expect(oldMetadata.lastQuotaRefreshError?.message).toBe(
+          'Imported quota failure',
+        )
+        const bootstraps = interceptBootstrap()
+        const asked: string[] = []
+        await withAccountEnv(accountPath, fixture.env, () =>
+          login('cli-label', {
+            prompt: async (message) => {
+              asked.push(message)
+              return 'cli-code'
+            },
+            exchange: async () => ({
+              type: 'success' as const,
+              access: 'sk-ant-oat01-new-access',
+              refresh: 'new-refresh',
+              expires: Date.now() + 3_600_000,
+            }),
+          }),
+        )
+        expect(asked).toEqual([
+          'Paste the full callback URL or authorization code here: ',
+        ])
+        const rows = await readNativeRows(fixture)
+        expect(rows).toHaveLength(1)
+        expect(rows[0]).toMatchObject({
+          id: 'cli-label',
+          label: 'cli-label',
+          enabled: true,
+          addedAt: before?.addedAt,
+          identity: cliAccountUuid,
+          credential: {
             type: 'oauth',
-            access: 'old-access',
-            refresh: 'old-refresh',
-            expires: 1,
-            enabled: true,
-            addedAt: 123,
-            quota: {
-              five_hour: {
-                usedPercent: 99,
-                remainingPercent: 1,
-                checkedAt: 123,
-              },
-            },
-            lastRefreshedAt: 123,
-            lastRefreshError: { message: 'old refresh failed', checkedAt: 123 },
-            lastQuotaRefreshError: {
-              message: 'old quota failed',
-              checkedAt: 123,
-            },
+            access: 'sk-ant-oat01-new-access',
+            refresh: 'new-refresh',
           },
-        ],
-      }),
-      'utf8',
+        })
+        expect(rows[0]?.credentialEpoch).toBeGreaterThan(
+          before?.credentialEpoch ?? 0,
+        )
+        expect(rows[0]?.quota).toBeUndefined()
+        if (rows[0]?.credential?.type !== 'oauth')
+          throw new Error('OAuth replacement is missing')
+        expect(rows[0].credential.lastRefreshedAt).toBeGreaterThan(
+          oldRefreshedAt,
+        )
+        const config = await readFile(fixture.paths.config, 'utf8')
+        expect(config).not.toContain('sk-ant-oat01-new-access')
+        expect(config).not.toContain('new-refresh')
+        const metadata = JSON.parse(
+          await readFile(fixture.paths.runtime, 'utf8'),
+        ).accounts['cli-label']
+        expect(metadata.lastRefreshError).toBeUndefined()
+        expect(metadata.lastQuotaRefreshError).toBeUndefined()
+        expect(metadata.quota).toBeUndefined()
+        expect(metadata.authLineageId).toMatch(/^[0-9a-f-]{36}$/)
+        expect(bootstraps).toEqual(['Bearer sk-ant-oat01-new-access'])
+        await expect(readFile(accountPath, 'utf8')).rejects.toThrow()
+        if (splitState)
+          await expect(
+            readFile(getAccountStatePath(accountPath), 'utf8'),
+          ).rejects.toThrow()
+      },
     )
-
-    // Label is passed as the arg, so the only prompt is the callback code.
-    const asked: string[] = []
-    const prompt = async (message: string) => {
-      asked.push(message)
-      return 'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub'
-    }
-    const exchange = async (): Promise<{
-      type: 'success'
-      access: string
-      refresh: string
-      expires: number
-    }> => ({
-      type: 'success',
-      access: 'new-access',
-      refresh: 'new-refresh',
-      expires: Date.now() + 3600 * 1000,
-    })
-
-    await withAccountEnv(accountPath, {}, () =>
-      login('cli-label', { prompt, exchange }),
-    )
-
-    expect(asked).toEqual([
-      'Paste the full callback URL or authorization code here: ',
-    ])
-
-    const storage = JSON.parse(await readFile(accountPath, 'utf8'))
-    expect(storage.accounts).toHaveLength(1)
-    expect(storage.accounts[0]).toMatchObject({
-      id: 'cli-label',
-      label: 'cli-label',
-      enabled: true,
-      addedAt: 123,
-    })
-    expect(storage.accounts[0].access).toBeUndefined()
-    expect(storage.accounts[0].refresh).toBeUndefined()
-    expect(storage.accounts[0].quota).toBeUndefined()
-    expect(storage.accounts[0].lastRefreshedAt).toBeUndefined()
-    expect(storage.accounts[0].lastRefreshError).toBeUndefined()
-    expect(storage.accounts[0].lastQuotaRefreshError).toBeUndefined()
-
-    const runtimeState = JSON.parse(
-      await readFile(getAccountStatePath(accountPath), 'utf8'),
-    )
-    expect(runtimeState.accounts['cli-label']).toMatchObject({
-      access: 'new-access',
-      refresh: 'new-refresh',
-    })
-    expect(runtimeState.accounts['cli-label'].quota).toBeUndefined()
-    expect(runtimeState.accounts['cli-label'].lastRefreshedAt).toBeNumber()
-    expect(runtimeState.accounts['cli-label'].lastRefreshError).toBeUndefined()
-    expect(
-      runtimeState.accounts['cli-label'].lastQuotaRefreshError,
-    ).toBeUndefined()
-  })
-
-  test('re-login with same label replaces split runtime state and clears stale reauth', async () => {
-    const tempDir = await createRoot()
-    const accountPath = join(tempDir, 'anthropic-auth.json')
-    const statePath = getAccountStatePath(accountPath)
-    const oldRefreshedAt = Date.now() - 60_000
-
-    await writeFile(
-      accountPath,
-      JSON.stringify(
-        {
-          version: 1,
-          main: { type: 'opencode', provider: 'anthropic' },
-          accounts: [
-            {
-              id: 'cli-label',
-              label: 'cli-label',
-              type: 'oauth',
-              enabled: true,
-              addedAt: 123,
-            },
-          ],
-        },
-        null,
-        2,
-      ),
-      'utf8',
-    )
-    await writeFile(
-      statePath,
-      JSON.stringify(
-        {
-          version: 1,
-          accounts: {
-            'cli-label': {
-              access: 'old-access',
-              refresh: 'old-refresh',
-              expires: 1,
-              lastRefreshedAt: oldRefreshedAt,
-              quota: {
-                five_hour: {
-                  usedPercent: 99,
-                  remainingPercent: 1,
-                  checkedAt: Date.now(),
-                },
-              },
-              lastRefreshError: {
-                message: 'old invalid_grant',
-                checkedAt: oldRefreshedAt,
-                nextRetryAt: Date.now() + 3_600_000,
-                permanent: true,
-              },
-              lastQuotaRefreshError: {
-                message: 'old quota error',
-                checkedAt: oldRefreshedAt,
-              },
-            },
-          },
-        },
-        null,
-        2,
-      ),
-      'utf8',
-    )
-
-    const prompt = async () =>
-      'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub'
-    const exchange = async (): Promise<{
-      type: 'success'
-      access: string
-      refresh: string
-      expires: number
-    }> => ({
-      type: 'success',
-      access: 'new-access',
-      refresh: 'new-refresh',
-      expires: Date.now() + 3600 * 1000,
-    })
-
-    await withAccountEnv(accountPath, {}, () =>
-      login('cli-label', { prompt, exchange }),
-    )
-
-    const runtimeState = JSON.parse(await readFile(statePath, 'utf8'))
-    expect(runtimeState.accounts['cli-label']).toMatchObject({
-      access: 'new-access',
-      refresh: 'new-refresh',
-    })
-    expect(runtimeState.accounts['cli-label'].lastRefreshedAt).toBeGreaterThan(
-      oldRefreshedAt,
-    )
-    expect(runtimeState.accounts['cli-label'].quota).toBeUndefined()
-    expect(runtimeState.accounts['cli-label'].lastRefreshError).toBeUndefined()
-    expect(
-      runtimeState.accounts['cli-label'].lastQuotaRefreshError,
-    ).toBeUndefined()
-  })
+  }
 })
 
 describe('CLI relay setup', () => {
