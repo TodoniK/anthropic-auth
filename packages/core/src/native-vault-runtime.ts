@@ -60,6 +60,7 @@ import { fetchOAuthAccountProfile } from './oauth-profile.ts'
 import { NativeAuthorityError } from './pool-authority.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 import { createNativePoolStore } from './pool-store.ts'
+import type { QuotaRequestDispatch } from './quota-manager.ts'
 
 export interface NativeVaultRuntimeOptions {
   paths: NativePoolPaths
@@ -177,6 +178,7 @@ export interface NativeVaultRuntime {
     routeId: string,
     fetchImpl?: typeof fetch,
     signal?: AbortSignal,
+    dispatch?: QuotaRequestDispatch,
   ): Promise<OAuthQuotaSnapshot>
   fetchProfile(
     routeId: string,
@@ -589,7 +591,7 @@ export function createNativeVaultRuntime(
         },
       }))
     },
-    async fetchQuota(routeId, fetchImpl = fetch, signal) {
+    async fetchQuota(routeId, fetchImpl = fetch, signal, dispatch) {
       const row = await rowFor(await runtime.read(), routeId)
       const state = await readNativeRuntime(paths.runtime, paths.storageId)
       const before =
@@ -633,6 +635,7 @@ export function createNativeVaultRuntime(
           if (failure)
             await runtime.publish(receipt, { lastQuotaRefreshError: failure })
         },
+        dispatch,
       )
       const quota = {
         ...result.value,
@@ -851,9 +854,41 @@ export function createNativeVaultRuntime(
       error: unknown,
       receipt: NativeCustodyReceipt,
     ) => Promise<void>,
+    dispatch?: QuotaRequestDispatch,
   ) {
     const combined = signalFor(signal)
     let served = await runtime.authorize(routeId, combined)
+    const send = (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      const physical = () => fetchImpl(input, { ...init, signal: combined })
+      if (!dispatch) return physical()
+      return dispatch(physical, async () => {
+        await requireActive(combined)
+        const route = requireIssued(served)
+        const current = await rowFor(
+          await readVaultRoster(paths.roster),
+          route.logicalId,
+        )
+        const key = JSON.stringify([
+          route.routeId,
+          served.credentialId,
+          served.assertedAccountIdentity,
+        ])
+        if (
+          !current?.enabled ||
+          current.state !== 'active' ||
+          current.routeId !== route.routeId ||
+          current.accountIdentity !== served.assertedAccountIdentity ||
+          (current.credentialId !== served.credentialId &&
+            !current.aliases?.includes(served.credentialId)) ||
+          (versions.get(key) ?? served.recordVersion) > served.recordVersion
+        )
+          throw new NativeCustodyError('identity-changed')
+        await requireActive(combined)
+      })
+    }
     let responseStatus: number | undefined
     const transport: typeof fetch = Object.assign(
       async (
@@ -861,7 +896,7 @@ export function createNativeVaultRuntime(
         init?: Parameters<typeof fetch>[1],
       ) => {
         responseStatus = undefined
-        let response = await fetchImpl(input, { ...init, signal: combined })
+        let response = await send(input, init)
         responseStatus = response.status
         if (response.status === 401 && !combined.aborted) {
           // Body cleanup can await. Complete it before final retry admission
@@ -896,11 +931,7 @@ export function createNativeVaultRuntime(
           responseStatus = undefined
           // A transport failure here propagates unreported: it is not evidence
           // that the newer version was rejected.
-          response = await fetchImpl(input, {
-            ...init,
-            headers,
-            signal: combined,
-          })
+          response = await send(input, { ...init, headers })
           responseStatus = response.status
           if (response.status === 401) await report(served)
         }

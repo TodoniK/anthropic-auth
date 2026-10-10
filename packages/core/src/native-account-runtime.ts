@@ -78,6 +78,7 @@ import {
 } from './pool-binding.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
+import type { QuotaRequestDispatch } from './quota-manager.ts'
 import type { RelayConfig } from './relay.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
@@ -219,6 +220,7 @@ export interface NativeAccountRuntime {
     routeId: string,
     fetchImpl?: typeof fetch,
     signal?: AbortSignal,
+    dispatch?: QuotaRequestDispatch,
   ): Promise<OAuthQuotaSnapshot>
   fetchProfile(
     routeId: string,
@@ -1208,10 +1210,10 @@ export function createNativeAccountRuntime(
         },
       }))
     },
-    async fetchQuota(routeId, fetchImpl = fetch, signal) {
+    async fetchQuota(routeId, fetchImpl = fetch, signal, dispatch) {
       const snapshot = await runtime.read()
       if (snapshot.mode === 'claustrum')
-        return vault.fetchQuota(routeId, fetchImpl, signal)
+        return vault.fetchQuota(routeId, fetchImpl, signal, dispatch)
       const before = snapshot.accounts.find((row) => row.id === routeId)
       const result = await fetchReading(
         routeId,
@@ -1243,6 +1245,7 @@ export function createNativeAccountRuntime(
               lastQuotaRefreshError: failure,
             })
         },
+        dispatch,
       )
       const quota = {
         ...result.value,
@@ -1339,6 +1342,7 @@ export function createNativeAccountRuntime(
       error: unknown,
       attempt: Extract<NativeRefreshResult, { status: 'usable' }>,
     ) => Promise<void>,
+    dispatch?: QuotaRequestDispatch,
   ) {
     const combined = AbortSignal.any([
       shutdown.signal,
@@ -1348,6 +1352,31 @@ export function createNativeAccountRuntime(
     if (first.status !== 'usable')
       throw new NativeCustodyError('route-unavailable')
     let served = first
+    const send = (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      const physical = () => fetchImpl(input, { ...init, signal: combined })
+      if (!dispatch) return physical()
+      return dispatch(physical, async () => {
+        await localAuthority(combined)
+        const row = await poolRow(served.binding.rowId)
+        if (
+          !row?.enabled ||
+          row.stamp !== 'bound' ||
+          row.credential?.type !== 'oauth' ||
+          !nativeLocalPoolBindingMatches(served.binding, paths, row) ||
+          !nativeLocalCredentialValidationMatches(
+            served.subject,
+            served.binding,
+            row.credential,
+          ) ||
+          (await physicalId(id)) !== served.binding.rowId
+        )
+          throw new NativeCustodyError('identity-changed')
+        await localAuthority(combined)
+      })
+    }
     let responseStatus: number | undefined
     const transport: typeof fetch = Object.assign(
       async (
@@ -1355,7 +1384,7 @@ export function createNativeAccountRuntime(
         init?: Parameters<typeof fetch>[1],
       ) => {
         responseStatus = undefined
-        let response = await fetchImpl(input, { ...init, signal: combined })
+        let response = await send(input, init)
         responseStatus = response.status
         if (response.status === 401 && !combined.aborted) {
           await response.body?.cancel().catch(() => {})
@@ -1379,11 +1408,7 @@ export function createNativeAccountRuntime(
             const headers = new Headers(init?.headers)
             headers.set('authorization', `Bearer ${served.access}`)
             responseStatus = undefined
-            response = await fetchImpl(input, {
-              ...init,
-              headers,
-              signal: combined,
-            })
+            response = await send(input, { ...init, headers })
             responseStatus = response.status
           }
         }

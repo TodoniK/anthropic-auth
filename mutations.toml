@@ -406,3 +406,51 @@ expect_message = "Expected promise that rejects"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "quota-spacing-counts-physical-dispatch-only"
+guards = "Quota admission refusals and lock losers cannot postpone a usable account's first usage GET."
+file = "packages/core/src/quota-manager.ts"
+old = "      return fn()\n    }\n    const queued = this.apiGate.then(gatedFn, gatedFn)"
+new = "      this.lastApiCallAt = this.now()\n      return fn()\n    }\n    const queued = this.apiGate.then(gatedFn, gatedFn)"
+test_file = "packages/core/src/tests/quota-dispatch.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/quota-dispatch.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["two unusable quota rows consume no dispatch spacing before the sole usable GET", "a quota lock loser neither sends a GET nor advances physical dispatch spacing"]
+expect_message = "error: expect(received).toBeUndefined()"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "quota-physical-get-gap-includes-failures"
+guards = "Every physical usage GET, including one after a provider failure, respects the one-second minimum start gap."
+file = "packages/core/src/quota-manager.ts"
+old = "if (remaining > 0)"
+new = "if (false)"
+test_file = "packages/core/src/tests/quota-dispatch.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/quota-dispatch.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["physical quota GET starts stay one second apart when the first GET fails"]
+expect_message = "error: expect(received).toBeGreaterThanOrEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "quota-rechecks-credential-after-spacing"
+guards = "An enrollment or account decline during the quota pacing wait prevents dispatch and consumes no timestamp or 401 report."
+file = "packages/core/src/quota-manager.ts"
+old = "await revalidate()"
+new = "// NON-VACUITY BREAK: skip post-wait credential eligibility"
+test_file = "packages/core/src/tests/native-vault-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["vault mode lost during quota spacing drops the attempt without a GET, spacing stamp or 401 report", "vault subject lost during quota spacing drops the attempt without a GET, spacing stamp or 401 report"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

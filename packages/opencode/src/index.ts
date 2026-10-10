@@ -1739,11 +1739,11 @@ const anthropicAuthPlugin = async (
   // rejected refresh token became usable, so it must not clear refresh errors.
   const quotaManager = new QuotaManager({
     storage: initialStorage,
-    fetchQuotaSnapshot: (request) => {
+    fetchQuotaSnapshot: (request, dispatch) => {
       assertNativeEnvironment()
       const routeId = request.kind === 'main' ? 'main' : request.accountId
       if (!routeId) throw new Error('Quota request has no account identity')
-      return nativeAccounts.fetchQuota(routeId)
+      return nativeAccounts.fetchQuota(routeId, undefined, undefined, dispatch)
     },
   })
   function quotaSnapshotIsExhausted(

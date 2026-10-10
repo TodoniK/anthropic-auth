@@ -28,6 +28,7 @@ import {
 } from '../native-vault-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
+import { QuotaManager } from '../quota-manager.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
@@ -1305,3 +1306,68 @@ test('offline setup inventory populates only vault files and cannot replace per-
   expect(f.counts.gets).toBe(1)
   await unchanged()
 })
+
+for (const change of ['mode', 'subject'] as const) {
+  test(`vault ${change} lost during quota spacing drops the attempt without a GET, spacing stamp or 401 report`, async () => {
+    const f = await fixture()
+    await f.runtime.refresh()
+    let gets = 0
+    let dispatches = 0
+    let entered!: () => void
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const transport: typeof fetch = Object.assign(
+      async () => {
+        gets++
+        return Response.json({
+          five_hour: { utilization: 4 },
+          seven_day: { utilization: 13 },
+        })
+      },
+      { preconnect: fetch.preconnect },
+    )
+    const manager = new QuotaManager({
+      storage: null,
+      fetchQuotaSnapshot: (_request, dispatch) =>
+        f.runtime.fetchQuota(
+          'main',
+          transport,
+          undefined,
+          (send, revalidate) => {
+            dispatches++
+            if (dispatches === 2) entered()
+            return dispatch(send, revalidate)
+          },
+        ),
+    })
+    deferCleanup(() => manager.close())
+    await manager.refreshMainWithMetadata(uuid, '')
+    const firstStamp: unknown = Object.getOwnPropertyDescriptor(
+      manager,
+      'lastApiCallAt',
+    )?.value
+    expect(typeof firstStamp).toBe('number')
+    const pending = manager.refreshMainWithMetadata(uuid, '').then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    )
+    await waiting
+    if (change === 'mode')
+      await rm(f.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE)
+    else await f.runtime.setEnabled('main', false)
+    const result = await pending
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      throw new Error('An unavailable vault quota attempt was admitted')
+    expect(result.error).toMatchObject({
+      code: change === 'mode' ? 'route-unavailable' : 'identity-changed',
+    })
+    expect(gets).toBe(1)
+    expect(f.counts.gets).toBe(2)
+    expect(f.reports).toEqual([])
+    expect(
+      Object.getOwnPropertyDescriptor(manager, 'lastApiCallAt')?.value,
+    ).toBe(firstStamp)
+  })
+}
