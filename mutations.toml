@@ -454,3 +454,19 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "pi-forwards-physical-quota-dispatch"
+guards = "Pi forwards each native usage GET through the shared quota dispatcher rather than bypassing physical-request spacing."
+file = "packages/pi/src/stream.ts"
+old = "fetchQuota(\n          id,\n          fetchPiOAuth,\n          undefined,\n          dispatch,\n        )"
+new = "fetchQuota(id, fetchPiOAuth)"
+test_file = "packages/pi/src/tests/quota-dispatch.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/pi/src/tests/quota-dispatch.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["Pi paces physical usage GETs for two due fallback accounts before a single model request"]
+expect_message = "error: expect(received).toBeGreaterThanOrEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
+broad_report = "tmp/mutations/pi.xml"
+broad_id = "{name}"

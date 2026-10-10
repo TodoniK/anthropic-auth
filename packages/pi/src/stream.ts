@@ -130,10 +130,15 @@ function getPiRoutingServices(
   if (!quotaManager) {
     quotaManager = new QuotaManager({
       storage,
-      fetchQuotaSnapshot: async (request) => {
+      fetchQuotaSnapshot: async (request, dispatch) => {
         const id = request.kind === 'main' ? 'main' : request.accountId
         if (!id) throw new Error('Native quota request has no account identity')
-        return (await native.service()).fetchQuota(id, fetchPiOAuth)
+        return (await native.service()).fetchQuota(
+          id,
+          fetchPiOAuth,
+          undefined,
+          dispatch,
+        )
       },
     })
     setBoundedService(quotaManagers, storagePath, {
