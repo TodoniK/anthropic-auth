@@ -65,6 +65,8 @@ export interface NativeVaultRuntimeOptions {
   paths: NativePoolPaths
   host: 'opencode' | 'pi'
   connect?: () => Promise<NativeCustodyClient>
+  /** Reuse the inventory verifier supplied by offline setup without changing per-send scoped authorization. */
+  discover?: () => Promise<NativeCustodyInventory>
   readToken?: () => Promise<{ token: string; token_generation: number }>
   env?: NodeJS.ProcessEnv
   now?: () => number
@@ -156,11 +158,11 @@ export interface NativeVaultRuntime {
     source: NativeCustodyReporterSource,
   ): Promise<void>
   /**
-   * Re-authorize after a 401 and admit one replay only for a strictly newer
-   * version of the same credential and account. With a `site`, the decision is
-   * logged as 'scoped 401 re-authorized' (versions and reason only, never
-   * credential material). It never reports the 401: the caller reports only
-   * the receipt whose response is final.
+   * After a 401, acquire a fresh receipt for the same credential and account.
+   * Permit one replay only if its recordVersion exceeds the rejected receipt's
+   * version. The optional site is a diagnostic call-site label: model requests,
+   * quota, profile or cache warming. Logs contain versions, never credentials.
+   * The caller reports only the receipt rejected by its final HTTP attempt.
    */
   prepareRetry(
     receipt: NativeCustodyReceipt,
@@ -181,7 +183,7 @@ export interface NativeVaultRuntime {
     fetchImpl?: typeof fetch,
     signal?: AbortSignal,
   ): Promise<OAuthAccountProfile>
-  /** Like fetchProfile, but returns before the profile is saved; see NativeDisplayProfile. */
+  /** Return the fetched account profile without waiting for its metadata write. NativeDisplayProfile.persisted reports whether that asynchronous write succeeded, failed or was refused. */
   fetchProfileForDisplay(
     routeId: string,
     fetchImpl?: typeof fetch,
@@ -206,7 +208,7 @@ export interface NativeVaultRuntime {
   close(): void
 }
 
-/** Publish initial account metadata only while the migration controller holds its journal lock and verifies that the host is stopped. */
+/** Publish the initial roster from validated account inventory. A caller importing captured state must fence that state through assertOwned, which runs again at the roster's actual publication. */
 export async function publishNativeVaultRosterSeed(
   paths: Pick<NativeVaultPaths, 'roster'>,
   input: NativeRosterSeedInput,
@@ -229,7 +231,7 @@ export async function publishNativeVaultRosterSeed(
   )
 }
 
-/** Bind imported metadata to the vault account list. The migration controller supplies journal-lock and stopped-host checks; this writer owns neither. */
+/** Match imported metadata to the held vault roster before publishing it. The caller's assertOwned fences its captured input; the roster lease separately prevents account replacement during the metadata write. */
 export async function publishNativeVaultRuntimeSeed(
   paths: Pick<NativeVaultPaths, 'roster' | 'runtime' | 'storageId'>,
   state: NativeRuntimeState,
@@ -262,7 +264,7 @@ export async function publishNativeVaultRuntimeSeed(
   })
 }
 
-/** Read inventory for offline setup; a list neither authorizes serving nor proves completeness without the controller's checks. */
+/** List accounts readable by this host's enrollment for offline setup. An inventory grants no bearer authority; every outbound request still needs a fresh scoped receipt. */
 export async function discoverNativeVaultInventory(
   options: NativeVaultRuntimeOptions,
   signal?: AbortSignal,
@@ -421,10 +423,11 @@ export function createNativeVaultRuntime(
       check(signal)
       if (!(await active())) return undefined
       check(signal)
-      // Cancellation belongs to this waiter, not to a peer using shared discovery.
+      // Abort this caller's wait, not the discovery operation: another caller
+      // may still need the result of that shared operation.
       refreshing ??= refreshVaultRoster({
         path: paths.roster,
-        custody,
+        custody: options.discover ? { discover: options.discover } : custody,
         signal: shutdown.signal,
         isActive: active,
         projection: () => ({ reservedRouteIds }),
@@ -485,7 +488,8 @@ export function createNativeVaultRuntime(
     },
     async prepareRetry(served, signal, site) {
       const route = requireIssued(served)
-      // The re-authorized receipt, kept beside the decision for diagnostics.
+      // Return the retry decision with any fresh receipt, including a refused
+      // one, so diagnostics can record the newly observed recordVersion.
       const decide = async (): Promise<
         [NativeCustodyRetry, NativeCustodyReceipt | undefined]
       > => {
@@ -665,8 +669,9 @@ export function createNativeVaultRuntime(
       if (!row) throw new NativeCustodyError('route-unavailable')
       // Update acceptance and the enabled flag together under the roster write
       // lock. Compare that held flag before changing it so repeated enable or
-      // disable calls report no change. It makes the same roster change as
-      // common-auth's acceptVaultRoute and declineVaultRoute.
+      // disable calls report no change. Enabling removes this credential/account
+      // pair from declined entries; disabling adds it so discovery cannot enable
+      // it again.
       return mutateVaultRoster(paths.roster, (current) => {
         const held = current?.rows.find(
           (entry) => entry.routeId === row.routeId,

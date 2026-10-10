@@ -1271,3 +1271,37 @@ test('unverified default discovery removes main admission without inheriting a l
   expect(f.counts.gets).toBe(0)
   await unchanged()
 })
+
+test('offline setup inventory populates only vault files and cannot replace per-send scoped authorization', async () => {
+  const f = await fixture()
+  const unchanged = await preservedLocalFiles(f)
+  let discoveries = 0
+  const runtime = createNativeVaultRuntime({
+    ...f.options,
+    discover: async () => {
+      discoveries++
+      return {
+        view: 'offline-verified-inventory',
+        credentials: [
+          {
+            credentialId: id,
+            credentialType: 'oauth',
+            accountIdentity: uuid,
+            state: 'active',
+          },
+        ],
+        skipped: [],
+      }
+    },
+  })
+  deferCleanup(() => runtime.close())
+  await runtime.refresh()
+  expect(discoveries).toBe(1)
+  expect(f.counts.connects).toBe(0)
+  expect(f.counts.gets).toBe(0)
+  const receipt = await runtime.authorize('main')
+  expect(receipt.accountIdentity).toBe(uuid)
+  expect(f.counts.connects).toBe(1)
+  expect(f.counts.gets).toBe(1)
+  await unchanged()
+})

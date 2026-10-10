@@ -1,6 +1,6 @@
 import {
   createNativeAccountRuntime,
-  readNativeMigrationJournal,
+  readNativeEnrollmentMode,
   requireNoSupervisedAuthContentSnapshot,
   runNativeMigration,
 } from '@cortexkit/anthropic-auth-core'
@@ -35,24 +35,11 @@ export async function migrateNativeLocalForHost(
   const processFence = async () => {
     requireNoSupervisedAuthContentSnapshot(env)
     await assertHostsStopped(options.fence)
+    if ((await readNativeEnrollmentMode(host, env)) !== 'local')
+      throw new Error('Disconnect from the vault first.')
   }
   await processFence()
   const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
-  const journal = await readNativeMigrationJournal(plan.paths)
-  if (
-    options.login &&
-    (journal?.phase === 'retired' || journal?.phase === 'committed')
-  ) {
-    const current = createNativeAccountRuntime({ paths: plan.paths, host })
-    try {
-      if ((await current.read()).mode !== 'local')
-        throw new Error(
-          'Exit vault custody with offline setup before local sign-in',
-        )
-    } finally {
-      current.close()
-    }
-  }
   const login = await options.login?.(host)
   if (
     login &&
@@ -78,14 +65,13 @@ export async function migrateNativeLocalForHost(
     const runtime = createNativeAccountRuntime({
       paths: plan.paths,
       host,
+      vault: { env },
       beforePoolWrite: processFence,
     })
     try {
       const snapshot = await runtime.read()
       if (snapshot.mode !== 'local')
-        throw new Error(
-          'Exit vault custody with offline setup before local sign-in',
-        )
+        throw new Error('Disconnect from the vault first.')
       await processFence()
       await runtime.loginOAuth({ routeId: 'main', replace: true, ...login })
     } finally {

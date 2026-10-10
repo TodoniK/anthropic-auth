@@ -1,15 +1,12 @@
 import { readFile } from 'node:fs/promises'
 import {
+  createNativeAccountRuntime,
   discoverNativeVaultInventory,
   inspectNativeHostAuthEntry,
   type NativeCustodyActivationHooks,
   type NativeCustodyInventory,
-  publishNativeVaultRosterSeed,
-  publishNativeVaultRuntimeSeed,
-  readNativeMigrationJournal,
+  readNativeEnrollmentMode,
   requireNoSupervisedAuthContentSnapshot,
-  runNativeCustodyActivation,
-  runNativeMigration,
 } from '@cortexkit/anthropic-auth-core'
 
 import {
@@ -29,7 +26,9 @@ export class NativeVaultActivationError extends Error {
       | 'auth-content-refused'
       | 'host-auth-invalid'
       | 'primary-conflict'
-      | 'consent-required',
+      | 'consent-required'
+      | 'pi-slot-helper-required'
+      | 'primary-unverified',
   ) {
     super(
       {
@@ -39,7 +38,11 @@ export class NativeVaultActivationError extends Error {
         'primary-conflict':
           'Pi has a stored Anthropic API key, which would take precedence over the vault account. Remove it in Pi, then rerun setup.',
         'consent-required':
-          'Pi has a stored Anthropic OAuth login. Rerun setup and agree to remove it so the vault account serves requests.',
+          'Pi has stored Anthropic authentication. Explicit consent is required to move it aside for vault use.',
+        'pi-slot-helper-required':
+          'Pi stored authentication requires the shared vault move-aside helper. No stored authentication was changed.',
+        'primary-unverified':
+          'The vault has no verified default Claude account. Sign in through the vault and rerun setup.',
       }[code],
     )
     this.name = 'NativeVaultActivationError'
@@ -50,7 +53,7 @@ export interface NativeVaultActivationOptions {
   env: NodeJS.ProcessEnv
   runner: CommandRunner
   fence: ProcessFence
-  /** The user's explicit consent to delete Pi's stored Anthropic OAuth login. */
+  /** Consent to move Pi's stored authentication aside; never consent to delete it. */
   removePiAnthropicAuth: boolean
   /**
    * Tests override the host paths, enrollment client and vault listing;
@@ -75,9 +78,9 @@ async function readHostAuth(path: string): Promise<unknown> {
 }
 
 /**
- * Explicit offline switch of one host to vault custody: enroll this host,
- * finish (or start) its migration, then activate vault custody. Each host is
- * enrolled and activated on its own; nothing here runs at host startup.
+ * Enroll this stopped host, discover its verified default vault account and
+ * leave the host auth slot untouched. Local credentials, migration journal,
+ * account metadata and routing assignments are not inputs to this operation.
  */
 export async function activateNativeVaultForHost(
   host: HarnessKind,
@@ -96,22 +99,20 @@ export async function activateNativeVaultForHost(
   }
   await processFence()
   const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
-  let entry: ReturnType<typeof inspectNativeHostAuthEntry>
-  try {
-    entry = inspectNativeHostAuthEntry(
-      host,
+  if (host === 'pi') {
+    const entry = inspectNativeHostAuthEntry(
+      'pi',
       await readHostAuth(plan.hostAuthPath),
     )
-  } catch {
-    throw new NativeVaultActivationError('host-auth-invalid')
+    if (entry.kind !== 'absent') {
+      if (!options.removePiAnthropicAuth)
+        throw new NativeVaultActivationError('consent-required')
+      // Pi's stored authentication must remain restorable after disconnect.
+      // Refuse before enrollment until its private move-aside support is available.
+      throw new NativeVaultActivationError('pi-slot-helper-required')
+    }
   }
-  if (host === 'pi') {
-    // Consent to remove an OAuth login never covers a Pi API key.
-    if (entry.kind === 'api_key')
-      throw new NativeVaultActivationError('primary-conflict')
-    if (entry.kind !== 'absent' && !options.removePiAnthropicAuth)
-      throw new NativeVaultActivationError('consent-required')
-  }
+  const priorMode = await readNativeEnrollmentMode(host, env)
   await enrollNativeVaultForHost(host, {
     env,
     runner: options.runner,
@@ -133,40 +134,25 @@ export async function activateNativeVaultForHost(
               }
             : env,
       }))
-  const journal = await readNativeMigrationJournal(plan.paths)
-  // A retired (fully finished) migration is not rerun, because rerunning it
-  // would repair host auth that the activation now checks. Otherwise finish
-  // or start the migration; a first migration records that vault custody was
-  // requested, which keeps serving refused until the activation commits.
-  if (journal?.phase !== 'retired')
-    await runNativeMigration({
-      paths: plan.paths,
-      legacyConfigPath: plan.legacyConfigPath,
-      legacyStatePath: plan.legacyStatePath,
-      host,
-      hostAuthPath: plan.hostAuthPath,
-      routingSourcePath: plan.routingSourcePath,
-      routingDestinationPath: plan.routingDestinationPath,
-      env,
-      processFence,
-      removePiAnthropicAuth: options.removePiAnthropicAuth,
-      custody: {
-        discover,
-        publishSeed: publishNativeVaultRosterSeed,
-        publishRuntimeSeed: publishNativeVaultRuntimeSeed,
-      },
-      ...(journal ? {} : { requestVaultActivation: true }),
-    })
-  const result = await runNativeCustodyActivation(
-    {
-      paths: plan.paths,
-      host,
-      env,
-      processFence,
-      removePiAnthropicAuth: options.removePiAnthropicAuth,
-      discover,
-    },
-    options.hooks,
-  )
-  return result.status
+  const runtime = createNativeAccountRuntime({
+    paths: plan.paths,
+    host,
+    vault: { env, discover },
+  })
+  try {
+    await processFence()
+    await runtime.vault.refresh()
+    const snapshot = await runtime.read()
+    const main = snapshot.accounts.find((row) => row.id === 'main')
+    if (
+      snapshot.mode !== 'claustrum' ||
+      !main?.accountIdentity ||
+      main.source !== 'vault'
+    )
+      throw new NativeVaultActivationError('primary-unverified')
+    await processFence()
+    return priorMode === 'claustrum' ? 'already-vault' : 'committed'
+  } finally {
+    runtime.close()
+  }
 }

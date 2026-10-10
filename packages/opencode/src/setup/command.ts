@@ -8,6 +8,7 @@ import {
   outro,
   spinner,
 } from '@clack/prompts'
+import { readNativeEnrollmentMode } from '@cortexkit/anthropic-auth-core'
 import { defaultCommandRunner } from './command-runner.ts'
 import { detectAll } from './detect.ts'
 import { activateNativeVaultForHost } from './native-activation.ts'
@@ -35,7 +36,7 @@ export interface SetupCommandOptions {
   fence?: ProcessFence
   env?: NodeJS.ProcessEnv
   isInteractive?: boolean
-  /** Test seams for host detection and per-host vault activation. */
+  /** Let tests substitute host detection and per-host vault activation. */
   detect?: typeof detectAll
   activate?: typeof activateNativeVaultForHost
   migrateLocal?: typeof migrateNativeLocalForHost
@@ -61,6 +62,13 @@ export async function runSetupCommand(
   const localLogin = explicitLogin
     ? (options.localLogin ?? loginNativeOffline)
     : undefined
+
+  if (explicitLogin && explicitClaustrum) {
+    log.error(
+      'Local sign-in and vault setup are two separate choices. Use --login or --claustrum, not both.',
+    )
+    return 1
+  }
 
   intro('CortexKit Anthropic Auth Setup')
 
@@ -153,7 +161,7 @@ export async function runSetupCommand(
     } else if (!nonInteractive) {
       const claustrumChoice = await confirm({
         message:
-          'Claustrum daemon is running. Switch Anthropic accounts to Claustrum vault custody? Local OAuth logins are removed once their vault accounts are verified.',
+          'Use Claude accounts from the Claustrum vault? Local account files stay unchanged and are not used while connected.',
         initialValue: false,
       })
 
@@ -166,14 +174,32 @@ export async function runSetupCommand(
     }
   }
 
-  // Pi's stored OAuth takes precedence over the extension's account pool.
+  if (localLogin && useClaustrum) {
+    log.error(
+      'Local sign-in and vault setup are two separate choices. Use --login or --claustrum, not both.',
+    )
+    return 1
+  }
+  if (localLogin || !useClaustrum) {
+    for (const host of selectedHosts) {
+      if ((await readNativeEnrollmentMode(host, env)) !== 'local') {
+        log.error('Disconnect from the vault first.')
+        return 1
+      }
+    }
+  }
+
+  // Pi chooses its stored Anthropic login before the extension's account pool.
+  // Moving it aside requires separate consent; ordinary --yes is insufficient.
   let removePiLocalAuth = false
   if (selectedHosts.includes('pi') && detection.pi.hasLocalAuth) {
     if (nonInteractive) {
-      // Deleting a stored login needs its own flag; --yes is not consent.
+      // Moving a stored login needs its own flag; --yes is not consent.
       if (!explicitRemovePiAuth) {
         log.error(
-          'Pi has a stored Anthropic login. Rerun with --remove-pi-auth to move it into the native account pool.',
+          useClaustrum
+            ? 'Pi has stored Anthropic authentication. Rerun with --remove-pi-auth to preserve it privately during vault use and restore it on disconnect.'
+            : 'Pi has a stored Anthropic login. Rerun with --remove-pi-auth to move it into the native account pool.',
         )
         outro('Setup aborted.')
         return 1
@@ -181,11 +207,14 @@ export async function runSetupCommand(
       removePiLocalAuth = true
     } else {
       log.warn(
-        'Pi has a stored Anthropic OAuth token. Native account-pool setup moves credentials out of the host auth store.',
+        useClaustrum
+          ? 'Pi has stored Anthropic authentication. Vault setup must preserve it privately and restore it on disconnect.'
+          : 'Pi has a stored Anthropic OAuth token. Native account-pool setup moves credentials out of the host auth store.',
       )
       const consent = await confirm({
-        message:
-          'Move the Pi Anthropic OAuth login into the native account pool and remove its stored copy?',
+        message: useClaustrum
+          ? 'Move Pi authentication aside privately for vault use, then restore it on disconnect?'
+          : 'Move the Pi Anthropic OAuth login into the native account pool and remove its stored copy?',
         initialValue: false,
       })
 
@@ -201,7 +230,7 @@ export async function runSetupCommand(
     }
   }
 
-  // 5. Verify host quiescence before any changes
+  // 5. Verify all hosts are stopped before making changes
   try {
     await assertHostsStopped(fence)
   } catch (error) {
