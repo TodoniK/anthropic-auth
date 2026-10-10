@@ -1,35 +1,67 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { describe, expect } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   addAccountPersistent,
+  createNativeAccountRuntime,
+  createNativePoolStore,
   getAccountStatePath,
   loadAccounts,
   saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 
+import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime'
 import { addApiRoute, login, relaySetup } from '../cli'
+import { migrateNativeOpencodeFixture } from './native-fixture'
 
-let tempDir: string
+const lifetime = createTestLifetimeSuite()
+const test = lifetime.test
 
-beforeEach(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'anthropic-cli-test-'))
-})
+async function createRoot() {
+  const root = await mkdtemp(join(tmpdir(), 'anthropic-cli-test-'))
+  lifetime.deferCleanup(() => rm(root, { recursive: true, force: true }))
+  return root
+}
 
-afterEach(async () => {
-  await rm(tempDir, { recursive: true, force: true })
-})
+async function readStoredBytes(path: string) {
+  try {
+    return await readFile(path)
+  } catch (error) {
+    if (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      error.code === 'ENOENT'
+    )
+      return undefined
+    throw error
+  }
+}
 
-// addApiRoute / login are exercised IN-PROCESS with injected deps rather than
-// via `bun [--preload] src/cli.ts ...`. The subprocess form (Bun.spawn +
-// optional --preload fetch stub + stdin pipe) hung indefinitely in CI
-// (proc.exited never resolving, 5000ms timeout) while passing locally — the
-// failure lived in that harness, not in the command logic, and was
-// unreproducible locally. Calling the commands directly with injected prompt
-// (and, for login, authorize/exchange) removes the entire fragile surface
-// (no spawn, no preload, no readline/stdin race, no real network) while still
-// exercising the real logic and asserting the same persisted outcomes.
+async function readNativeRows(
+  fixture: Awaited<ReturnType<typeof nativeFixture>>,
+) {
+  const view = await createNativePoolStore({
+    paths: fixture.paths,
+    quota: nativeQuotaCodec,
+  }).read()
+  expect(view.status).toBe('ready')
+  if (view.status !== 'ready') throw new Error('Native API pool did not load')
+  return view.rows
+}
+
+async function nativeFixture(root: string) {
+  return migrateNativeOpencodeFixture({
+    root,
+    lifetime,
+    legacyConfig: { version: 1, accounts: [] },
+  })
+}
+
+// Inject prompts and OAuth responses so command tests never open a browser
+// or use interactive stdin. Storage assertions still read the actual files.
 
 // Run a command body against a temp account file, restoring any env we touch.
 async function withAccountEnv<T>(
@@ -55,12 +87,15 @@ async function withAccountEnv<T>(
 }
 
 describe('CLI api add', () => {
-  test('saves API route config and stores API key in runtime state', async () => {
-    const accountPath = join(tempDir, 'anthropic-auth.json')
+  test('saves API route config and stores API key only in private pool state', async () => {
+    const tempDir = await createRoot()
+    const fixture = await nativeFixture(tempDir)
+    const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
 
     await withAccountEnv(
       accountPath,
       {
+        ...fixture.env,
         OPENCODE_ANTHROPIC_AUTH_API_BASE_URL: 'https://api.kie.ai/claude',
         OPENCODE_ANTHROPIC_AUTH_API_KEY: 'kie-key',
         OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER: 'authorization-bearer',
@@ -73,29 +108,41 @@ describe('CLI api add', () => {
         }),
     )
 
-    const storage = JSON.parse(await readFile(accountPath, 'utf8'))
-    expect(storage.accounts[0]).toMatchObject({
+    const rows = await readNativeRows(fixture)
+    const account = rows.find((row) => row.id === 'kie-opus')
+    expect(account).toMatchObject({
       id: 'kie-opus',
       label: 'kie-opus',
       type: 'api',
       enabled: true,
-      baseURL: 'https://api.kie.ai/claude',
-      authHeader: 'authorization-bearer',
+      stamp: 'bound',
+      credential: {
+        type: 'api',
+        apiKey: 'kie-key',
+        baseURL: 'https://api.kie.ai/claude',
+        authHeader: 'authorization-bearer',
+      },
     })
-    expect(storage.accounts[0].apiKey).toBeUndefined()
-
-    const runtimeState = JSON.parse(
-      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    expect(await readFile(fixture.paths.config, 'utf8')).not.toContain(
+      'kie-key',
     )
-    expect(runtimeState.accounts['kie-opus'].apiKey).toBe('kie-key')
+    expect(await readFile(fixture.paths.state, 'utf8')).toContain('kie-key')
+    await expect(readFile(accountPath, 'utf8')).rejects.toThrow()
   })
 
   test('rejects invalid API base URL before saving route state', async () => {
-    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const tempDir = await createRoot()
+    const fixture = await nativeFixture(tempDir)
+    const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    const before = await Promise.all([
+      readStoredBytes(fixture.paths.config),
+      readStoredBytes(fixture.paths.state),
+    ])
 
     const promise = withAccountEnv(
       accountPath,
       {
+        ...fixture.env,
         OPENCODE_ANTHROPIC_AUTH_API_BASE_URL: 'https://secret@example.com/v1',
         OPENCODE_ANTHROPIC_AUTH_API_KEY: 'kie-key',
         OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER: 'authorization-bearer',
@@ -110,13 +157,20 @@ describe('CLI api add', () => {
       'API fallback base URL must be an http(s) URL',
     )
 
-    // Nothing should have been persisted for the rejected route.
+    expect(
+      await Promise.all([
+        readStoredBytes(fixture.paths.config),
+        readStoredBytes(fixture.paths.state),
+      ]),
+    ).toEqual(before)
+    expect(await readNativeRows(fixture)).toEqual([])
     await expect(readFile(accountPath, 'utf8')).rejects.toThrow()
   })
 })
 
 describe('CLI login', () => {
   test('refuses before authorization while global Claustrum custody is committed', async () => {
+    const tempDir = await createRoot()
     const accountPath = join(tempDir, 'anthropic-auth.json')
     await saveAccounts(
       {
@@ -148,6 +202,7 @@ describe('CLI login', () => {
   })
 
   test('continues from label prompt to OAuth callback prompt and saves account', async () => {
+    const tempDir = await createRoot()
     const accountPath = join(tempDir, 'anthropic-auth.json')
 
     // Real authorize() (exercises PKCE + state + the printed URL); exchange()
@@ -234,6 +289,7 @@ describe('CLI login', () => {
   })
 
   test('allows human-readable local OAuth labels without the obsolete manifest label restriction', async () => {
+    const tempDir = await createRoot()
     const accountPath = join(tempDir, 'anthropic-auth.json')
 
     await withAccountEnv(accountPath, {}, () =>
@@ -255,6 +311,7 @@ describe('CLI login', () => {
   })
 
   test('preserves an account committed while the interactive OAuth flow is open', async () => {
+    const tempDir = await createRoot()
     const accountPath = join(tempDir, 'anthropic-auth.json')
     const now = Date.now()
     const exchange = async (): Promise<{
@@ -305,6 +362,7 @@ describe('CLI login', () => {
   })
 
   test('re-login with same label clears stale errors and quota', async () => {
+    const tempDir = await createRoot()
     const accountPath = join(tempDir, 'anthropic-auth.json')
 
     await writeFile(
@@ -398,6 +456,7 @@ describe('CLI login', () => {
   })
 
   test('re-login with same label replaces split runtime state and clears stale reauth', async () => {
+    const tempDir = await createRoot()
     const accountPath = join(tempDir, 'anthropic-auth.json')
     const statePath = getAccountStatePath(accountPath)
     const oldRefreshedAt = Date.now() - 60_000
@@ -495,18 +554,12 @@ describe('CLI login', () => {
 })
 
 describe('CLI relay setup', () => {
-  // relaySetup is exercised IN-PROCESS with an injected fetch + prompt rather
-  // than via `bun --preload ... src/cli.ts relay setup`. The old subprocess
-  // form hung indefinitely in CI (timed out at 5000ms with proc.exited never
-  // resolving) — the failure lived in the subprocess+--preload+readline/stdin
-  // harness, not in relaySetup's logic, and was unreproducible locally. Calling
-  // relaySetup directly with injected deps removes that entire fragile surface
-  // (no spawn, no preload-stub-application risk, no real network, no stdin/pipe
-  // race) while still exercising the real setup logic: KV create, worker
-  // upload, enable workers.dev, subdomain lookup, token generation, and config
-  // save — the same four Cloudflare calls and the same persisted relay config.
+  // Cloudflare requests use a synthetic transport. The command still executes
+  // provisioning in order and saves its private relay token in native storage.
   test('deploys worker resources and saves relay config', async () => {
-    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const tempDir = await createRoot()
+    const fixture = await nativeFixture(tempDir)
+    const accountPath = fixture.env.OPENCODE_ANTHROPIC_AUTH_FILE
     const calls: Array<{ url: string; method?: string }> = []
     let accountAddedDuringProvisioning = false
 
@@ -518,15 +571,24 @@ describe('CLI relay setup', () => {
       calls.push({ url, method: init?.method })
       if (!accountAddedDuringProvisioning) {
         accountAddedDuringProvisioning = true
-        await addAccountPersistent(
-          {
-            id: 'added-during-relay',
+        const concurrent = createNativeAccountRuntime({
+          paths: fixture.paths,
+          host: 'opencode',
+        })
+        try {
+          await concurrent.putAccount({
+            routeId: 'added-during-relay',
             label: 'added-during-relay',
-            type: 'oauth',
-            refresh: 'relay-race-refresh',
-          },
-          accountPath,
-        )
+            credential: {
+              type: 'oauth',
+              access: 'sk-ant-oat01-relay-race-access',
+              refresh: 'relay-race-refresh',
+              expires: Date.now() + 5 * 60 * 60 * 1000,
+            },
+          })
+        } finally {
+          concurrent.close()
+        }
       }
       if (url.includes('/storage/kv/namespaces'))
         return Response.json({ success: true, result: { id: 'kv-id' } })
@@ -556,38 +618,50 @@ describe('CLI relay setup', () => {
       return promptAnswers[message] ?? ''
     }
 
-    const prevFile = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-    const prevToken = process.env.CLOUDFLARE_API_TOKEN
-    const prevAccount = process.env.CLOUDFLARE_ACCOUNT_ID
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
-    process.env.CLOUDFLARE_API_TOKEN = 'cf-token'
-    process.env.CLOUDFLARE_ACCOUNT_ID = 'account-id'
-    try {
-      await relaySetup({ fetchImpl, prompt })
-    } finally {
-      if (prevFile === undefined)
-        delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-      else process.env.OPENCODE_ANTHROPIC_AUTH_FILE = prevFile
-      if (prevToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN
-      else process.env.CLOUDFLARE_API_TOKEN = prevToken
-      if (prevAccount === undefined) delete process.env.CLOUDFLARE_ACCOUNT_ID
-      else process.env.CLOUDFLARE_ACCOUNT_ID = prevAccount
-    }
+    await withAccountEnv(
+      accountPath,
+      {
+        ...fixture.env,
+        CLOUDFLARE_API_TOKEN: 'cf-token',
+        CLOUDFLARE_ACCOUNT_ID: 'account-id',
+      },
+      () => relaySetup({ fetchImpl, prompt }),
+    )
 
     // Token + account come from env, so the only prompt is the worker name.
     expect(askedPrompts).toEqual(['Worker name [opencode-anthropic-relay]: '])
 
-    const storage = JSON.parse(await readFile(accountPath, 'utf8'))
-    expect(storage.relay).toMatchObject({
-      enabled: true,
-      url: 'https://opencode-anthropic-relay.user-subdomain.workers.dev',
-      fallbackToDirect: true,
-      transport: 'http',
+    const reader = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
     })
-    expect(storage.relay.token).toBeString()
-    expect(
-      storage.accounts.map((account: { id: string }) => account.id),
-    ).toEqual(['added-during-relay'])
+    try {
+      const relay = await reader.getRelayConfig()
+      expect(relay).toMatchObject({
+        enabled: true,
+        url: 'https://opencode-anthropic-relay.user-subdomain.workers.dev',
+        fallbackToDirect: true,
+        transport: 'http',
+      })
+      expect(relay?.token).toBeString()
+      if (!relay?.token) throw new Error('Relay setup did not save a token')
+      const snapshot = await reader.read()
+      expect(snapshot.accounts.map((account) => account.id)).toEqual([
+        'added-during-relay',
+      ])
+      expect(snapshot.policyStorage.relay?.token).toBeUndefined()
+      expect(await readFile(fixture.paths.config, 'utf8')).not.toContain(
+        relay.token,
+      )
+      expect((await readNativeRows(fixture))[0]?.credential).toMatchObject({
+        type: 'oauth',
+        access: 'sk-ant-oat01-relay-race-access',
+        refresh: 'relay-race-refresh',
+      })
+      await expect(readFile(accountPath, 'utf8')).rejects.toThrow()
+    } finally {
+      reader.close()
+    }
 
     expect(calls).toHaveLength(4)
     expect(calls.map((c) => `${c.method ?? 'GET'} ${c.url}`)).toEqual([
