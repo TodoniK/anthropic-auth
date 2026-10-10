@@ -374,3 +374,19 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "pi-vault-routing-passes-account-uuid"
+guards = "Pi cannot reuse a vault session pin after the default Claude account UUID changes."
+file = "packages/pi/src/stream.ts"
+old = "candidates: incompleteQuotaPool ? [] : routes.candidates,\n      retainAccountIds: routes.retainAccountIds,\n      accountIdentities: vaultAccountIdentities(),"
+new = "candidates: incompleteQuotaPool ? [] : routes.candidates,\n      retainAccountIds: routes.retainAccountIds,"
+test_file = "packages/pi/src/tests/scoped-stream.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/pi/src/tests/scoped-stream.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["Pi vault default UUID replacement re-places the old session without inheriting quota or changing an unrelated fallback pin"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
+broad_report = "tmp/mutations/pi.xml"
+broad_id = "{name}"

@@ -1,4 +1,5 @@
-import { afterEach, expect, test } from 'bun:test'
+import { expect, test as registerTest } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -7,6 +8,7 @@ import {
   type NativeCustodyClient as ClaustrumScopedClient,
   getLogLevel,
   type LogTestRecord,
+  resolveNativePoolPaths,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -27,6 +29,7 @@ import {
   ModelRuntime,
   type ProviderConfig,
 } from '@earendil-works/pi-coding-agent'
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import {
@@ -37,24 +40,20 @@ import {
   fixtureAccountIdentity,
   readNativePiFixture,
   saveNativePiFixture,
-  setNativePiFixtureMode,
 } from './native-fixture.ts'
 import { trackPiTestBody } from './setup.ts'
 
 const originalFetch = globalThis.fetch
+const lifetimes = createTestLifetimeSuite()
+const { deferCleanup } = lifetimes
+const wrapBody = <Args extends unknown[]>(body: (...args: Args) => unknown) =>
+  lifetimes.wrapBody((...args: Args) =>
+    trackPiTestBody(Promise.resolve().then(() => body(...args))),
+  )
+const test = (name: string, body: () => unknown, timeout?: number) =>
+  registerTest(name, wrapBody(body), timeout)
 let dir: string | undefined
 let path: string | undefined
-afterEach(async () => {
-  if (path) closePiNativeRuntime(path)
-  globalThis.fetch = originalFetch
-  delete process.env.PI_ANTHROPIC_AUTH_FILE
-  delete process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
-  delete process.env.PI_CODING_AGENT_DIR
-  delete process.env.PI_AGENT_DIR
-  if (dir) await rm(dir, { recursive: true, force: true })
-  dir = undefined
-  path = undefined
-})
 const model: Model<Api> = {
   id: 'claude-fable-5-1',
   name: 'Fable',
@@ -95,16 +94,34 @@ async function fixture(
 ) {
   dir = await mkdtemp(join(tmpdir(), 'pi-scoped-stream-'))
   path = join(dir, 'accounts.json')
+  const root = dir
+  const storagePath = path
+  const envKeys = [
+    'PI_CODING_AGENT_DIR',
+    'PI_AGENT_DIR',
+    'PI_ANTHROPIC_AUTH_FILE',
+    'PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+    'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
+  ]
+  const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
+  deferCleanup(() => {
+    closePiNativeRuntime(storagePath)
+    globalThis.fetch = originalFetch
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    if (path === storagePath) {
+      path = undefined
+      dir = undefined
+    }
+  })
+  deferCleanup(() => rm(root, { recursive: true, force: true }))
   const tokenPath = join(dir, 'pi-token.json')
   process.env.PI_CODING_AGENT_DIR = dir
   process.env.PI_AGENT_DIR = dir
   process.env.PI_ANTHROPIC_AUTH_FILE = path
   process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
-  await writeFile(
-    tokenPath,
-    JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
-    { mode: 0o600 },
-  )
   await saveNativePiFixture(
     {
       version: 1,
@@ -132,13 +149,34 @@ async function fixture(
     path,
     { primary: false },
   )
+  const localPaths = await resolveNativePoolPaths(
+    storagePath,
+    join(root, 'anthropic-auth-state.json'),
+  )
+  const localFiles = [
+    localPaths.config,
+    localPaths.state,
+    localPaths.runtime,
+    localPaths.journal,
+  ]
+  const beforeLocal = await Promise.all(
+    localFiles.map((file) => readFile(file)),
+  )
+  await writeFile(
+    tokenPath,
+    JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
   const rows = [row('oauth:anthropic', fixtureAccountIdentity('main'))]
   const gets: Array<Parameters<ClaustrumScopedClient['getScoped']>[0]> = []
   const reports: Array<
     Parameters<ClaustrumScopedClient['reportAuthFailureScoped']>[0]
   > = []
   const client: ClaustrumScopedClient = {
-    listScoped: async () => ({ rows, view: `view-${rows.length}` }),
+    listScoped: async () => ({
+      rows,
+      view: createHash('sha256').update(JSON.stringify(rows)).digest('hex'),
+    }),
     getScoped: async (input) => {
       gets.push(input)
       return {
@@ -156,19 +194,26 @@ async function fixture(
     close: () => {},
   }
   const native = getPiNativeRuntime(path, { connect: async () => client })
-  await setNativePiFixtureMode(path, 'claustrum')
-  const roster = await (await native.service()).vault.refresh()
+  const service = await native.service()
+  const roster = await service.vault.refresh()
+  await service.updateSettings((settings) => ({
+    ...settings,
+    routing: { mode },
+  }))
+  if (relay)
+    await service.updateRelay({
+      enabled: true,
+      url: 'https://relay.invalid',
+      token: 'relay-test-secret',
+      transport: 'http',
+      fallbackToDirect: true,
+    })
   const primary = roster?.rows.find(
     (account) => account.credentialId === 'oauth:anthropic',
   )
   if (!primary?.accountIdentity)
     throw new Error('Fixture vault primary identity is missing')
-  await setNativePiFixtureMode(path, 'claustrum', {
-    routeId: primary.routeId,
-    credentialId: primary.credentialId,
-    accountIdentity: primary.accountIdentity,
-  })
-  return { rows, gets, reports, client, path }
+  return { rows, gets, reports, client, path, localFiles, beforeLocal, native }
 }
 
 test('Pi sends using scoped credentials without host auth, and never bootstraps with a cached token', async () => {
@@ -278,9 +323,9 @@ test('fallback-first discovers a new account on the next turn and honors a live 
   })
 })
 
-test.each([500, 401])(
+registerTest.each([500, 401])(
   'relay status %i falls back direct with a fresh version-fenced credential',
-  async (relayStatus) => {
+  wrapBody(async (relayStatus) => {
     const f = await fixture('main-first', true)
     // Relay and direct use different records; no rotation occurs after the
     // direct send, so a genuine 401 must report its exact served version.
@@ -331,7 +376,7 @@ test.each([500, 401])(
         reporterSource: 'direct',
       },
     ])
-  },
+  }),
 )
 
 test('scoped model switches reuse the existing sticky allocator and its Opus reserve preference', async () => {
@@ -431,9 +476,9 @@ const hostCredentials: Array<{ name: string; credential?: Credential }> = [
   },
 ]
 
-test.each(hostCredentials)(
+registerTest.each(hostCredentials)(
   'real Pi model runtime honors custody with $name',
-  async ({ credential }) => {
+  wrapBody(async ({ credential }) => {
     const f = await fixture()
     let writes = 0,
       sends = 0
@@ -549,12 +594,12 @@ test.each(hostCredentials)(
         { sessionManager: { getSessionId: () => undefined } },
       )
     }
-  },
+  }),
 )
 
-test.each([200, 401])(
+registerTest.each([200, 401])(
   'Pi retries in-flight scoped 401 once and fences final status %i',
-  async (finalStatus) => {
+  wrapBody(async (finalStatus) => {
     const f = await fixture()
     let version = 1
     const gets: number[] = []
@@ -625,12 +670,12 @@ test.each([200, 401])(
         reason: 'rotated',
       }),
     )
-  },
+  }),
 )
 
-test.each([200, 401])(
+registerTest.each([200, 401])(
   'Pi HTTP relay retries rotated scoped credential once; final status %i',
-  async (finalStatus) => {
+  wrapBody(async (finalStatus) => {
     const f = await fixture('main-first', true)
     let version = 1
     const reports: number[] = [],
@@ -681,12 +726,12 @@ test.each([200, 401])(
     expect(result.stopReason).toBe(finalStatus === 401 ? 'error' : 'stop')
     expect(relayTokens).toEqual(['Bearer relay-pi-1', 'Bearer relay-pi-2'])
     expect(reports).toEqual(finalStatus === 401 ? [1, 2] : [1])
-  },
+  }),
 )
 
-test.each([200, 401])(
+registerTest.each([200, 401])(
   'Pi CacheKeep retries a rotated scoped receipt once, final status %i',
-  async (finalStatus) => {
+  wrapBody(async (finalStatus) => {
     const f = await fixture()
     let version = 1
     const sent: string[] = []
@@ -747,12 +792,12 @@ test.each([200, 401])(
     expect(f.reports.map((report) => report.recordVersion)).toEqual(
       finalStatus === 401 ? [1, 2] : [1],
     )
-  },
+  }),
 )
 
-test.each([200, 401])(
+registerTest.each([200, 401])(
   'Pi WebSocket relay retries a strict-newer native receipt once and reports every rejected version; final status %i',
-  async (finalStatus) =>
+  wrapBody(async (finalStatus) =>
     trackPiTestBody(
       (async () => {
         const f = await fixture()
@@ -844,6 +889,7 @@ test.each([200, 401])(
         }
       })(),
     ),
+  ),
 )
 
 test('Pi WebSocket reconnect authorizes the replacement physical attempt without reporting a transport failure', () =>
@@ -954,7 +1000,7 @@ test('Pi refuses an unchanged native vault version after 401 without local or pa
   expect(f.reports.map((report) => report.recordVersion)).toEqual([1])
 })
 
-test.each([
+registerTest.each([
   'https://unapproved.invalid/v1',
   'http://api.anthropic.com',
   'https://user:password@api.anthropic.com/v1',
@@ -963,7 +1009,7 @@ test.each([
   'not a URL',
 ])(
   'Pi rejects native OAuth recipient %s before authorization or dispatch',
-  async (baseUrl) => {
+  wrapBody(async (baseUrl) => {
     const f = await fixture()
     let sends = 0
     globalThis.fetch = Object.assign(
@@ -981,7 +1027,7 @@ test.each([
     expect(result.errorMessage).toContain('official Anthropic HTTPS origin')
     expect(f.gets).toEqual([])
     expect(sends).toBe(0)
-  },
+  }),
 )
 
 test('Pi accepts the official versioned OAuth endpoint with redirects disabled', async () => {
@@ -1041,12 +1087,12 @@ test('Pi refuses a foreign CacheKeep target before authorizing a native receipt'
   expect(sends).toBe(0)
 })
 
-test.each([
+registerTest.each([
   { name: 'Fable', id: 'claude-fable-5-1', allowed: false },
   { name: 'Sonnet', id: 'claude-sonnet-5-5', allowed: true },
 ])(
   'Pi final native vault admission rechecks the pending request model: $name',
-  (requested) =>
+  wrapBody((requested) =>
     trackPiTestBody(
       (async () => {
         const f = await fixture()
@@ -1132,4 +1178,102 @@ test.each([
         expect(f.reports).toEqual([])
       })(),
     ),
+  ),
 )
+
+test('Pi vault default UUID replacement re-places the old session without inheriting quota or changing an unrelated fallback pin', async () => {
+  const f = await fixture('sticky-balanced')
+  f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+  const served: string[] = []
+  globalThis.fetch = Object.assign(
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      const index =
+        Number(/vault-test-access-(\d+)$/.exec(authorization)?.[1]) - 1
+      const credentialId = f.gets[index]?.credentialId
+      if (!credentialId) throw new Error('Request did not use a scoped receipt')
+      if (String(input).includes('/api/oauth/usage'))
+        return Response.json({
+          five_hour: {
+            utilization: 20,
+            resets_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+          seven_day: {
+            utilization: 20,
+            resets_at: new Date(Date.now() + 86_400_000).toISOString(),
+          },
+          limits: [
+            {
+              kind: 'weekly_scoped',
+              group: 'weekly',
+              percent: credentialId === 'oauth:anthropic' ? 100 : 0,
+              scope: { model: { display_name: 'Fable' } },
+            },
+          ],
+        })
+      if (!String(input).includes('/v1/messages'))
+        throw new Error('Unexpected outbound request')
+      served.push(credentialId)
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const mainSession = 'vault-default-session'
+  const fallbackSession = 'vault-fallback-session'
+  const opus = { ...model, id: 'claude-opus-5' }
+  expect(
+    (
+      await streamCortexKitAnthropic(opus, context, {
+        sessionId: mainSession,
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  expect(
+    (
+      await streamCortexKitAnthropic(model, context, {
+        sessionId: fallbackSession,
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  expect(served).toEqual(['oauth:anthropic', 'oauth:anthropic:work'])
+  const routingPath = await f.native.routingPath()
+  const fallbackKey = createHash('sha256').update(fallbackSession).digest('hex')
+  const mainKey = createHash('sha256').update(mainSession).digest('hex')
+  const beforeText = await readFile(routingPath, 'utf8')
+  const fallbackPinBytes = (text: string) => {
+    const match = text.match(new RegExp(`"${fallbackKey}":\\s*(\\{[^}]*\\})`))
+    if (!match?.[1]) throw new Error('Expected fallback pin is missing')
+    return match[1]
+  }
+  const beforePin = fallbackPinBytes(beforeText)
+  expect(JSON.parse(beforeText).assignments[mainKey].accountIdentity).toBe(
+    fixtureAccountIdentity('main'),
+  )
+  const nextUuid = fixtureAccountIdentity('replacement-main')
+  f.rows[0] = row('oauth:anthropic', nextUuid)
+  await (await f.native.service()).vault.refresh()
+  const replacement = (await f.native.view()).accounts.find(
+    (account) => account.id === 'main',
+  )
+  expect(replacement?.accountIdentity).toBe(nextUuid)
+  expect(replacement?.quota).toBeUndefined()
+  expect(
+    (
+      await streamCortexKitAnthropic(opus, context, {
+        sessionId: mainSession,
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  const afterText = await readFile(routingPath, 'utf8')
+  expect(JSON.parse(afterText).assignments[mainKey].accountIdentity).toBe(
+    nextUuid,
+  )
+  expect(fallbackPinBytes(afterText)).toBe(beforePin)
+  expect(await Promise.all(f.localFiles.map((file) => readFile(file)))).toEqual(
+    f.beforeLocal,
+  )
+})

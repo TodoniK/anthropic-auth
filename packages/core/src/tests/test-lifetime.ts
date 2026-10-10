@@ -126,17 +126,18 @@ export function createTestLifetimeSuite() {
         'Test fixture teardown failed',
       )
   })
+  const wrapBody =
+    <Args extends unknown[]>(body: (...args: Args) => unknown) =>
+    (...args: Args) => {
+      const lifetime = new TestLifetime()
+      lifetimes.add(lifetime)
+      return context.run(lifetime, () => lifetime.runBody(() => body(...args)))
+    }
   return {
+    /** Keep native test.each argument expansion and names while giving each case its own fixture lifetime. */
+    wrapBody,
     test(name: string, body: () => unknown, timeout?: number): void {
-      registerTest(
-        name,
-        () => {
-          const lifetime = new TestLifetime()
-          lifetimes.add(lifetime)
-          return context.run(lifetime, () => lifetime.runBody(body))
-        },
-        timeout,
-      )
+      registerTest(name, wrapBody(body), timeout)
     },
     deferCleanup: (cleanup: () => void | Promise<void>) =>
       current().deferCleanup(cleanup),

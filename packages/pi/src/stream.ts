@@ -327,7 +327,7 @@ export async function getPiTrackedCacheKeepSessions() {
   return getPiCacheKeepRegistry().list(cacheKeepManager.trackedSessions())
 }
 
-/** Exercise the real prewarm dispatch without wall-clock or timer mocks. */
+/** Call prewarmNow directly to exercise its provider request without clock or timer mocks. */
 export function __prewarmPiCacheKeepForTest(
   input: Parameters<CacheKeepManager['prewarmNow']>[0],
 ) {
@@ -502,8 +502,8 @@ async function sendAnthropicRequest(options: {
   if (!options.apiAccount && !verifiedUuid) {
     if (selected?.source === 'vault')
       throw new Error('Pi vault route identity is unasserted')
-    // The local service may learn a UUID by validating an unidentified row.
-    // This lookup supplies identity only; dispatch still authorizes afresh.
+    // Validation can learn the UUID of an account that has no verified identity.
+    // This lookup returns only that UUID; the model send authorizes the credential again.
     verifiedUuid = (
       await native.authorize(
         routeId,
@@ -745,7 +745,7 @@ async function sendAnthropicRequest(options: {
           onUpstreamStatus: (status) => {
             if (status === 401) {
               relay401Attempt = attempt
-              // A WebSocket status may arrive after the response has been returned.
+              // The relay can report an upstream 401 after returning the streaming response.
               relayReports.push(report(attempt, status, 'relay_status_field'))
             }
           },
@@ -771,8 +771,8 @@ async function sendAnthropicRequest(options: {
     if (rotated) {
       retried401 = true
       await response.body?.cancel().catch(() => {})
-      // Use the replacement credential for the next request attempt only. A
-      // relay-to-direct fallback obtains a separate authorization.
+      // Use the replacement credential only for the retried relay request.
+      // A direct request after relay failure obtains its own authorization.
       nextAttempt = rotated
       relay401Attempt = undefined
       response = await sendRelayAttempt()
@@ -834,6 +834,15 @@ async function executeWithFallback(options: {
   let storage = snapshot.policyStorage
   const accountView = (id: string) =>
     snapshot.accounts.find((account) => account.id === id)
+  const vaultAccountIdentities = () => {
+    if (snapshot.mode !== 'claustrum') return undefined
+    const identities = new Map<string, string>()
+    for (const account of snapshot.accounts) {
+      if (account.source === 'vault' && account.accountIdentity)
+        identities.set(account.id, account.accountIdentity)
+    }
+    return identities
+  }
   const nativeReady = (id: string) => {
     const account = accountView(id)
     return Boolean(
@@ -871,8 +880,8 @@ async function executeWithFallback(options: {
   ): boolean {
     if (stickyQuotaSnapshotIsFresh(quota, storage, Date.now(), modelId))
       return true
-    // A successful windowless usage response is not the same as a failed
-    // probe. Pi intentionally admits the former as unknown-capacity OAuth.
+    // A successful usage response without quota windows is not a failed poll.
+    // Pi can serve that OAuth account without a known remaining capacity.
     if (
       !quota ||
       quota.five_hour ||
@@ -1158,10 +1167,11 @@ async function executeWithFallback(options: {
       family: stickyRouteFamilyForModel(options.model.id),
       modelId: options.model.id,
       affinityModelId: options.model.id,
-      // Existing affinity can survive a transient probe failure, but an
-      // incomplete pool cannot create a new balanced assignment.
+      // Keep an existing route after a temporary quota poll failure, but do not
+      // choose a new balanced route until the account pool has current quota data.
       candidates: incompleteQuotaPool ? [] : routes.candidates,
       retainAccountIds: routes.retainAccountIds,
+      accountIdentities: vaultAccountIdentities(),
       storage,
       inputBytes: initialInputBytes,
     })
@@ -1328,6 +1338,7 @@ async function executeWithFallback(options: {
             modelId: options.model.id,
             candidates: routes.candidates,
             retainAccountIds: routes.retainAccountIds,
+            accountIdentities: vaultAccountIdentities(),
             storage,
             inputBytes: initialInputBytes,
             excludeAccountIds: new Set([failedRouteId]),
