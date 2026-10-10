@@ -310,3 +310,51 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "vault-affinity-fast-uuid-fence"
+guards = "A cached vault session pin cannot follow a replaced default account UUID."
+file = "packages/core/src/sticky-routing.ts"
+old = "matchesAccountIdentity(cached) &&"
+new = "true && /* NON-VACUITY BREAK: retain a replaced vault UUID */"
+test_file = "packages/core/src/tests/native-vault-affinity.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-affinity.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["replacing the vault default UUID re-places only its session while an unrelated fallback pin survives byte-identical"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-affinity-locked-uuid-fence"
+guards = "The locked routing reread must reject a pin bound to the previous vault UUID."
+file = "packages/core/src/sticky-routing.ts"
+old = "matchesAccountIdentity(current) &&"
+new = "true && /* NON-VACUITY BREAK: let the locked path retain the old UUID */"
+test_file = "packages/core/src/tests/native-vault-affinity.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-affinity.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a replaced vault default using the same logical main id gets a new UUID-bound pin and no old preference or timestamps"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-affinity-requires-verified-uuid"
+guards = "A vault account without a verified UUID cannot receive a new session pin."
+file = "packages/core/src/sticky-routing.ts"
+old = "identityForAccount(candidate.accountId) !== undefined"
+new = "true /* NON-VACUITY BREAK: allocate an unverified vault route */"
+test_file = "packages/core/src/tests/native-vault-affinity.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-affinity.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a vault route without a verified UUID is never pinned, including retained logical main and warm-cache preference"]
+expect_message = "error: expect(received).toBeNull()"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

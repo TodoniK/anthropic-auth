@@ -46,6 +46,8 @@ export type StickyRouteCandidate = {
 
 export type StickyRouteAssignment = {
   accountId: string
+  /** Verified account UUID for a credential held by the vault. Pins using credentials stored by this host omit the field. */
+  accountIdentity?: string
   family: StickyRouteFamily
   affinityModelId?: string
   assignedAt: number
@@ -195,8 +197,18 @@ function normalizeAssignment(
   ) {
     return
   }
+  if (
+    Object.hasOwn(value, 'accountIdentity') &&
+    (typeof value.accountIdentity !== 'string' ||
+      value.accountIdentity.length === 0 ||
+      value.accountIdentity.trim() !== value.accountIdentity)
+  )
+    return
   return {
     accountId: value.accountId,
+    ...(typeof value.accountIdentity === 'string'
+      ? { accountIdentity: value.accountIdentity }
+      : {}),
     family: value.family as StickyRouteFamily,
     affinityModelId:
       typeof value.affinityModelId === 'string'
@@ -726,6 +738,8 @@ export class StickySessionRouter {
     affinityModelId?: string
     candidates: readonly StickyRouteCandidate[]
     retainAccountIds: ReadonlySet<string>
+    /** Verified UUIDs for every vault account the host retains, even when quota prevents selection. Omit when credentials are stored by the host instead of the vault. */
+    accountIdentities?: ReadonlyMap<string, string>
     storage: AccountStorage | null
     inputBytes: number
     preferredAccountId?: string
@@ -739,11 +753,25 @@ export class StickySessionRouter {
       affinityModelId !== undefined
         ? assignment.affinityModelId === affinityModelId
         : assignment.family === input.family
+    const identityForAccount = (accountId: string) => {
+      const identity = input.accountIdentities?.get(accountId)
+      return typeof identity === 'string' &&
+        identity.length > 0 &&
+        identity.trim() === identity
+        ? identity
+        : undefined
+    }
+    const matchesAccountIdentity = (assignment: StickyRouteAssignment) => {
+      if (!input.accountIdentities) return true
+      const identity = identityForAccount(assignment.accountId)
+      return identity !== undefined && assignment.accountIdentity === identity
+    }
     const cached = this.state.assignments[key]
     if (
       cached &&
       this.assignmentIsActive(cached) &&
       matchesAffinity(cached) &&
+      matchesAccountIdentity(cached) &&
       input.retainAccountIds.has(cached.accountId) &&
       !input.excludeAccountIds?.has(cached.accountId)
     ) {
@@ -767,6 +795,7 @@ export class StickySessionRouter {
       if (
         current &&
         matchesAffinity(current) &&
+        matchesAccountIdentity(current) &&
         input.retainAccountIds.has(current.accountId) &&
         !input.excludeAccountIds?.has(current.accountId)
       ) {
@@ -780,14 +809,20 @@ export class StickySessionRouter {
         }
       }
       const affinityChanged = Boolean(current && !matchesAffinity(current))
-      if (affinityChanged) {
+      const identityChanged = Boolean(
+        current && !matchesAccountIdentity(current),
+      )
+      if (affinityChanged || identityChanged) {
         delete state.assignments[key]
       }
       const candidates = input.candidates.filter(
-        (candidate) => !input.excludeAccountIds?.has(candidate.accountId),
+        (candidate) =>
+          !input.excludeAccountIds?.has(candidate.accountId) &&
+          (!input.accountIdentities ||
+            identityForAccount(candidate.accountId) !== undefined),
       )
       const preferred =
-        !affinityChanged && input.preferredAccountId
+        !affinityChanged && !identityChanged && input.preferredAccountId
           ? candidates.find(
               (candidate) =>
                 candidate.accountId === input.preferredAccountId &&
@@ -813,6 +848,9 @@ export class StickySessionRouter {
       const selectedQuota = knownQuota(selected.quota)
       const assignment: StickyRouteAssignment = {
         accountId: selected.accountId,
+        ...(input.accountIdentities
+          ? { accountIdentity: identityForAccount(selected.accountId) }
+          : {}),
         family: input.family,
         affinityModelId,
         assignedAt: now,
@@ -826,7 +864,10 @@ export class StickySessionRouter {
         accountId: selected.accountId,
         assignment: { ...assignment },
         created: !current,
-        migrated: Boolean(current && current.accountId !== selected.accountId),
+        migrated: Boolean(
+          current &&
+            (identityChanged || current.accountId !== selected.accountId),
+        ),
       }
     } finally {
       await lock.release()
