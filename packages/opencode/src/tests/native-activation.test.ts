@@ -22,11 +22,15 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 
-import { runSetupCommand } from './command.ts'
-import { activateNativeVaultForHost } from './native-activation.ts'
-import { migrateNativeLocalForHost } from './native-local.ts'
-import { resolveNativeSetupPaths } from './native-paths.ts'
-import type { CommandRunner, HarnessKind, ProcessFence } from './types.ts'
+import { runSetupCommand } from '../setup/command.ts'
+import { activateNativeVaultForHost } from '../setup/native-activation.ts'
+import { migrateNativeLocalForHost } from '../setup/native-local.ts'
+import { resolveNativeSetupPaths } from '../setup/native-paths.ts'
+import type {
+  CommandRunner,
+  HarnessKind,
+  ProcessFence,
+} from '../setup/types.ts'
 
 const { test, deferCleanup } = createTestLifetimeSuite()
 
