@@ -9231,163 +9231,190 @@ describe('auth.loader', () => {
     )
   }
 
-  test('fetch wrapper sets OAuth headers and prefixes tools', async () => {
-    await useTempAccountFile(createFallbackStorage({ accounts: [] }), {
-      access: 'sk-ant-oat01-my-access-token',
-      refresh: 'refresh',
-      expires: Date.now() + 100000,
-    })
-
-    let capturedHeaders: Headers | undefined
-    let capturedBody: string | undefined
-
-    globalThis.fetch = mock(
-      withNativeAdmission((input: any, init: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/api/oauth/usage')) {
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0 },
-                seven_day: { utilization: 0 },
-              }),
-              { status: 200 },
-            ),
-          )
-        }
-        capturedHeaders = init?.headers
-        capturedBody = init?.body
-        return Promise.resolve(new Response(null, { status: 200 }))
-      }),
-    ) as unknown as typeof fetch
-
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-my-access-token',
-          refresh: 'refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models: {} },
-    )
-
-    const body = JSON.stringify({
-      tools: [{ name: 'bash', type: 'function' }],
-      messages: [{ role: 'user', content: 'hello world test message' }],
-      system: 'You are a helpful assistant.',
-    })
-
-    await result.fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'x-session-affinity': 'session-abc' },
-      body,
-    })
-
-    expect(capturedHeaders).toBeDefined()
-    expect(capturedHeaders!.get('authorization')).toBe(
-      'Bearer sk-ant-oat01-my-access-token',
-    )
-    expect(capturedHeaders!.get('x-api-key')).toBeNull()
-    expect(capturedHeaders!.get('x-session-affinity')).toBeNull()
-    expect(capturedHeaders!.get('x-opencode-session')).toBeNull()
-    expect(capturedHeaders!.get('anthropic-beta')).toContain('oauth-2025-04-20')
-
-    const parsedBody = JSON.parse(capturedBody!)
-    // Tool name should be prefixed
-    expect(parsedBody.tools[0].name).toBe('mcp_Bash')
-    // Three-block layout: billing header, identity, rest
-    expect(parsedBody.system).toHaveLength(3)
-    expect(parsedBody.system[0].text).toContain('x-anthropic-billing-header')
-    expect(parsedBody.system[1].text).toBe(
-      "You are Claude Code, Anthropic's official CLI for Claude.",
-    )
-    expect(parsedBody.system[2].text).toBe('You are a helpful assistant.')
-    // User message is untouched
-    expect(parsedBody.messages[0].content).toBe('hello world test message')
-  })
-
-  test('uses configured relay instead of uploading full body directly', async () => {
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        relay: {
-          enabled: true,
-          url: 'https://relay.example.test',
-          token: 'relay-token',
-          fallbackToDirect: true,
-          transport: 'http',
-        },
-      }),
-      {
+  test.each(['url', 'request'] as const)(
+    'fetch wrapper sets OAuth headers and prefixes tools for %s input',
+    async (kind) => {
+      await useTempAccountFile(createFallbackStorage({ accounts: [] }), {
         access: 'sk-ant-oat01-my-access-token',
         refresh: 'refresh',
         expires: Date.now() + 100000,
-      },
-    )
+      })
 
-    let capturedUrl: string | undefined
-    let capturedBody: string | undefined
-    let capturedHeaders: Headers | undefined
-    globalThis.fetch = mock(
-      withNativeAdmission((input: any, init: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/api/oauth/usage')) {
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0 },
-                seven_day: { utilization: 0 },
-              }),
-              { status: 200 },
-            ),
-          )
-        }
-        capturedUrl = url
-        capturedBody = init?.body
-        capturedHeaders = new Headers(init?.headers)
-        return Promise.resolve(
-          new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
-        )
-      }),
-    ) as unknown as typeof fetch
+      let capturedHeaders: Headers | undefined
+      let capturedBody: string | undefined
 
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
+      globalThis.fetch = mock(
+        withNativeAdmission((input: any, init: any) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage')) {
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  five_hour: { utilization: 0 },
+                  seven_day: { utilization: 0 },
+                }),
+                { status: 200 },
+              ),
+            )
+          }
+          capturedHeaders = init?.headers
+          capturedBody = init?.body
+          return Promise.resolve(new Response(null, { status: 200 }))
+        }),
+      ) as unknown as typeof fetch
+
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'sk-ant-oat01-my-access-token',
+            refresh: 'refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+
+      const body = JSON.stringify({
+        tools: [{ name: 'bash', type: 'function' }],
+        messages: [{ role: 'user', content: 'hello world test message' }],
+        system: 'You are a helpful assistant.',
+      })
+
+      const requestInit = {
+        method: 'POST',
+        headers: {
+          'x-session-affinity': `session-abc-${kind}`,
+          'x-opencode-session-id': `session-abc-${kind}`,
+          'x-opencode-parent-session-id': 'parent-abc',
+        },
+        body,
+      }
+      if (kind === 'request')
+        await result.fetch(new Request(MESSAGES_URL, requestInit))
+      else await result.fetch(MESSAGES_URL, requestInit)
+
+      expect(capturedHeaders).toBeDefined()
+      expect(capturedHeaders!.get('authorization')).toBe(
+        'Bearer sk-ant-oat01-my-access-token',
+      )
+      expect(capturedHeaders!.get('x-api-key')).toBeNull()
+      expect(capturedHeaders!.get('x-session-affinity')).toBeNull()
+      expect(capturedHeaders!.get('x-opencode-session')).toBeNull()
+      expect(capturedHeaders!.get('x-opencode-session-id')).toBeNull()
+      expect(capturedHeaders!.get('x-opencode-parent-session-id')).toBeNull()
+      expect(capturedHeaders!.get('anthropic-beta')).toContain(
+        'oauth-2025-04-20',
+      )
+
+      const parsedBody = JSON.parse(capturedBody!)
+      expect(parsedBody.tools[0].name).toBe('mcp_Bash')
+      // Three-block layout: billing header, identity, rest
+      expect(parsedBody.system).toHaveLength(3)
+      expect(parsedBody.system[0].text).toContain('x-anthropic-billing-header')
+      expect(parsedBody.system[1].text).toBe(
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+      )
+      expect(parsedBody.system[2].text).toBe('You are a helpful assistant.')
+      // User message is untouched
+      expect(parsedBody.messages[0].content).toBe('hello world test message')
+    },
+  )
+
+  test.each(['url', 'request'] as const)(
+    'uses configured relay instead of uploading full body directly for %s input',
+    async (kind) => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          relay: {
+            enabled: true,
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            fallbackToDirect: true,
+            transport: 'http',
+          },
+        }),
+        {
           access: 'sk-ant-oat01-my-access-token',
           refresh: 'refresh',
           expires: Date.now() + 100000,
+        },
+      )
+
+      let capturedUrl: string | undefined
+      let capturedBody: string | undefined
+      let capturedHeaders: Headers | undefined
+      globalThis.fetch = mock(
+        withNativeAdmission((input: any, init: any) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage')) {
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  five_hour: { utilization: 0 },
+                  seven_day: { utilization: 0 },
+                }),
+                { status: 200 },
+              ),
+            )
+          }
+          capturedUrl = url
+          capturedBody = init?.body
+          capturedHeaders = new Headers(init?.headers)
+          return Promise.resolve(
+            new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
+          )
         }),
-      { models: {} },
-    )
+      ) as unknown as typeof fetch
 
-    await result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      headers: { 'x-session-affinity': 'session-abc' },
-      body: JSON.stringify({
-        messages: [{ role: 'user', content: 'hello' }],
-        system: 'system',
-      }),
-    })
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'sk-ant-oat01-my-access-token',
+            refresh: 'refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
 
-    expect(capturedUrl).toBe('https://relay.example.test/')
-    expect(capturedHeaders?.get('x-relay-token')).toBe('relay-token')
-    const payload = JSON.parse(capturedBody!)
-    expect(payload).toMatchObject({
-      mode: 'full_sync',
-      affinity: 'session-abc',
-      upstream: {
-        url: 'https://api.anthropic.com/v1/messages?beta=true',
-      },
-    })
-    expect(payload.upstream.headers['x-session-affinity']).toBeUndefined()
-    expect(payload.upstream.headers['x-opencode-session']).toBeUndefined()
-    expect(payload.body.length).toBeGreaterThan(0)
-  })
+      const requestInit = {
+        method: 'POST',
+        headers: {
+          'x-session-affinity': `session-abc-${kind}`,
+          'x-opencode-session-id': `session-abc-${kind}`,
+          'x-opencode-parent-session-id': 'parent-abc',
+        },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'hello' }],
+          system: 'system',
+        }),
+      }
+      if (kind === 'request')
+        await result.fetch(new Request(MESSAGES_URL, requestInit))
+      else await result.fetch(MESSAGES_URL, requestInit)
+
+      expect(capturedUrl).toBe('https://relay.example.test/')
+      expect(capturedHeaders?.get('x-relay-token')).toBe('relay-token')
+      const payload = JSON.parse(capturedBody!)
+      expect(payload).toMatchObject({
+        mode: 'full_sync',
+        affinity: `session-abc-${kind}`,
+        upstream: {
+          url: 'https://api.anthropic.com/v1/messages?beta=true',
+        },
+      })
+      expect(payload.upstream.headers['x-session-affinity']).toBeUndefined()
+      expect(payload.upstream.headers['x-opencode-session']).toBeUndefined()
+      expect(payload.upstream.headers['x-opencode-session-id']).toBeUndefined()
+      expect(
+        payload.upstream.headers['x-opencode-parent-session-id'],
+      ).toBeUndefined()
+      expect(payload.body.length).toBeGreaterThan(0)
+    },
+  )
 
   test('reloads relay config from sidecar after plugin startup', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }), {
