@@ -1,6 +1,6 @@
 # Mutation proofs for request guards
 
-`mutations.toml` records sixteen edits, each replacing one specified source block
+`mutations.toml` records eighteen edits, each replacing one specified source block
 with a broken safeguard. Named test assertions must detect each break.
 
 Run only from an isolated clone or worktree. `ckdev-mutate` is the mutation test
@@ -53,6 +53,8 @@ sibling repositories.
 | `refresh-backoff-preserves-attempt-budget` | Start transient backoff after the first attempt. | A transient failure must leave the coordinator's remaining attempts available; 429 and permanent failures still back off immediately. |
 | `native-activation-before-401-refresh` | Remove the activation check before transport reauthorization. | A revoked native host activation must trigger no token exchange. |
 | `native-activation-after-authorization` | Remove the activation check after transport authorization. | An activation revoked during fresh token validation must prevent model dispatch. |
+| `fallback-killswitch-polls-before-selection` | Skip the due-quota check before fallback-first selection. | A fallback below its hard limit must not serve. |
+| `fallback-quota-sweeps-do-not-overlap` | Run startup and request quota sweeps concurrently. | Two requests reuse one current poll per account. |
 | `runtime-read-no-follow` | Follow a symlink installed between inspection and opening. | The runtime reader must reject the symlink. |
 | `runtime-read-opened-mode` | Ignore the opened file's permissions. | A replacement with mode 0644 must be rejected. |
 | `runtime-read-opened-owner` | Ignore the opened file's owner. | A foreign owner on the opened handle must be rejected. |

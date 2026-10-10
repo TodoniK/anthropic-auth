@@ -967,13 +967,13 @@ async function nativeTokenAnswer(
  * answered here.
  */
 function withNativeTokenExchange<Input, Init>(
-  handler: (input: Input, init: Init) => unknown,
-): (input: Input, init: Init) => Promise<unknown> {
+  handler: (input: Input, init: Init) => Response | Promise<Response>,
+): (input: Input, init: Init) => Promise<Response> {
   return async (input, init) =>
     (await nativeTokenAnswer(
       input as Parameters<typeof fetch>[0],
       init as RequestInit | undefined,
-    )) ?? handler(input, init)
+    )) ?? (await handler(input, init))
 }
 
 /**
@@ -1048,8 +1048,8 @@ function withNativeAdmission<Input, Init>(
  * Let the test's handler control these endpoints for its fallback accounts.
  */
 function withMainAdmission<Input, Init>(
-  handler: (input: Input, init: Init) => unknown,
-): (input: Input, init: Init) => Promise<unknown> {
+  handler: (input: Input, init: Init) => Response | Promise<Response>,
+): (input: Input, init: Init) => Promise<Response> {
   return async (input, init) => {
     const main = poolLogins.slice(0, 1)
     const request = input as Parameters<typeof fetch>[0]
@@ -1434,7 +1434,7 @@ function mainOnlyVault(): NativeCustodyClient {
 }
 
 /**
- * Run setup migration for accounts whose credentials remain in Claustrum.
+ * Run setup migration for accounts whose credentials remain in the vault.
  * The fixture's enrollment token permits listing vault accounts for this host.
  * Plugin startup then reads the committed, credential-free account inventory.
  */
@@ -4758,7 +4758,7 @@ describe('quota header feed extended integration', () => {
     expect(await readFeedEntries()).toEqual([])
   })
 
-  test('sidebar quota refresh uses the rotated main host token', async () => {
+  test('sidebar quota refresh preserves rotated account metadata without acquiring credentials', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
@@ -4772,7 +4772,7 @@ describe('quota header feed extended integration', () => {
       },
     )
     const currentAccess = 'sk-ant-oat01-main-access-before-rotation'
-    globalThis.fetch = mock(
+    const fetchSpy = mock(
       withNativeTokenExchange((input: unknown, init?: RequestInit) => {
         const url = extractUrl(input as string | URL | Request)
         if (url.startsWith(MESSAGES_URL)) {
@@ -4794,7 +4794,10 @@ describe('quota header feed extended integration', () => {
         }
         return Promise.reject(new Error(`Unexpected test fetch: ${url}`))
       }),
-    ) as unknown as typeof fetch
+    )
+    globalThis.fetch = Object.assign(fetchSpy, {
+      preconnect: globalThis.fetch.preconnect,
+    })
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(
       () =>
@@ -4818,14 +4821,27 @@ describe('quota header feed extended integration', () => {
       expires: Date.now() + 100_000,
     })
 
-    const resolved = await (
-      plugin as {
-        __resolveSidebarQuotaAccessForTest: () => Promise<{
-          access: string | undefined
-        }>
-      }
-    ).__resolveSidebarQuotaAccessForTest()
-    expect(resolved.access).toBe('sk-ant-oat01-main-access-after-rotation')
+    const pool = migratedPool
+    if (!pool) throw new Error('Expected migrated pool')
+    const reader = createNativeAccountRuntime({
+      paths: pool.paths,
+      host: 'opencode',
+    })
+    bodyLifetime().deferCleanup(() => reader.close())
+    expect(
+      (await reader.captureLocalSubject('main')).version?.accessFingerprint,
+    ).toBe(tokenFingerprint('sk-ant-oat01-main-access-after-rotation'))
+    await waitForAccountStorage(
+      (storage) => storage?.quota?.mainQuota?.five_hour?.usedPercent === 25,
+    )
+    const requestsBeforeDisplay = fetchSpy.mock.calls.length
+    const resolved = await plugin.__resolveSidebarQuotaAccessForTest()
+    expect(resolved.access).toBeUndefined()
+    expect(resolved.storage?.quota?.mainQuota?.accountIdentity).toBe(
+      '44444444-4444-4444-4444-444444444444',
+    )
+    expect(resolved.storage?.quota?.mainQuota?.five_hour?.usedPercent).toBe(25)
+    expect(fetchSpy.mock.calls.length).toBe(requestsBeforeDisplay)
     await plugin.dispose?.()
   })
 
@@ -7216,7 +7232,9 @@ describe('auth.loader', () => {
     clearExistingRouting: boolean,
   ) {
     await useTempAccountFile(
-      createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+      bindPoolAccounts(
+        createFallbackStorage({ routing: { mode: 'fallback-first' } }),
+      ),
     )
     globalThis.fetch = mock(
       withNativeAdmission((input: string | URL | Request) => {
@@ -7235,8 +7253,8 @@ describe('auth.loader', () => {
       }),
     ) as unknown as typeof fetch
 
-    const plugin = await getPlugin()
-    await plugin.auth.loader(
+    const plugin = await getPlugin(createMockClient(), tempConfigDir)
+    const loaded = await plugin.auth.loader(
       () =>
         Promise.resolve({
           type: 'oauth',
@@ -7246,7 +7264,11 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    // Establish the plugin's actual route before testing a quota-only write.
+    const response = await loaded.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
     await drainSidebarWrites()
+    expect((await getSidebarState()).activeId).toBe('fallback-1')
     if (clearExistingRouting) {
       const current = await getSidebarState()
       await setSidebarState({
@@ -7280,13 +7302,11 @@ describe('auth.loader', () => {
     const blockingWrite = setSidebarState(await getSidebarState())
     await blocked
     try {
-      await expectHandledCommandResponse(
-        plugin['command.execute.before']({
-          command: 'claude',
-          arguments: '',
-          sessionID: 'session-1',
-        }),
-      )
+      const refreshed = await applyMenuAction(plugin, 'session-1', {
+        sectionId: 'Quota',
+        actionId: 'quota-refresh',
+      })
+      expect(refreshed.ok).toBe(true)
       // Replace the shared pool config JSON file with a directory so later
       // account reads fail instead of returning an outdated snapshot.
       const accountFile = migratedPool?.paths.config
@@ -10111,8 +10131,8 @@ describe('auth.loader', () => {
     }
     const locked = bodyLifetime().gate()
     const release = bodyLifetime().gate()
-    // Block the actual native profile destination, not the retired config
-    // file. Credential validation completed before acquiring this writer.
+    // Hold the profile's runtime-file lock after credential validation.
+    // Status must display the fetched tier without waiting for this writer.
     const writer = withLock(
       pool.paths.runtime,
       {
@@ -12850,11 +12870,9 @@ describe('auth.loader', () => {
     )
     mainAccountIssues('sk-ant-oat01-new-access')
     let tokenRefreshCount = 0
-    // The first plugin's token exchange is held open, so the second plugin's
-    // request arrives while that refresh is still in progress. OpenCode's
-    // auth store no longer receives refreshed tokens (the pool persists
-    // them), so the delayed persistence the legacy test held is now the
-    // in-flight exchange itself.
+    // Hold the first plugin's exchange open while the second requests
+    // credentials. Both must join one refresh, and only the pool stores
+    // the returned tokens; OpenCode's activation slot stays unchanged.
     const tokenRequestStarted = lifetimeSignal()
     const tokenResponse = heldResponse()
 
@@ -14028,7 +14046,7 @@ describe('auth.loader', () => {
   })
 
   test('successful fallback-first request advances the every-N counter and refreshes the served fallback', async () => {
-    // Regression: the request counter must increment before the fallback-first
+    // The request counter must increment before the fallback-first
     // early return, so a served fallback's active-route every-N refresh fires.
     await useTempAccountFile(
       createFallbackStorage({
@@ -14585,7 +14603,7 @@ describe('auth.loader', () => {
     )
     expect(state.route).toBe('fallback')
 
-    // REGRESSION: pre-fix the async callback rewrites activeId to 'main'.
+    // The callback must preserve the active fallback instead of selecting main.
     const after = await getSidebarState()
     expect(after.activeId).toBe('fallback-1')
   })
@@ -16404,7 +16422,7 @@ describe('auth.loader', () => {
       },
     })
 
-    // Reproduce the host race from issue #162: an idle probe starts, then a new
+    // Reproduce the host race: an idle probe starts, then a new
     // prompt marks the session busy before the asynchronous status response
     // arrives with its now-stale idle snapshot. The notice must remain queued;
     // otherwise OpenCode can adopt that ignored user message as the active retry
@@ -16991,7 +17009,7 @@ describe('auth.loader', () => {
       }),
     }
 
-    // First request hits the refusal. After the fix, onContentFilter fires
+    // First request hits the refusal. onContentFilter fires
     // causing the stream to reject with a ContentFilterError.
     const filtered = await result.fetch(MESSAGES_URL, request)
     await expect(filtered.text()).rejects.toThrow()
@@ -17083,39 +17101,16 @@ describe('auth.loader', () => {
   test('warms Fable with the OAuth account that was filtered when Opus routes elsewhere', async () => {
     const now = Date.now()
     await useTempAccountFile(
-      createFallbackStorage({
-        claudeCache: { enabled: true, mode: 'hybrid' },
-        cacheKeep: { enabled: false },
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: { usedPercent: 0, remainingPercent: 100 },
-            seven_day: { usedPercent: 0, remainingPercent: 100 },
-            scoped: [
-              {
-                id: 'claude-weekly-scoped-fable',
-                title: 'Fable only',
-                modelName: 'Fable',
-                usedPercent: 100,
-                remainingPercent: 0,
-                checkedAt: now,
-              },
-            ],
-          },
-          mainQuotaCheckedAt: now,
-          mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
-        } as AccountStorage['quota'],
-        accounts: [
-          {
-            id: 'fable-fallback',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fallback-access',
-            refresh: 'fallback-refresh',
-            expires: now + 5 * 60 * 60 * 1000,
-            quota: {
+      bindPoolAccounts(
+        createFallbackStorage({
+          claudeCache: { enabled: true, mode: 'hybrid' },
+          cacheKeep: { enabled: false },
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
               five_hour: {
                 usedPercent: 0,
                 remainingPercent: 100,
@@ -17126,20 +17121,54 @@ describe('auth.loader', () => {
                 remainingPercent: 100,
                 checkedAt: now,
               },
+              checkedAt: now,
               scoped: [
                 {
                   id: 'claude-weekly-scoped-fable',
                   title: 'Fable only',
                   modelName: 'Fable',
-                  usedPercent: 25,
-                  remainingPercent: 75,
+                  usedPercent: 100,
+                  remainingPercent: 0,
                   checkedAt: now,
                 },
               ],
             },
-          },
-        ],
-      }),
+            mainQuotaCheckedAt: now,
+            mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
+          } as AccountStorage['quota'],
+          accounts: [
+            {
+              id: 'fable-fallback',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fallback-access',
+              refresh: 'fallback-refresh',
+              expires: now + 5 * 60 * 60 * 1000,
+              quota: {
+                five_hour: {
+                  usedPercent: 0,
+                  remainingPercent: 100,
+                  checkedAt: now,
+                },
+                seven_day: {
+                  usedPercent: 0,
+                  remainingPercent: 100,
+                  checkedAt: now,
+                },
+                scoped: [
+                  {
+                    id: 'claude-weekly-scoped-fable',
+                    title: 'Fable only',
+                    modelName: 'Fable',
+                    usedPercent: 25,
+                    remainingPercent: 75,
+                    checkedAt: now,
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      ),
     )
     const calls: Array<{ model: string; auth: string; warm: boolean }> = []
     let firstFable = true
@@ -17148,34 +17177,38 @@ describe('auth.loader', () => {
     const refusal =
       'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"}}\n\n'
 
-    globalThis.fetch = mock((input: any, init: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: { utilization: 0 },
-              seven_day: { utilization: 0 },
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-      const body = JSON.parse(String(init?.body)) as {
-        model: string
-        max_tokens?: number
-      }
-      const auth = new Headers(init?.headers).get('authorization') ?? ''
-      calls.push({ model: body.model, auth, warm: body.max_tokens === 0 })
-      if (body.max_tokens === 0) {
-        return Promise.resolve(new Response('{}', { status: 200 }))
-      }
-      if (body.model === 'claude-fable-5' && firstFable) {
-        firstFable = false
-        return Promise.resolve(new Response(refusal, { status: 200 }))
-      }
-      return Promise.resolve(new Response(success, { status: 200 }))
-    }) as unknown as typeof fetch
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage')) {
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  five_hour: { utilization: 0 },
+                  seven_day: { utilization: 0 },
+                }),
+                { status: 200 },
+              ),
+            )
+          }
+          const body = JSON.parse(String(init?.body)) as {
+            model: string
+            max_tokens?: number
+          }
+          const auth = new Headers(init?.headers).get('authorization') ?? ''
+          calls.push({ model: body.model, auth, warm: body.max_tokens === 0 })
+          if (body.max_tokens === 0) {
+            return Promise.resolve(new Response('{}', { status: 200 }))
+          }
+          if (body.model === 'claude-fable-5' && firstFable) {
+            firstFable = false
+            return Promise.resolve(new Response(refusal, { status: 200 }))
+          }
+          return Promise.resolve(new Response(success, { status: 200 }))
+        },
+      ),
+    ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(
@@ -17230,49 +17263,86 @@ describe('auth.loader', () => {
     ])
   })
 
-  test('background fallback refresh updates the sidebar without a request', async () => {
+  test('sidebar refresh reads metadata without authorizing expired main credentials', async () => {
+    const main = { ...syntheticMainHostAuth(), expires: Date.now() - 1_000 }
     await useTempAccountFile(
       createFallbackStorage({
-        accounts: [
-          {
-            id: 'fallback-1',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fallback-access',
-            refresh: 'fallback-refresh',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-            quota: {
-              // Stale (old checkedAt) → background pass will refresh it.
-              five_hour: {
-                usedPercent: 0,
-                remainingPercent: 100,
-                checkedAt: 1,
-              },
-              seven_day: {
-                usedPercent: 0,
-                remainingPercent: 100,
-                checkedAt: 1,
+        accounts: [],
+        quota: { enabled: false },
+        refresh: { enabled: false },
+      }),
+      main,
+    )
+    const requests: string[] = []
+    globalThis.fetch = Object.assign(
+      mock(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        requests.push(extractUrl(input))
+        return (await nativeAdmissionAnswer(input, init)) ?? Response.json({})
+      }),
+      { preconnect: globalThis.fetch.preconnect },
+    )
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () => Promise.resolve({ type: 'oauth', ...main }),
+      { models: {} },
+    )
+    const display = await plugin.__resolveSidebarQuotaAccessForTest()
+    expect(display.storage?.quota?.enabled).toBe(false)
+    expect(display.access).toBeUndefined()
+    expect(requests).toEqual([])
+  })
+
+  test('background fallback refresh updates the sidebar without a request', async () => {
+    await useTempAccountFile(
+      bindPoolAccounts(
+        createFallbackStorage({
+          accounts: [
+            {
+              id: 'fallback-1',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fallback-access',
+              refresh: 'fallback-refresh',
+              expires: Date.now() + 5 * 60 * 60 * 1000,
+              quota: {
+                // Plugin startup polls this OAuth account's usage because its saved reading is old.
+                five_hour: {
+                  usedPercent: 0,
+                  remainingPercent: 100,
+                  checkedAt: 1,
+                },
+                seven_day: {
+                  usedPercent: 0,
+                  remainingPercent: 100,
+                  checkedAt: 1,
+                },
               },
             },
-          },
-        ],
-      }),
+          ],
+        }),
+      ),
     )
 
+    const usageAuthorizations: Array<string | null> = []
     globalThis.fetch = mock(
-      withNativeAdmission((input: any) => {
-        if (extractUrl(input).includes('/api/oauth/usage')) {
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0.42 },
-                seven_day: { utilization: 0.1 },
-              }),
-              { status: 200 },
-            ),
-          )
-        }
-        return Promise.resolve(new Response('ok', { status: 200 }))
-      }),
+      withNativeAdmission(
+        (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          if (extractUrl(input).includes('/api/oauth/usage')) {
+            usageAuthorizations.push(
+              new Headers(init?.headers).get('authorization'),
+            )
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  five_hour: { utilization: 0.42 },
+                  seven_day: { utilization: 0.1 },
+                }),
+                { status: 200 },
+              ),
+            )
+          }
+          return Promise.resolve(new Response('ok', { status: 200 }))
+        },
+      ),
     ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
@@ -17288,6 +17358,12 @@ describe('auth.loader', () => {
       { models: {} },
     )
 
+    await plugin.__fallbackRefreshReady
+    expect(usageAuthorizations).toContain('Bearer sk-ant-oat01-fallback-access')
+    expect(
+      (await readNativeRuntimeState()).accounts['fallback-1']?.quota?.five_hour
+        ?.usedPercent,
+    ).toBe(0.42)
     // The background pass refreshes the stale fallback and the hook re-writes the
     // sidebar — without any request to the messages endpoint.
     // utilization: 0.42 → usedPercent: 0.42 (stored as-is, not multiplied by 100)
@@ -17699,13 +17775,11 @@ describe('auth.loader', () => {
       )
     }
 
-    // Harvested quota is published to the native pool; the legacy state file
-    // these tests once read is retired by migration.
+    // Read the account runtime state that stores response-header quota.
     async function waitForState(predicate: (state: any) => boolean) {
       let lastState: unknown
       for (let attempt = 0; attempt < 200; attempt++) {
-        // Typed loosely, as the parsed legacy file was: each test asserts the
-        // fields it expects to be present.
+        // Each test checks its required fields in the persisted projection.
         const state: any = await readNativeRuntimeState()
         lastState = state
         if (predicate(state)) return state
@@ -17732,8 +17806,7 @@ describe('auth.loader', () => {
         (value) => value.main?.quota?.source === 'headers',
       )
       expect(state.main.quota.five_hour.usedPercent).toBe(78)
-      // Header quota is bound to the main account, never to the access token
-      // that happened to carry it (the legacy store's quotaToken).
+      // Header quota belongs to the account UUID, not its rotating token.
       expect(state.main.quota.accountIdentity).toBe(poolMainIdentity())
     })
 
@@ -17873,8 +17946,7 @@ describe('auth.loader', () => {
         (value) => value.main?.quota?.source === 'headers',
       )
       expect(state.main.quota.five_hour.usedPercent).toBe(78)
-      // Header quota is bound to the main account, never to the access token
-      // that happened to carry it (the legacy store's quotaToken).
+      // Header quota belongs to the account UUID, not its rotating token.
       expect(state.main.quota.accountIdentity).toBe(poolMainIdentity())
     })
 
@@ -20048,10 +20120,12 @@ describe('killswitch fetch gate', () => {
     }
   })
 
-  afterEach(() => {
-    globalThis.fetch = originalFetch
-    pluginRuntimeOverrides = {}
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+  afterEach(async () => {
+    await drainBeforeReset(testLifetime, () => {
+      globalThis.fetch = originalFetch
+      pluginRuntimeOverrides = {}
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    })
   })
 
   const oauthLoader = () =>
@@ -20254,28 +20328,34 @@ describe('killswitch fetch gate', () => {
     )
 
     let servedAuth: string | undefined
+    const quotaAuthorizations: string[] = []
+    const modelAuthorizations: string[] = []
     globalThis.fetch = mock(
-      withNativeAdmission((input: any, init: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/api/oauth/usage')) {
-          const authorization =
-            new Headers(init?.headers).get('authorization') ?? ''
-          const isMain = authorization.includes('sk-ant-oat01-main-access')
-          // Main has 80% remaining and can serve. The fallback's 30% passes
-          // the 10% routing minimum but fails its 50% hard-block threshold.
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: isMain ? 20 : 70 },
-                seven_day: { utilization: isMain ? 20 : 50 },
-              }),
-              { status: 200 },
-            ),
-          )
-        }
-        servedAuth = new Headers(init?.headers).get('authorization') ?? ''
-        return Promise.resolve(new Response('message-ok', { status: 200 }))
-      }),
+      withNativeAdmission(
+        (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage')) {
+            const authorization =
+              new Headers(init?.headers).get('authorization') ?? ''
+            quotaAuthorizations.push(authorization)
+            const isMain = authorization.includes('sk-ant-oat01-main-access')
+            // Main has 80% remaining and can serve. The fallback's 30% passes
+            // the 10% routing minimum but fails its 50% hard-block threshold.
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  five_hour: { utilization: isMain ? 20 : 70 },
+                  seven_day: { utilization: isMain ? 20 : 50 },
+                }),
+                { status: 200 },
+              ),
+            )
+          }
+          servedAuth = new Headers(init?.headers).get('authorization') ?? ''
+          modelAuthorizations.push(servedAuth)
+          return Promise.resolve(new Response('message-ok', { status: 200 }))
+        },
+      ),
     ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
@@ -20285,6 +20365,16 @@ describe('killswitch fetch gate', () => {
     expect(response.status).toBe(200)
     expect(servedAuth).toContain('sk-ant-oat01-main-access')
     expect(servedAuth).not.toContain('sk-ant-oat01-fallback-access')
+    const again = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(again.status).toBe(200)
+    expect(modelAuthorizations).toEqual([
+      'Bearer sk-ant-oat01-main-access',
+      'Bearer sk-ant-oat01-main-access',
+    ])
+    expect(quotaAuthorizations).toEqual([
+      'Bearer sk-ant-oat01-fallback-access',
+      'Bearer sk-ant-oat01-main-access',
+    ])
   })
 
   test('fail-closed killswitch blocks the first request when main quota is unknown', async () => {
@@ -21595,8 +21685,8 @@ describe('claude-prime sidebar on toggle', () => {
         }),
       { models: {} },
     )
-    // Prime a baseline sidebar write by issuing `/claude-prime on` (the
-    // mutation path publishes the sidebar section per M7).
+    // Enable priming and confirm its sidebar row exists before disabling it.
+    // Otherwise an absent row after disable could make this test pass vacuously.
     expect(
       (
         await applyMenuAction(plugin, 'ses_test', {
@@ -21624,10 +21714,9 @@ describe('claude-prime sidebar on toggle', () => {
 })
 
 describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
-  // R1: only snapshots stamped during the current refresh call are fresh.
-  // R2: refreshPrimeFallbackQuota must make exactly ONE usage-API call
-  // (the refreshAccountQuota path), not two. The second quotaManager.
-  // refreshFallback call is redundant — its result is ignored.
+  // Before starting an account's five-hour window, PrimeManager must obtain
+  // its quota from one current usage request. Cached quota cannot authorize
+  // that request, and the fallback quota check must not poll twice.
 
   const originalFetch = globalThis.fetch
 
@@ -21791,11 +21880,9 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
   test('R2: refreshPrimeFallbackQuota makes exactly one usage-API call per tick', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
-    // Each test runs from a fresh temp dir but the prime marker dir is
-    // shared across processes. Sweep any leftover marker for this reset
-    // epoch so a prior suite's fire doesn't suppress the R2 claim AND
-    // doesn't trigger the manager's `refreshPrimeFallbackQuota` twice
-    // (once for the cached account, once for the due account).
+    // A marker records that an account's five-hour window was already started.
+    // Remove markers from this sandbox so a previous run cannot suppress
+    // this test's request or make it check a different reset window.
     await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
       recursive: true,
       force: true,
@@ -22104,11 +22191,10 @@ async function primeWarningsAfterQuotaCheck(
 }
 
 describe('claude-prime — warn dedup (R3)', () => {
-  // R3: on a fresh-check-ok-but-fire-time-token-refresh-fails path,
-  // both the adapter-side `prime fire failed` warn (index.ts main
-  // catch) and the manager-side warn emit the same message. Only the
-  // manager should log — the adapter must surface the error to the
-  // manager as a non-ok result and not log itself.
+  // PrimeManager sends a minimal model request to start a five-hour window.
+  // If refreshing its token fails after quota checking, the adapter must
+  // return that failure to the manager. Only the manager logs the warning,
+  // so one failed request produces one warning rather than duplicate alerts.
 
   const originalFetch = globalThis.fetch
 

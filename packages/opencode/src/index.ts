@@ -1102,9 +1102,6 @@ type PluginRuntimeOverrides = Partial<{
   cacheKeepAggregateRefreshIntervalMs: number
 }>
 
-// Keep boot above the resident IPC fast path, but never let a stale-marked
-// refresh turn a vault treadmill into a seconds-long plugin-start delay.
-
 function getConfiguredClaustrumConnectionFile(): string | undefined {
   const configured =
     process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE?.trim() ||
@@ -2356,7 +2353,7 @@ const anthropicAuthPlugin = async (
   ): Promise<void> {
     if (!quotaHeaderFeedRegistry) return
     if (served.accountId === 'main' && !served.mainQuotaIdentity?.quotaKey) {
-      // Observed-at staleness exposes silence; an unknown key must not replace verified data.
+      // An unresolved main account must not overwrite verified account-bound quota.
       return
     }
     const storage =
@@ -2587,9 +2584,25 @@ const anthropicAuthPlugin = async (
     }
   }
 
-  async function refreshFallbackQuotas(force = false) {
+  let fallbackQuotaRefreshQueue: Promise<void> = Promise.resolve()
+  function refreshFallbackQuotas(force = false, requiredByPolicy = false) {
+    // Startup and request preflight can both observe missing quota before
+    // either poll finishes. Serialize the read/check/poll sequence so the
+    // next sweep sees the preceding result. Explicit refresh still polls.
+    const operation = fallbackQuotaRefreshQueue.then(() =>
+      pollFallbackQuotas(force, requiredByPolicy),
+    )
+    fallbackQuotaRefreshQueue = operation.catch(() => {})
+    return operation
+  }
+  async function pollFallbackQuotas(force: boolean, requiredByPolicy: boolean) {
     const snapshot = await nativeAccounts.read()
-    if (!force && snapshot.policyStorage.quota?.enabled === false) return
+    if (
+      !force &&
+      !requiredByPolicy &&
+      snapshot.policyStorage.quota?.enabled === false
+    )
+      return
     for (const account of snapshot.accounts) {
       if (account.id === 'main' || account.type !== 'oauth' || !account.enabled)
         continue
@@ -2616,6 +2629,9 @@ const anthropicAuthPlugin = async (
         // Keep any separate refresh-token rejection; a usage poll cannot fix it.
       }
     }
+    // Poll results and their backoff are already stored. Publish them without
+    // waiting for sidebar I/O or changing the active request's route.
+    void refreshSidebarQuota().catch(() => {})
   }
   const fallbackManager = {
     refreshQuotaForDueAccounts: () => refreshFallbackQuotas(),
@@ -3877,24 +3893,15 @@ const anthropicAuthPlugin = async (
     )
   }
 
-  // Re-write the sidebar using the LAST known routing decision, refreshing only
-  // the quota numbers. Used by async quota refreshes (main + background fallback)
-  // so they never clobber the active account back to 'main'.
   async function resolveSidebarQuotaAccess() {
+    // Read saved account quota and profile data without requesting an OAuth
+    // token. Acquiring credentials can refresh main merely to redraw the sidebar.
     const storage = await loadAccounts(accountStoragePath)
-    let access: string | undefined
-    if (latestGetAuth) {
-      try {
-        const auth = await latestGetAuth()
-        access = getClaustrumMode(storage) === 'local' ? auth.access : undefined
-      } catch {
-        // best-effort
-      }
-    }
-    access ??= mainServedAccessToken
-    return { storage, access }
+    return { storage, access: undefined }
   }
 
+  // Quota timers do not choose the model request's account. Reuse the last
+  // routing decision so a display-only write cannot select main instead.
   async function refreshSidebarQuota() {
     // Rebuild the cross-process CacheKeep aggregate first: sibling plugin
     // instances (other project directories) may track sessions this instance
@@ -4026,21 +4033,12 @@ const anthropicAuthPlugin = async (
   async function refreshSidebarAfterMutation(
     updatedStorage: AccountStorage | null,
   ) {
-    if (latestGetAuth) {
-      try {
-        await getAllTrackedCacheKeepSessions().catch(() => {})
-        const auth = await latestGetAuth()
-        await writeSidebarState(updatedStorage, {
-          activeId: lastSidebarRouting.activeId,
-          route: lastSidebarRouting.route,
-          mainAccessToken: auth.access,
-          mainRefreshToken: auth.refresh,
-          routingAuthoritative: false,
-        })
-      } catch {
-        // auth not yet available — sidebar will refresh on next request
-      }
-    }
+    await getAllTrackedCacheKeepSessions().catch(() => {})
+    await writeSidebarState(updatedStorage, {
+      activeId: lastSidebarRouting.activeId,
+      route: lastSidebarRouting.route,
+      routingAuthoritative: false,
+    })
   }
 
   function publishFableRecoveryNotice(
@@ -4528,11 +4526,8 @@ const anthropicAuthPlugin = async (
       }
     }
 
-    // Publish the new prime section to the sidebar file (M7) so the
-    // expanded Prime row appears on `on` and disappears on `off` without
-    // waiting for the next quota refresh path. The post-mutation storage
-    // IS authoritative; we re-read it so the section payload reflects
-    // the freshly persisted flag.
+    // After toggling quota priming, update its sidebar status immediately.
+    // Read storage again so the display uses the newly saved enabled flag.
     if (action.type === 'enable' || action.type === 'disable') {
       const reloaded = await loadAccounts(accountStoragePath)
       if (reloaded && latestGetAuth) {
@@ -5226,7 +5221,9 @@ const anthropicAuthPlugin = async (
         throw new Error(`Unsupported native menu action: ${unsupported}`)
       }
     }
-    await refreshSidebarAfterMutation(await loadAccounts())
+    // Account and setting changes are committed before this display update.
+    // A held sidebar writer must not delay the menu's action result.
+    void refreshSidebarAfterMutation(await loadAccounts()).catch(() => {})
     return {
       ok: true,
       text: text
@@ -7182,6 +7179,15 @@ const anthropicAuthPlugin = async (
             storageArg: Awaited<ReturnType<typeof loadAccounts>>,
             options: { includeApiRoutes?: boolean; modelId?: string } = {},
           ): Promise<Array<OAuthAccount | ApiKeyAccount>> {
+            // Fallback-first can return before the main quota gate. Learn due
+            // fallback quotas before applying hard limits, without acquiring
+            // main credentials or polling accounts whose quotas are fresh.
+            if (isKillswitchEnabled(storageArg)) {
+              await refreshFallbackQuotas(false, true)
+              // Polling can also bind a newly discovered account UUID. Filter
+              // the published quotas, not the request's earlier account view.
+              storageArg = await loadAccounts(accountStoragePath)
+            }
             const usableOAuth = await fallbackManager.getUsableFallbackAccounts(
               storageArg,
               { modelId: options.modelId },
@@ -9106,25 +9112,15 @@ const anthropicAuthPlugin = async (
                 )
                 if (needsRefresh) {
                   try {
-                    const fallbackAccts = (storage?.accounts ?? []).filter(
-                      (a): a is OAuthAccount =>
-                        a.enabled !== false &&
-                        isOAuthAccount(a) &&
-                        (isScopedCustodyActive(storage)
-                          ? isFallbackAccountVaultServed(a.id, storage)
-                          : Boolean(a.access)),
-                    )
                     await Promise.all([
                       quotaManager.refreshMain(
                         requestMainQuotaIdentity?.quotaKey,
                         auth.access,
                         requestMainQuotaIdentity?.generation,
                       ),
-                      quotaManager.refreshAllFallbacks(
-                        fallbackAccts,
-                        (account) =>
-                          isScopedCustodyActive(storage) ? '' : account.access,
-                      ),
+                      // Fallback-first may have just polled these accounts.
+                      // Keep those fresh readings rather than polling twice.
+                      refreshFallbackQuotas(false, true),
                     ])
                   } catch (error) {
                     log('[quota] killswitch refresh failed', {
@@ -9224,7 +9220,7 @@ const anthropicAuthPlugin = async (
                 // Decide whether the block is scoped-driven (request's
                 // model matches a scoped window that is at/below the scoped
                 // threshold) vs a whole-account 5h/7d-driven block. A
-                // healthy Fable window + 5h/7d breach is NOT scoped-driven.
+                // healthy model-specific window + 5h/7d breach is NOT scoped-driven.
                 const scoped = resolveScopedDrivenBlock({
                   mainQuota,
                   requestModelId,

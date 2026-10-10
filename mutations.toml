@@ -248,7 +248,6 @@ test_file = "packages/opencode/src/tests/index.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-prebuild = ["bun", "run", "--cwd", "packages/core", "build"]
 expect_red = ["auth.loader > sticky 401 retry refuses a foreign-provider tombstone before the token endpoint"]
 expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
@@ -270,8 +269,43 @@ test_file = "packages/opencode/src/tests/index.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-prebuild = ["bun", "run", "--cwd", "packages/core", "build"]
 expect_red = ["auth.loader > physical OAuth authorization refuses host revocation during fresh token validation"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "fallback-killswitch-polls-before-selection"
+guards = "Fallback-first routing must learn due quota before allowing an account to bypass its killswitch."
+file = "packages/opencode/src/index.ts"
+old = '''              await refreshFallbackQuotas(false, true)
+              // Polling can also bind'''
+new = '''              await Promise.resolve()
+              // Polling can also bind'''
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["killswitch fetch gate > fallback-first routing does not serve from a killswitch-killed fallback"]
+expect_message = "error: expect(received).toContain(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "fallback-quota-sweeps-do-not-overlap"
+guards = "Startup and request quota sweeps must not independently decide to poll the same still-unknown account."
+file = "packages/opencode/src/index.ts"
+old = '''    const operation = fallbackQuotaRefreshQueue.then(() =>
+      pollFallbackQuotas(force, requiredByPolicy),
+    )'''
+new = '''    const operation = pollFallbackQuotas(force, requiredByPolicy)'''
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["killswitch fetch gate > fallback-first routing does not serve from a killswitch-killed fallback"]
 expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
