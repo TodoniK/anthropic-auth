@@ -102,6 +102,7 @@ export type NativeMenuActionId =
   | 'add-oauth-start'
   | 'add-oauth-finish'
   | 'custody-mode'
+  | 'vault-disconnect'
   | 'quota-refresh'
   | 'routing-mode'
   | 'routing-reset'
@@ -124,12 +125,13 @@ export type NativeMenuActionId =
   | 'prime-off'
   | 'start-fire'
 
-type DestructiveId = 'remove' | 'enrollment-reset'
+type DestructiveId = 'remove' | 'enrollment-reset' | 'vault-disconnect'
 type InteractiveId =
   | 'add-apikey'
   | 'add-oauth-start'
   | 'add-oauth-finish'
   | 'custody-mode'
+  | 'vault-disconnect'
 
 type ActionSafety<Id extends NativeMenuActionId> = (Id extends DestructiveId
   ? { readonly destructive: true; readonly confirm: string }
@@ -157,12 +159,23 @@ export type NativeMenuAction = {
           readonly offlineRequired: true
           readonly setupInstructions: readonly string[]
         }
-      : {
-          readonly kind: 'action'
-          readonly command: NativeMenuCommandId
-          readonly group: NativeMenuGroupId
-          readonly parameters: readonly NativeMenuParameter[]
-        })
+      : Id extends 'vault-disconnect'
+        ? {
+            /**
+             * Ends this host's vault enrollment through the host's own
+             * disconnect capability, never through the account dispatch.
+             */
+            readonly kind: 'vault-disconnect'
+            readonly command: 'account'
+            readonly group: 'Accounts'
+            readonly parameters: readonly []
+          }
+        : {
+            readonly kind: 'action'
+            readonly command: NativeMenuCommandId
+            readonly group: NativeMenuGroupId
+            readonly parameters: readonly NativeMenuParameter[]
+          })
 }[NativeMenuActionId]
 
 export type NativeMenuStatus = {
@@ -341,6 +354,19 @@ const actions: readonly NativeMenuAction[] = Object.freeze(
           'Use the explicit offline setup flow for the selected local or claustrum mode.',
           'This menu only provides guidance; it does not change settings, propose enrollment, or report setup success.',
         ],
+      },
+      {
+        id: 'vault-disconnect',
+        kind: 'vault-disconnect',
+        command: 'account',
+        group: 'Accounts',
+        label: 'Disconnect from the vault',
+        destructive: true,
+        confirm:
+          "Disconnect this host from the vault and return to local accounts? The vault keeps this host's enrollment approved until an operator revokes it there.",
+        interactive: true,
+        headlessRefusal: 'interactive-required',
+        parameters: [],
       },
       {
         ...ordinary,
@@ -629,7 +655,85 @@ const statuses: readonly NativeMenuStatus[] = Object.freeze(
   ).map((status) => Object.freeze(status)),
 )
 
-function buildModel(host: NativeMenuHost): NativeMenuModel {
+/**
+ * Actions offered only under local custody. Most write accounts or credentials
+ * held by this host: sign-in, API-key additions, removal and reordering.
+ * Enrollment reset repairs a terminal enrollment ceremony, and custody setup
+ * guidance describes connecting through offline setup; neither has a use
+ * while the host is enrolled. Under claustrum custody the vault is the only
+ * account authority, so these actions are left out of the menu and refused if
+ * a request for one still arrives. They return once the host is disconnected
+ * from the vault and back in local custody.
+ */
+export const NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS = Object.freeze([
+  'remove',
+  'move-up',
+  'move-down',
+  'enrollment-reset',
+  'add-apikey',
+  'add-oauth-start',
+  'add-oauth-finish',
+  'custody-mode',
+] as const satisfies readonly NativeMenuActionId[])
+
+export type NativeMenuLocalCustodyActionId =
+  (typeof NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS)[number]
+
+const localCustodyActionIds: ReadonlySet<NativeMenuActionId> = new Set(
+  NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS,
+)
+
+/** True for an action offered only while the host is in local custody. */
+export function isNativeMenuLocalCustodyAction(
+  id: NativeMenuActionId,
+): id is NativeMenuLocalCustodyActionId {
+  return localCustodyActionIds.has(id)
+}
+
+/**
+ * When the host uses its local credential pool, hide vault-disconnect because
+ * no vault enrollment needs to end. Offer disconnect when enrollment grants
+ * this host access to the vault, or when that enrollment cannot be read so a
+ * person can recover from damaged enrollment files.
+ */
+export const NATIVE_MENU_VAULT_CUSTODY_ACTION_IDS = Object.freeze([
+  'vault-disconnect',
+] as const satisfies readonly NativeMenuActionId[])
+
+export type NativeMenuVaultCustodyActionId =
+  (typeof NATIVE_MENU_VAULT_CUSTODY_ACTION_IDS)[number]
+
+const vaultCustodyActionIds: ReadonlySet<NativeMenuActionId> = new Set(
+  NATIVE_MENU_VAULT_CUSTODY_ACTION_IDS,
+)
+
+/** True for actions shown when this host obtains credentials from the vault instead of its local pool. */
+export function isNativeMenuVaultCustodyAction(
+  id: NativeMenuActionId,
+): id is NativeMenuVaultCustodyActionId {
+  return vaultCustodyActionIds.has(id)
+}
+
+function offeredUnder(
+  custody: NativeMenuCustodyMode,
+  id: NativeMenuActionId,
+): boolean {
+  return custody === 'local'
+    ? !isNativeMenuVaultCustodyAction(id)
+    : !isNativeMenuLocalCustodyAction(id)
+}
+
+function hostOffers(host: NativeMenuHost, action: NativeMenuAction): boolean {
+  return (
+    host === 'opencode' ||
+    !['quota', 'killswitch', 'prime', 'start'].includes(action.command)
+  )
+}
+
+function buildModel(
+  host: NativeMenuHost,
+  custody: NativeMenuCustodyMode,
+): NativeMenuModel {
   return Object.freeze({
     host,
     groups: Object.freeze(
@@ -640,10 +744,8 @@ function buildModel(host: NativeMenuHost): NativeMenuModel {
             actions.filter(
               (action) =>
                 action.group === id &&
-                (host === 'opencode' ||
-                  !['quota', 'killswitch', 'prime', 'start'].includes(
-                    action.command,
-                  )),
+                hostOffers(host, action) &&
+                offeredUnder(custody, action.id),
             ),
           ),
           statuses: Object.freeze(
@@ -660,11 +762,48 @@ function buildModel(host: NativeMenuHost): NativeMenuModel {
 }
 
 const models = Object.freeze({
-  opencode: buildModel('opencode'),
-  pi: buildModel('pi'),
+  opencode: Object.freeze({
+    local: buildModel('opencode', 'local'),
+    claustrum: buildModel('opencode', 'claustrum'),
+  }),
+  pi: Object.freeze({
+    local: buildModel('pi', 'local'),
+    claustrum: buildModel('pi', 'claustrum'),
+  }),
 })
 
-/** Stable frozen metadata, with no current settings or credential material. */
-export function getNativeMenuModel(host: NativeMenuHost): NativeMenuModel {
-  return models[host]
+const actionLists = Object.freeze({
+  opencode: Object.freeze(
+    actions.filter((action) => hostOffers('opencode', action)),
+  ),
+  pi: Object.freeze(actions.filter((action) => hostOffers('pi', action))),
+})
+
+/**
+ * Every action the host supports under either custody mode, in menu order.
+ * Request checking uses this list so it can recognise an action the current
+ * custody mode no longer offers and refuse it by name.
+ */
+export function listNativeMenuActions(
+  host: NativeMenuHost,
+): readonly NativeMenuAction[] {
+  return actionLists[host]
+}
+
+/**
+ * Stable frozen metadata, with no current settings or credential material.
+ * Returns the actions the host offers under the given custody mode: local
+ * custody leaves out NATIVE_MENU_VAULT_CUSTODY_ACTION_IDS, and claustrum
+ * custody leaves out NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS. Local custody means
+ * this host keeps its own accounts; claustrum custody means the host is
+ * enrolled in the vault, which owns its accounts. The mode is required so no
+ * caller can fall back to the full action set by omission and offer local
+ * credential changes (sign-in, API keys, removal, reordering) to a host
+ * enrolled in the vault.
+ */
+export function getNativeMenuModel(
+  host: NativeMenuHost,
+  custody: NativeMenuCustodyMode,
+): NativeMenuModel {
+  return models[host][custody]
 }

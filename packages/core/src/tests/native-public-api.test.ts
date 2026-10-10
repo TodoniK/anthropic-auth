@@ -33,8 +33,8 @@ test('native public factories do not expose internal runtime or authority publis
 
 test('the public menu getter preserves both host profiles', () => {
   for (const host of ['opencode', 'pi'] as const) {
-    const exposed = publicApi.getNativeMenuModel(host)
-    expect(exposed).toEqual(getNativeMenuModel(host))
+    const exposed = publicApi.getNativeMenuModel(host, 'local')
+    expect(exposed).toEqual(getNativeMenuModel(host, 'local'))
     expect(exposed.host).toBe(host)
     expect(exposed.groups.length).toBeGreaterThan(0)
     expect(new Set(exposed.groups.map((group) => group.id)).size).toBe(

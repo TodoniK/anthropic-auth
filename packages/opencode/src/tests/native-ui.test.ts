@@ -1,6 +1,13 @@
 import { expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  getHostClaustrumEnrollmentPaths,
+  readNativeEnrollmentMode,
+} from '@cortexkit/anthropic-auth-core'
 import type {
   CommandApplyRequest,
   CommandApplyResult,
@@ -13,7 +20,11 @@ import type {
 } from '@opencode-ai/plugin/tui'
 import { testRender } from '@opentui/solid'
 import type { JSX } from 'solid-js'
-import { createNativeUi } from '../../../core/src/native-ui.ts'
+import {
+  createNativeUi,
+  type NativeUiOptions,
+} from '../../../core/src/native-ui.ts'
+import { createNativeCommand } from '../native-command.ts'
 import { openNativeMenuDialog } from '../tui/command-dialogs.tsx'
 
 test('dual TUI entry exposes both default host methods without eagerly loading OC1 TSX', () => {
@@ -44,10 +55,14 @@ test('dual TUI entry exposes both default host methods without eagerly loading O
   })
 })
 
-async function harness() {
+async function harness(
+  readMode: NativeUiOptions['readMode'] = async () => 'local',
+) {
   const menu = createNativeUi({
     host: 'opencode',
     interactive: true,
+    readMode,
+    disconnectVault: async () => 'idle',
     dispatch: async () => ({ ok: true, text: 'Applied' }),
     readStatus: async (command) => `${command}: honest status`,
   })
@@ -211,6 +226,36 @@ test('single Claude dialog displays all sections, honest status and every action
   expect(h.cleared).toBe(1)
 })
 
+test('vault-connected Accounts dialog shows read-only guidance and no local account actions', async () => {
+  const h = await harness(async () => 'claustrum')
+  await h.draw()
+  h.choose('Accounts')
+  const text = await h.draw()
+  expect(text).toContain('Accounts are managed in the vault.')
+  expect(text).toContain('account: honest status')
+  expect(h.select?.options.map((option) => option.value)).toEqual([
+    'action:enable',
+    'action:disable',
+    'action:reset-backoff',
+    'action:vault-disconnect',
+    '__back',
+  ])
+  // The guidance line is shown as text, never as a selectable option.
+  expect(
+    h.select?.options.some((option) =>
+      option.title.includes('Accounts are managed in the vault'),
+    ),
+  ).toBe(false)
+  h.choose('__back')
+  await h.draw()
+  h.choose('Cache')
+  await h.draw()
+  expect(h.select?.options.map((option) => option.value)).toContain(
+    'action:cache-on',
+  )
+  expect(h.requests).toEqual([])
+})
+
 test('renderer collects API key, label, baseURL and authHeader without seeding secrets', async () => {
   const h = await harness()
   await h.draw()
@@ -367,4 +412,71 @@ test('failed IPC is generic and duplicate clicks do not repeat an effect', async
   await h.settle()
   await h.draw()
   expect(h.toasts).toEqual(['Menu apply unavailable; outcome unknown.'])
+})
+
+test('the OpenCode command wrapper disconnects through Core by default and returns the host to local accounts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'opencode-native-disconnect-'))
+  const previous = process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
+  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+    root,
+    'opencode-enrollment.json',
+  )
+  try {
+    const enrollment = getHostClaustrumEnrollmentPaths('opencode')
+    await writeFile(
+      enrollment.tokenPath,
+      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    await writeFile(
+      enrollment.statePath,
+      JSON.stringify({
+        version: 1,
+        phase: 'approved',
+        proposedName: 'anthropic-auth-opencode',
+        tokenGeneration: 1,
+        updatedAt: 1,
+      }),
+      { mode: 0o600 },
+    )
+    const calls: string[] = []
+    // Neither the custody reader nor the disconnect is injected, so both use
+    // the wrapper's defaults for OpenCode's own enrollment.
+    const command = createNativeCommand({
+      host: 'opencode',
+      interactive: true,
+      dispatch: async (request) => {
+        calls.push(request.action)
+        return { ok: true, text: 'Applied' }
+      },
+      readStatus: async (command) => `${command}: public status`,
+    })
+    const opened = await command.open('session-a')
+    expect(
+      opened.menu.sections[0]?.actions.map((action) => action.id),
+    ).toContain('vault-disconnect')
+    const request: CommandApplyRequest = {
+      command: 'claude',
+      sectionId: 'Accounts',
+      actionId: 'vault-disconnect',
+      sessionId: 'session-a',
+    }
+    expect(await command.apply(request)).toMatchObject({
+      ok: false,
+      code: 'confirmation-required',
+    })
+    expect(await readNativeEnrollmentMode('opencode')).toBe('claustrum')
+    expect(await command.apply({ ...request, confirmed: true })).toMatchObject({
+      ok: true,
+      text: 'Disconnected from the vault. This host uses local accounts again.',
+    })
+    expect(await readNativeEnrollmentMode('opencode')).toBe('local')
+    expect(calls).toEqual([])
+  } finally {
+    if (previous === undefined)
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
+    else
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = previous
+    await rm(root, { recursive: true, force: true })
+  }
 })

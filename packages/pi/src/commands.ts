@@ -1,10 +1,15 @@
+import { join } from 'node:path'
 import {
   createNativeUi,
+  disconnectNativeVaultForHost,
   type NativeMenuCommandId,
   type NativeMenuDispatch,
+  type NativeUiOptions,
+  openNativePiAuthSlot,
+  readNativeEnrollmentMode,
   runPiCommandMenu,
 } from '@cortexkit/anthropic-auth-core'
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import { type ExtensionAPI, getAgentDir } from '@earendil-works/pi-coding-agent'
 
 /** Backend callbacks use native authority; the renderer never receives credentials. */
 export interface PiNativeCommands {
@@ -13,7 +18,34 @@ export interface PiNativeCommands {
     command: Exclude<NativeMenuCommandId, 'start'>,
     invocation: { sessionId?: string },
   ) => Promise<string>
+  /**
+   * Reads Pi's credential custody for each menu open and apply. When left
+   * out, the enrollment record the environment points to is read; there is
+   * no local fallback.
+   */
+  readMode?: NativeUiOptions['readMode']
+  /**
+   * Disconnects Pi from the vault. When left out, Core first restores the
+   * Anthropic sign-in that enrollment set aside in Pi's own auth file, then
+   * ends Pi's enrollment.
+   */
+  disconnectVault?: NativeUiOptions['disconnectVault']
 }
+
+/**
+ * Pi's default disconnect. The auth file is the one Pi's SDK uses
+ * (getAgentDir() honours PI_CODING_AGENT_DIR); Core chooses the private
+ * stash and placeholder, so setup and disconnect always agree on them.
+ */
+const disconnectPi: NativeUiOptions['disconnectVault'] = () =>
+  disconnectNativeVaultForHost({
+    host: 'pi',
+    env: process.env,
+    slot: openNativePiAuthSlot({
+      env: process.env,
+      authPath: join(getAgentDir(), 'auth.json'),
+    }),
+  })
 
 export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
   pi.registerCommand('claude', {
@@ -27,10 +59,31 @@ export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
         )
         return
       }
+      const disconnect = backend.disconnectVault ?? disconnectPi
       const menu = createNativeUi({
         host: 'pi',
         dispatch: backend.dispatch,
         readStatus: backend.readStatus,
+        readMode:
+          backend.readMode ??
+          (() => readNativeEnrollmentMode('pi', process.env)),
+        disconnectVault: async (options) => {
+          const result = await disconnect(options)
+          // Reload after successful or already-inactive enrollment so Pi sees
+          // any restored sign-in. Reload failure cannot undo the completed
+          // disconnect, so report it separately without exposing the exception.
+          if (result === 'disconnected' || result === 'idle') {
+            try {
+              await ctx.modelRegistry.refresh()
+            } catch {
+              ctx.ui.notify(
+                'Vault enrollment is inactive, but Pi could not reload its saved sign-in. Restart Pi before sending another request.',
+                'error',
+              )
+            }
+          }
+          return result
+        },
         interactive: ctx.hasUI,
       })
       const sessionId = ctx.sessionManager.getSessionId()

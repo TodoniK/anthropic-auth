@@ -294,12 +294,12 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     import type {
       NativeLocalCredentialService, NativeLocalCredentialServiceOptions, NativeRefreshRequest, NativeRefreshResult,
       NativeCustody, NativeCustodyOptions, NativeCustodyIdentity, NativeCustodyReceipt,
-      NativeMenuExecutor, NativeMenuExecutorOptions, NativeMenuHost, NativeMenuModel,
+      NativeMenuExecutor, NativeMenuExecutorOptions, NativeMenuCustodyMode, NativeMenuHost, NativeMenuModel,
     } from '@cortexkit/anthropic-auth-core';
     const localFactory: (options: NativeLocalCredentialServiceOptions) => NativeLocalCredentialService = core.createNativeLocalCredentialService;
     const custodyFactory: (options: NativeCustodyOptions) => NativeCustody = core.createNativeCustody;
     const menuFactory: (options: NativeMenuExecutorOptions) => NativeMenuExecutor = core.createNativeMenuExecutor;
-    const menuModel: (host: NativeMenuHost) => NativeMenuModel = core.getNativeMenuModel;
+    const menuModel: (host: NativeMenuHost, custody: NativeMenuCustodyMode) => NativeMenuModel = core.getNativeMenuModel;
     type LocalAuthorize = (request: NativeRefreshRequest) => Promise<NativeRefreshResult>;
     type CustodyAuthorize = (identity: NativeCustodyIdentity, signal?: AbortSignal) => Promise<NativeCustodyReceipt>;
     type NativeAuthorize = NativeLocalCredentialService['authorize'] extends LocalAuthorize ? true : false;
@@ -396,7 +396,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     assert.equal(loaded.rows[0].credential.access, 'synthetic-access');
     for (const factory of ['createNativeLocalCredentialService', 'createNativeCustody', 'getNativeMenuModel', 'createNativeMenuExecutor', 'captureNativeLocalPoolBinding']) assert.equal(typeof core[factory], 'function', factory);
     for (const host of ['opencode', 'pi']) {
-      const model = core.getNativeMenuModel(host);
+      const model = core.getNativeMenuModel(host, 'local');
       assert.equal(model.host, host);
       assert.ok(model.groups.length > 0);
     }

@@ -17,11 +17,15 @@ import {
   type NativeMenuDispatchValues,
   type NativeMenuExecutionContext,
   type NativeMenuExecutionResult,
+  type NativeMenuExecutor,
   type NativeMenuExecutorOptions,
   type NativeMenuRequest,
 } from '../native-menu-executor.ts'
 import {
   getNativeMenuModel,
+  listNativeMenuActions,
+  NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS,
+  NATIVE_MENU_VAULT_CUSTODY_ACTION_IDS,
   type NativeMenuActionId,
   type NativeMenuHost,
 } from '../native-menu-model.ts'
@@ -49,7 +53,7 @@ const typeContracts: [
   Assert<
     Equal<
       NativeMenuDispatchRequest['action'],
-      Exclude<NativeMenuActionId, 'custody-mode'>
+      Exclude<NativeMenuActionId, 'custody-mode' | 'vault-disconnect'>
     >
   >,
   Assert<Equal<keyof NativeMenuActionValues, NativeMenuActionId>>,
@@ -279,6 +283,7 @@ const samples: { [Id in NativeMenuActionId]: RequestFor<Id> } = {
     values: { code: 'abc#state', label: 'Second' },
   },
   'custody-mode': { action: 'custody-mode', values: { mode: 'claustrum' } },
+  'vault-disconnect': { action: 'vault-disconnect' },
   'quota-refresh': { action: 'quota-refresh' },
   'routing-mode': {
     action: 'routing-mode',
@@ -373,6 +378,7 @@ const SESSION_ACTIONS: readonly NativeMenuActionId[] = [
 ]
 const full: NativeMenuExecutionContext = {
   interactive: true,
+  custodyMode: 'local',
   confirmed: true,
   sessionId: 'session-1',
 }
@@ -389,10 +395,9 @@ function harness(
   return { calls, executor: createNativeMenuExecutor({ host, dispatch }) }
 }
 
+/** IDs of every action this host offers under local or claustrum custody. */
 function hostActionIds(host: NativeMenuHost): NativeMenuActionId[] {
-  return getNativeMenuModel(host).groups.flatMap((group) =>
-    group.actions.map((action) => action.id),
-  )
+  return listNativeMenuActions(host).map((action) => action.id)
 }
 
 // Untyped entry point for malformed runtime input a menu could still send.
@@ -436,7 +441,7 @@ test('every available action reaches the capability with exactly the checked val
   expect(Object.keys(samples).sort()).toEqual(hostActionIds('opencode').sort())
   for (const host of ['opencode', 'pi'] as const) {
     for (const id of hostActionIds(host)) {
-      if (id === 'custody-mode') continue
+      if (id === 'custody-mode' || id === 'vault-disconnect') continue
       const { calls, executor } = harness(host)
       const result = await executor.execute(samples[id], full)
       expect(result).toEqual({
@@ -530,7 +535,7 @@ test('actions the host does not offer and unknown actions are refused', async ()
 
 test('custody setup is offline guidance only and never dispatches', async () => {
   const { calls, executor } = harness()
-  const model = getNativeMenuModel('opencode')
+  const model = getNativeMenuModel('opencode', 'local')
     .groups.flatMap((group) => group.actions)
     .find((action) => action.id === 'custody-mode')
   if (model?.kind !== 'setup-guidance')
@@ -538,7 +543,7 @@ test('custody setup is offline guidance only and never dispatches', async () => 
   for (const mode of ['local', 'claustrum'] as const) {
     const result = await executor.execute(
       { action: 'custody-mode', values: { mode } },
-      { interactive: true },
+      { interactive: true, custodyMode: 'local' },
     )
     expect(result).toEqual({
       status: 'guidance',
@@ -550,7 +555,10 @@ test('custody setup is offline guidance only and never dispatches', async () => 
       expect(result.instructions).toBe(model.setupInstructions)
   }
   expect(
-    await executor.execute(samples['custody-mode'], { interactive: false }),
+    await executor.execute(samples['custody-mode'], {
+      interactive: false,
+      custodyMode: 'local',
+    }),
   ).toEqual({
     status: 'refused',
     code: 'offline-required',
@@ -583,7 +591,12 @@ test('interactive-only actions are refused in headless contexts', async () => {
   }
   expect(calls).toHaveLength(0)
   expect(
-    (await executor.execute(samples.enable, { interactive: false })).status,
+    (
+      await executor.execute(samples.enable, {
+        interactive: false,
+        custodyMode: 'local',
+      })
+    ).status,
   ).toBe('executed')
 })
 
@@ -591,9 +604,9 @@ test('destructive actions require explicit confirmation', async () => {
   const { calls, executor } = harness()
   for (const id of ['remove', 'enrollment-reset'] as const) {
     for (const context of [
-      { interactive: true },
-      { interactive: true, confirmed: false },
-    ]) {
+      { interactive: true, custodyMode: 'local' },
+      { interactive: true, custodyMode: 'local', confirmed: false },
+    ] as const) {
       expect(await executor.execute(samples[id], context)).toEqual({
         status: 'refused',
         code: 'confirmation-required',
@@ -604,7 +617,12 @@ test('destructive actions require explicit confirmation', async () => {
   expect(calls).toHaveLength(0)
   expect((await executor.execute(samples.remove, full)).status).toBe('executed')
   expect(
-    (await executor.execute(samples.enable, { interactive: true })).status,
+    (
+      await executor.execute(samples.enable, {
+        interactive: true,
+        custodyMode: 'local',
+      })
+    ).status,
   ).toBe('executed')
 })
 
@@ -614,8 +632,8 @@ test('session-dependent actions require a session identifier', async () => {
     for (const sessionId of [undefined, '', '   ']) {
       const context =
         sessionId === undefined
-          ? { interactive: true }
-          : { interactive: true, sessionId }
+          ? { interactive: true, custodyMode: 'local' as const }
+          : { interactive: true, custodyMode: 'local' as const, sessionId }
       expect(await executor.execute(samples[id], context)).toEqual({
         status: 'refused',
         code: 'session-required',
@@ -625,8 +643,12 @@ test('session-dependent actions require a session identifier', async () => {
   }
   expect(calls).toHaveLength(0)
   expect(
-    (await executor.execute(samples['quota-refresh'], { interactive: true }))
-      .status,
+    (
+      await executor.execute(samples['quota-refresh'], {
+        interactive: true,
+        custodyMode: 'local',
+      })
+    ).status,
   ).toBe('executed')
 })
 
@@ -643,6 +665,7 @@ test('a signal aborted before dispatch does no work', async () => {
   expect(
     await executor.execute(samples['custody-mode'], {
       interactive: true,
+      custodyMode: 'local',
       signal: controller.signal,
     }),
   ).toEqual({ status: 'refused', code: 'aborted', action: 'custody-mode' })
@@ -1143,12 +1166,18 @@ test('malformed contexts are refused before any dispatch', async () => {
     null,
     undefined,
     {},
-    { interactive: 'yes' },
-    { interactive: true, confirmed: 1 },
-    { interactive: true, sessionId: 5 },
-    { interactive: true, extra: true },
-    { interactive: true, signal: fakeSignal },
-    { interactive: true, signal: {} },
+    { interactive: 'yes', custodyMode: 'local' },
+    { interactive: true, custodyMode: 'local', confirmed: 1 },
+    { interactive: true, custodyMode: 'local', sessionId: 5 },
+    { interactive: true, custodyMode: 'local', extra: true },
+    { interactive: true, custodyMode: 'local', signal: fakeSignal },
+    { interactive: true, custodyMode: 'local', signal: {} },
+    // Custody has no default: a missing or unknown mode is not local.
+    { interactive: true },
+    { interactive: true, custodyMode: undefined },
+    { interactive: true, custodyMode: 'vault' },
+    { interactive: true, custodyMode: 'LOCAL' },
+    { interactive: true, custodyMode: null },
   ]) {
     // Called directly so an undefined context is not replaced by a default.
     const result = await Reflect.apply(executor.execute, undefined, [
@@ -1170,11 +1199,15 @@ test('proxies are refused without running any trap', async () => {
   const cases: [unknown, unknown][] = [
     [trappedProxy({ action: 'enable', values: { id: 'a' } }, log), full],
     [{ action: 'enable', values: trappedProxy({ id: 'a' }, log) }, full],
-    [samples.enable, trappedProxy({ interactive: true }, log)],
+    [
+      samples.enable,
+      trappedProxy({ interactive: true, custodyMode: 'local' }, log),
+    ],
     [
       samples['prime-on'],
       {
         interactive: true,
+        custodyMode: 'local',
         signal: trappedProxy(new AbortController().signal, log),
       },
     ],
@@ -1223,7 +1256,7 @@ test('accessors, iterators and foreign prototypes are refused without being call
   )
   const accessorValues = Object.defineProperty({}, 'id', getter('id', 'a'))
   const accessorContext = Object.defineProperty(
-    {},
+    { custodyMode: 'local' },
     'interactive',
     getter('interactive', true),
   )
@@ -1466,4 +1499,199 @@ test('the emitted declaration carries no common-auth reference', async () => {
     ({ specifier }) => specifier,
   )
   expect(specifiers.sort()).toEqual(['./native-menu-model.ts'])
+})
+
+test('claustrum custody refuses local-custody actions before checking or dispatching them', async () => {
+  for (const host of ['opencode', 'pi'] as const) {
+    const { calls, executor } = harness(host)
+    const vault = { ...full, custodyMode: 'claustrum' } as const
+    for (const id of NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS) {
+      expect(await executor.execute(samples[id], vault)).toEqual({
+        status: 'refused',
+        code: 'vault-managed',
+        action: id,
+      })
+      // The custody refusal comes first: a headless request, an unconfirmed
+      // removal or a request with missing input is still reported as
+      // vault-managed rather than inviting the caller to fix and resend it.
+      expect(
+        await executeRaw(
+          executor,
+          { action: id, values: {} },
+          {
+            interactive: false,
+            custodyMode: 'claustrum',
+          },
+        ),
+      ).toEqual({ status: 'refused', code: 'vault-managed', action: id })
+    }
+    expect(calls).toHaveLength(0)
+    // Every other action this host offers, except vault disconnect which
+    // this harness has no capability for, still reaches the capability.
+    const retained = hostActionIds(host).filter(
+      (id) =>
+        !(NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS as readonly string[]).includes(
+          id,
+        ) &&
+        !(NATIVE_MENU_VAULT_CUSTODY_ACTION_IDS as readonly string[]).includes(
+          id,
+        ),
+    )
+    for (const id of retained)
+      expect((await executor.execute(samples[id], vault)).status).toBe(
+        'executed',
+      )
+    expect<string[]>(calls.map(([request]) => request.action)).toEqual(retained)
+    // The same executor serves local actions again once custody is local.
+    for (const id of NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS)
+      expect((await executor.execute(samples[id], full)).status).toBe(
+        id === 'custody-mode' ? 'guidance' : 'executed',
+      )
+  }
+})
+
+function disconnectHarness(
+  host: NativeMenuHost,
+  outcome: () => Promise<unknown>,
+) {
+  const dispatched: NativeMenuDispatchRequest[] = []
+  const disconnects: NativeMenuDispatchOptions[] = []
+  const options: unknown = {
+    host,
+    dispatch: async (request: NativeMenuDispatchRequest) => {
+      dispatched.push(request)
+      return { ok: true, text: 'done' }
+    },
+    disconnectVault: async (options: NativeMenuDispatchOptions) => {
+      disconnects.push(options)
+      return outcome()
+    },
+  }
+  // Reflect.apply skips type checking, so the disconnect callback may
+  // resolve to a value outside NativeVaultDisconnectResult, as a JavaScript
+  // host could.
+  const executor: NativeMenuExecutor = Reflect.apply(
+    createNativeMenuExecutor,
+    undefined,
+    [options],
+  )
+  return { executor, dispatched, disconnects }
+}
+
+test('vault disconnect runs only the disconnect capability, only under claustrum custody', async () => {
+  const vault = { ...full, custodyMode: 'claustrum' } as const
+  for (const host of ['opencode', 'pi'] as const) {
+    for (const result of [
+      'disconnected',
+      'idle',
+      'busy',
+      'conflict',
+    ] as const) {
+      const { executor, dispatched, disconnects } = disconnectHarness(
+        host,
+        async () => result,
+      )
+      expect(
+        await executor.execute(samples['vault-disconnect'], vault),
+      ).toEqual({ status: 'disconnect', action: 'vault-disconnect', result })
+      expect(disconnects).toEqual([{}])
+      expect(dispatched).toEqual([])
+    }
+    const { executor, dispatched, disconnects } = disconnectHarness(
+      host,
+      async () => 'disconnected',
+    )
+    // A menu opened while enrolled may submit after the host already left.
+    expect(await executor.execute(samples['vault-disconnect'], full)).toEqual({
+      status: 'refused',
+      code: 'vault-not-connected',
+      action: 'vault-disconnect',
+    })
+    expect(
+      await executor.execute(samples['vault-disconnect'], {
+        ...vault,
+        interactive: false,
+      }),
+    ).toEqual({
+      status: 'refused',
+      code: 'interactive-required',
+      action: 'vault-disconnect',
+    })
+    expect(
+      await executor.execute(samples['vault-disconnect'], {
+        ...vault,
+        confirmed: false,
+      }),
+    ).toEqual({
+      status: 'refused',
+      code: 'confirmation-required',
+      action: 'vault-disconnect',
+    })
+    expect(
+      await executeRaw(
+        executor,
+        { action: 'vault-disconnect', values: { id: 'x' } },
+        vault,
+      ),
+    ).toEqual({
+      status: 'refused',
+      code: 'unknown-parameter',
+      action: 'vault-disconnect',
+    })
+    const controller = new AbortController()
+    controller.abort()
+    expect(
+      await executor.execute(samples['vault-disconnect'], {
+        ...vault,
+        signal: controller.signal,
+      }),
+    ).toEqual({
+      status: 'refused',
+      code: 'aborted',
+      action: 'vault-disconnect',
+    })
+    expect(disconnects).toEqual([])
+    expect(dispatched).toEqual([])
+  }
+})
+
+test('vault disconnect is unsupported without a capability and reports capability failures generically', async () => {
+  const vault = { ...full, custodyMode: 'claustrum' } as const
+  const { calls, executor } = harness()
+  expect(await executor.execute(samples['vault-disconnect'], vault)).toEqual({
+    status: 'refused',
+    code: 'unsupported-action',
+  })
+  expect(calls).toEqual([])
+  for (const [outcome, code] of [
+    [
+      async () => {
+        throw new Error('sk-ant-synthetic-secret')
+      },
+      'execution-failed',
+    ],
+    [async () => 'removed', 'invalid-outcome'],
+    [async () => ({ result: 'disconnected' }), 'invalid-outcome'],
+    [async () => undefined, 'invalid-outcome'],
+  ] as const) {
+    const { executor } = disconnectHarness('pi', outcome)
+    const result = await executor.execute(samples['vault-disconnect'], vault)
+    expect(result).toEqual({
+      status: 'failed',
+      action: 'vault-disconnect',
+      code,
+    })
+    expect(JSON.stringify(result)).not.toContain('synthetic-secret')
+  }
+  for (const disconnectVault of ['yes', {}, null]) {
+    expect(() =>
+      Reflect.apply(createNativeMenuExecutor, undefined, [
+        {
+          host: 'opencode',
+          dispatch: async () => ({ ok: true, text: 'done' }),
+          disconnectVault,
+        },
+      ]),
+    ).toThrow('Native menu executor option disconnectVault is invalid')
+  }
 })

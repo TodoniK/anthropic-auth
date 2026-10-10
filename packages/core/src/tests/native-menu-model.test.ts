@@ -8,7 +8,12 @@ import type {
 import { moduleReferences } from '../../scripts/check-native-type-closure.ts'
 import {
   getNativeMenuModel,
+  isNativeMenuLocalCustodyAction,
+  isNativeMenuVaultCustodyAction,
+  listNativeMenuActions,
   NATIVE_MENU_GROUP_IDS,
+  NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS,
+  NATIVE_MENU_VAULT_CUSTODY_ACTION_IDS,
   type NativeMenuAction,
   type NativeMenuActionId,
   type NativeMenuHost,
@@ -65,12 +70,15 @@ const producerParity: [
   Assert<
     Equal<
       Extract<NativeMenuAction, { kind: 'action' }>['id'],
-      Exclude<NativeMenuActionId, 'custody-mode'>
+      Exclude<NativeMenuActionId, 'custody-mode' | 'vault-disconnect'>
     >
   >,
   Assert<
     Assignable<
-      Extract<NativeMenuAction, { id: 'remove' | 'enrollment-reset' }>,
+      Extract<
+        NativeMenuAction,
+        { id: 'remove' | 'enrollment-reset' | 'vault-disconnect' }
+      >,
       { destructive: true; confirm: string }
     >
   >,
@@ -84,6 +92,7 @@ const producerParity: [
             | 'add-oauth-start'
             | 'add-oauth-finish'
             | 'custody-mode'
+            | 'vault-disconnect'
         }
       >,
       { interactive: true; headlessRefusal: NativeMenuRefusalCode }
@@ -860,7 +869,9 @@ const fixture: Record<
 }
 
 function allActions(host: NativeMenuHost) {
-  return getNativeMenuModel(host).groups.flatMap((group) => group.actions)
+  return getNativeMenuModel(host, 'local').groups.flatMap(
+    (group) => group.actions,
+  )
 }
 
 function parameterSignature(parameter: NativeMenuParameter): string {
@@ -890,16 +901,16 @@ test('native group order is Accounts, Quota, Routing, Limits, Cache, Diagnostics
   ] as const
   expect(NATIVE_MENU_GROUP_IDS).toEqual(order)
   for (const host of ['opencode', 'pi'] as const) {
-    expect(getNativeMenuModel(host).groups.map((group) => group.id)).toEqual([
-      ...order,
-    ])
+    expect(
+      getNativeMenuModel(host, 'local').groups.map((group) => group.id),
+    ).toEqual([...order])
   }
   expect(producerParity).toEqual([true, true, true, true, true, true])
 })
 
 for (const host of ['opencode', 'pi'] as const) {
   test(`${host} preserves the literal pinned action and status inventory`, () => {
-    const model = getNativeMenuModel(host)
+    const model = getNativeMenuModel(host, 'local')
     const actual: (string | boolean | readonly string[])[][] = model.groups
       .flatMap((group) => group.actions)
       .map((action) => [
@@ -945,7 +956,7 @@ for (const host of ['opencode', 'pi'] as const) {
 }
 
 test('Pi Prime and quota remain status-only with no Limits or start actions', () => {
-  const pi = getNativeMenuModel('pi')
+  const pi = getNativeMenuModel('pi', 'local')
   expect(pi.groups.find((group) => group.id === 'Limits')).toEqual({
     id: 'Limits',
     actions: [],
@@ -1056,7 +1067,7 @@ test('custody-mode is typed offline setup guidance, never an executable authorit
 
 test('every descriptor has only closed public metadata and parameter identifiers', () => {
   for (const host of ['opencode', 'pi'] as const) {
-    const model = getNativeMenuModel(host)
+    const model = getNativeMenuModel(host, 'local')
     expectKeys(model, ['host', 'groups'])
     for (const group of model.groups) {
       expectKeys(group, ['id', 'actions', 'statuses'])
@@ -1125,10 +1136,10 @@ function expectDeepFrozen(value: unknown) {
 test('output is deterministic and deeply frozen including nested parameter domains', () => {
   expectDeepFrozen(NATIVE_MENU_GROUP_IDS)
   for (const host of ['opencode', 'pi'] as const) {
-    const model = getNativeMenuModel(host)
+    const model = getNativeMenuModel(host, 'local')
     const before = JSON.stringify(model)
     expectDeepFrozen(model)
-    expect(getNativeMenuModel(host)).toBe(model)
+    expect(getNativeMenuModel(host, 'local')).toBe(model)
     expect(Reflect.set(model, 'host', 'other')).toBe(false)
     expect(
       Reflect.set(model.groups, model.groups.length, { id: 'Accounts' }),
@@ -1136,7 +1147,7 @@ test('output is deterministic and deeply frozen including nested parameter domai
     const action = model.groups[0]!.actions[0]!
     expect(Reflect.set(action, 'label', 'changed')).toBe(false)
     expect(Reflect.set(action.parameters[0]!, 'id', 'changed')).toBe(false)
-    expect(JSON.stringify(getNativeMenuModel(host))).toBe(before)
+    expect(JSON.stringify(getNativeMenuModel(host, 'local'))).toBe(before)
     expect(JSON.parse(before)).toEqual(model)
   }
 })
@@ -1156,4 +1167,85 @@ test('emitted native menu declaration has no producer or internal-types referenc
       /(^|\/)internal-types(\/|$)/.test(specifier.replaceAll('\\', '/')),
   )
   expect(forbidden.map(({ specifier }) => specifier)).toEqual([])
+})
+
+test("each custody mode leaves out exactly the other mode's actions on every host", () => {
+  expect([...NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS]).toEqual([
+    'remove',
+    'move-up',
+    'move-down',
+    'enrollment-reset',
+    'add-apikey',
+    'add-oauth-start',
+    'add-oauth-finish',
+    'custody-mode',
+  ])
+  expect([...NATIVE_MENU_VAULT_CUSTODY_ACTION_IDS]).toEqual([
+    'vault-disconnect',
+  ])
+  expectDeepFrozen(NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS)
+  expectDeepFrozen(NATIVE_MENU_VAULT_CUSTODY_ACTION_IDS)
+  for (const host of ['opencode', 'pi'] as const) {
+    const all = listNativeMenuActions(host)
+    expectDeepFrozen(all)
+    expect(listNativeMenuActions(host)).toBe(all)
+    // The local and claustrum models are each cached, and are different objects.
+    const catalog = getNativeMenuModel(host, 'local')
+    expect(getNativeMenuModel(host, 'local')).toBe(catalog)
+    const vault = getNativeMenuModel(host, 'claustrum')
+    expect(getNativeMenuModel(host, 'claustrum')).toBe(vault)
+    expect(catalog).not.toBe(vault)
+    expectDeepFrozen(vault)
+    expect(vault.host).toBe(host)
+    expect(vault.groups.map((group) => group.id)).toEqual(
+      catalog.groups.map((group) => group.id),
+    )
+    const inGroup = (id: string) => all.filter((action) => action.group === id)
+    for (const [index, group] of vault.groups.entries()) {
+      const local = catalog.groups[index]
+      if (!local) throw new Error('group missing')
+      expect(group.statuses).toEqual(local.statuses)
+      expect(local.actions).toEqual(
+        inGroup(local.id).filter(
+          (action) => !isNativeMenuVaultCustodyAction(action.id),
+        ),
+      )
+      expect(group.actions).toEqual(
+        inGroup(group.id).filter(
+          (action) => !isNativeMenuLocalCustodyAction(action.id),
+        ),
+      )
+    }
+    const accounts = (model: typeof vault) =>
+      model.groups
+        .find((group) => group.id === 'Accounts')
+        ?.actions.map((action) => action.id)
+    expect(accounts(vault)).toEqual([
+      'enable',
+      'disable',
+      'reset-backoff',
+      'vault-disconnect',
+    ])
+    expect(accounts(catalog)).not.toContain('vault-disconnect')
+    expect(accounts(catalog)).toContain('custody-mode')
+    // Settings, quota and vault-account controls stay in both modes.
+    const kept = (model: typeof vault) =>
+      model.groups.flatMap((group) => group.actions).map((action) => action.id)
+    expect(kept(vault)).toContain('cache-on')
+    expect(kept(vault)).toContain('logging-level')
+    if (host === 'opencode') expect(kept(vault)).toContain('quota-refresh')
+    expect(all.find((action) => action.id === 'vault-disconnect')).toEqual({
+      id: 'vault-disconnect',
+      kind: 'vault-disconnect',
+      command: 'account',
+      group: 'Accounts',
+      label: 'Disconnect from the vault',
+      destructive: true,
+      confirm:
+        "Disconnect this host from the vault and return to local accounts? The vault keeps this host's enrollment approved until an operator revokes it there.",
+      interactive: true,
+      headlessRefusal: 'interactive-required',
+      parameters: [],
+    })
+  }
 })

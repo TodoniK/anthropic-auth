@@ -1,6 +1,8 @@
 import { types as utilTypes } from 'node:util'
 import {
-  getNativeMenuModel,
+  isNativeMenuLocalCustodyAction,
+  isNativeMenuVaultCustodyAction,
+  listNativeMenuActions,
   type NativeMenuAction,
   type NativeMenuActionId,
   type NativeMenuCacheMode,
@@ -72,6 +74,7 @@ export type NativeMenuActionValues = {
     readonly label?: string | null
   }
   readonly 'custody-mode': { readonly mode: NativeMenuCustodyMode }
+  readonly 'vault-disconnect': NativeMenuNoValues
   readonly 'quota-refresh': NativeMenuNoValues
   readonly 'routing-mode': { readonly mode: NativeMenuRoutingMode }
   readonly 'routing-reset': NativeMenuNoValues
@@ -118,10 +121,13 @@ export type NativeMenuSessionActionId =
   | 'add-oauth-start'
   | 'add-oauth-finish'
 
-/** Custody changes are offline setup steps, so they are never dispatched. */
+/**
+ * Custody changes are offline setup steps, and vault disconnect goes through
+ * the host's own disconnect capability, so neither is dispatched.
+ */
 export type NativeMenuDispatchActionId = Exclude<
   NativeMenuActionId,
-  'custody-mode'
+  'custody-mode' | 'vault-disconnect'
 >
 
 /** Checked values: empty optional inputs are left out instead of `null`. */
@@ -166,12 +172,44 @@ export type NativeMenuDispatch = (
 export type NativeMenuExecutorOptions = {
   readonly host: NativeMenuHost
   readonly dispatch: NativeMenuDispatch
+  /**
+   * Ends this host's vault enrollment. Without it the executor does not offer
+   * vault-disconnect and refuses it as unsupported.
+   */
+  readonly disconnectVault?: NativeVaultDisconnect
 }
+
+/**
+ * What a host's vault disconnect reports. `disconnected`: the host is back in
+ * local custody. `idle`: no active enrollment remains; Pi's saved sign-in may
+ * still have been restored. `busy`: another process holds the enrollment lock
+ * and disconnect could not finish. `conflict`:
+ * the host's stored sign-in could not be restored without overwriting one it
+ * already has, so both were kept and the enrollment remains.
+ */
+export type NativeVaultDisconnectResult =
+  | 'disconnected'
+  | 'idle'
+  | 'busy'
+  | 'conflict'
+
+/** The host capability that disconnects this host from the vault. */
+export type NativeVaultDisconnect = (
+  options: NativeMenuDispatchOptions,
+) => Promise<NativeVaultDisconnectResult>
 
 /** Facts about the invocation that the safety rules depend on. */
 export type NativeMenuExecutionContext = {
   /** False when no person can answer prompts (a headless or scripted run). */
   readonly interactive: boolean
+  /**
+   * The host's credential custody, read just before this request. Under
+   * claustrum custody the vault owns every account, so actions listed in
+   * NATIVE_MENU_LOCAL_CUSTODY_ACTION_IDS are refused before dispatch. Under
+   * local custody there is no enrollment to end, so vault disconnect is
+   * refused. There is no default: a context without a valid mode is refused.
+   */
+  readonly custodyMode: NativeMenuCustodyMode
   /** True once the person confirmed an action that requires confirmation. */
   readonly confirmed?: boolean
   /** The conversation the request came from, when the host has one. */
@@ -190,6 +228,10 @@ export type NativeMenuExecutorRefusalCode =
   | 'confirmation-required'
   | 'session-required'
   | 'aborted'
+  /** The host is connected to the vault, which owns its accounts. */
+  | 'vault-managed'
+  /** The host is not connected to the vault, so there is nothing to end. */
+  | 'vault-not-connected'
 
 export type NativeMenuExecutionResult =
   | {
@@ -205,8 +247,14 @@ export type NativeMenuExecutionResult =
        * unreadable. Whether its effect happened is unknown.
        */
       readonly status: 'failed'
-      readonly action: NativeMenuDispatchActionId
+      readonly action: NativeMenuDispatchActionId | 'vault-disconnect'
       readonly code: 'execution-failed' | 'invalid-outcome'
+    }
+  | {
+      /** The host's disconnect capability ran and reported this result. */
+      readonly status: 'disconnect'
+      readonly action: 'vault-disconnect'
+      readonly result: NativeVaultDisconnectResult
     }
   | {
       /** Offline custody setup steps; nothing was changed. */
@@ -474,6 +522,7 @@ function isAborted(signal: AbortSignal | undefined): boolean {
 
 type CheckedContext = {
   readonly interactive: boolean
+  readonly custodyMode: NativeMenuCustodyMode
   readonly confirmed: boolean
   readonly sessionId?: string
   readonly signal?: AbortSignal
@@ -481,6 +530,7 @@ type CheckedContext = {
 
 const CONTEXT_KEYS = [
   'interactive',
+  'custodyMode',
   'confirmed',
   'sessionId',
   'signal',
@@ -490,10 +540,12 @@ function readContext(value: unknown): CheckedContext | undefined {
   const fields = readPlain(value, CONTEXT_KEYS)
   if (!(fields instanceof Map)) return undefined
   const interactive = fields.get('interactive')
+  const custodyMode = fields.get('custodyMode')
   const confirmed = fields.get('confirmed')
   const sessionId = fields.get('sessionId')
   const rawSignal = fields.get('signal')
   if (typeof interactive !== 'boolean') return undefined
+  if (custodyMode !== 'local' && custodyMode !== 'claustrum') return undefined
   if (confirmed !== undefined && typeof confirmed !== 'boolean')
     return undefined
   if (sessionId !== undefined && typeof sessionId !== 'string') return undefined
@@ -505,6 +557,7 @@ function readContext(value: unknown): CheckedContext | undefined {
   }
   return {
     interactive,
+    custodyMode,
     confirmed: confirmed === true,
     ...(sessionId !== undefined && hasContent(sessionId) ? { sessionId } : {}),
     ...(signal !== undefined ? { signal } : {}),
@@ -517,6 +570,10 @@ type Plan =
       readonly kind: 'dispatch'
       readonly action: NativeMenuDispatchActionId
       readonly request: NativeMenuDispatchRequest
+      readonly options: NativeMenuDispatchOptions
+    }
+  | {
+      readonly kind: 'disconnect'
       readonly options: NativeMenuDispatchOptions
     }
 
@@ -539,6 +596,21 @@ function plan(
 
   const context = readContext(rawContext)
   if (!context) return done(refused('invalid-context', action.id))
+  // A menu opened before the host connected to the vault can still submit an
+  // action offered only under local custody. Refuse it before any input is
+  // read or dispatched.
+  if (
+    context.custodyMode === 'claustrum' &&
+    isNativeMenuLocalCustodyAction(action.id)
+  )
+    return done(refused('vault-managed', action.id))
+  // Likewise a menu opened while enrolled can submit a disconnect after the
+  // host has already left the vault.
+  if (
+    context.custodyMode === 'local' &&
+    isNativeMenuVaultCustodyAction(action.id)
+  )
+    return done(refused('vault-not-connected', action.id))
   if (action.interactive && !context.interactive)
     return done(refused(action.headlessRefusal, action.id))
 
@@ -585,6 +657,11 @@ function plan(
     )
   }
 
+  const options = Object.freeze(
+    context.signal !== undefined ? { signal: context.signal } : {},
+  )
+  if (action.kind === 'vault-disconnect') return { kind: 'disconnect', options }
+
   const dispatchRequest = Object.freeze({
     action: action.id,
     values: Object.freeze(checked),
@@ -594,11 +671,17 @@ function plan(
     kind: 'dispatch',
     action: action.id,
     request: dispatchRequest,
-    options: Object.freeze(
-      context.signal !== undefined ? { signal: context.signal } : {},
-    ),
+    options,
   }
 }
+
+const DISCONNECT_RESULTS: ReadonlySet<unknown> =
+  new Set<NativeVaultDisconnectResult>([
+    'disconnected',
+    'idle',
+    'busy',
+    'conflict',
+  ])
 
 function readOutcome(
   action: NativeMenuDispatchActionId,
@@ -618,24 +701,68 @@ function invalidOption(key: string): TypeError {
 
 /**
  * Creates an executor for one host. The host's available actions and their
- * safety rules come from getNativeMenuModel; `dispatch` is captured once and
- * called only with fully checked requests.
+ * safety rules come from the native menu model; `dispatch` and
+ * `disconnectVault` are captured once and called only with fully checked
+ * requests.
  */
 export function createNativeMenuExecutor(
   options: NativeMenuExecutorOptions,
 ): NativeMenuExecutor {
-  const fields = readPlain(options, ['host', 'dispatch'])
+  const fields = readPlain(options, ['host', 'dispatch', 'disconnectVault'])
   if (!(fields instanceof Map))
     throw new TypeError('Native menu executor options are invalid')
   const host = fields.get('host')
   const dispatch = fields.get('dispatch')
+  const disconnectVault = fields.get('disconnectVault')
   if (!HOSTS.has(host)) throw invalidOption('host')
   if (typeof dispatch !== 'function' || utilTypes.isProxy(dispatch))
     throw invalidOption('dispatch')
+  if (
+    disconnectVault !== undefined &&
+    (typeof disconnectVault !== 'function' ||
+      utilTypes.isProxy(disconnectVault))
+  )
+    throw invalidOption('disconnectVault')
 
   const actions = new Map<string, NativeMenuAction>()
-  for (const group of getNativeMenuModel(host as NativeMenuHost).groups)
-    for (const action of group.actions) actions.set(action.id, action)
+  // Index every action the host supports in either custody mode; plan()
+  // refuses the ones the request's custody mode does not offer before any
+  // capability runs. Without a disconnect capability, vault-disconnect is not
+  // offered at all.
+  for (const action of listNativeMenuActions(host as NativeMenuHost))
+    if (action.kind !== 'vault-disconnect' || disconnectVault !== undefined)
+      actions.set(action.id, action)
+
+  const disconnect = async (
+    options: NativeMenuDispatchOptions,
+  ): Promise<NativeMenuExecutionResult> => {
+    let result: unknown
+    try {
+      result = await Reflect.apply(
+        disconnectVault as NativeVaultDisconnect,
+        undefined,
+        [options],
+      )
+    } catch {
+      // The thrown value is never read: it may carry secrets or run code.
+      return Object.freeze({
+        status: 'failed',
+        action: 'vault-disconnect',
+        code: 'execution-failed',
+      })
+    }
+    if (!DISCONNECT_RESULTS.has(result))
+      return Object.freeze({
+        status: 'failed',
+        action: 'vault-disconnect',
+        code: 'invalid-outcome',
+      })
+    return Object.freeze({
+      status: 'disconnect',
+      action: 'vault-disconnect',
+      result: result as NativeVaultDisconnectResult,
+    })
+  }
 
   const execute = async (
     request: NativeMenuRequest,
@@ -648,6 +775,7 @@ export function createNativeMenuExecutor(
       return refused('invalid-request')
     }
     if (next.kind === 'done') return next.result
+    if (next.kind === 'disconnect') return disconnect(next.options)
     let outcome: unknown
     try {
       outcome = await Reflect.apply(dispatch, undefined, [

@@ -31,6 +31,8 @@ describe('rpc-server', () => {
     const menu = createNativeUi({
       host: 'opencode',
       interactive: true,
+      readMode: async () => 'local',
+      disconnectVault: async () => 'idle',
       dispatch: async (request) => {
         calls.push(request)
         return { ok: true, text: 'Applied limits' }
@@ -117,6 +119,8 @@ describe('rpc-server', () => {
     const menu = createNativeUi({
       host: 'opencode',
       interactive: true,
+      readMode: async () => 'local',
+      disconnectVault: async () => 'idle',
       dispatch: async () => {
         calls++
         return { ok: true, text: 'removed' }
@@ -145,6 +149,59 @@ describe('rpc-server', () => {
       true,
     )
     expect(calls).toBe(1)
+  })
+
+  test('native IPC refuses a stale local account apply after the vault connects and restores it after disconnect', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'aa-native-rpc-'))
+    const calls: NativeMenuDispatchRequest[] = []
+    let custody: 'local' | 'claustrum' = 'local'
+    const menu = createNativeUi({
+      host: 'opencode',
+      interactive: true,
+      readMode: async () => custody,
+      disconnectVault: async () => 'idle',
+      dispatch: async (request) => {
+        calls.push(request)
+        return { ok: true, text: 'Applied' }
+      },
+      readStatus: async () => 'public',
+    })
+    const server = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'legacy', knobs: {} }),
+      applyMenu: (request) =>
+        menu.apply(request, { sessionId: request.sessionId, notify() {} }),
+    })
+    stop = server.stop
+    const client = createRpcClient(dir, process.pid)
+    const opened = await menu.open({ sessionId: 'a', notify() {} })
+    expect(
+      opened.menu.sections[0]?.actions.map((action) => action.id),
+    ).toContain('add-apikey')
+    const request: CommandApplyRequest = {
+      command: 'claude',
+      sectionId: 'Accounts',
+      actionId: 'add-apikey',
+      values: { apiKey: 'synthetic-rpc-key' },
+      sessionId: 'a',
+    }
+    custody = 'claustrum'
+    const refused = await client.applyMenu(request)
+    expect(refused).toMatchObject({ ok: false, code: 'vault-managed' })
+    expect(JSON.stringify(refused)).not.toContain('synthetic-rpc-key')
+    expect(refused.menu?.sections[0]?.lines[0]).toBe(
+      'Accounts are managed in the vault. Disconnect from the vault to use local accounts.',
+    )
+    expect(
+      refused.menu?.sections[0]?.actions.map((action) => action.id),
+    ).not.toContain('add-apikey')
+    expect(calls).toEqual([])
+    custody = 'local'
+    expect((await client.applyMenu(request)).ok).toBe(true)
+    expect(calls).toEqual([
+      { action: 'add-apikey', values: { apiKey: 'synthetic-rpc-key' } },
+    ])
   })
 
   test('native IPC redacts arbitrary callback errors and refuses an absent capability', async () => {

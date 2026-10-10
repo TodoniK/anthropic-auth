@@ -44,11 +44,16 @@ import {
   type NativeMenuDispatch,
   type NativeMenuExecutionResult,
   type NativeMenuRequest,
+  type NativeVaultDisconnect,
+  type NativeVaultDisconnectResult,
 } from './native-menu-executor.ts'
 import {
   getNativeMenuModel,
+  isNativeMenuLocalCustodyAction,
+  listNativeMenuActions,
   type NativeMenuAction,
   type NativeMenuCommandId,
+  type NativeMenuCustodyMode,
   type NativeMenuGroupId,
   type NativeMenuHost,
   type NativeMenuParameter,
@@ -63,9 +68,36 @@ export interface NativeUiOptions {
     command: Exclude<NativeMenuCommandId, 'start'>,
     invocation: CommandInvocation,
   ) => Promise<string>
+  /**
+   * Reads the host's current credential custody from its enrollment record,
+   * never from status text. It is called each time the menu opens or applies
+   * an action, so connecting or disconnecting the vault takes effect without
+   * rebuilding the menu. Under 'claustrum' the menu leaves out and refuses
+   * actions offered only under local custody: host-local account and
+   * credential writes, and enrollment reset. A rejection or any other value
+   * is treated as unknown custody, which also withholds them.
+   */
+  readonly readMode: () => Promise<NativeMenuCustodyMode>
+  /**
+   * Disconnects this host from the vault; while enrolled, this is the host's
+   * only enrollment action. Before ending the enrollment, the callback
+   * restores any host sign-in set aside when the host joined the vault. If
+   * that restore would overwrite a sign-in the host already has, the callback
+   * reports `conflict` and leaves the enrollment in place. Every host must
+   * supply it: a host enrolled in the vault, or with an unreadable
+   * enrollment, always needs a way back to local accounts.
+   */
+  readonly disconnectVault: NativeVaultDisconnect
   /** The host sets this flag; RPC callers cannot declare themselves interactive. */
   readonly interactive: boolean
 }
+
+/** Shown in Accounts while the vault owns this host's accounts. */
+const VAULT_ACCOUNTS_GUIDANCE =
+  'Accounts are managed in the vault. Disconnect from the vault to use local accounts.'
+/** Shown in Accounts when the host's custody mode cannot be read. */
+const UNKNOWN_CUSTODY_GUIDANCE =
+  'Account custody could not be read, so local account changes are unavailable.'
 
 const slots: Record<NativeMenuGroupId, SectionSlot> = {
   Accounts: 'accounts',
@@ -231,6 +263,30 @@ function showSignInLink(text: string, scrub: (text: string) => string) {
   return text.split(link).map(scrub).join(link)
 }
 
+/** What a person sees for each result of a vault disconnect. */
+const DISCONNECT_OUTCOMES: Readonly<
+  Record<NativeVaultDisconnectResult, ReturnType<typeof outcome>>
+> = {
+  disconnected: {
+    ok: true,
+    text: 'Disconnected from the vault. This host uses local accounts again.',
+  },
+  idle: {
+    ok: true,
+    text: 'This host has no active vault enrollment.',
+  },
+  busy: {
+    ok: false,
+    code: 'busy',
+    text: "Vault disconnect could not finish because another process is changing this host's enrollment. Try again.",
+  },
+  conflict: {
+    ok: false,
+    code: 'conflict',
+    text: 'Disconnect stopped: this host already has a different stored sign-in, so it and the sign-in saved when the host joined the vault were both kept, and the vault connection remains. Resolve the two sign-ins with offline setup.',
+  },
+}
+
 function outcome(result: NativeMenuExecutionResult): {
   ok: boolean
   text: string
@@ -249,9 +305,23 @@ function outcome(result: NativeMenuExecutionResult): {
         ok: true,
         text: `Offline ${result.mode} setup guidance (nothing changed):\n${result.instructions.join('\n')}`,
       }
+    case 'disconnect':
+      return DISCONNECT_OUTCOMES[result.result]
     case 'failed':
       return { ok: false, code: result.code, text: 'Action failed.' }
     case 'refused':
+      if (result.code === 'vault-managed')
+        return {
+          ok: false,
+          code: result.code,
+          text: `Action refused: ${VAULT_ACCOUNTS_GUIDANCE}`,
+        }
+      if (result.code === 'vault-not-connected')
+        return {
+          ok: false,
+          code: result.code,
+          text: 'Action refused: this host is not connected to the vault.',
+        }
       return {
         ok: false,
         code: result.code,
@@ -272,17 +342,28 @@ function outcome(result: NativeMenuExecutionResult): {
  * hidden entry until those controls support it.
  */
 export function createNativeUi(options: NativeUiOptions): CommandMenu {
-  const { host, dispatch, readStatus, interactive } = options
-  const native = getNativeMenuModel(host)
-  const executor = createNativeMenuExecutor({ host, dispatch })
+  const { host, dispatch, readStatus, readMode, disconnectVault, interactive } =
+    options
+  if (typeof readMode !== 'function')
+    throw new TypeError('Native UI requires a custody mode reader')
+  if (typeof disconnectVault !== 'function')
+    throw new TypeError('Native UI requires a vault disconnect callback')
+  // Look up submitted actions in every action the host supports under either
+  // custody mode, not just the ones currently shown. A hidden or stale action
+  // is then still recognised, and its secret input keys (an API key or OAuth
+  // code) are known, so the refusal and any status notification redact them.
+  const catalog = listNativeMenuActions(host)
+  const executor = createNativeMenuExecutor({
+    host,
+    dispatch,
+    disconnectVault,
+  })
   const protectedIds = new Set(
-    native.groups.flatMap((group) =>
-      group.actions.flatMap((action) =>
-        action.parameters.flatMap((parameter) =>
-          parameter.kind === 'text' && parameter.protectedEntry
-            ? [parameter.id]
-            : [],
-        ),
+    catalog.flatMap((action) =>
+      action.parameters.flatMap((parameter) =>
+        parameter.kind === 'text' && parameter.protectedEntry
+          ? [parameter.id]
+          : [],
       ),
     ),
   )
@@ -301,15 +382,43 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
     }
   }
 
+  /**
+   * Reads custody for one open or apply. Only the two known modes count; a
+   * rejection or any other value is unknown, never local. The rejection value
+   * is not inspected because it could quote credentials.
+   */
+  async function readCustody(): Promise<NativeMenuCustodyMode | undefined> {
+    try {
+      const mode: unknown = await readMode()
+      return mode === 'local' || mode === 'claustrum' ? mode : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   async function model(
     invocation: CommandInvocation,
     scrub: (text: string) => string = redact,
     readable = true,
   ): Promise<CommandMenuModel> {
     const safeInvocation = capture(invocation, scrub)
+    const custody = await readCustody()
+    // When the custody mode cannot be read, the menu shows the vault
+    // (claustrum) action set. Sign-in, API-key, removal and reordering
+    // actions stay hidden because they would write this host's own account
+    // files. Account enable, disable, reset-backoff, plugin settings and
+    // vault disconnect remain, so a host whose enrollment is corrupt can
+    // still disconnect and return to local accounts.
+    const offered = getNativeMenuModel(host, custody ?? 'claustrum')
     const sections = []
-    for (const group of native.groups) {
+    for (const group of offered.groups) {
       const lines: string[] = []
+      if (group.id === 'Accounts' && custody !== 'local')
+        lines.push(
+          custody === 'claustrum'
+            ? VAULT_ACCOUNTS_GUIDANCE
+            : UNKNOWN_CUSTODY_GUIDANCE,
+        )
       for (const status of group.statuses) {
         if (!readable) {
           lines.push(`${status.label}: status unavailable.`)
@@ -333,7 +442,15 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
           label: action.label,
           knobs: action.parameters.map(knob),
           ...(action.destructive
-            ? { confirm: { message: action.confirm, irreversible: true } }
+            ? {
+                confirm: {
+                  message: action.confirm,
+                  // Disconnecting is reversed by connecting the host to the
+                  // vault again with offline setup. Removal and enrollment
+                  // reset cannot be reversed that way.
+                  irreversible: action.kind !== 'vault-disconnect',
+                },
+              }
             : {}),
           ...(action.kind === 'setup-guidance'
             ? { description: 'Offline guidance only; no settings are changed.' }
@@ -363,11 +480,9 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
         // Refuse without inspecting the thrown value.
         request = undefined
       }
-      const group = native.groups.find(
-        (entry) => entry.id === request?.sectionId,
-      )
-      const action: NativeMenuAction | undefined = group?.actions.find(
-        (entry) => entry.id === request?.actionId,
+      const action: NativeMenuAction | undefined = catalog.find(
+        (entry) =>
+          entry.id === request?.actionId && entry.group === request?.sectionId,
       )
       const values: Record<string, unknown> = { ...request?.values }
       // Status callbacks can reflect submitted input even after a request was
@@ -436,6 +551,24 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
           }
         }
       }
+      // The custody mode is read again for every apply. The menu may have
+      // been opened under the other mode, and an action the current mode
+      // does not offer must be refused before it reaches the host.
+      const custody = await readCustody()
+      // Unknown custody refuses local-custody actions here. Vault disconnect
+      // stays available because a corrupted enrollment must keep a recovery
+      // action. The host's disconnect callback does the safety checks: it
+      // deletes only this host's enrollment token and ceremony record, and
+      // refuses if either file has the wrong owner or is readable by others.
+      // For Pi it first restores the Anthropic sign-in that enrollment moved
+      // out of Pi's auth file, and stops without disconnecting if that would
+      // overwrite a sign-in Pi already has.
+      if (custody === undefined && isNativeMenuLocalCustodyAction(action.id))
+        return finish({
+          ok: false,
+          code: 'custody-unavailable',
+          text: `Action refused: ${UNKNOWN_CUSTODY_GUIDANCE}`,
+        })
       // The scalar transport cannot express the correlated native request type.
       // This is the untrusted boundary: the executor checks every field before
       // the injected capability receives a typed NativeMenuDispatchRequest.
@@ -443,6 +576,7 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
         { action: action.id, values } as NativeMenuRequest,
         {
           interactive,
+          custodyMode: custody ?? 'claustrum',
           confirmed: request.confirmed,
           sessionId: invocation.sessionId,
         },

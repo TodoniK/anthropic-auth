@@ -1,16 +1,32 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { disconnectClaustrumEnrollment } from '@cortexkit/common-auth/claustrum'
 import type {
   CommandApplyRequest,
   KnobValues,
 } from '@cortexkit/common-auth/commands'
 import { authorize, exchange } from '../auth.ts'
+import { getHostClaustrumEnrollmentPaths } from '../claustrum-enrollment.ts'
 import { TOKEN_URL } from '../constants.ts'
-import type { NativeMenuDispatchRequest } from '../native-menu-executor.ts'
+import { readNativeEnrollmentMode } from '../native-enrollment-authority.ts'
+import type {
+  NativeMenuDispatchRequest,
+  NativeVaultDisconnect,
+  NativeVaultDisconnectResult,
+} from '../native-menu-executor.ts'
 import type {
   NativeMenuActionId,
   NativeMenuGroupId,
 } from '../native-menu-model.ts'
-import { createNativeUi, runPiCommandMenu } from '../native-ui.ts'
+import {
+  type CommandMenu,
+  createNativeUi,
+  type NativeUiOptions,
+  runPiCommandMenu,
+} from '../native-ui.ts'
+import { resolveNativePoolPaths } from '../pool-paths.ts'
 
 const opaqueId = 'vault:oauth:team:person'
 const entries = [{ account: opaqueId, fh: 5, sd: 10, scoped: 23 }]
@@ -37,6 +53,7 @@ const fixtures = {
     { code: 'synthetic-code', label: 'two words' },
   ],
   'custody-mode': ['Accounts', { mode: 'claustrum' }],
+  'vault-disconnect': ['Accounts', {}],
   'quota-refresh': ['Quota', {}],
   'routing-mode': ['Routing', { mode: 'sticky-balanced' }],
   'routing-reset': ['Routing', {}],
@@ -61,6 +78,9 @@ const fixtures = {
 } satisfies Record<NativeMenuActionId, [NativeMenuGroupId, KnobValues]>
 
 const invocation = { sessionId: 'conversation-1', notify() {} }
+const localCustody = async () => 'local' as const
+/** These tests never select disconnect; return 'idle' if the callback is invoked. */
+const unusedDisconnect = async () => 'idle' as const
 const piUnavailable = [
   'quota-refresh',
   'killswitch-on',
@@ -71,12 +91,69 @@ const piUnavailable = [
   'start-fire',
 ]
 
-function setup(host: 'opencode' | 'pi' = 'opencode', interactive = true) {
+function applyFixture(
+  menu: CommandMenu,
+  actionId: NativeMenuActionId,
+  patch: Partial<CommandApplyRequest> = {},
+) {
+  return menu.apply(
+    {
+      command: 'claude',
+      sectionId: fixtures[actionId][0],
+      actionId,
+      values: fixtures[actionId][1],
+      sessionId: invocation.sessionId,
+      confirmed: true,
+      ...patch,
+    },
+    invocation,
+  )
+}
+
+/**
+ * Exercise JavaScript callers that return an invalid value from readMode.
+ * Reflect.apply allows those inputs without weakening the production type.
+ */
+function rawSetup(
+  readMode: () => Promise<unknown>,
+  disconnectVault: NativeVaultDisconnect,
+) {
+  const calls: NativeMenuDispatchRequest[] = []
+  const options: unknown = {
+    host: 'opencode',
+    interactive: true,
+    readMode,
+    disconnectVault,
+    dispatch: async (request: NativeMenuDispatchRequest) => {
+      calls.push(request)
+      return { ok: true, text: 'Applied' }
+    },
+    readStatus: async (command: string) => `${command}: public status`,
+  }
+  const menu: CommandMenu = Reflect.apply(createNativeUi, undefined, [options])
+  return {
+    menu,
+    calls,
+    apply: (
+      actionId: NativeMenuActionId,
+      patch: Partial<CommandApplyRequest> = {},
+    ) => applyFixture(menu, actionId, patch),
+  }
+}
+
+function setup(
+  host: 'opencode' | 'pi' = 'opencode',
+  interactive = true,
+  readMode: NativeUiOptions['readMode'] = localCustody,
+  disconnectVault: NativeVaultDisconnect = unusedDisconnect,
+) {
   const calls: NativeMenuDispatchRequest[] = []
   const reads: string[] = []
   const menu = createNativeUi({
     host,
     interactive,
+    readMode,
+    disconnectVault,
     dispatch: async (request) => {
       calls.push(request)
       return { ok: true, text: 'Applied' }
@@ -89,19 +166,7 @@ function setup(host: 'opencode' | 'pi' = 'opencode', interactive = true) {
   const apply = (
     actionId: NativeMenuActionId,
     patch: Partial<CommandApplyRequest> = {},
-  ) =>
-    menu.apply(
-      {
-        command: 'claude',
-        sectionId: fixtures[actionId][0],
-        actionId,
-        values: fixtures[actionId][1],
-        sessionId: invocation.sessionId,
-        confirmed: true,
-        ...patch,
-      },
-      invocation,
-    )
+  ) => applyFixture(menu, actionId, patch)
   return { menu, calls, reads, apply }
 }
 
@@ -178,7 +243,9 @@ describe('native UI contract', () => {
         ),
       ).toEqual(
         Object.keys(fixtures).filter(
-          (id) => host === 'opencode' || !piUnavailable.includes(id),
+          (id) =>
+            (host === 'opencode' || !piUnavailable.includes(id)) &&
+            id !== 'vault-disconnect',
         ),
       )
       const actions = payload.menu.sections.flatMap(
@@ -219,6 +286,9 @@ describe('native UI contract', () => {
     })
     for (const actionId of Object.keys(fixtures) as NativeMenuActionId[]) {
       if (host === 'pi' && piUnavailable.includes(actionId)) continue
+      // This loop covers local accounts. Separate disconnect tests check hosts
+      // with vault enrollment and every disconnect outcome.
+      if (actionId === 'vault-disconnect') continue
       test(`${host} executes ${actionId} with all parameters intact`, async () => {
         const { calls, apply } = setup(host)
         const result = await apply(actionId)
@@ -338,6 +408,8 @@ describe('native UI contract', () => {
     const menu = createNativeUi({
       host: 'opencode',
       interactive: true,
+      readMode: localCustody,
+      disconnectVault: unusedDisconnect,
       dispatch: async () => {
         after = true
         return { ok: true, text: 'Accepted synthetic-private-key' }
@@ -378,6 +450,8 @@ describe('native UI contract', () => {
         const menu = createNativeUi({
           host: 'opencode',
           interactive: mode !== 'headless',
+          readMode: localCustody,
+          disconnectVault: unusedDisconnect,
           dispatch: async () => {
             dispatches++
             return { ok: true, text: `Accepted ${secret}` }
@@ -489,6 +563,8 @@ describe('native UI contract', () => {
     const menu = createNativeUi({
       host: 'opencode',
       interactive: true,
+      readMode: localCustody,
+      disconnectVault: unusedDisconnect,
       dispatch: async () => {
         dispatches++
         return { ok: true, text: 'not expected' }
@@ -527,6 +603,8 @@ describe('native UI contract', () => {
     const menu = createNativeUi({
       host: 'opencode',
       interactive: true,
+      readMode: localCustody,
+      disconnectVault: unusedDisconnect,
       dispatch: async () => {
         throw new Error('secret-operation-material')
       },
@@ -590,6 +668,8 @@ describe('OAuth sign-in link', () => {
     const menu = createNativeUi({
       host: 'opencode',
       interactive: true,
+      readMode: localCustody,
+      disconnectVault: unusedDisconnect,
       dispatch: async (request) => {
         if (request.action === 'add-oauth-start') {
           pending = await authorize('max')
@@ -695,6 +775,8 @@ describe('OAuth sign-in link', () => {
     const menu = createNativeUi({
       host: 'opencode',
       interactive: true,
+      readMode: localCustody,
+      disconnectVault: unusedDisconnect,
       dispatch: async () => {
         dispatches++
         return outcome
@@ -820,11 +902,432 @@ describe('OAuth sign-in link', () => {
     const headless = createNativeUi({
       host: 'opencode',
       interactive: false,
+      readMode: localCustody,
+      disconnectVault: unusedDisconnect,
       dispatch: async () => ({ ok: true, text }),
       readStatus: async () => 'public',
     })
     expect((await headless.apply(request, invocation)).code).toBe(
       'interactive-required',
     )
+  })
+})
+
+const localCustodyIds: readonly NativeMenuActionId[] = [
+  'remove',
+  'move-up',
+  'move-down',
+  'enrollment-reset',
+  'add-apikey',
+  'add-oauth-start',
+  'add-oauth-finish',
+  'custody-mode',
+]
+const vaultGuidance =
+  'Accounts are managed in the vault. Disconnect from the vault to use local accounts.'
+const unknownGuidance =
+  'Account custody could not be read, so local account changes are unavailable.'
+
+function offeredIds(
+  sections: readonly { actions: readonly { id: string }[] }[],
+) {
+  return sections.flatMap((section) =>
+    section.actions.map((action) => action.id),
+  )
+}
+
+describe('vault custody', () => {
+  for (const host of ['opencode', 'pi'] as const) {
+    test(`${host} vault menu removes local-custody actions and shows one guidance line`, async () => {
+      const { menu, calls, reads } = setup(
+        host,
+        true,
+        async () => 'claustrum',
+        async () => 'disconnected',
+      )
+      const local = await setup(host).menu.open(invocation)
+      const payload = await menu.open(invocation)
+      const accounts = payload.menu.sections.find(
+        (section) => section.id === 'Accounts',
+      )
+      expect(accounts?.lines[0]).toBe(vaultGuidance)
+      expect(
+        payload.menu.sections.flatMap((section) => section.lines),
+      ).toContain(vaultGuidance)
+      expect(
+        payload.menu.sections
+          .flatMap((section) => section.lines)
+          .filter((line) => line === vaultGuidance),
+      ).toHaveLength(1)
+      // The guidance is a read-only line, never a selectable item or action.
+      expect(accounts?.items).toEqual([])
+      expect(accounts?.actions.map((action) => action.id)).toEqual([
+        'enable',
+        'disable',
+        'reset-backoff',
+        'vault-disconnect',
+      ])
+      // Disconnect is confirmed, but marked reversible: connecting again
+      // through offline setup undoes it.
+      expect(accounts?.actions.at(-1)?.confirm).toEqual({
+        message:
+          "Disconnect this host from the vault and return to local accounts? The vault keeps this host's enrollment approved until an operator revokes it there.",
+        irreversible: false,
+      })
+      expect(
+        offeredIds(payload.menu.sections).filter(
+          (id) => id !== 'vault-disconnect',
+        ),
+      ).toEqual(
+        offeredIds(local.menu.sections).filter(
+          (id) => !(localCustodyIds as readonly string[]).includes(id),
+        ),
+      )
+      expect(offeredIds(local.menu.sections)).not.toContain('vault-disconnect')
+      // Every other section, its status lines and its actions are unchanged.
+      expect(payload.menu.sections.slice(1)).toEqual(
+        local.menu.sections.slice(1),
+      )
+      expect(accounts?.lines.slice(1)).toEqual(
+        local.menu.sections[0]?.lines ?? [],
+      )
+      expect(reads).toContain('account:conversation-1')
+      expect(calls).toEqual([])
+    })
+  }
+
+  test('a stale local-custody apply is refused before dispatch and the refreshed menu is the vault menu', async () => {
+    let custody: 'local' | 'claustrum' = 'local'
+    const { menu, calls, apply } = setup('opencode', true, async () => custody)
+    const opened = await menu.open(invocation)
+    for (const id of localCustodyIds)
+      expect(offeredIds(opened.menu.sections)).toContain(id)
+    // The vault is connected after the menu was opened.
+    custody = 'claustrum'
+    for (const id of localCustodyIds) {
+      const result = await apply(id)
+      expect(result).toMatchObject({ ok: false, code: 'vault-managed' })
+      expect(result.text).toBe(`Action refused: ${vaultGuidance}`)
+      expect(result.text).not.toContain('synthetic-key')
+      expect(result.text).not.toContain('synthetic-code')
+      expect(result.menu?.sections[0]?.lines[0]).toBe(vaultGuidance)
+      expect(offeredIds(result.menu?.sections ?? [])).not.toContain(id)
+    }
+    expect(calls).toEqual([])
+    // Retained settings and vault-account controls still dispatch.
+    expect((await apply('cache-on')).ok).toBe(true)
+    expect((await apply('enable')).ok).toBe(true)
+    expect(calls.map((call) => call.action)).toEqual(['cache-on', 'enable'])
+  })
+
+  test('local-custody actions return after the vault is disconnected', async () => {
+    let custody: 'local' | 'claustrum' = 'claustrum'
+    const { menu, calls, apply } = setup('opencode', true, async () => custody)
+    expect(
+      offeredIds((await menu.open(invocation)).menu.sections),
+    ).not.toContain('add-oauth-start')
+    expect((await apply('add-oauth-start')).code).toBe('vault-managed')
+    custody = 'local'
+    const restored = await menu.open(invocation)
+    for (const id of localCustodyIds)
+      expect(offeredIds(restored.menu.sections)).toContain(id)
+    expect(
+      restored.menu.sections.flatMap((section) => section.lines),
+    ).not.toContain(vaultGuidance)
+    expect((await apply('add-oauth-start')).ok).toBe(true)
+    expect((await apply('remove')).ok).toBe(true)
+    expect(calls.map((call) => call.action)).toEqual([
+      'add-oauth-start',
+      'remove',
+    ])
+  })
+
+  test('an unreadable or unknown custody mode never counts as local but still offers disconnect', async () => {
+    let disconnects = 0
+    const disconnect = async () => {
+      disconnects++
+      return 'disconnected' as const
+    }
+    // readMode returns a Promise, so a rejecting reader satisfies its type.
+    const rejecting = setup(
+      'opencode',
+      true,
+      async () => {
+        throw new Error('sk-ant-synthetic-secret unreadable')
+      },
+      disconnect,
+    )
+    // Results outside the declared mode type can only come from an untyped
+    // host, so these menus are built through the untyped runtime boundary.
+    const malformed = ['vault', 'LOCAL', undefined, null, 1].map((mode) =>
+      rawSetup(async () => mode, disconnect),
+    )
+    for (const [index, { menu, calls, apply }] of [
+      rejecting,
+      ...malformed,
+    ].entries()) {
+      const payload = await menu.open(invocation)
+      expect(payload.menu.sections[0]?.lines[0]).toBe(unknownGuidance)
+      expect(JSON.stringify(payload)).not.toContain('synthetic-secret')
+      for (const id of localCustodyIds) {
+        expect(offeredIds(payload.menu.sections)).not.toContain(id)
+        const result = await apply(id)
+        expect(result).toMatchObject({ ok: false, code: 'custody-unavailable' })
+        expect(result.text).toBe(`Action refused: ${unknownGuidance}`)
+      }
+      expect(calls).toEqual([])
+      expect((await apply('cache-off')).ok).toBe(true)
+      expect(calls.map((call) => call.action)).toEqual(['cache-off'])
+      // When the enrollment record cannot be read, disconnecting is the way
+      // back to local accounts, so it stays offered and still requires
+      // confirmation.
+      expect(offeredIds(payload.menu.sections)).toContain('vault-disconnect')
+      expect(
+        await apply('vault-disconnect', { confirmed: false }),
+      ).toMatchObject({ ok: false, code: 'confirmation-required' })
+      expect(disconnects).toBe(index)
+      expect((await apply('vault-disconnect')).ok).toBe(true)
+      expect(disconnects).toBe(index + 1)
+    }
+  })
+
+  test('a malformed enrollment token offers a confirmed disconnect that returns to local without touching local account files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'native-ui-malformed-token-'))
+    try {
+      const env = {
+        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+          root,
+          'opencode-enrollment.json',
+        ),
+      }
+      const enrollment = getHostClaustrumEnrollmentPaths('opencode', env)
+      const local = await resolveNativePoolPaths(
+        join(root, 'anthropic-auth.json'),
+        join(root, 'anthropic-auth-state.json'),
+      )
+      const files = [
+        local.legacyConfig,
+        local.legacyState,
+        local.config,
+        local.state,
+        local.runtime,
+        local.journal,
+        local.roster,
+      ]
+      for (const file of files)
+        await writeFile(file, JSON.stringify({ file }), { mode: 0o600 })
+      const bytes = () => Promise.all(files.map((file) => readFile(file)))
+      const before = await bytes()
+      await writeFile(enrollment.tokenPath, 'synthetic-secret-not-json', {
+        mode: 0o600,
+      })
+      const calls: NativeMenuDispatchRequest[] = []
+      const menu = createNativeUi({
+        host: 'opencode',
+        interactive: true,
+        readMode: () => readNativeEnrollmentMode('opencode', env),
+        // The common-auth helper that deletes this host's enrollment token and
+        // ceremony state under the enrollment lock. OpenCode disconnect is
+        // only this step: OpenCode keeps no host sign-in to restore.
+        disconnectVault: () =>
+          disconnectClaustrumEnrollment(enrollment, 'anthropic-auth-opencode'),
+        dispatch: async (request) => {
+          calls.push(request)
+          return { ok: true, text: 'Applied' }
+        },
+        readStatus: async (command) => `${command}: public status`,
+      })
+      const opened = await menu.open(invocation)
+      expect(opened.menu.sections[0]?.lines[0]).toBe(unknownGuidance)
+      expect(offeredIds(opened.menu.sections)).toContain('vault-disconnect')
+      expect(offeredIds(opened.menu.sections)).not.toContain('add-apikey')
+      expect(JSON.stringify(opened)).not.toContain('synthetic-secret')
+      const apply = (patch: Partial<CommandApplyRequest> = {}) =>
+        applyFixture(menu, 'vault-disconnect', patch)
+      expect(await apply({ confirmed: false })).toMatchObject({
+        ok: false,
+        code: 'confirmation-required',
+      })
+      expect(await readFile(enrollment.tokenPath, 'utf8')).toBe(
+        'synthetic-secret-not-json',
+      )
+      const result = await apply()
+      expect(result).toMatchObject({
+        ok: true,
+        text: 'Disconnected from the vault. This host uses local accounts again.',
+      })
+      expect(await readNativeEnrollmentMode('opencode', env)).toBe('local')
+      const ids = offeredIds(result.menu?.sections ?? [])
+      for (const id of localCustodyIds) expect(ids).toContain(id)
+      expect(ids).not.toContain('vault-disconnect')
+      expect(calls).toEqual([])
+      expect(await bytes()).toEqual(before)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('the custody reader is required', () => {
+    const base = {
+      host: 'opencode',
+      interactive: true,
+      dispatch: async () => ({ ok: true, text: 'Applied' }),
+      readStatus: async () => 'public',
+    }
+    for (const options of [base, { ...base, readMode: 'local' }]) {
+      // Invoked through the untyped boundary: these objects do not satisfy
+      // NativeUiOptions, which is what a JavaScript host could still pass.
+      expect(() => Reflect.apply(createNativeUi, undefined, [options])).toThrow(
+        'Native UI requires a custody mode reader',
+      )
+    }
+  })
+
+  const disconnectTexts: Record<
+    NativeVaultDisconnectResult,
+    { ok: boolean; code?: string; text: string }
+  > = {
+    disconnected: {
+      ok: true,
+      text: 'Disconnected from the vault. This host uses local accounts again.',
+    },
+    idle: {
+      ok: true,
+      text: 'This host has no active vault enrollment.',
+    },
+    busy: {
+      ok: false,
+      code: 'busy',
+      text: "Vault disconnect could not finish because another process is changing this host's enrollment. Try again.",
+    },
+    conflict: {
+      ok: false,
+      code: 'conflict',
+      text: 'Disconnect stopped: this host already has a different stored sign-in, so it and the sign-in saved when the host joined the vault were both kept, and the vault connection remains. Resolve the two sign-ins with offline setup.',
+    },
+  }
+
+  for (const host of ['opencode', 'pi'] as const) {
+    test(`${host} confirmed vault disconnect runs only the disconnect capability and reports each result`, async () => {
+      for (const [result, expected] of Object.entries(disconnectTexts)) {
+        let custody: 'local' | 'claustrum' = 'claustrum'
+        let disconnects = 0
+        const { menu, calls, apply } = setup(
+          host,
+          true,
+          async () => custody,
+          async () => {
+            disconnects++
+            // A real disconnect makes the custody reader report local, so
+            // local accounts are in use again.
+            if (result === 'disconnected') custody = 'local'
+            return result as NativeVaultDisconnectResult
+          },
+        )
+        await menu.open(invocation)
+        const unconfirmed = await apply('vault-disconnect', {
+          confirmed: false,
+        })
+        expect(unconfirmed).toMatchObject({
+          ok: false,
+          code: 'confirmation-required',
+          needsConfirmation: true,
+        })
+        expect(disconnects).toBe(0)
+        const applied = await apply('vault-disconnect')
+        expect({
+          ok: applied.ok,
+          text: applied.text,
+          ...(applied.code !== undefined ? { code: applied.code } : {}),
+        }).toEqual(expected)
+        expect(disconnects).toBe(1)
+        expect(calls).toEqual([])
+        // The menu returned with the result reads the custody mode again
+        // after the disconnect ran.
+        const ids = offeredIds(applied.menu?.sections ?? [])
+        if (result === 'disconnected') {
+          expect(ids).not.toContain('vault-disconnect')
+          for (const id of localCustodyIds) expect(ids).toContain(id)
+        } else {
+          expect(ids).toContain('vault-disconnect')
+          expect(ids).not.toContain('add-apikey')
+        }
+      }
+    })
+  }
+
+  test('a stale or headless disconnect is refused before the capability runs', async () => {
+    let custody: 'local' | 'claustrum' = 'claustrum'
+    let disconnects = 0
+    const disconnect = async () => {
+      disconnects++
+      return 'disconnected' as const
+    }
+    const { menu, apply } = setup(
+      'opencode',
+      true,
+      async () => custody,
+      disconnect,
+    )
+    expect(offeredIds((await menu.open(invocation)).menu.sections)).toContain(
+      'vault-disconnect',
+    )
+    // The host's custody changed to local after this menu was opened.
+    custody = 'local'
+    const stale = await apply('vault-disconnect')
+    expect(stale).toMatchObject({
+      ok: false,
+      code: 'vault-not-connected',
+      text: 'Action refused: this host is not connected to the vault.',
+    })
+    const headless = setup(
+      'opencode',
+      false,
+      async () => 'claustrum',
+      disconnect,
+    )
+    expect((await headless.apply('vault-disconnect')).code).toBe(
+      'interactive-required',
+    )
+    expect(disconnects).toBe(0)
+  })
+
+  test('the vault disconnect callback is required', () => {
+    const base = {
+      host: 'pi',
+      interactive: true,
+      readMode: async () => 'claustrum',
+      dispatch: async () => ({ ok: true, text: 'Applied' }),
+      readStatus: async () => 'public',
+    }
+    for (const options of [
+      base,
+      { ...base, disconnectVault: undefined },
+      { ...base, disconnectVault: 'disconnect' },
+    ]) {
+      // Invoked through the untyped boundary: these objects do not satisfy
+      // NativeUiOptions, which is what a JavaScript host could still pass.
+      expect(() => Reflect.apply(createNativeUi, undefined, [options])).toThrow(
+        'Native UI requires a vault disconnect callback',
+      )
+    }
+  })
+
+  test('a failing disconnect capability is reported generically', async () => {
+    const { apply } = setup(
+      'pi',
+      true,
+      async () => 'claustrum',
+      async () => {
+        throw new Error('sk-ant-synthetic-secret refused')
+      },
+    )
+    const result = await apply('vault-disconnect')
+    expect(result).toMatchObject({
+      ok: false,
+      code: 'execution-failed',
+      text: 'Action failed.',
+    })
+    expect(JSON.stringify(result)).not.toContain('synthetic-secret')
   })
 })
