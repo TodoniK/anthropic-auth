@@ -1,7 +1,8 @@
 # Mutation proofs for request guards
 
-`mutations.toml` records eighteen edits, each replacing one specified source block
-with a broken safeguard. Named test assertions must detect each break.
+`mutations.toml` records edits that replace specified source blocks with broken
+safeguards. Each break must fail an assertion in a test listed in that control's
+`expect_red` field.
 
 Run only from an isolated clone or worktree. `ckdev-mutate` is the mutation test
 runner: it applies the configured edits and runs tests in that checkout, without
@@ -38,7 +39,9 @@ These proofs send no HTTP requests to model providers and use no real credential
 They do not change existing application tests, CI workflows, dependencies or
 sibling repositories.
 
-| Control | Runtime break | Existing assertion |
+Examples of guards covered by the catalogue:
+
+| Control | Runtime break | Assertion |
 | --- | --- | --- |
 | `history-refuses-meaningful-assistant` | Treat meaningful assistant trailers as removable empty trailers. | `refuses unknown or meaningful content 0 without mutating history` in Core request-history tests. |
 | `fast-excludes-opus-46-47` | Widen `claude-opus-4-8` to `claude-opus-4-`, incorrectly enabling fast mode for Opus 4.6 and 4.7. | Core asserts that fast mode is not supported for Opus 4.6, 4.7 and `4.7[1m]`. |
@@ -53,8 +56,8 @@ sibling repositories.
 | `refresh-backoff-preserves-attempt-budget` | Start transient backoff after the first attempt. | A transient failure must leave the coordinator's remaining attempts available; 429 and permanent failures still back off immediately. |
 | `native-activation-before-401-refresh` | Remove the activation check before transport reauthorization. | A revoked native host activation must trigger no token exchange. |
 | `native-activation-after-authorization` | Remove the activation check after transport authorization. | An activation revoked during fresh token validation must prevent model dispatch. |
-| `fallback-killswitch-polls-before-selection` | Skip the due-quota check before fallback-first selection. | A fallback below its hard limit must not serve. |
-| `fallback-quota-sweeps-do-not-overlap` | Run startup and request quota sweeps concurrently. | Two requests reuse one current poll per account. |
+| `fallback-killswitch-polls-before-selection` | Choose an account without fetching its missing or expired quota first. | Hold the fallback's usage GET and prove no model dispatch or main poll occurs before its reading returns; then verify the route follows that reading. |
+| `fallback-quota-sweeps-do-not-overlap` | Start another sweep before the previous sweep finishes. | A background sweep started during startup's held GET must read the stored result, not issue a second fallback GET from a stale snapshot. |
 | `runtime-read-no-follow` | Follow a symlink installed between inspection and opening. | The runtime reader must reject the symlink. |
 | `runtime-read-opened-mode` | Ignore the opened file's permissions. | A replacement with mode 0644 must be rejected. |
 | `runtime-read-opened-owner` | Ignore the opened file's owner. | A foreign owner on the opened handle must be rejected. |
@@ -84,7 +87,8 @@ bun scripts/run-mutation-bun.ts packages/core/src/tests/fast.test.ts \
   'fast mode eligibility for claude-opus-4-7[1m] is false'
 ```
 
-The wrapper accepts only the seven reviewed owning test files. It rejects empty,
+The wrapper accepts canonical `*.test.ts` files directly under the Core,
+OpenCode or Pi package's `src/tests/` directory. It rejects empty,
 control-character and boundary-whitespace names and unsafe/unsupported paths.
 Bun prints nested scopes separated by ` > `, but its name filter joins those
 scopes with spaces. The wrapper applies that observed convention, escapes regex

@@ -277,35 +277,35 @@ broad_id = "{name}"
 
 [[control]]
 id = "fallback-killswitch-polls-before-selection"
-guards = "Fallback-first routing must learn due quota before allowing an account to bypass its killswitch."
+guards = "Fallback-first routing must poll a due fallback's quota, and wait for that reading, before choosing a route under an enabled killswitch."
 file = "packages/opencode/src/index.ts"
-old = '''              await refreshFallbackQuotas(false, true)
+old = '''              const unavailable = await refreshFallbackQuotas(false, true)
               // Polling can also bind'''
-new = '''              await Promise.resolve()
+new = '''              const unavailable = new Set<string>() // NON-VACUITY BREAK: choose a route without polling due fallbacks
               // Polling can also bind'''
-test_file = "packages/opencode/src/tests/index.test.ts"
+test_file = "packages/opencode/src/tests/quota-sweep.test.ts"
 runner = "command"
-command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/quota-sweep.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["killswitch fetch gate > fallback-first routing does not serve from a killswitch-killed fallback"]
-expect_message = "error: expect(received).toContain(expected)"
+expect_red = ["fallback-first holds dispatch until the due fallback usage GET returns, then serves the fallback from that reading", "fallback-first learns from the due fallback usage GET that it is below its floor before polling or serving main"]
+expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
 
 [[control]]
 id = "fallback-quota-sweeps-do-not-overlap"
-guards = "Startup and request quota sweeps must not independently decide to poll the same still-unknown account."
+guards = "A fallback quota sweep started while another sweep's poll is outstanding must read the pool after that reading is stored, not poll the same account again from an older snapshot."
 file = "packages/opencode/src/index.ts"
 old = '''    const operation = fallbackQuotaRefreshQueue.then(() =>
       pollFallbackQuotas(force, requiredByPolicy),
     )'''
-new = '''    const operation = pollFallbackQuotas(force, requiredByPolicy)'''
-test_file = "packages/opencode/src/tests/index.test.ts"
+new = '''    const operation = pollFallbackQuotas(force, requiredByPolicy) // NON-VACUITY BREAK: start sweeps without waiting for the previous one'''
+test_file = "packages/opencode/src/tests/quota-sweep.test.ts"
 runner = "command"
-command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/quota-sweep.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["killswitch fetch gate > fallback-first routing does not serve from a killswitch-killed fallback"]
+expect_red = ["a background sweep started during the held startup usage GET reads the pool after that reading is stored and polls the account once"]
 expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
