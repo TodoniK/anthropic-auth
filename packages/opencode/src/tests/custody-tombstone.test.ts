@@ -381,10 +381,6 @@ async function createTempStorage<T>(
   }
 }
 
-afterEach(() => {
-  globalThis.fetch = originalFetch
-})
-
 const livePlugins = new Set<Set<PluginHooks>>()
 // Registered before the lifetime suite's own afterEach: dispose every native
 // plugin (its timers and vault client) before that hook waits for a possibly
@@ -398,6 +394,13 @@ afterEach(async () => {
   await disposeAll(plugins, 'Custody tombstone plugin cancellation failed')
 })
 const lifetimes = createTestLifetimeSuite()
+// Registered after the lifetime suite's afterEach, so it runs only once a
+// timed-out native body has settled and its own cleanup has restored fetch.
+// Restoring earlier would let that body resume against the original fetch
+// instead of the synthetic provider it installed.
+afterEach(() => {
+  globalThis.fetch = originalFetch
+})
 
 describe('Claustrum custody tombstones', () => {
   test('recognizes only provider-bound OAuth tombstones', () => {
