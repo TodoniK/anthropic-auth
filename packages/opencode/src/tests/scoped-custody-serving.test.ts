@@ -9,6 +9,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import type { ScopedInventoryRow } from '@cortexkit/claustrum-client'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
+import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
 import { drainSidebarWrites, getSidebarStateFile } from '../sidebar-state.ts'
@@ -578,7 +579,7 @@ test('loader and model request remain usable when a peer holds the scoped roster
   // native roster refresh must take before listing the vault.
   const lease = await acquireRefreshFileLock({
     name: 'claustrum-roster',
-    path: fixture.paths.roster,
+    path: nativeVaultPaths(fixture.paths).roster,
     ttlMs: 30_000,
     renew: true,
   })

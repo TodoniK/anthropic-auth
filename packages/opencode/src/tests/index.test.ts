@@ -20497,27 +20497,37 @@ describe('killswitch fetch gate', () => {
     // (5h:10): a fallback at 30% passes routing policy but is killswitch-killed.
     // fallback-first must NOT serve from it — it should fall through to the
     // healthy main account instead.
-    await useTempAccountFile(
-      createFallbackStorage({
-        routing: { mode: 'fallback-first' },
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: false,
+    const storage = createFallbackStorage({
+      routing: { mode: 'fallback-first' },
+      quota: {
+        enabled: true,
+        checkIntervalMinutes: 5,
+        minimumRemaining: { five_hour: 10, seven_day: 20 },
+        failClosedOnUnknownQuota: false,
+      },
+      killswitch: { enabled: true, main: { five_hour: 50, seven_day: 10 } },
+      accounts: [
+        {
+          id: 'fallback-1',
+          type: 'oauth',
+          access: 'sk-ant-oat01-fallback-access',
+          refresh: 'fallback-refresh',
+          expires: Date.now() + 5 * 60 * 60 * 1000,
         },
-        killswitch: { enabled: true, main: { five_hour: 50, seven_day: 10 } },
-        accounts: [
-          {
-            id: 'fallback-1',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fallback-access',
-            refresh: 'fallback-refresh',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-          },
-        ],
-      }),
+      ],
+    })
+    const fallback = storage.accounts.find(
+      (account) => account.id === 'fallback-1',
     )
+    if (!fallback || !isOAuthAccount(fallback))
+      throw new Error('Missing killswitch fixture fallback')
+    delete fallback.quota
+    await useTempAccountFile(storage)
+    const initialFallback = (await readAccountStorage())?.accounts.find(
+      (account): account is OAuthAccount =>
+        account.id === 'fallback-1' && isOAuthAccount(account),
+    )
+    expect(initialFallback?.quota).toBeUndefined()
 
     let servedAuth: string | undefined
     const quotaAuthorizations: string[] = []

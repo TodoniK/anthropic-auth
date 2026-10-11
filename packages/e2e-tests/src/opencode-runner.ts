@@ -26,17 +26,16 @@ import { setTimeout as delay } from 'node:timers/promises'
 import {
   createNativeAccountRuntime,
   custodyTombstoneOAuth,
-  discoverNativeVaultInventory,
   getStickyRoutingStatePath,
   type NativeMigrationJournal,
   type NativePoolPaths,
   type NativeRefreshResult,
   type ProviderAccountUuid,
-  publishNativeVaultRosterSeed,
-  publishNativeVaultRuntimeSeed,
   resolveNativePoolPaths,
   runNativeMigration,
 } from '@cortexkit/anthropic-auth-core'
+
+import { nativeVaultPaths } from '../../core/src/native-vault-paths.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '../../..')
 const PLUGIN_ENTRY = join(REPO_ROOT, 'packages/opencode/src/index.ts')
@@ -196,10 +195,11 @@ export type NativeAccountFixture =
   | { kind: 'vault' }
   | { kind: 'unmigrated'; hostAuth?: Record<string, unknown> }
 
-/** Credential paths and the journal recording completed transfer from host auth. */
-export type MigratedNativeAccounts = {
+/** Only local OAuth fixtures have a migration journal; vault fixtures use enrollment without moving local credentials. */
+export type PreparedNativeAccounts = {
+  kind: 'local' | 'vault'
   paths: NativePoolPaths
-  journal: NativeMigrationJournal
+  journal?: NativeMigrationJournal
   hostAuthPath: string
   routingDestinationPath: string
   /** Credential authorization result for the test's primary local login, if present. */
@@ -209,14 +209,15 @@ export type MigratedNativeAccounts = {
 /** Account UUID returned by the fake bootstrap response for the primary test login. */
 export const FIXTURE_MAIN_ACCOUNT_UUID = '11111111-1111-4111-8111-111111111111'
 /** Token returned by the fake refresh endpoint and used by the test OpenCode server. */
-export const FIXTURE_ADMITTED_ACCESS_TOKEN = 'test-access-token-admitted'
+export const FIXTURE_ADMITTED_ACCESS_TOKEN =
+  'sk-ant-oat01-test-access-token-admitted'
 
 export type SpawnedOpencode = {
   url: string
   port: number
   env: IsolatedEnv
   /** Undefined for an `unmigrated` fixture. */
-  native?: MigratedNativeAccounts
+  native?: PreparedNativeAccounts
   kill: () => Promise<void>
   stdout: () => string
   stderr: () => string
@@ -583,13 +584,13 @@ async function nativeSetupLayout(env: IsolatedEnv): Promise<NativeSetupLayout> {
   }
 }
 
-async function migrateNativeAccounts(input: {
+async function prepareNativeAccounts(input: {
   layout: NativeSetupLayout
   childEnv: Record<string, string>
   fixture: Exclude<NativeAccountFixture, { kind: 'unmigrated' }>
   options: SpawnOptions
   hostStarted: () => boolean
-}): Promise<MigratedNativeAccounts> {
+}): Promise<PreparedNativeAccounts> {
   const { layout, fixture } = input
   const { paths } = layout
   if (
@@ -607,7 +608,7 @@ async function migrateNativeAccounts(input: {
       : (fixture.hostAuth ?? {
           anthropic: {
             type: 'oauth',
-            access: 'test-access-token',
+            access: 'sk-ant-oat01-test-access-token',
             refresh: 'test-refresh-token',
             expires: Date.now() + 60 * 60 * 1000,
           },
@@ -617,6 +618,59 @@ async function migrateNativeAccounts(input: {
     mode: 0o600,
     flag: 'wx',
   })
+
+  if (fixture.kind === 'vault') {
+    if (input.hostStarted())
+      throw new Error('Host started before vault fixture preparation')
+    if (input.childEnv.OPENCODE_AUTH_CONTENT !== undefined)
+      throw new Error(
+        'A vault fixture must activate through its real auth.json',
+      )
+    const runtime = createNativeAccountRuntime({
+      paths,
+      host: 'opencode',
+      vault: { env: input.childEnv },
+    })
+    try {
+      await runtime.vault.refresh()
+      const snapshot = await runtime.read()
+      if (
+        snapshot.mode !== 'claustrum' ||
+        !snapshot.accounts.some((account) => account.id === 'main')
+      )
+        throw new Error(
+          'Vault fixture did not discover an enrolled primary account',
+        )
+      await runtime.updateSettings((settings) => ({
+        ...settings,
+        quota: { enabled: false },
+        refresh: { enabled: false },
+        ...(input.options.quotaFeed
+          ? { quotaHeaderFeed: { enabled: true } }
+          : {}),
+        ...(input.options.hybridCache
+          ? { claudeCache: { enabled: true, mode: 'hybrid' } }
+          : {}),
+      }))
+      if (input.options.relay)
+        await runtime.updateRelay({
+          enabled: true,
+          ...input.options.relay,
+          fallbackToDirect: false,
+        })
+      const routingDestinationPath = nativeVaultPaths(paths).routing
+      input.childEnv.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE =
+        routingDestinationPath
+      return {
+        kind: 'vault',
+        paths,
+        hostAuthPath: layout.hostAuthPath,
+        routingDestinationPath,
+      }
+    } finally {
+      runtime.close()
+    }
+  }
 
   // runNativeMigration calls processFence to confirm no host is running
   // before it reads the legacy files and again before it commits. The child
@@ -640,27 +694,15 @@ async function migrateNativeAccounts(input: {
     env: migrationEnv,
     removePiAnthropicAuth: false,
     processFence,
-    ...(fixture.kind === 'vault' && {
-      custody: {
-        discover: () =>
-          discoverNativeVaultInventory({
-            paths,
-            host: 'opencode',
-            env: migrationEnv,
-          }),
-        publishSeed: publishNativeVaultRosterSeed,
-        publishRuntimeSeed: publishNativeVaultRuntimeSeed,
-      },
-    }),
   })
   if (fenceChecks === 0)
     throw new Error('Fixture migration did not check its process fence')
   if (journal.phase !== 'retired')
     throw new Error(`Fixture migration ended in phase ${journal.phase}`)
 
-  const mainAdmission =
-    fixture.kind === 'local' ? await admitLocalMain(paths) : undefined
+  const mainAdmission = await admitLocalMain(paths)
   return {
+    kind: 'local',
     paths,
     journal,
     hostAuthPath: layout.hostAuthPath,
@@ -978,7 +1020,7 @@ export async function spawnOpencode(
     childEnv.OPENCODE_AUTH_CONTENT = JSON.stringify({
       anthropic: {
         type: 'oauth',
-        access: 'test-access-token',
+        access: 'sk-ant-oat01-test-access-token',
         refresh: 'test-refresh-token',
         expires: Date.now() + 60 * 60 * 1000,
       },
@@ -989,12 +1031,10 @@ export async function spawnOpencode(
         ? undefined
         : await nativeSetupLayout(env)
     if (nativeLayout) {
-      // Offline setup moves the synthetic OAuth credentials into this test's
-      // common-auth account pool. OpenCode's auth.json retains only a non-secret
-      // OAuth activation value, which the host must read from disk. Remove the
-      // inherited OPENCODE_AUTH_CONTENT override: it supplies an auth snapshot
-      // instead, and the plugin refuses that credential source. A deliberate
-      // test override applied below still reaches migration's refusal check.
+      // Local fixtures move synthetic OAuth tokens into the test pool before
+      // startup. Vault fixtures use an enrolled daemon and an inert auth slot.
+      // Both read auth.json from disk. An explicit OPENCODE_AUTH_CONTENT override
+      // below must still fail the plugin's environment-credential refusal.
       delete childEnv.OPENCODE_AUTH_CONTENT
       // Session-to-account assignments move from the old sidecar directory
       // to nativeLayout.routingDestinationPath during migration. Give the
@@ -1013,13 +1053,12 @@ export async function spawnOpencode(
       if (value === undefined) delete childEnv[key]
       else childEnv[key] = value
     }
-    // Import the synthetic OAuth credentials into the test-only common-auth
-    // pool before starting OpenCode. Use the final child environment, after
-    // test overrides, so setup and serving resolve the same account paths
-    // and forbidden auth snapshots cannot bypass the migration guard.
+    // Prepare the local OAuth pool or discover the enrolled vault accounts before
+    // starting the child. Use its final environment to resolve the same paths.
+    // Only local OAuth fixtures migrate; vault discovery leaves local files alone.
     const native =
       nativeLayout && nativeAccounts.kind !== 'unmigrated'
-        ? await migrateNativeAccounts({
+        ? await prepareNativeAccounts({
             layout: nativeLayout,
             childEnv,
             fixture: nativeAccounts,

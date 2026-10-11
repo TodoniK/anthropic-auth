@@ -77,11 +77,6 @@ describe('zero-bind scoped custody', () => {
         OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: daemon.connectionFile,
       },
       beforeSpawn: async (env) => {
-        const path = join(env.configDir, 'anthropic-auth.json')
-        await writeFile(path, JSON.stringify({
-          version: 1, accounts: [], quota: { enabled: false },
-          claustrum: { mode: 'claustrum', scopedRoster: true, primaryAccount: { credentialId: mainId, accountId: 'account-main', state: 'active' } },
-        }), { mode: 0o600 })
         await writeFile(join(env.configDir, 'claustrum-enrollment.json'), JSON.stringify({ token: 'aa'.repeat(32), token_generation: 1 }), { mode: 0o600 })
       },
     })
@@ -200,20 +195,6 @@ describe('scoped credential rotations in the OpenCode process', () => {
         OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: daemon.connectionFile,
       },
       beforeSpawn: async (env) => {
-        await writeFile(join(env.configDir, 'anthropic-auth.json'), JSON.stringify({
-          version: 1,
-          accounts: [],
-          quota: { enabled: false },
-          claustrum: {
-            mode: 'claustrum',
-            scopedRoster: true,
-            primaryAccount: {
-              credentialId: mainId,
-              accountId: main.account_id,
-              state: 'active',
-            },
-          },
-        }), { mode: 0o600 })
         await writeFile(join(env.configDir, 'claustrum-enrollment.json'),
           JSON.stringify({ token: 'aa'.repeat(32), token_generation: 1 }),
           { mode: 0o600 })

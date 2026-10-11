@@ -239,8 +239,13 @@ function syntheticVault() {
 
 async function readAccounts(
   paths: Awaited<ReturnType<typeof resolveNativePoolPaths>>,
+  env?: NodeJS.ProcessEnv,
 ) {
-  const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
+  const runtime = createNativeAccountRuntime({
+    paths,
+    host: 'opencode',
+    vault: { env },
+  })
   try {
     return await runtime.read()
   } finally {
@@ -362,7 +367,7 @@ test('vault custody discovery publishes the roster and runtime seed through the 
   })
   expect(vault.calls.close).toBeGreaterThan(0)
 
-  const snapshot = await readAccounts(fixture.paths)
+  const snapshot = await readAccounts(fixture.paths, fixture.env)
   expect(snapshot.mode).toBe('claustrum')
   const fallback = snapshot.accounts.find(
     (account) => account.id === 'fallback-route',

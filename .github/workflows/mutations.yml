@@ -30,6 +30,8 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       - run: bun install --frozen-lockfile
+      - name: Build shared Core for test preloads
+        run: bun run --cwd packages/core build
       - name: Install pinned mutation runner
         shell: bash
         run: |
