@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
-import { realpath, rm, stat } from 'node:fs/promises'
+import { readFile, realpath, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { createTestLifetimeSuite } from '../../packages/core/src/tests/test-lifetime.ts'
 import {
   createMutationSandbox,
@@ -382,7 +382,11 @@ test('invalid names and unsafe paths refuse before spawning', async () => {
     { file, name: 'name\u0085' },
     { file: '../fast.test.ts', name },
     { file: '/tmp/fast.test.ts', name },
+    { file: 'C:\\tmp\\fast.test.ts', name },
     { file: 'packages/core/../pi/src/tests/convert.test.ts', name },
+    { file: 'packages/core/src/tests/../fast.test.ts', name },
+    { file: 'packages/core/src/tests/nested/fast.test.ts', name },
+    { file: 'packages/other/src/tests/fast.test.ts', name },
     { file: 'packages/core/src/tests/setup.ts', name },
     { file: 'constructor', name },
   ]
@@ -730,6 +734,45 @@ test('missing, empty, garbage and mismatched report identities refuse', () => {
   ).toThrow()
 })
 
+test('every mutation catalogue command selects its package-local test under the owning config', async () => {
+  const parsed: unknown = Bun.TOML.parse(
+    await readFile(resolve(import.meta.dir, '../../mutations.toml'), 'utf8'),
+  )
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    !('control' in parsed) ||
+    !Array.isArray(parsed.control) ||
+    parsed.control.length === 0
+  )
+    throw new Error('Expected mutation catalogue controls')
+
+  for (const control of parsed.control) {
+    if (!control || typeof control !== 'object' || !('command' in control))
+      throw new Error('Expected a mutation catalogue command')
+    const command = control.command
+    if (
+      !Array.isArray(command) ||
+      command[0] !== 'bun' ||
+      command[1] !== 'scripts/run-mutation-bun.ts' ||
+      command.length !== 4 ||
+      typeof command[2] !== 'string' ||
+      command[3] !== '{test}'
+    )
+      throw new Error('Unexpected mutation catalogue test command')
+
+    const file = command[2]
+    const packageRoot = (
+      ['packages/core', 'packages/opencode', 'packages/pi'] as const
+    ).find((root) => file.startsWith(`${root}/`))
+    if (!packageRoot)
+      throw new Error(`Unowned mutation catalogue test file: ${file}`)
+    const selected = selectionFor(file, 'catalogue selection probe')
+    expect(selected.cwd).toBe(packageRoot)
+    expect(selected.file).toBe(file.slice(packageRoot.length + 1))
+  }
+})
+
 test('native guard selection uses the actual owning package and reviewed preload config', () => {
   for (const [file, cwd, relative] of [
     [
@@ -752,7 +795,7 @@ test('native guard selection uses the actual owning package and reviewed preload
       'packages/opencode',
       'src/tests/index.test.ts',
     ],
-  ]) {
+  ] as const) {
     if (!file || !cwd || !relative)
       throw new Error('Expected complete test selection')
     const name =
