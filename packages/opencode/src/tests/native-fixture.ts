@@ -1,6 +1,7 @@
 import { lstat, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join } from 'node:path'
 import {
+  createNativePoolStore,
   discoverNativeVaultInventory,
   getStickyRoutingStatePath,
   type NativeCustodyClient,
@@ -11,6 +12,8 @@ import {
   resolveNativePoolPaths,
   runNativeMigration,
 } from '@cortexkit/anthropic-auth-core'
+import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
+import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 
 /**
  * deferCleanup registers fixture removal; trackDetached registers work that
@@ -119,6 +122,57 @@ async function writeSource(
   )
 }
 
+/** Native account metadata in the shape the vault runtime seed publisher accepts. */
+type NativeRuntimeState = Parameters<typeof publishNativeVaultRuntimeSeed>[1]
+
+/** The migrated vault account metadata, rebound to the vault namespace's storage. */
+function vaultRuntimeSeed(
+  state: NativeRuntimeState,
+  storageId: string,
+): NativeRuntimeState {
+  const accounts: NativeRuntimeState['accounts'] = {}
+  for (const [id, entry] of Object.entries(state.accounts))
+    if (entry.binding.kind === 'custody')
+      accounts[id] = { ...entry, binding: { ...entry.binding, storageId } }
+  return { ...state, storageId, accounts }
+}
+
+/**
+ * Give the vault namespace the migrated settings. The default vault account
+ * stays pinned by its credential and account UUID; enrollment, not a mode
+ * flag, selects vault custody, so the flag is not carried over.
+ */
+async function seedVaultSettings(paths: NativePoolPaths) {
+  const local = await createNativePoolStore({
+    paths,
+    quota: nativeQuotaCodec,
+  }).readSettings()
+  if (local.status !== 'ready')
+    throw new Error('Fixture migration left no readable settings')
+  const vault = createNativePoolStore({
+    paths: nativeVaultPaths(paths),
+    quota: nativeQuotaCodec,
+  })
+  await vault.initialize()
+  await vault.updateSettings(() => {
+    const settings = structuredClone(local.settings)
+    const claustrum = settings.claustrum
+    if (
+      claustrum &&
+      typeof claustrum === 'object' &&
+      !Array.isArray(claustrum)
+    ) {
+      const {
+        mode: _mode,
+        scopedRoster: _scopedRoster,
+        ...rest
+      } = claustrum as Record<string, unknown>
+      settings.claustrum = rest
+    }
+    return settings
+  })
+}
+
 async function migrate(
   input: NativeOpencodeFixtureInput,
 ): Promise<NativeOpencodeFixture> {
@@ -176,6 +230,8 @@ async function migrate(
   if (input.hostAuth !== undefined)
     await writeSource(hostAuthPath, input.hostAuth)
   const custody = input.custody
+  const vaultPaths = nativeVaultPaths(paths)
+  // The owner-only enrollment token is what selects vault custody.
   if (custody) await writeSource(enrollmentPath, custody.enrollment)
 
   // This fixture does not start or inspect host processes. Its processFence
@@ -207,8 +263,25 @@ async function migrate(
             connect: custody.connect,
             env: { ...env },
           }),
-        publishSeed: publishNativeVaultRosterSeed,
-        publishRuntimeSeed: publishNativeVaultRuntimeSeed,
+        // Vault accounts are served from the vault namespace, which the
+        // enrollment selects; the copies the migration keeps beside the local
+        // pool remain only as its own bookkeeping. Publish each seed to both.
+        publishSeed: async (localPaths, seedInput, options) => {
+          await publishNativeVaultRosterSeed(
+            { roster: vaultPaths.roster },
+            seedInput,
+            options,
+          )
+          return publishNativeVaultRosterSeed(localPaths, seedInput, options)
+        },
+        publishRuntimeSeed: async (localPaths, state, options) => {
+          await publishNativeVaultRuntimeSeed(localPaths, state, options)
+          await publishNativeVaultRuntimeSeed(
+            vaultPaths,
+            vaultRuntimeSeed(state, vaultPaths.storageId),
+            options,
+          )
+        },
       },
     }),
   })
@@ -216,6 +289,7 @@ async function migrate(
     throw new Error('Fixture migration did not check its process fence')
   if (journal.phase !== 'retired')
     throw new Error(`Fixture migration ended in phase ${journal.phase}`)
+  if (custody) await seedVaultSettings(paths)
   return {
     root,
     paths,

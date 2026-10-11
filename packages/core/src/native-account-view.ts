@@ -184,7 +184,30 @@ export function applyNativeMetadataPatch(
     ) as NativeRuntimeEntry['quota']
     next.quotaCheckedAt = quota.checkedAt
   }
-  if (patch.quotaErrorClearedAt !== undefined) delete next.lastQuotaRefreshError
+  // Quota results can finish out of order. Preserve newer failures and clear
+  // markers instead of letting a delayed writer restore an old restriction.
+  if (patch.quotaErrorClearedAt !== undefined)
+    next.quotaErrorClearedAt = Math.max(
+      entry.quotaErrorClearedAt ?? 0,
+      patch.quotaErrorClearedAt,
+    )
+  if (patch.quotaErrorGeneration !== undefined)
+    next.quotaErrorGeneration = Math.max(
+      entry.quotaErrorGeneration ?? 0,
+      patch.quotaErrorGeneration,
+    )
+  if (
+    entry.lastQuotaRefreshError &&
+    patch.lastQuotaRefreshError &&
+    patch.lastQuotaRefreshError.checkedAt <
+      entry.lastQuotaRefreshError.checkedAt
+  )
+    next.lastQuotaRefreshError = entry.lastQuotaRefreshError
+  if (
+    next.lastQuotaRefreshError &&
+    next.lastQuotaRefreshError.checkedAt <= (next.quotaErrorClearedAt ?? -1)
+  )
+    delete next.lastQuotaRefreshError
   return next
 }
 

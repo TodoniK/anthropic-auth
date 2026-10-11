@@ -777,12 +777,12 @@ describe('OpenCode 2 native Anthropic adapter: refusals', () => {
     const cases: {
       name: string
       answers: Parameters<typeof makeSource>[0]
-      error: unknown
+      error: typeof NativeAnthropicNoAccountError
     }[] = [
       {
         name: 'no account chosen',
         answers: { choose: () => undefined, chooseAccount: () => undefined },
-        error: 'installer: no-account',
+        error: NativeAnthropicNoAccountError,
       },
       {
         name: 'authorization refused',
@@ -814,12 +814,10 @@ describe('OpenCode 2 native Anthropic adapter: refusals', () => {
       const failure = await host
         .run(scopeOf(), hostRequest(sonnetPayload()))
         .catch((caught: unknown) => caught)
-      if (typeof error === 'string') {
-        expect((failure as Error).message, name).toBe(error)
-      } else {
-        expect(failure, name).toBeInstanceOf(error as typeof Error)
-        expect((failure as Error).message, name).toBe(NO_ACCOUNT_REFUSAL)
-      }
+      expect(failure, name).toBeInstanceOf(error)
+      if (!(failure instanceof Error))
+        throw new Error('Expected a local refusal')
+      expect(failure.message, name).toBe(NO_ACCOUNT_REFUSAL)
       expect(host.sent, name).toHaveLength(0)
     }
   })

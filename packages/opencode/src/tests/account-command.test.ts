@@ -635,24 +635,24 @@ describe('executeAccountCommand status', () => {
     expect(result.text).not.toContain('request`touch')
   })
 
-  test('routes enrollment-reset only in Claustrum mode', async () => {
-    const local = await executeAccountCommand({
+  test('terminal enrollment reset delegates to enrollment state without a stored custody-mode prerequisite', async () => {
+    const resetEnrollment = mock(async () => ({ text: 'reset' }))
+    for (const mode of ['local', 'claustrum'] as const) {
+      const storage = baseStorage()
+      storage.claustrum = { mode }
+      const result = await executeAccountCommand({
+        argumentsText: 'enrollment-reset',
+        storage,
+        resetEnrollment,
+      })
+      expect(result.text).toBe('reset')
+    }
+    expect(resetEnrollment).toHaveBeenCalledTimes(2)
+    const unavailable = await executeAccountCommand({
       argumentsText: 'enrollment-reset',
       storage: baseStorage(),
-      resetEnrollment: async () => ({ text: 'unexpected' }),
     })
-    expect(local.text).toContain('only in Claustrum mode')
-
-    const storage = baseStorage()
-    storage.claustrum = { mode: 'claustrum' }
-    const resetEnrollment = mock(async () => ({ text: 'reset' }))
-    const result = await executeAccountCommand({
-      argumentsText: 'enrollment-reset',
-      storage,
-      resetEnrollment,
-    })
-    expect(result.text).toBe('reset')
-    expect(resetEnrollment).toHaveBeenCalledTimes(1)
+    expect(unavailable.text).toBe('Claustrum enrollment reset is unavailable.')
   })
 
   test('projects a scoped fallback conservatively without a status projection', async () => {

@@ -1,40 +1,16 @@
-// The Anthropic half of the OpenCode 2 hooks recipe: what
-// `@cortexkit/common-auth/opencode2` leaves to its caller, for requests the
-// host sends itself through its own Anthropic HTTP driver.
-//
-// The installer in common-auth edits those requests at fixed points and asks
-// this adapter, in order, for one physical send (an "attempt"):
-//
-// - `chooseAccount`: which account the request goes to;
-// - `accountHeaders`: that account's credential headers, plus the attempt's
-//   `data`, which the installer hands back on every later call for the same
-//   send;
-// - `rewriteRequest`: the Claude Code wire shape for an OAuth send (URL,
-//   persona headers, body rewrite and signature), or the plain API shape for
-//   an API-key send;
-// - `quotaFromHeaders`, `limitFromResponse`, `inspectEvent`, `limitFromError`:
-//   what the response says about the account;
-// - `rewriteResponse`: undoing the OAuth tool-name prefix in the response;
-// - `onAttemptEnd`: how the send ended.
-//
-// Everything about accounts and policy belongs to an injected source owned
-// by Core (`NativeAnthropicSource`): which account to use, the credential it
-// authorizes for one send, the body rewrite options (billing, effort, cache,
-// safety, diagnostics), and how a response or error is classified. The
-// adapter never reads an account pool, never falls back to the host's own
-// credential, and never guesses an account or a plan from the wire. What the
-// source says about one send (its route and its opaque provenance, such as a
-// vault receipt) stays attached to that send and is handed back unchanged.
-//
-// The adapter never sends anything itself: no retry, no second send from the
-// response side, no relay. Retrying on another account is the installer's
-// retry hook, which acts only on the limit signals the source returns here.
+// OpenCode sends the requests; this adapter supplies account credentials,
+// Claude Code request transforms and response classification to common-auth's
+// transport hooks. The injected source uses Core's account and policy services.
+// Each response keeps the credential version and account of its own request,
+// including HTTP relay responses. This adapter never sends a retry itself.
 
+import { createHash } from 'node:crypto'
 import {
   applyCustomHeaders,
   assertNotCustodyTombstone,
   type ClaudeCodeIdentity,
   mergeAnthropicBetas,
+  remapModelId,
   remapRequestBodyModel,
   stripEmptyTrailingAssistantMessages,
   TrailingAssistantHistoryError,
@@ -105,7 +81,7 @@ const CREDENTIAL_HEADERS = new Set(['authorization', 'x-api-key'])
  * it.
  */
 export const NO_ACCOUNT_REFUSAL =
-  'request refused: no account with a usable credential'
+  'Claude pool login is selected but no native account is usable. Complete offline migration or repair the pool and its quota policy before retrying.'
 
 /**
  * Most sends whose credential may wait between `accountHeaders` and
@@ -129,6 +105,20 @@ const MAX_STREAM_ERROR_MESSAGE = 500
 export type NativeAnthropicRoute = 'oauth' | 'api'
 
 /**
+ * Where one send goes: directly to Anthropic, or through the selected HTTP
+ * relay. A selected WebSocket relay appears here only so the adapter can
+ * refuse it before anything is sent. No local proxy transport is used.
+ */
+export type NativeAnthropicDispatch =
+  | { readonly kind: 'direct' }
+  | {
+      readonly kind: 'http-relay'
+      readonly url: string
+      readonly token: string
+    }
+  | { readonly kind: 'websocket-relay' }
+
+/**
  * What the source authorizes for one send. `provenance` is the source's own
  * record of the account and credential version that serve it (a local slot,
  * a vault receipt with its version, an API key row). The adapter hands it back
@@ -144,6 +134,7 @@ export type NativeAnthropicAuthorization<P> =
       /** Additional OAuth request headers; authorization and x-api-key edits are ignored so they cannot replace the authorized bearer. */
       readonly headers?: HeaderEdits
       readonly provenance: P
+      readonly dispatch?: NativeAnthropicDispatch
     }
   | {
       readonly route: 'api'
@@ -154,15 +145,17 @@ export type NativeAnthropicAuthorization<P> =
       /** The URL the send goes to instead of the host's, for this account. */
       readonly baseURL?: string
       readonly provenance: P
+      readonly dispatch?: NativeAnthropicDispatch
     }
 
 /**
- * The per-send value the installer carries as `Attempt.data`. It holds no
- * credential and no request body.
+ * Correlation metadata carried by common-auth's request hooks for one send.
+ * It contains neither credentials nor request body content.
  */
 export interface NativeAnthropicAttemptData<P> {
   readonly route: NativeAnthropicRoute
   readonly provenance: P
+  readonly dispatch: 'direct' | 'http-relay'
 }
 
 /**
@@ -174,6 +167,7 @@ export interface NativeAnthropicAttemptContext<P> extends AccountRequest {
   readonly transport: Transport | undefined
   readonly route: NativeAnthropicRoute
   readonly provenance: P
+  readonly dispatch: 'direct' | 'http-relay'
 }
 
 /** Non-nullable options accepted by rewriteRequestBody. */
@@ -277,6 +271,10 @@ export interface NativeAnthropicSource<Q, P> {
   readonly requestOptions?: (
     input: NativeAnthropicRequestContext<P>,
   ) => Promise<NativeAnthropicBodyOptions> | NativeAnthropicBodyOptions
+  /** Rechecks policy after asynchronous rewriting, immediately before dispatch. */
+  readonly admitRequest?: (
+    input: NativeAnthropicAttemptContext<P>,
+  ) => Promise<void> | void
   /** Response observers for an OAuth response. */
   readonly responseOptions?: (
     input: NativeAnthropicResponseContext<P>,
@@ -295,6 +293,10 @@ export interface NativeAnthropicSource<Q, P> {
       readonly headers: Headers
       readonly body: () => Promise<string>
     },
+  ) => Promise<LimitSignal | undefined> | LimitSignal | undefined
+  /** Classifies a relay-local failure, never an Anthropic credential failure. */
+  readonly limitFromRelayFailure?: (
+    input: NativeAnthropicResponseContext<P>,
   ) => Promise<LimitSignal | undefined> | LimitSignal | undefined
   /** Classifies an `error` event inside a streamed response. */
   readonly limitFromStreamError?: (
@@ -347,6 +349,8 @@ export interface NativeAnthropicAdapter<Q, P> {
    * none of them can return, and calls the source's `forgetSession`.
    */
   forgetSession(sessionID: string): void
+  /** Revokes all pending work. Later calls refuse without invoking the source. */
+  dispose(): void
   /** Number of sends authorized and not yet rewritten or ended. */
   readonly pendingSendCount: number
   /** Number of OAuth access tokens held for sends not yet rewritten. */
@@ -390,6 +394,19 @@ export class NativeAnthropicRevokedError extends Error {
   }
 }
 
+/** OpenCode 2's HTTP model driver cannot speak the relay's binary WebSocket protocol. */
+export class NativeAnthropicTransportRefusal extends Error {
+  readonly kind = 'unsupported-transport'
+  readonly providerID = ANTHROPIC_PROVIDER_ID
+
+  constructor() {
+    super(
+      'request refused: WebSocket relay is not supported on OpenCode 2; select HTTP relay or direct transport',
+    )
+    this.name = 'NativeAnthropicTransportRefusal'
+  }
+}
+
 /**
  * The request was refused with a local 400 because it can never succeed as
  * written: its history ends on a meaningful assistant turn, or an effort
@@ -423,6 +440,9 @@ interface PendingSend {
     readonly identity?: ClaudeCodeIdentity
   }
   readonly baseURL?: string
+  readonly dispatch?: NativeAnthropicDispatch
+  readonly apiHeaders?: HeaderEdits
+  readonly oauthHeaders?: HeaderEdits
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -485,7 +505,8 @@ const OAUTH_ONLY_BETAS = new Set([
   SERVER_SIDE_FALLBACK_BETA,
 ])
 
-/** The host's betas for an API send, without the OAuth-only ones. */
+/** Remove plugin-added OAuth authentication, Claude Code compatibility and server
+ * safety-fallback betas from paid API/proxy sends; preserve unrelated host betas. */
 function apiBetas(value: string) {
   const kept = value
     .split(',')
@@ -495,12 +516,10 @@ function apiBetas(value: string) {
 }
 
 /**
- * Applies the API route's body rules. There is no Claude Code persona, tool
- * prefix or signature; only the local history check, the plugin's
- * server-side fallback opt-in and stored fallback markers removed (the same
- * rule the OAuth rewrite applies when fallback is off), and the configured
- * model remap. Returns the body text unchanged when nothing changed or it is
- * not a JSON object.
+ * Validate history, remove OAuth-only fallback fields and internal boundary
+ * markers, and apply the configured model alias for paid API/proxy requests.
+ * No Claude Code identity, tool-name prefix or body signature is added.
+ * Preserve the original text when no field changes or the body is not an object.
  */
 function rewriteApiBody(body: string) {
   const parsed = parseJson(body)
@@ -557,6 +576,19 @@ export function createNativeAnthropicAdapter<Q, P>(
   // keeps it on the attempt), because the retry hook may ask about the send
   // after it has ended.
   const localRefusals = new WeakMap<Data, string>()
+  // A relay's own failure is not a provider credential failure. Only a
+  // provider request-id proves that its response came from Anthropic.
+  const relayUpstream = new WeakMap<Data, boolean>()
+  let disposed = false
+
+  const fromUpstream = (headers: Headers, data: Data) => {
+    if (data.dispatch !== 'http-relay') return true
+    const upstream = /^req_[A-Za-z0-9_-]+$/.test(
+      headers.get('request-id') ?? '',
+    )
+    relayUpstream.set(data, upstream)
+    return upstream
+  }
 
   const refuse = (scope: RequestScope) =>
     new NativeAnthropicNoAccountError(scope.sessionID, scope.kind)
@@ -574,6 +606,8 @@ export function createNativeAnthropicAdapter<Q, P>(
     scope: RequestScope,
     work: (ensureLive: () => void) => Promise<T>,
   ): Promise<T> => {
+    if (disposed)
+      throw new NativeAnthropicRevokedError(scope.sessionID, scope.kind)
     const operation = { revoked: false }
     let operations = inProgress.get(scope.sessionID)
     if (!operations) {
@@ -582,7 +616,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     }
     operations.add(operation)
     const ensureLive = () => {
-      if (operation.revoked) {
+      if (disposed || operation.revoked) {
         throw new NativeAnthropicRevokedError(scope.sessionID, scope.kind)
       }
     }
@@ -626,6 +660,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     transport: attempt.transport,
     route: data.route,
     provenance: data.provenance,
+    dispatch: data.dispatch,
   })
 
   const accountHeaders = (
@@ -643,6 +678,18 @@ export function createNativeAnthropicAdapter<Q, P>(
     auth: NativeAnthropicAuthorization<P> | undefined,
   ): AccountHeadersResult<Data> => {
     if (!auth) throw refuse(scope)
+    if (auth.dispatch?.kind === 'websocket-relay')
+      throw new NativeAnthropicTransportRefusal()
+    const dispatch =
+      auth.dispatch?.kind === 'http-relay' ? 'http-relay' : 'direct'
+    const relayHeaders: HeaderEdits | undefined =
+      auth.dispatch?.kind === 'http-relay'
+        ? {
+            authorization: null,
+            'x-api-key': null,
+            'x-relay-token': auth.dispatch.token,
+          }
+        : undefined
     if (auth.route === 'oauth') {
       if (!auth.accessToken) throw refuse(scope)
       // A slot whose credential the vault owns holds a non-secret activation
@@ -653,6 +700,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       const data: Data = Object.freeze({
         route: 'oauth',
         provenance: auth.provenance,
+        dispatch,
       })
       remember(data, {
         sessionID: scope.sessionID,
@@ -660,11 +708,16 @@ export function createNativeAnthropicAdapter<Q, P>(
           accessToken: auth.accessToken,
           ...(auth.identity ? { identity: auth.identity } : {}),
         },
+        dispatch: auth.dispatch,
+        oauthHeaders: auth.headers,
       })
       const extra = lowerCaseEdits(auth.headers)
       for (const name of CREDENTIAL_HEADERS) delete extra[name]
+      // rewriteRequest finalizes betas for the outgoing body. Omit that header
+      // here so the installer's later generic edits cannot overwrite it.
+      delete extra['anthropic-beta']
       return {
-        headers: {
+        headers: relayHeaders ?? {
           ...extra,
           'x-api-key': null,
           authorization: `Bearer ${auth.accessToken}`,
@@ -681,12 +734,15 @@ export function createNativeAnthropicAdapter<Q, P>(
     const data: Data = Object.freeze({
       route: 'api',
       provenance: auth.provenance,
+      dispatch,
     })
     remember(data, {
       sessionID: scope.sessionID,
       ...(auth.baseURL ? { baseURL: auth.baseURL } : {}),
+      dispatch: auth.dispatch,
+      apiHeaders: headers,
     })
-    return { headers, attempt: data }
+    return { headers: relayHeaders ?? headers, attempt: data }
   }
 
   const rewriteRequest = (
@@ -715,6 +771,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     }
 
     const headers = new Headers(request.headers)
+    applyCustomHeaders(headers)
     const correlation = takeInternalHeaders(headers)
     let body = request.body === null ? undefined : await request.text()
     // A session forgotten while the body was read never reaches the source's
@@ -725,10 +782,25 @@ export function createNativeAnthropicAdapter<Q, P>(
     try {
       if (data.route === 'oauth' && send.oauth) {
         const { accessToken, identity } = send.oauth
+        for (const [name, value] of Object.entries(
+          lowerCaseEdits(send.oauthHeaders),
+        )) {
+          if (CREDENTIAL_HEADERS.has(name)) continue
+          if (value === null) headers.delete(name)
+          else headers.set(name, value)
+        }
         let finalBody: Record<string, unknown> | null = null
         if (body !== undefined && messages) {
           const context: NativeAnthropicRequestContext<P> = {
             ...contextOf(attempt, data),
+            modelID: (() => {
+              const payload = parseJson(body)
+              return remapModelId(
+                isRecord(payload) && typeof payload.model === 'string'
+                  ? payload.model
+                  : input.modelID,
+              )
+            })(),
             route: 'oauth',
             correlation,
           }
@@ -752,6 +824,10 @@ export function createNativeAnthropicAdapter<Q, P>(
         if (body !== undefined && messages) body = rewriteApiBody(body)
         headers.delete('authorization')
         headers.delete('x-api-key')
+        for (const [name, value] of Object.entries(send.apiHeaders ?? {})) {
+          if (value === null) headers.delete(name)
+          else headers.set(name, value)
+        }
         if (body !== undefined && messages && !headers.has('content-type')) {
           headers.set('content-type', 'application/json')
         }
@@ -761,7 +837,6 @@ export function createNativeAnthropicAdapter<Q, P>(
           if (kept) headers.set('anthropic-beta', kept)
           else headers.delete('anthropic-beta')
         }
-        applyCustomHeaders(headers)
       }
     } catch (error) {
       const refusal = localRefusalFrom(error)
@@ -774,6 +849,16 @@ export function createNativeAnthropicAdapter<Q, P>(
     }
 
     // The body may have changed length; let the runtime compute it.
+    const finalPayload = body !== undefined ? parseJson(body) : undefined
+    await source.admitRequest?.({
+      ...contextOf(attempt, data),
+      modelID: remapModelId(
+        isRecord(finalPayload) && typeof finalPayload.model === 'string'
+          ? finalPayload.model
+          : input.modelID,
+      ),
+    })
+    takeInternalHeaders(headers)
     if (body !== undefined) headers.delete('content-length')
     // Recheck session revocation after rewriting and signing before the
     // authenticated request can be returned to the caller.
@@ -783,6 +868,37 @@ export function createNativeAnthropicAdapter<Q, P>(
         request.url,
         send.baseURL !== undefined ? { baseURL: send.baseURL } : {},
       ).url?.toString() ?? request.url
+    if (send.dispatch?.kind === 'http-relay') {
+      // Each HTTP relay attempt sends the complete upstream body, not a patch.
+      // A host retry authorizes credentials again and builds a new envelope;
+      // it must not reuse this attempt's authorization.
+      const upstreamBody = body ?? ''
+      headers.delete('x-relay-token')
+      const envelope = {
+        protocol: 1,
+        type: 'request',
+        affinity: input.sessionID,
+        upstream: {
+          url,
+          method: request.method,
+          headers: Object.fromEntries(headers),
+        },
+        mode: 'full_sync',
+        revision: 1,
+        body: upstreamBody,
+        next_hash: `sha256:${createHash('sha256').update(upstreamBody).digest('hex')}`,
+      }
+      return new Request(send.dispatch.url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-relay-token': send.dispatch.token,
+        },
+        redirect: 'error',
+        signal: request.signal,
+        body: JSON.stringify(envelope),
+      })
+    }
     return new Request(url, {
       method: request.method,
       headers,
@@ -795,11 +911,35 @@ export function createNativeAnthropicAdapter<Q, P>(
   const adapter: OpenCode2AuthAdapter<Q, Data> = {
     providerID: ANTHROPIC_PROVIDER_ID,
     chooseAccount: (input) =>
-      tracked(input, async () => source.chooseAccount(input)),
+      tracked(input, async () => {
+        const accountId = await source.chooseAccount(input)
+        if (!accountId) throw refuse(input)
+        return accountId
+      }),
     accountHeaders,
     rewriteRequest,
+    rewriteHandshakeURL() {
+      throw new NativeAnthropicTransportRefusal()
+    },
     rewriteResponse({ response, attempt }) {
       const data = attempt.data
+      if (data && !fromUpstream(response.headers, data)) {
+        // Relay authentication errors must not appear as an OAuth 401 to the
+        // host or the native credential service.
+        if (response.status === 401)
+          return Response.json(
+            {
+              type: 'error',
+              error: {
+                type: 'api_error',
+                message:
+                  'Relay authentication failed before Anthropic received the request',
+              },
+            },
+            { status: 502 },
+          )
+        return undefined
+      }
       // Only the OAuth route prefixes tool names, so only its responses are
       // mapped back. An API response reaches the host byte for byte.
       if (data?.route !== 'oauth' || !response.body) return undefined
@@ -816,7 +956,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     },
     quotaFromHeaders(headers, status, attempt) {
       const data = attempt.data
-      if (!data) return undefined
+      if (!data || !fromUpstream(headers, data)) return undefined
       return source.quotaFromHeaders?.(headers, {
         ...contextOf(attempt, data),
         status,
@@ -824,7 +964,13 @@ export function createNativeAnthropicAdapter<Q, P>(
     },
     async limitFromResponse({ status, headers, body, attempt }) {
       const data = attempt.data
-      if (!data || !source.limitFromResponse) return undefined
+      if (!data) return undefined
+      if (!fromUpstream(headers, data))
+        return source.limitFromRelayFailure?.({
+          ...contextOf(attempt, data),
+          status,
+        })
+      if (!source.limitFromResponse) return undefined
       return source.limitFromResponse({
         ...contextOf(attempt, data),
         status,
@@ -848,6 +994,8 @@ export function createNativeAnthropicAdapter<Q, P>(
       const message =
         typeof error.message === 'string' ? error.message : undefined
       const data = attempt.data
+      if (data?.dispatch === 'http-relay' && relayUpstream.get(data) === false)
+        return undefined
       const limit = data
         ? source.limitFromStreamError?.({
             ...contextOf(attempt, data),
@@ -869,6 +1017,8 @@ export function createNativeAnthropicAdapter<Q, P>(
       // A local refusal is about the request, not the account: answering it
       // with a limit would move the same broken request to another account.
       if (!data || localRefusals.has(data)) return undefined
+      if (data.dispatch === 'http-relay' && relayUpstream.get(data) === false)
+        return undefined
       return source.limitFromHostError?.(error, contextOf(attempt, data))
     },
     async onAttemptEnd(attempt, outcome) {
@@ -876,8 +1026,13 @@ export function createNativeAnthropicAdapter<Q, P>(
       if (!data) return
       pending.delete(data)
       const check = localRefusals.get(data)
+      const { status, ...rest } = outcome
       const ended = source.onAttemptEnd?.(contextOf(attempt, data), {
-        ...outcome,
+        ...rest,
+        ...(status !== undefined &&
+        (data.dispatch !== 'http-relay' || relayUpstream.get(data) === true)
+          ? { status }
+          : {}),
         ...(check !== undefined ? { localRefusal: { check } } : {}),
       })
       if ((await settleWithin(ended, endTimeoutMs)) === 'timed-out') {
@@ -890,6 +1045,15 @@ export function createNativeAnthropicAdapter<Q, P>(
 
   return {
     adapter,
+    dispose() {
+      disposed = true
+      for (const [sessionID, operations] of inProgress) {
+        for (const operation of operations) operation.revoked = true
+        source.forgetSession?.(sessionID)
+      }
+      inProgress.clear()
+      pending.clear()
+    },
     forgetSession(sessionID) {
       for (const operation of inProgress.get(sessionID) ?? []) {
         operation.revoked = true

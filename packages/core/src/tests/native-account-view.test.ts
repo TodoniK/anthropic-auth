@@ -370,3 +370,72 @@ for (const roster of [
     expect(JSON.stringify(rows)).toBe(before)
   })
 }
+
+test('native metadata ignores quota failures at or before the successful observation floor', () => {
+  const entry = {
+    ...runtime.accounts['primary-row']!,
+    quotaErrorClearedAt: 200,
+  }
+  for (const checkedAt of [199, 200]) {
+    const next = applyNativeMetadataPatch(entry, {
+      lastQuotaRefreshError: {
+        message: 'late failure',
+        checkedAt,
+        accountIdentity: uuid,
+      },
+    })
+    expect(next.lastQuotaRefreshError).toBeUndefined()
+    expect(next.quotaErrorClearedAt).toBe(200)
+  }
+  expect(
+    applyNativeMetadataPatch(entry, {
+      lastQuotaRefreshError: {
+        message: 'new failure',
+        checkedAt: 201,
+        accountIdentity: uuid,
+      },
+    }).lastQuotaRefreshError?.checkedAt,
+  ).toBe(201)
+})
+
+test('native metadata retains newer quota failures against delayed writers', () => {
+  const failure = {
+    message: 'new failure',
+    checkedAt: 300,
+    accountIdentity: uuid,
+  }
+  const next = applyNativeMetadataPatch(
+    { ...runtime.accounts['primary-row']!, lastQuotaRefreshError: failure },
+    {
+      lastQuotaRefreshError: {
+        message: 'old failure',
+        checkedAt: 250,
+        accountIdentity: uuid,
+      },
+    },
+  )
+  expect(next.lastQuotaRefreshError).toEqual(failure)
+})
+
+test('native quota clear floors and generations cannot move backward or clear a newer failure', () => {
+  const entry = {
+    ...runtime.accounts['primary-row']!,
+    quotaErrorClearedAt: 250,
+    quotaErrorGeneration: 3,
+    lastQuotaRefreshError: {
+      message: 'new failure',
+      checkedAt: 300,
+      accountIdentity: uuid,
+    },
+  }
+  const stale = applyNativeMetadataPatch(entry, {
+    quotaErrorClearedAt: 200,
+    quotaErrorGeneration: 1,
+  })
+  expect(stale.quotaErrorClearedAt).toBe(250)
+  expect(stale.quotaErrorGeneration).toBe(3)
+  expect(stale.lastQuotaRefreshError).toEqual(entry.lastQuotaRefreshError)
+  const cleared = applyNativeMetadataPatch(entry, { quotaErrorClearedAt: 350 })
+  expect(cleared.quotaErrorClearedAt).toBe(350)
+  expect(cleared.lastQuotaRefreshError).toBeUndefined()
+})

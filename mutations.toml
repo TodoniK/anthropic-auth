@@ -470,3 +470,19 @@ expect_message = "error: expect(received).toBeGreaterThanOrEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
 broad_report = "tmp/mutations/pi.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "quota-metadata-excludes-cleared-failures"
+guards = "Late quota failures cannot restore restrictions cleared by a newer successful observation."
+file = "packages/core/src/native-account-view.ts"
+old = "next.lastQuotaRefreshError.checkedAt <= (next.quotaErrorClearedAt ?? -1)"
+new = "false"
+test_file = "packages/core/src/tests/native-account-view.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-account-view.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["native metadata ignores quota failures at or before the successful observation floor", "native quota clear floors and generations cannot move backward or clear a newer failure"]
+expect_message = "error: expect(received).toBeUndefined()"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

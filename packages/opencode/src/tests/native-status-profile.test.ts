@@ -28,8 +28,9 @@ import {
 
 // The unified /claude menu fetches missing or stale OAuth profiles before it
 // shows the account and quota sections. These tests run the real plugin on a
-// migrated native pool and never call auth.loader: the menu must work before
-// OpenCode first asks the plugin for credentials. Profile HTTP goes through a
+// migrated native pool. Except where a test starts the startup profile display
+// itself, they never call auth.loader: the menu must work before OpenCode
+// first asks the plugin for credentials. Profile HTTP goes through a
 // replaced global fetch, installed before the plugin captures it.
 
 const { test, deferCleanup, trackDetached, gate } = createTestLifetimeSuite()
@@ -727,6 +728,91 @@ test('vault accounts show fetched profiles through vault-issued credentials', as
   )
 })
 
+test('a menu opened while startup fetches an unidentified route joins that request', async () => {
+  const s = await start(
+    { legacyConfig: localLegacyConfig(), hostAuth: localHostAuth() },
+    {
+      beforePlugin: async (paths) => {
+        // Main already has a fresh saved profile, so only the fallback route
+        // needs a profile request.
+        await seedProfile(
+          paths,
+          'main',
+          accountTier[mainIdentity] ?? '',
+          Date.now(),
+        )
+      },
+    },
+  )
+  expect(await storedTiers(s.paths)).toEqual({
+    main: accountTier[mainIdentity],
+    'fallback-route': undefined,
+  })
+  const release = gate()
+  let fallbackArrived!: () => void
+  const arrived = new Promise<void>((resolve) => {
+    fallbackArrived = resolve
+  })
+  s.network.respond = async (account) => {
+    // The menu sends the request for the account added before it opened
+    // only after it has decided, for every route, whether to join an
+    // existing profile request or send a new one. Releasing the held
+    // fallback answer at that point cannot hide a second fallback request,
+    // and the menu waits for every request it sent before it renders.
+    if (account === otherIdentity) release.open()
+    if (
+      account === fallbackIdentity &&
+      s.network.profileAccounts.filter((entry) => entry === fallbackIdentity)
+        .length === 1
+    ) {
+      fallbackArrived()
+      await release.wait
+    }
+    return undefined
+  }
+  // OpenCode's first credential request starts the startup profile display,
+  // which has no time bound of its own.
+  const loader = s.plugin.auth?.loader
+  if (!loader) throw new Error('The plugin has no auth loader')
+  await loader(
+    async () =>
+      custodyTombstoneOAuth('anthropic') as Awaited<
+        ReturnType<Parameters<typeof loader>[0]>
+      >,
+    { models: {} } as unknown as Parameters<typeof loader>[1],
+  )
+  // The startup request has authorized the fallback route, which recorded
+  // the route's account identity, and its answer is still held.
+  await arrived
+  const runtime = createNativeAccountRuntime({
+    paths: s.paths,
+    host: 'opencode',
+    local: nativeLocal(),
+  })
+  try {
+    await runtime.loginOAuth({
+      routeId: 'other-route',
+      credential: {
+        access: 'sk-ant-oat01-synthetic-other-access',
+        refresh: 'synthetic-other-refresh',
+        expires: Date.now() + 8 * 60 * 60_000,
+      },
+      replace: false,
+    })
+  } finally {
+    runtime.close()
+  }
+  const text = await s.readMenu()
+  expect(accountLine(text, 'fallback-route')).toContain('Max 5x')
+  expect(accountLine(text, 'other-route')).toContain('Max 10x')
+  // One request per account: the menu joined the startup fallback request
+  // that was still in flight instead of repeating it.
+  expect(s.network.profileAccounts.sort()).toEqual(
+    [fallbackIdentity, otherIdentity].sort(),
+  )
+  expect(s.network.unexpected).toEqual([])
+})
+
 test('missing native authority refuses status without any profile request', async () => {
   const s = await start({
     legacyConfig: localLegacyConfig(),
@@ -745,7 +831,7 @@ test('a profile whose save was refused is not shown once the refusal is known', 
     saveRefused = resolve
   })
   // The deferred refusal gate: `refused` resolves when the plugin logs that
-  // the fallback profile save failed. Teardown opens `teardown` before it
+  // it refused to publish the fallback profile. Teardown opens `teardown` before it
   // joins the test body, so a body still waiting for a refusal that never
   // came is released instead of hanging teardown.
   const teardown = gate()
@@ -755,7 +841,7 @@ test('a profile whose save was refused is not shown once the refusal is known', 
   })
   __setLogTestSink((record) => {
     if (
-      record.message === 'failed to save account profile' &&
+      record.message === 'refused account profile publication' &&
       record.payload?.account === 'fallback-route'
     )
       saveRefused()

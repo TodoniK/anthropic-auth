@@ -1,27 +1,38 @@
 import { afterEach, expect, mock } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   __setLogTestSink,
   type authorize,
   CacheKeepManager,
   createNativeAccountRuntime,
+  createNativePoolStore,
   custodyTombstoneOAuth,
-  discoverNativeVaultInventory,
   getLogLevel,
   type LogTestRecord,
   type NativeCustodyClient,
   PrimeManager,
-  publishNativeVaultRosterSeed,
-  publishNativeVaultRuntimeSeed,
   resetClaudeCodeIdentityCachesForTest,
   resolveNativePoolPaths,
   runNativeMigration,
+  StickySessionRouter,
   setLogLevel,
+  stickyRouteFamilyForModel,
 } from '@cortexkit/anthropic-auth-core'
 import { createOpencodeClient, type Provider } from '@opencode-ai/sdk'
 import { $ } from 'bun'
+import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
+import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { MockRelayServer } from '../../../e2e-tests/src/mock-relay.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
@@ -46,6 +57,7 @@ const envKeys = [
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
   'OPENCODE_AUTH_CONTENT',
   'CLAUDE_CONFIG_DIR',
+  'XDG_DATA_HOME',
 ] as const
 const originalFetch = globalThis.fetch
 const provider: Provider = {
@@ -212,6 +224,8 @@ async function setupBody() {
   })
   await writeFile(configPath, legacyBytes, { mode: 0o600 })
   process.env.CLAUDE_CONFIG_DIR = join(directory, 'synthetic-claude')
+  // OpenCode's own login store for this test, never the user's.
+  process.env.XDG_DATA_HOME = join(directory, 'synthetic-data')
   resetClaudeCodeIdentityCachesForTest()
   network.mockClear()
   globalThis.fetch = Object.assign(
@@ -423,6 +437,9 @@ async function migrateServingFixture(
   }> = []
   const authorizedGets: string[] = []
   let vaultVersion = 1
+  // The account the vault's default credential belongs to; the user can
+  // replace it with a different account under the same credential ID.
+  let defaultIdentity = mainIdentity
   const scopedClient: NativeCustodyClient = {
     async listScoped() {
       return {
@@ -430,7 +447,7 @@ async function migrateServingFixture(
         rows: [
           {
             id: 'oauth:anthropic',
-            accountId: mainIdentity,
+            accountId: defaultIdentity,
             credentialType: 'oauth',
             state: 'active',
             categories: ['anthropic-native'],
@@ -467,7 +484,9 @@ async function migrateServingFixture(
         credentialId,
         material: `sk-ant-oat01-vault-${credentialId === 'oauth:anthropic' ? 'main' : 'fallback'}-v${vaultVersion}`,
         accountId:
-          credentialId === 'oauth:anthropic' ? mainIdentity : fallbackIdentity,
+          credentialId === 'oauth:anthropic'
+            ? defaultIdentity
+            : fallbackIdentity,
         recordVersion: vaultVersion,
         expiresAtMs: Date.now() + 8 * 60 * 60_000,
       }
@@ -477,98 +496,102 @@ async function migrateServingFixture(
     },
     close() {},
   }
-  const config = {
-    version: 1,
-    mainAccountId: 'primary-route',
-    refresh: { enabled: false },
-    quota: { enabled: false },
-    routing: { mode: 'main-first' },
-    ...(mode === 'claustrum'
-      ? {
-          claustrum: {
-            mode,
-            scopedRoster: true,
-            primaryAccount: {
-              credentialId: 'oauth:anthropic',
-              accountId: mainIdentity,
-              state: 'active',
-            },
-          },
-        }
-      : {}),
-    accounts: fallback
-      ? [
-          {
-            id: 'fallback-route',
-            type: 'oauth',
-            enabled: true,
-            ...(mode === 'claustrum'
-              ? {
-                  refresh: '',
-                  claustrumScopedCredentialId: 'oauth:secondary',
-                  anthropicAccountUuid: fallbackIdentity,
-                }
-              : {
-                  access: 'sk-ant-oat01-local-fallback',
-                  refresh: 'synthetic-fallback-refresh',
-                  expires: Date.now() + 8 * 60 * 60_000,
-                }),
-          },
-        ]
-      : [],
-  }
-  await writeFile(paths.legacyConfig, JSON.stringify(config), { mode: 0o600 })
-  await writeFile(
-    hostAuthPath,
-    JSON.stringify({
-      anthropic:
-        mode === 'claustrum'
-          ? custodyTombstoneOAuth('anthropic')
-          : {
+  if (mode === 'claustrum') {
+    // The plugin serves Claude from the credential vault when this host's
+    // enrollment token file exists (readable by its owner only, mode 0600);
+    // the account settings no longer decide that. Vault account settings,
+    // account list and metadata are separate files beside the local ones.
+    // Write the token, create empty vault settings, then ask the vault for its
+    // account list once: that records the accounts and marks the default
+    // account as main. Local credentials are never migrated or touched.
+    await writeFile(
+      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE!,
+      JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    const vaultPaths = nativeVaultPaths(paths)
+    await createNativePoolStore({
+      paths: vaultPaths,
+      quota: nativeQuotaCodec,
+    }).initialize()
+    const runtime = createNativeAccountRuntime({
+      paths,
+      host: 'opencode',
+      vault: { connect: async () => scopedClient },
+    })
+    try {
+      expect((await runtime.read()).mode).toBe('claustrum')
+      await runtime.vault.refresh()
+      await runtime.updateSettings((settings) => ({
+        ...settings,
+        refresh: { enabled: false },
+        quota: { enabled: false },
+        routing: { mode: 'main-first' },
+      }))
+      const snapshot = await runtime.read()
+      expect(snapshot.routingPath).toBe(vaultPaths.routing)
+      expect(
+        snapshot.accounts.find((account) => account.id === 'main')
+          ?.accountIdentity,
+      ).toBe(mainIdentity)
+    } finally {
+      runtime.close()
+    }
+    // The local account files stay exactly as the user left them.
+    expect(await readFile(configPath, 'utf8')).toBe(legacyBytes)
+  } else {
+    const config = {
+      version: 1,
+      mainAccountId: 'primary-route',
+      refresh: { enabled: false },
+      quota: { enabled: false },
+      routing: { mode: 'main-first' },
+      accounts: fallback
+        ? [
+            {
+              id: 'fallback-route',
               type: 'oauth',
-              access: 'sk-ant-oat01-local-main',
-              refresh: 'synthetic-primary-refresh',
+              enabled: true,
+              access: 'sk-ant-oat01-local-fallback',
+              refresh: 'synthetic-fallback-refresh',
               expires: Date.now() + 8 * 60 * 60_000,
             },
-      other: { type: 'api', key: 'synthetic-unrelated-provider' },
-    }),
-    { mode: 0o600 },
-  )
-  await writeFile(
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE!,
-    JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
-    { mode: 0o600 },
-  )
-  const journal = await runNativeMigration({
-    paths,
-    host: 'opencode',
-    hostAuthPath,
-    routingSourcePath: join(directory, 'legacy-routing.json'),
-    routingDestinationPath: join(directory, 'native-routing.json'),
-    env: {},
-    processFence: async () => {},
-    removePiAnthropicAuth: false,
-    ...(mode === 'claustrum'
-      ? {
-          custody: {
-            discover: () =>
-              discoverNativeVaultInventory({
-                paths,
-                host: 'opencode',
-                connect: async () => scopedClient,
-              }),
-            publishSeed: publishNativeVaultRosterSeed,
-            publishRuntimeSeed: publishNativeVaultRuntimeSeed,
-          },
-        }
-      : {}),
-  })
-  expect(journal.phase).toBe('retired')
-  expect(journal.version).toBe(4)
-  expect(JSON.parse(await readFile(hostAuthPath, 'utf8')).other).toEqual({
-    type: 'api',
-    key: 'synthetic-unrelated-provider',
-  })
+          ]
+        : [],
+    }
+    await writeFile(paths.legacyConfig, JSON.stringify(config), {
+      mode: 0o600,
+    })
+    await writeFile(
+      hostAuthPath,
+      JSON.stringify({
+        anthropic: {
+          type: 'oauth',
+          access: 'sk-ant-oat01-local-main',
+          refresh: 'synthetic-primary-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        },
+        other: { type: 'api', key: 'synthetic-unrelated-provider' },
+      }),
+      { mode: 0o600 },
+    )
+    const journal = await runNativeMigration({
+      paths,
+      host: 'opencode',
+      hostAuthPath,
+      routingSourcePath: join(directory, 'legacy-routing.json'),
+      routingDestinationPath: join(directory, 'native-routing.json'),
+      env: {},
+      processFence: async () => {},
+      removePiAnthropicAuth: false,
+    })
+    expect(journal.phase).toBe('retired')
+    expect(journal.version).toBe(4)
+    expect(JSON.parse(await readFile(hostAuthPath, 'utf8')).other).toEqual({
+      type: 'api',
+      key: 'synthetic-unrelated-provider',
+    })
+  }
   const records: Array<{ url: string; authorization: string; body: string }> =
     []
   const fetchProvider = async (
@@ -646,10 +669,17 @@ async function migrateServingFixture(
     rotateVault: () => {
       vaultVersion++
     },
+    replaceDefaultAccount: (identity: string) => {
+      defaultIdentity = identity
+    },
   }
 }
 
-async function sendNative(plugin: PluginHooks, model = 'claude-sonnet-4-6') {
+async function sendNative(
+  plugin: PluginHooks,
+  model = 'claude-sonnet-4-6',
+  sessionId = `synthetic-session-${directory}`,
+) {
   const options = await load(plugin, async () =>
     custodyTombstoneOAuth('anthropic'),
   )
@@ -657,7 +687,7 @@ async function sendNative(plugin: PluginHooks, model = 'claude-sonnet-4-6') {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-session-affinity': `synthetic-session-${directory}`,
+      'x-session-affinity': sessionId,
     },
     body: JSON.stringify({
       model,
@@ -1076,6 +1106,479 @@ for (const mode of ['main-first', 'fallback-first'] as const) {
     })
   }
 }
+
+/** A session's sticky assignment in a routing file, keyed as the router keys it. */
+async function stickyPin(path: string, sessionId: string) {
+  const state = JSON.parse(await readFile(path, 'utf8')) as {
+    assignments: Record<
+      string,
+      { accountId: string; accountIdentity?: string; assignedAt: number }
+    >
+  }
+  return state.assignments[createHash('sha256').update(sessionId).digest('hex')]
+}
+
+test('a replaced default vault account loses its session pins and quota while another account keeps its pin', async () => {
+  const fixture = await migrateServingFixture('claustrum', true)
+  const replacementIdentity = '33333333-3333-4333-8333-333333333333'
+  const model = 'claude-sonnet-4-6'
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+    vault: { connect: async () => fixture.scopedClient },
+  })
+  let routingPath: string | undefined
+  let fallbackRoute: string | undefined
+  try {
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      quota: { enabled: true },
+      routing: { mode: 'sticky-balanced' },
+    }))
+    for (const route of (await runtime.read()).accounts) {
+      const receipt = await runtime.authorizeVault(route.id)
+      expect(
+        await runtime.vault.publish(receipt, {
+          quota: {
+            accountIdentity: receipt.accountIdentity,
+            checkedAt: Date.now(),
+            five_hour: {
+              remainingPercent: 90,
+              usedPercent: 10,
+              checkedAt: Date.now(),
+            },
+            seven_day: {
+              remainingPercent: 90,
+              usedPercent: 10,
+              checkedAt: Date.now(),
+            },
+          },
+        }),
+      ).toBe(true)
+    }
+    const before = await runtime.read()
+    routingPath = before.routingPath
+    fallbackRoute = before.accounts.find(
+      (account) => account.accountIdentity === fallbackIdentity,
+    )?.id
+    expect(
+      before.accounts.find((account) => account.id === 'main')?.quota,
+    ).toMatchObject({ accountIdentity: mainIdentity })
+  } finally {
+    runtime.close()
+  }
+  if (!routingPath || !fallbackRoute)
+    throw new Error('Vault fixture has no routing file or fallback route')
+  // Earlier sessions pinned through the vault routing file: one to the
+  // default account, one to the other vault account.
+  const earlier = new StickySessionRouter({ path: routingPath })
+  const identities = new Map([
+    ['main', mainIdentity],
+    [fallbackRoute, fallbackIdentity],
+  ])
+  for (const [sessionId, accountId] of [
+    ['session-on-default', 'main'],
+    ['session-on-fallback', fallbackRoute],
+  ] as const) {
+    const pinned = await earlier.resolve({
+      sessionId,
+      family: stickyRouteFamilyForModel(model),
+      modelId: model,
+      affinityModelId: model,
+      candidates: [
+        {
+          accountId,
+          quota: {
+            accountIdentity: identities.get(accountId),
+            checkedAt: Date.now(),
+            five_hour: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: Date.now(),
+            },
+            seven_day: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: Date.now(),
+            },
+          },
+          order: 0,
+        },
+      ],
+      retainAccountIds: new Set(identities.keys()),
+      accountIdentities: identities,
+      storage: null,
+      inputBytes: 1,
+    })
+    expect(pinned?.accountId).toBe(accountId)
+  }
+  const defaultPin = await stickyPin(routingPath, 'session-on-default')
+  const fallbackPin = await stickyPin(routingPath, 'session-on-fallback')
+  expect(defaultPin?.accountIdentity).toBe(mainIdentity)
+
+  // The user replaces the account behind the vault's default credential.
+  fixture.replaceDefaultAccount(replacementIdentity)
+  const discovery = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+    vault: { connect: async () => fixture.scopedClient },
+  })
+  try {
+    await discovery.vault.refresh()
+    const main = (await discovery.read()).accounts.find(
+      (account) => account.id === 'main',
+    )
+    expect(main?.accountIdentity).toBe(replacementIdentity)
+    // The previous account's usage reading is not carried over.
+    expect(main?.quota).toBeUndefined()
+  } finally {
+    discovery.close()
+  }
+
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  expect((await sendNative(plugin, model, 'session-on-default')).status).toBe(
+    200,
+  )
+  expect((await sendNative(plugin, model, 'session-on-fallback')).status).toBe(
+    200,
+  )
+  // The session pinned to the replaced account is placed again and its new
+  // pin names the account that now serves it.
+  const replaced = await stickyPin(routingPath, 'session-on-default')
+  expect(replaced?.accountIdentity).toBeDefined()
+  expect(replaced?.accountIdentity).not.toBe(mainIdentity)
+  expect(replaced?.assignedAt).toBeGreaterThan(defaultPin?.assignedAt ?? 0)
+  expect(replaced?.accountIdentity).toBe(
+    replaced?.accountId === 'main' ? replacementIdentity : fallbackIdentity,
+  )
+  // The other vault account's pin is untouched.
+  const kept = await stickyPin(routingPath, 'session-on-fallback')
+  expect(kept).toMatchObject({
+    accountId: fallbackRoute,
+    accountIdentity: fallbackIdentity,
+    assignedAt: fallbackPin?.assignedAt,
+  })
+  const sent = fixture.records
+    .filter((record) => record.url.includes('/v1/messages'))
+    .map((record) => record.authorization)
+  expect(sent).toHaveLength(2)
+  expect(sent[1]).toBe('Bearer sk-ant-oat01-vault-fallback-v1')
+})
+
+test('vault sticky routing keeps session assignments only in the vault routing file', async () => {
+  const fixture = await migrateServingFixture('claustrum', true)
+  // The local session-to-account assignment file. While the host uses the
+  // vault, sticky routing must neither read nor rewrite it. Its content is
+  // not JSON, so a request that tried to read it would fail to route.
+  const localRouting = process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE!
+  const localBytes = 'synthetic local routing state, not JSON'
+  await writeFile(localRouting, localBytes, { mode: 0o600 })
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+    vault: { connect: async () => fixture.scopedClient },
+  })
+  let vaultRouting: string | undefined
+  try {
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      quota: { enabled: true },
+      routing: { mode: 'sticky-balanced' },
+    }))
+    vaultRouting = (await runtime.read()).routingPath
+    const quota = () => ({
+      checkedAt: Date.now(),
+      five_hour: {
+        remainingPercent: 90,
+        usedPercent: 10,
+        checkedAt: Date.now(),
+      },
+      seven_day: {
+        remainingPercent: 90,
+        usedPercent: 10,
+        checkedAt: Date.now(),
+      },
+    })
+    for (const route of (await runtime.read()).accounts) {
+      const receipt = await runtime.authorizeVault(route.id)
+      expect(
+        await runtime.vault.publish(receipt, {
+          quota: { ...quota(), accountIdentity: receipt.accountIdentity },
+        }),
+      ).toBe(true)
+    }
+  } finally {
+    runtime.close()
+  }
+  if (!vaultRouting) throw new Error('Vault mode names no routing file')
+  expect(vaultRouting).not.toBe(localRouting)
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  expect((await sendNative(plugin)).status).toBe(200)
+  const assignments = Object.values(
+    (
+      JSON.parse(await readFile(vaultRouting, 'utf8')) as {
+        assignments: Record<string, { accountId: string }>
+      }
+    ).assignments,
+  )
+  expect(assignments).toHaveLength(1)
+  expect(await readFile(localRouting, 'utf8')).toBe(localBytes)
+})
+
+/** OpenCode's login store for this test, under the test's XDG_DATA_HOME. */
+function hostLoginStore() {
+  return join(process.env.XDG_DATA_HOME!, 'opencode', 'auth.json')
+}
+
+async function writeHostLoginStore(bytes: string) {
+  await mkdir(dirname(hostLoginStore()), { recursive: true })
+  await writeFile(hostLoginStore(), bytes, { mode: 0o600 })
+}
+
+function vaultLoginMethod(plugin: PluginHooks) {
+  return plugin.auth?.methods.find(
+    (method) => method.label === 'Claude via credential vault',
+  )
+}
+
+async function startVaultLogin(plugin: PluginHooks) {
+  const method = vaultLoginMethod(plugin)
+  if (method?.type !== 'oauth')
+    throw new Error('Plugin offers no vault login method')
+  const started = await method.authorize()
+  if (started.method !== 'auto')
+    throw new Error('Vault login unexpectedly asks for a code')
+  return started.callback()
+}
+
+const localHostOAuth = {
+  type: 'oauth' as const,
+  access: 'sk-ant-oat01-synthetic-host-login',
+  refresh: 'synthetic-host-login-refresh',
+  expires: Date.now() + 60 * 60_000,
+}
+
+test('vault login is offered only while this host holds an enrollment token', async () => {
+  const plugin = await createPlugin()
+  expect(vaultLoginMethod(plugin)).toBeUndefined()
+  await writeFile(
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE!,
+    JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  expect(vaultLoginMethod(plugin)?.type).toBe('oauth')
+  expect(network).not.toHaveBeenCalled()
+})
+
+test('enrolled vault login returns the exact placeholder for an empty slot without any network', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  network.mockClear()
+  const placeholder = custodyTombstoneOAuth('anthropic')
+  expect(await startVaultLogin(plugin)).toEqual({
+    type: 'success',
+    access: placeholder.access,
+    refresh: placeholder.refresh,
+    expires: placeholder.expires,
+  })
+  // The plugin returns the placeholder; it never writes OpenCode's store.
+  await expect(readFile(hostLoginStore(), 'utf8')).rejects.toThrow()
+  expect(network).not.toHaveBeenCalled()
+})
+
+for (const [state, bytes] of [
+  ['a local OAuth login', JSON.stringify({ anthropic: localHostOAuth })],
+  [
+    'a stored API key',
+    JSON.stringify({ anthropic: { type: 'api', key: 'synthetic-host-key' } }),
+  ],
+  [
+    'the placeholder itself',
+    JSON.stringify({ anthropic: custodyTombstoneOAuth('anthropic') }),
+  ],
+  ['unparseable logins', '{"anthropic": '],
+  ['logins of the wrong shape', JSON.stringify(['anthropic'])],
+  ['a null Anthropic entry', JSON.stringify({ anthropic: null })],
+  [
+    'an incomplete OAuth entry',
+    JSON.stringify({ anthropic: { type: 'oauth' } }),
+  ],
+] as const) {
+  test(`enrolled vault login refuses ${state} and leaves its bytes unchanged`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    await writeHostLoginStore(bytes)
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+    })
+    network.mockClear()
+    await expect(startVaultLogin(plugin)).rejects.toThrow()
+    expect(await readFile(hostLoginStore(), 'utf8')).toBe(bytes)
+    expect(network).not.toHaveBeenCalled()
+  })
+}
+
+for (const unsafe of ['symlink', 'group-readable'] as const) {
+  test(`vault login refuses an ${unsafe} host login store before network or any write`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    const bytes = JSON.stringify({
+      other: { type: 'api', key: 'synthetic-unrelated-provider' },
+    })
+    await writeHostLoginStore(bytes)
+    if (unsafe === 'symlink') {
+      const target = join(dirname(hostLoginStore()), 'original-auth.json')
+      await writeFile(target, bytes, { mode: 0o600 })
+      await rm(hostLoginStore())
+      await symlink(target, hostLoginStore())
+    } else {
+      await chmod(hostLoginStore(), 0o640)
+    }
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+    })
+    network.mockClear()
+    await expect(startVaultLogin(plugin)).rejects.toThrow(
+      'Invalid native host auth source.',
+    )
+    expect(await readFile(hostLoginStore(), 'utf8')).toBe(bytes)
+    expect(network).not.toHaveBeenCalled()
+  })
+}
+
+test('enrolled host refuses a local OAuth slot without using it and the vault login sees it as occupied', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  network.mockClear()
+  const slot = structuredClone(localHostOAuth)
+  const options = await load(plugin, async () => slot)
+  await expect(
+    requestFetch(options)('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+    }),
+  ).rejects.toThrow('Remove it and choose the vault login, or disconnect')
+  // OpenCode's Anthropic login is read through the reader OpenCode gave the
+  // auth loader (it returns the local OAuth login above); no auth.json file
+  // exists in this test.
+  await expect(startVaultLogin(plugin)).rejects.toThrow(
+    'already holds an Anthropic login',
+  )
+  expect(slot).toEqual(localHostOAuth)
+  expect(network).not.toHaveBeenCalled()
+  expect(fixture.authorizedGets).toEqual([])
+})
+
+test('enrolled host refuses a placeholder look-alike that carries an access token', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  network.mockClear()
+  const options = await load(plugin, async () => ({
+    ...custodyTombstoneOAuth('anthropic'),
+    access: 'sk-ant-oat01-synthetic-look-alike',
+  }))
+  await expect(
+    requestFetch(options)('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+    }),
+  ).rejects.toThrow('Remove it and choose the vault login, or disconnect')
+  expect(network).not.toHaveBeenCalled()
+  expect(fixture.authorizedGets).toEqual([])
+})
+
+test('enrolled host passes a stored API key through unchanged', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  network.mockClear()
+  const slot = { type: 'api' as const, key: 'synthetic-host-key' }
+  expect(await load(plugin, async () => slot)).toEqual({})
+  expect(slot).toEqual({ type: 'api', key: 'synthetic-host-key' })
+  expect(network).not.toHaveBeenCalled()
+  expect(fixture.authorizedGets).toEqual([])
+})
+
+function proMaxMethod(plugin: PluginHooks) {
+  const method = plugin.auth?.methods.find(
+    (candidate) => candidate.label === 'Claude Pro/Max',
+  )
+  if (method?.type !== 'oauth')
+    throw new Error('Plugin offers no Claude Pro/Max sign-in')
+  return method
+}
+
+function syntheticAuthorize(): typeof authorize {
+  return mock(async () => ({
+    url: 'https://example.test/oauth',
+    redirectUri: 'https://example.test/callback',
+    verifier: 'synthetic-verifier',
+    state: 'synthetic-state',
+  }))
+}
+
+test('an enrolled host with local account settings refuses Pro/Max sign-in before the browser flow starts', async () => {
+  await migrateServingFixture('local')
+  // The local pool and its settings stay as migrated; only the enrollment
+  // token says this host now uses the vault.
+  await writeFile(
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE!,
+    JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  const authorizeImpl = syntheticAuthorize()
+  const plugin = await createPlugin({ authorize: authorizeImpl })
+  network.mockClear()
+  await expect(proMaxMethod(plugin).authorize()).rejects.toThrow(
+    'Disconnect from the vault first.',
+  )
+  expect(authorizeImpl).not.toHaveBeenCalled()
+  expect(network).not.toHaveBeenCalled()
+})
+
+test('an unenrolled host with a leftover vault mode setting still starts Pro/Max sign-in', async () => {
+  const fixture = await migrateServingFixture('local')
+  // Simulate an old custody-mode flag by writing directly to the store.
+  // Runtime settings updates reject that flag; enrollment alone selects
+  // the credential source.
+  const store = createNativePoolStore({
+    paths: fixture.paths,
+    quota: nativeQuotaCodec,
+  })
+  await store.updateSettings((settings) => ({
+    ...settings,
+    claustrum: { mode: 'claustrum' },
+  }))
+  const stored = await store.readSettings()
+  expect(stored.status === 'ready' && stored.settings.claustrum).toEqual({
+    mode: 'claustrum',
+  })
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+  })
+  try {
+    expect((await runtime.read()).mode).toBe('local')
+  } finally {
+    runtime.close()
+  }
+  const authorizeImpl = syntheticAuthorize()
+  const plugin = await createPlugin({ authorize: authorizeImpl })
+  network.mockClear()
+  const started = await proMaxMethod(plugin).authorize()
+  expect(started.url).toBe('https://example.test/oauth')
+  expect(authorizeImpl).toHaveBeenCalledTimes(1)
+  expect(network).not.toHaveBeenCalled()
+})
 
 test('OAuth SDK callback commits native credentials and returns only inert activation', async () => {
   const fixture = await migrateServingFixture('local')

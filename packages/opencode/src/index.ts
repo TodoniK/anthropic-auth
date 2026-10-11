@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import type { NativeRefreshFailure } from '@cortexkit/anthropic-auth-core'
 import {
   type AccountCommandStatusProjection,
@@ -86,6 +87,7 @@ import {
   getStickyRoutingStatePath,
   getThinkingPrefixMismatchBehavior,
   type IdentityState,
+  inspectNativeHostAuthEntry,
   isApiKeyAccount,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
@@ -161,6 +163,8 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   readClaustrumEnrollmentStatus,
+  readNativeEnrollmentMode,
+  readNativeHostAuthKind,
   readNativeMigrationJournal,
   refreshBackoffActive,
   remapRequestBodyModel,
@@ -258,6 +262,7 @@ import {
   resolveContentFilterFallbackMode,
   type ServerSideFallbackOutcome,
 } from './server-fallback.ts'
+import { getOpenCodeAuthPath } from './setup/paths.ts'
 import {
   getInitialSidebarRoutingTestHooks,
   getSidebarState,
@@ -1323,18 +1328,16 @@ const anthropicAuthPlugin = async (
           credentialEpoch: binding.credentialEpoch,
         }
     }
-    if (
-      snapshot.mode !== 'claustrum' ||
-      !snapshot.accounts.some((account) => account.source === 'vault')
-    )
-      return snapshot.policyStorage
+    if (snapshot.mode !== 'claustrum') return snapshot.policyStorage
     const primary = snapshot.accounts.find(
       (account) => account.id === 'main' && account.source === 'vault',
     )
     const primaryUuid = asProviderAccountUuid(primary?.accountIdentity)
-    // Routing uses scopedRoster to identify a discovered vault account pool.
-    // Derive it from native account rows, not legacy config. This is routing
-    // metadata only; each physical send obtains a fresh vault credential.
+    // Enrollment, not account settings, selects vault custody, so an enrolled
+    // host routes over the vault account pool even before its first roster
+    // discovery has listed any account. Derive the pool marker from the
+    // native mode, not legacy config. This is routing metadata only; each
+    // physical send obtains a fresh vault credential.
     return {
       ...snapshot.policyStorage,
       claustrum: {
@@ -1728,11 +1731,43 @@ const anthropicAuthPlugin = async (
   const desktopNoticeIdleUserMessages = new Map<string, string>()
   const desktopNoticeMessageIds = new Map<string, Set<string>>()
   const desktopNoticeProbes = new Map<string, number>()
-  const stickySessionRouter = new StickySessionRouter({
-    path:
-      process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE ||
-      getStickyRoutingStatePath(accountStoragePath),
-  })
+  // Session-to-account assignments live in separate files for local and vault
+  // accounts. A local host keeps its configured assignment file; an enrolled
+  // host uses only the vault routing file the native runtime names, so vault
+  // routing never opens or rewrites the local file. The runtime's mode is read
+  // per use because enrollment can change while the plugin runs.
+  const localStickyRoutingPath =
+    process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE ||
+    getStickyRoutingStatePath(accountStoragePath)
+  const stickySessionRouters = new Map<string, StickySessionRouter>()
+  async function currentStickyRouting(): Promise<{
+    router: StickySessionRouter
+    accountIdentities?: ReadonlyMap<string, string>
+  }> {
+    const snapshot = await nativeAccounts.read()
+    let path = localStickyRoutingPath
+    // Vault pins are bound to the verified account UUID behind each route, so
+    // a route whose vault account was replaced (such as a new default account
+    // under the same credential) loses its pins and quota preference, while
+    // other accounts keep theirs. Local routing passes no map and keeps its
+    // assignments unchanged.
+    let accountIdentities: Map<string, string> | undefined
+    if (snapshot.mode === 'claustrum') {
+      if (!snapshot.routingPath)
+        throw new Error('Vault routing storage is unavailable')
+      path = snapshot.routingPath
+      accountIdentities = new Map()
+      for (const account of snapshot.accounts)
+        if (account.source === 'vault' && account.accountIdentity)
+          accountIdentities.set(account.id, account.accountIdentity)
+    }
+    let router = stickySessionRouters.get(path)
+    if (!router) {
+      router = new StickySessionRouter({ path })
+      stickySessionRouters.set(path, router)
+    }
+    return { router, ...(accountIdentities && { accountIdentities }) }
+  }
   // The runtime stores quota readings for the account and tokens used to fetch
   // them. QuotaManager caches those readings and when they were checked.
   // A failed poll supplies no exhaustion evidence and cannot prove that a
@@ -1990,6 +2025,8 @@ const anthropicAuthPlugin = async (
      * later display does not wait on the same attempt again.
      */
     deadline?: AbortSignal
+    /** True once the profile response arrived or the attempt failed. */
+    settled?: boolean
     profile?: OAuthAccountProfile
     persistence?: 'pending' | 'saved' | 'refused' | 'failed'
     isCurrent?: () => Promise<boolean>
@@ -2052,6 +2089,7 @@ const anthropicAuthPlugin = async (
       )
       .then(
         ({ profile, persisted, isCurrent }) => {
+          hydration.settled = true
           // Keep a profile only for the account it was read for. A route
           // whose identity was not yet known accepts the identity this read
           // reports; the display checks it against the route again later.
@@ -2101,6 +2139,7 @@ const anthropicAuthPlugin = async (
           void saving.then(() => profilePublications.delete(saving))
         },
         (error: unknown) => {
+          hydration.settled = true
           logger.debug('quota', 'failed to hydrate account profile', {
             account: account.id,
             error: error instanceof Error ? error.message : String(error),
@@ -2172,6 +2211,20 @@ const anthropicAuthPlugin = async (
         continue
       const key = profileHydrationKey(account.id, account.accountIdentity)
       let hydration = profileHydrations.get(key)
+      if (!hydration && account.accountIdentity !== undefined) {
+        // A profile attempt for a route whose account was not yet known
+        // first authorizes the route, and that records the account identity.
+        // A display that starts while such an attempt is still in flight
+        // therefore sees the route as identified. Join the in-flight attempt
+        // instead of sending a second profile request for the same route; the
+        // check after the wait still requires the fetched profile to name
+        // this account before it is filed or shown.
+        const earlier = profileHydrations.get(profileHydrationKey(account.id))
+        if (earlier && !earlier.settled) {
+          hydration = earlier
+          unidentified.set(account.id, earlier)
+        }
+      }
       if (
         !hydration ||
         (hydration.profile && !oauthProfileIsFresh(hydration.profile, now))
@@ -3002,6 +3055,88 @@ const anthropicAuthPlugin = async (
   let latestGetActivation:
     | (() => Promise<{ type: string; active: boolean }>)
     | null = null
+  // OpenCode's own reader for this host's Anthropic login, captured from the
+  // first auth.loader call. The vault login method prefers it to reading
+  // OpenCode's auth file itself.
+  let latestHostGetAuth: (() => Promise<unknown>) | null = null
+
+  /** The native placeholder, field for field; a look-alike is a different login. */
+  function isExactNativePlaceholder(auth: unknown) {
+    const placeholder = custodyTombstoneOAuth('anthropic')
+    if (!auth || typeof auth !== 'object') return false
+    const value = auth as Record<string, unknown>
+    return (
+      value.type === placeholder.type &&
+      value.access === placeholder.access &&
+      value.refresh === placeholder.refresh &&
+      value.expires === placeholder.expires
+    )
+  }
+
+  /**
+   * What OpenCode's login store holds for Anthropic: 'absent' or the kind of
+   * login. Uses OpenCode's reader when a loader call supplied one; otherwise
+   * reads OpenCode's auth file without changing it. Anything that cannot be
+   * read or recognized with certainty throws, so callers refuse rather than
+   * treat the slot as empty.
+   */
+  async function hostAnthropicLoginKind(): Promise<
+    ReturnType<typeof inspectNativeHostAuthEntry>['kind']
+  > {
+    if (latestHostGetAuth) {
+      // OpenCode's reader returns the Anthropic entry itself; undefined means
+      // there is none, while null or a malformed entry is refused.
+      const entry = await latestHostGetAuth()
+      return inspectNativeHostAuthEntry(
+        'opencode',
+        entry === undefined ? {} : { anthropic: entry },
+      ).kind
+    }
+    if (process.env.OPENCODE_AUTH_CONTENT !== undefined)
+      throw new Error(
+        'OpenCode logins cannot be checked while OPENCODE_AUTH_CONTENT is set',
+      )
+    return readNativeHostAuthKind('opencode', getOpenCodeAuthPath())
+  }
+
+  /**
+   * The vault login only writes the native placeholder into an empty
+   * Anthropic slot, and only while this host is enrolled with the vault.
+   */
+  async function requireVaultLoginAllowed() {
+    if ((await readNativeEnrollmentMode('opencode')) !== 'claustrum')
+      throw new Error(
+        'This host is not connected to the credential vault; run setup to connect it first',
+      )
+    if ((await hostAnthropicLoginKind()) !== 'absent')
+      throw new Error(
+        'OpenCode already holds an Anthropic login; remove it before choosing the vault login',
+      )
+  }
+  const vaultLoginMethod = {
+    label: 'Claude via credential vault',
+    type: 'oauth' as const,
+    authorize: async () => {
+      await requireVaultLoginAllowed()
+      return {
+        url: '',
+        instructions:
+          'Claude requests use the credential vault this host is connected to. OpenCode stores only a placeholder, never a credential.',
+        method: 'auto' as const,
+        callback: async () => {
+          // The slot or enrollment may have changed while OpenCode waited.
+          await requireVaultLoginAllowed()
+          const placeholder = custodyTombstoneOAuth('anthropic')
+          return {
+            type: 'success' as const,
+            access: placeholder.access,
+            refresh: placeholder.refresh,
+            expires: placeholder.expires,
+          }
+        },
+      }
+    },
+  }
   const cacheKeepRegistry = new CacheKeepSessionRegistry({
     directory:
       process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR ||
@@ -4479,7 +4614,7 @@ const anthropicAuthPlugin = async (
     }
 
     if (action.type === 'reset' && sessionId) {
-      await stickySessionRouter.clear(sessionId)
+      await (await currentStickyRouting()).router.clear(sessionId)
       logger.info('commands', 'sticky routing assignment reset')
     }
 
@@ -4620,9 +4755,9 @@ const anthropicAuthPlugin = async (
     // -- add-oauth-start ---------------------------------------------------
     if (action.type === 'add-oauth-start') {
       if (
-        getClaustrumMode(await loadAccounts(accountStoragePath)) === 'claustrum'
+        (await readNativeEnrollmentMode('opencode', process.env)) !== 'local'
       ) {
-        throw new Error('Exit Claustrum mode first: /claude-account local')
+        throw new Error('Disconnect from the vault first.')
       }
       const authResult = await authorizeImpl('max')
       const entry: OAuthPendingEntry = {
@@ -5680,6 +5815,7 @@ const anthropicAuthPlugin = async (
             active: isCustodyTombstoneOAuth(current, 'anthropic'),
           }
         }
+        latestHostGetAuth = hostGetAuth
         const activation = await hostGetAuth()
         // Ordinary OpenCode API-key authentication remains unchanged. After
         // migration, the OAuth marker only enables our provider. Each send must
@@ -5691,6 +5827,32 @@ const anthropicAuthPlugin = async (
             fetch: async () => {
               throw new Error(
                 'Native OAuth cannot serve while OPENCODE_AUTH_CONTENT is set',
+              )
+            },
+          }
+        }
+        // While this host is enrolled with the vault, only the exact native
+        // placeholder enables Claude. Any other OAuth login in OpenCode's slot
+        // is left byte-for-byte as it is and never used, refreshed or checked
+        // with the provider; requests refuse with the way out instead.
+        let enrolled: boolean
+        try {
+          enrolled =
+            (await readNativeEnrollmentMode('opencode')) === 'claustrum'
+        } catch (error) {
+          return {
+            apiKey: '',
+            fetch: async () => {
+              throw error
+            },
+          }
+        }
+        if (enrolled && !isExactNativePlaceholder(activation)) {
+          return {
+            apiKey: '',
+            fetch: async () => {
+              throw new Error(
+                'This host uses the credential vault, but OpenCode holds a separate Anthropic login. Remove it and choose the vault login, or disconnect from the vault.',
               )
             },
           }
@@ -5981,7 +6143,13 @@ const anthropicAuthPlugin = async (
               main,
               fallbacks: fallbackDimensions.fallbacks,
               evidence: mainEvidence,
-              authority: nativeMigrationAuthorityPhase(journal),
+              // Vault files have no migration journal: the host's enrollment
+              // alone authorizes them, and it already selected vault mode.
+              // Local accounts still require the committed migration record.
+              authority:
+                custodyMode === 'claustrum'
+                  ? 'committed'
+                  : nativeMigrationAuthorityPhase(journal),
             })
           } catch (error) {
             if (!(error instanceof CustodyStateMismatchError)) throw error
@@ -6075,24 +6243,6 @@ const anthropicAuthPlugin = async (
             mainAccessToken: auth.access,
             routingAuthoritative: false,
           })
-          if (
-            process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION !==
-            '1'
-          ) {
-            void ensureProfilesForQuotaDisplay(
-              initialStorage ?? createEmptyStorage(),
-              auth.access,
-            )
-              .then((displayStorage) => {
-                writeSidebarState(displayStorage, {
-                  activeId: 'main',
-                  route: 'main',
-                  mainAccessToken: auth.access,
-                  routingAuthoritative: false,
-                })
-              })
-              .catch(() => {})
-          }
 
           function isReplayableRequest(
             input: string | URL | Request,
@@ -8321,8 +8471,11 @@ const anthropicAuthPlugin = async (
                     requestedModelId: routingModelId,
                     mainQuotaIdentity: requestMainQuotaIdentity,
                   })
-                  const resolveRoute = (excludeAccountIds?: Set<string>) =>
-                    stickySessionRouter.resolve({
+                  const resolveRoute = async (
+                    excludeAccountIds?: Set<string>,
+                  ) => {
+                    const routing = await currentStickyRouting()
+                    return routing.router.resolve({
                       sessionId,
                       family,
                       modelId: routingModelId,
@@ -8336,7 +8489,11 @@ const anthropicAuthPlugin = async (
                           : 1,
                       preferredAccountId,
                       excludeAccountIds,
+                      ...(routing.accountIdentities && {
+                        accountIdentities: routing.accountIdentities,
+                      }),
                     })
+                  }
                   const mainPermanentlyUnavailable = isPermanentRefreshError(
                     stickyRoutes.storage?.refresh?.mainLastRefreshError,
                   )
@@ -9355,96 +9512,109 @@ const anthropicAuthPlugin = async (
 
         return {}
       },
-      methods: [
-        {
-          label: 'Claude Pro/Max',
-          type: 'oauth',
-          authorize: async () => {
-            if (
-              getClaustrumMode(await loadAccounts(accountStoragePath)) ===
-              'claustrum'
-            ) {
-              throw new Error(
-                'Exit Claustrum mode first: /claude-account local',
-              )
-            }
-            if (process.env.OPENCODE_AUTH_CONTENT !== undefined) {
-              throw new Error(
-                'Local login cannot be verified while OPENCODE_AUTH_CONTENT is set',
-              )
-            }
-            const result = await authorizeImpl('max')
-            return {
-              url: result.url,
-              instructions: 'Paste the authorization code here:',
-              method: 'code',
-              callback: async (code: string) => {
-                const exchanged = await exchange(
-                  code,
-                  result.verifier,
-                  result.redirectUri,
-                  result.state,
+      // Offered only while this host holds a vault enrollment token; the
+      // method itself rechecks vault authority and the empty slot.
+      get methods() {
+        return [
+          ...(existsSync(getHostClaustrumEnrollmentPaths('opencode').tokenPath)
+            ? [vaultLoginMethod]
+            : []),
+          {
+            label: 'Claude Pro/Max',
+            type: 'oauth',
+            authorize: async () => {
+              // Enrollment alone decides whether this host signs in locally;
+              // check it before the browser sign-in starts. Saving the new
+              // login is refused again by the native runtime if the host
+              // enrolls while the user is signing in.
+              if (
+                (await readNativeEnrollmentMode('opencode', process.env)) !==
+                'local'
+              ) {
+                throw new Error('Disconnect from the vault first.')
+              }
+              // Local sign-in saves into the migrated local account pool;
+              // reading it refuses before the browser flow when offline
+              // migration has not run.
+              await nativeAccounts.read()
+              if (process.env.OPENCODE_AUTH_CONTENT !== undefined) {
+                throw new Error(
+                  'Local login cannot be verified while OPENCODE_AUTH_CONTENT is set',
                 )
-                if (exchanged.type === 'failed') return exchanged
-                assertNativeEnvironment()
-                await nativeAccounts.loginOAuth({
-                  routeId: 'main',
-                  replace: true,
-                  credential: {
-                    access: exchanged.access,
-                    refresh: exchanged.refresh,
-                    expires: exchanged.expires,
-                  },
-                })
-                const activation = custodyTombstoneOAuth('anthropic')
-                return {
-                  type: 'success' as const,
-                  access: activation.access,
-                  refresh: activation.refresh,
-                  expires: activation.expires,
-                }
-              },
-            }
-          },
-        },
-        {
-          label: 'Create an API Key',
-          type: 'oauth',
-          authorize: async () => {
-            const result = await authorize('console')
-            return {
-              url: result.url,
-              instructions: 'Paste the authorization code here:',
-              method: 'code',
-              callback: async (code: string) => {
-                const credentials = await exchange(
-                  code,
-                  result.verifier,
-                  result.redirectUri,
-                  result.state,
-                )
-                if (credentials.type === 'failed') return credentials
-                const apiKey = await fetch(
-                  `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
-                  {
-                    method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                      authorization: `Bearer ${credentials.access}`,
+              }
+              const result = await authorizeImpl('max')
+              return {
+                url: result.url,
+                instructions: 'Paste the authorization code here:',
+                method: 'code',
+                callback: async (code: string) => {
+                  const exchanged = await exchange(
+                    code,
+                    result.verifier,
+                    result.redirectUri,
+                    result.state,
+                  )
+                  if (exchanged.type === 'failed') return exchanged
+                  assertNativeEnvironment()
+                  await nativeAccounts.loginOAuth({
+                    routeId: 'main',
+                    replace: true,
+                    credential: {
+                      access: exchanged.access,
+                      refresh: exchanged.refresh,
+                      expires: exchanged.expires,
                     },
-                  },
-                ).then((r) => r.json() as Promise<{ raw_key: string }>)
-                return { type: 'success' as const, key: apiKey.raw_key }
-              },
-            }
+                  })
+                  const activation = custodyTombstoneOAuth('anthropic')
+                  return {
+                    type: 'success' as const,
+                    access: activation.access,
+                    refresh: activation.refresh,
+                    expires: activation.expires,
+                  }
+                },
+              }
+            },
           },
-        },
-        {
-          provider: 'anthropic',
-          label: 'Manually enter API Key',
-          type: 'api',
-        },
-      ],
+          {
+            label: 'Create an API Key',
+            type: 'oauth',
+            authorize: async () => {
+              const result = await authorize('console')
+              return {
+                url: result.url,
+                instructions: 'Paste the authorization code here:',
+                method: 'code',
+                callback: async (code: string) => {
+                  const credentials = await exchange(
+                    code,
+                    result.verifier,
+                    result.redirectUri,
+                    result.state,
+                  )
+                  if (credentials.type === 'failed') return credentials
+                  const apiKey = await fetch(
+                    `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
+                    {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        authorization: `Bearer ${credentials.access}`,
+                      },
+                    },
+                  ).then((r) => r.json() as Promise<{ raw_key: string }>)
+                  return { type: 'success' as const, key: apiKey.raw_key }
+                },
+              }
+            },
+          },
+          {
+            provider: 'anthropic',
+            label: 'Manually enter API Key',
+            type: 'api',
+          },
+        ]
+      },
     },
     dispose,
     __primeManager: primeManager,

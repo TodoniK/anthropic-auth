@@ -38,7 +38,6 @@ import {
   createNativePoolStore,
   custodyTombstoneOAuth,
   extractBillingHeaderCCH,
-  FallbackAccountManager,
   getAccountStatePath,
   getClaudeCodeIdentityForVerifiedAccount,
   getDumpDirectory,
@@ -67,6 +66,11 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { withLock } from '@cortexkit/common-auth/fs'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
+import type { NativeRefreshObservation } from '../../../core/src/native-refresh-coordinator.ts'
+import {
+  publishNativeLocalRefreshFailure,
+  readNativeRuntime,
+} from '../../../core/src/native-runtime.ts'
 import { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
 import { EFFORT_MARKER_PREFIX } from '../effort-history'
 import { AnthropicAuthPlugin } from '../index'
@@ -1248,16 +1252,27 @@ async function updatePoolSettings(
 /**
  * Add an alternative OAuth account through a separate account runtime.
  * Its tokens belong only in shared storage, never in OpenCode's auth.json.
+ * Sign-in verifies which Claude account the access token belongs to; here
+ * that lookup answers `accountIdentity` (a new synthetic account by default)
+ * instead of calling the bootstrap endpoint.
  */
 async function addPoolOAuthAccount(
   routeId: string,
   credential: { access: string; refresh: string; expires: number },
+  accountIdentity: string = randomUUID(),
 ) {
   const pool = migratedPool
   if (!pool) throw new Error('This test has no migrated pool')
   const runtime = createNativeAccountRuntime({
     paths: pool.paths,
     host: 'opencode',
+    local: {
+      resolveIdentity: async () => ({
+        deviceId: 'synthetic-device',
+        sessionId: 'synthetic-session',
+        accountUuid: accountIdentity as ProviderAccountUuid,
+      }),
+    },
   })
   try {
     await runtime.loginOAuth({ routeId, credential, replace: false })
@@ -2005,27 +2020,15 @@ describe('scoped enrollment is explicit', () => {
   })
 
   test('enrollment-reset only clears terminal state; setup owns the next proposal', async () => {
-    const vault = mainOnlyVault()
-    const fixture = await useVaultAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        mainAccountId: 'primary-route',
-        claustrum: {
-          mode: 'claustrum',
-          scopedRoster: true,
-          primaryAccount: {
-            credentialId: 'oauth:anthropic',
-            accountId: syntheticMainIdentity as ProviderAccountUuid,
-            state: 'active',
-          },
-        },
-      }),
-      vault,
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    if (!tempConfigDir) throw new Error('Missing local fixture directory')
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+      tempConfigDir,
+      'opencode-enrollment.json',
     )
-    // Represent lost host enrollment by removing its consumer token. Keep a
-    // terminal refusal record so reset clears that record without proposing.
-    await rm(fixture.enrollmentPath)
-    const stateFile = fixture.enrollmentPath.replace(/\.json$/, '-state.json')
+    // A terminal refused ceremony has no approved token. Local custody can
+    // clear that record without proposing another enrollment.
+    const stateFile = join(tempConfigDir, 'opencode-enrollment-state.json')
     await writeFile(
       stateFile,
       JSON.stringify({
@@ -2037,9 +2040,7 @@ describe('scoped enrollment is explicit', () => {
       }),
       { mode: 0o600 },
     )
-    const plugin = await getPlugin(createMockClient(), fixture.root, {
-      claustrumScopedConnect: async () => vault,
-    })
+    const plugin = await getPlugin(createMockClient(), tempConfigDir)
     const result = await applyMenuAction(plugin, 'ses_reset_only', {
       sectionId: 'Accounts',
       actionId: 'enrollment-reset',
@@ -2195,39 +2196,104 @@ describe('fallback quota persistence ordering', () => {
   test('does not restore a late quota error older than the persisted success', async () => {
     const successAt = Date.now()
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [
-          {
-            id: 'fallback-late-error',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fallback-access',
-            refresh: 'fallback-refresh',
-            expires: successAt + 5 * 60 * 60 * 1000,
-            quota: {
-              five_hour: {
-                usedPercent: 10,
-                remainingPercent: 90,
-                checkedAt: successAt,
-              },
-              seven_day: {
-                usedPercent: 20,
-                remainingPercent: 80,
-                checkedAt: successAt,
+      bindPoolAccounts(
+        createFallbackStorage({
+          accounts: [
+            {
+              id: 'fallback-late-error',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fallback-access',
+              refresh: 'fallback-refresh',
+              expires: successAt + 5 * 60 * 60 * 1000,
+              quota: {
+                five_hour: {
+                  usedPercent: 10,
+                  remainingPercent: 90,
+                  checkedAt: successAt,
+                },
+                seven_day: {
+                  usedPercent: 20,
+                  remainingPercent: 80,
+                  checkedAt: successAt,
+                },
               },
             },
-          },
-        ],
-      }),
+          ],
+        }),
+      ),
     )
 
-    const plugin = await getPlugin()
-    await plugin.__persistFallbackQuotaErrorForTest('fallback-late-error', {
-      message: 'older quota failure',
-      checkedAt: successAt - 1,
-      nextRetryAt: successAt + 60_000,
-      retryCount: 1,
-      accountIdentity: 'fallback-late-error',
+    if (!migratedPool) throw new Error('Missing native quota fixture')
+    const identity = poolLogins.find(
+      (login) => login.access === 'sk-ant-oat01-fallback-access',
+    )?.identity
+    if (!identity) throw new Error('Missing fallback fixture identity')
+    const runtime = createNativeAccountRuntime({
+      paths: migratedPool.paths,
+      host: 'opencode',
+      local: {
+        refreshToken: async () => ({
+          access: 'sk-ant-oat01-fallback-access',
+          refresh: 'fallback-refresh',
+          expires: successAt + 5 * 60 * 60 * 1_000,
+          expiresIn: 5 * 60 * 60,
+        }),
+        resolveIdentity: async () =>
+          getClaudeCodeIdentityForVerifiedAccount(
+            'fallback-late-error',
+            identity as ProviderAccountUuid,
+          ),
+        now: () => successAt,
+      },
     })
+    const plugin = await getPlugin()
+    try {
+      const authorized = await runtime.authorizeLocal('fallback-late-error')
+      expect(authorized.status).toBe('usable')
+      if (authorized.status !== 'usable')
+        throw new Error(
+          `Fallback quota fixture is not authorized: ${authorized.status}`,
+        )
+      let quotaRequests = 0
+      await runtime.fetchQuota(
+        'fallback-late-error',
+        Object.assign(
+          async (input: Parameters<typeof fetch>[0]) => {
+            expect(extractUrl(input)).toBe(
+              'https://api.anthropic.com/api/oauth/usage',
+            )
+            quotaRequests++
+            return Response.json({
+              five_hour: { utilization: 10, resets_at: null },
+              seven_day: { utilization: 20, resets_at: null },
+            })
+          },
+          {
+            preconnect() {
+              throw new Error('Unexpected fixture preconnect')
+            },
+          },
+        ),
+      )
+      expect(quotaRequests).toBe(1)
+      expect(
+        (await readAccountStorage())?.accounts.find(
+          (account): account is OAuthAccount =>
+            account.id === 'fallback-late-error' && isOAuthAccount(account),
+        )?.quota?.five_hour?.usedPercent,
+      ).toBe(10)
+      await runtime.publishLocal(authorized.subject, {
+        lastQuotaRefreshError: {
+          message: 'older quota failure',
+          checkedAt: successAt - 1,
+          nextRetryAt: successAt + 60_000,
+          retryCount: 1,
+          accountIdentity: identity,
+        },
+      })
+    } finally {
+      runtime.close()
+    }
     await plugin.dispose?.()
 
     const saved = await readAccountStorage()
@@ -4033,7 +4099,7 @@ describe('quota header feed integration', () => {
           ],
         }),
       }),
-    ).rejects.toThrow('Native OAuth authorization refused: refused')
+    ).rejects.toThrow('Claude OAuth refresh is backed off')
     expect(calls).toBe(0)
     expect(
       (await readAccountStorage())?.refresh?.mainLastRefreshError?.permanent,
@@ -4422,54 +4488,97 @@ describe('main identity boot order', () => {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
   })
 
-  test('mints before background refresh can observe storage and survives token rotation', async () => {
+  test('publishes main identity before background timers observe storage and preserves it across native token rotation', async () => {
     await useTempAccountFile(
-      createFallbackStorage({ quota: { enabled: false }, accounts: [] }),
+      bindPoolAccounts(
+        createFallbackStorage({ quota: { enabled: false }, accounts: [] }),
+      ),
+      { ...syntheticMainHostAuth(), expires: Date.now() + 8 * 60 * 60_000 },
     )
     process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    const timerCallbacks: (() => void)[] = []
     const observedIds: (string | undefined)[] = []
     const timerObservedIds: (string | undefined)[] = []
     let authCalls = 0
     const auth = () => {
       authCalls += 1
       if (authCalls > 1) {
-        void readAccountStorage().then((storage) =>
-          observedIds.push(storage?.mainAccountId),
+        bodyLifetime().trackDetached(
+          readAccountStorage().then((storage) =>
+            observedIds.push(storage?.mainAccountId),
+          ),
         )
       }
-      return Promise.resolve({
-        type: 'oauth' as const,
-        access: `access-${authCalls}`,
-        refresh: `refresh-${authCalls}`,
-        expires: Date.now() + 100_000,
-      })
+      return Promise.resolve(custodyTombstoneOAuth('anthropic'))
     }
     const plugin = await getPlugin(undefined, undefined, {
       setInterval: ((callback: () => void) => {
-        const config = JSON.parse(
-          readFileSync(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
-        ) as { mainAccountId?: unknown }
+        if (!migratedPool) throw new Error('Missing native main fixture')
+        const runtime = JSON.parse(
+          readFileSync(migratedPool.paths.runtime, 'utf8'),
+        ) as {
+          accounts: Record<
+            string,
+            { binding: { kind: string; rowId: string; identity?: string } }
+          >
+        }
         timerObservedIds.push(
-          typeof config.mainAccountId === 'string'
-            ? config.mainAccountId
-            : undefined,
+          Object.values(runtime.accounts).find(
+            (entry) => entry.binding.kind === 'local',
+          )?.binding.identity,
         )
-        callback()
+        timerCallbacks.push(callback)
         return { unref() {} } as unknown as ReturnType<typeof setInterval>
       }) as typeof setInterval,
       clearInterval: (() => {}) as typeof clearInterval,
     })
-    timerObservedIds.length = 0
-
     await plugin.auth.loader(auth, { models: {} })
-    await Bun.sleep(25)
     const first = (await readAccountStorage())?.mainAccountId
+    if (!first || !migratedPool) throw new Error('Missing native main identity')
+    const runtime = createNativeAccountRuntime({
+      paths: migratedPool.paths,
+      host: 'opencode',
+      local: {
+        refreshToken: async () => ({
+          access: 'sk-ant-oat01-main-boot-rotated',
+          refresh: 'main-boot-rotated-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+          expiresIn: 8 * 60 * 60,
+        }),
+        resolveIdentity: async () =>
+          getClaudeCodeIdentityForVerifiedAccount(
+            'main',
+            poolMainIdentity() as ProviderAccountUuid,
+          ),
+      },
+    })
+    try {
+      const rotated = await runtime.authorizeLocal('main', {
+        intent: 'refresh',
+      })
+      if (rotated.status !== 'usable')
+        throw new Error(
+          `Native main rotation failed: ${rotated.status} ${'failure' in rotated ? JSON.stringify(rotated.failure) : 'reason' in rotated ? rotated.reason : ''}`,
+        )
+      expect(rotated.status).toBe('usable')
+      expect(rotated.access).toBe('sk-ant-oat01-main-boot-rotated')
+    } finally {
+      runtime.close()
+    }
+    const mainLogin = poolLogins[0]
+    if (!mainLogin) throw new Error('Missing main mock account')
+    mainLogin.access = 'sk-ant-oat01-main-boot-rotated'
+    mainLogin.refresh = 'main-boot-rotated-refresh'
     await plugin.auth.loader(auth, { models: {} })
+    await Promise.all(
+      timerCallbacks.map((callback) => Promise.resolve(callback())),
+    )
     const second = (await readAccountStorage())?.mainAccountId
 
     expect(first).toMatch(/^[0-9a-f-]{36}$/)
     expect(second).toBe(first)
-    expect(timerObservedIds).toEqual([first, first])
+    expect(timerObservedIds.length).toBeGreaterThan(0)
+    expect(timerObservedIds.every((identity) => identity === first)).toBe(true)
     expect(observedIds).toContain(first)
   })
 })
@@ -4550,61 +4659,84 @@ describe('AnthropicAuthPlugin', () => {
   test('refresh error merge prefers the newer observation by checkedAt', async () => {
     const accountId = 'fallback-fence-recency'
     const now = Date.now()
-    const errorAt = (checkedAt: number, message: string) =>
-      buildRefreshOperationError({
-        error: new ClaudeOAuthRefreshError(
-          400,
-          `{"error":"invalid_grant","m":"${message}"}`,
-        ),
-        now: checkedAt,
-        accountIdentity: accountId,
-      })
     await useTempAccountFile(
-      createFallbackStorage({
-        quota: { enabled: false },
-        accounts: [
-          {
-            id: accountId,
-            type: 'oauth',
-            access: 'sk-ant-oat01-dead',
-            refresh: 'dead-refresh',
-            expires: now + 3 * 60 * 60_000,
-            lastRefreshedAt: now - 60_000,
-            lastRefreshError: errorAt(now - 200_000, 'older-latch'),
-          },
-        ],
-        claustrum: { mode: 'local' },
-      }),
+      bindPoolAccounts(
+        createFallbackStorage({
+          quota: { enabled: false },
+          accounts: [
+            {
+              id: accountId,
+              type: 'oauth',
+              access: 'sk-ant-oat01-dead',
+              refresh: 'dead-refresh',
+              expires: now + 8 * 60 * 60_000,
+            },
+          ],
+        }),
+      ),
     )
-    const newerSnapshot = await readAccountStorage()
-    if (!newerSnapshot) throw new Error('missing test storage')
-    const newerAccount = newerSnapshot.accounts.find(
-      (account): account is OAuthAccount =>
-        account.id === accountId && isOAuthAccount(account),
-    )
-    if (!newerAccount) throw new Error('missing account')
-    newerAccount.lastRefreshError = errorAt(now, 'newer-incoming')
-    await saveAccounts(newerSnapshot)
-    const afterNewer = (await readAccountStorage())?.accounts.find(
-      (account): account is OAuthAccount =>
-        account.id === accountId && isOAuthAccount(account),
-    )
-    expect(afterNewer?.lastRefreshError?.message).toContain('newer-incoming')
-
-    const olderSnapshot = await readAccountStorage()
-    if (!olderSnapshot) throw new Error('missing test storage')
-    const olderAccount = olderSnapshot.accounts.find(
-      (account): account is OAuthAccount =>
-        account.id === accountId && isOAuthAccount(account),
-    )
-    if (!olderAccount) throw new Error('missing account')
-    olderAccount.lastRefreshError = errorAt(now - 300_000, 'older-incoming')
-    await saveAccounts(olderSnapshot)
-    const afterOlder = (await readAccountStorage())?.accounts.find(
-      (account): account is OAuthAccount =>
-        account.id === accountId && isOAuthAccount(account),
-    )
-    expect(afterOlder?.lastRefreshError?.message).toContain('newer-incoming')
+    if (!migratedPool) throw new Error('Missing native refresh fixture')
+    const paths = migratedPool.paths
+    const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
+    try {
+      const subject = await runtime.captureLocalSubject(accountId)
+      const read = await readNativeRuntime(paths.runtime, paths.storageId)
+      const entry = Object.values(
+        read.status === 'ready' ? read.state.accounts : {},
+      ).find(
+        (value) =>
+          value.binding.kind === 'local' &&
+          value.binding.rowId === subject.binding.rowId,
+      )
+      const event: NativeRefreshObservation = {
+        status: 'failed',
+        failure: {
+          kind: 'provider',
+          classification: 'invalid-grant',
+          status: 400,
+        },
+        persisted: false,
+        binding: subject.binding,
+        credentialFingerprint: subject.credentialFingerprint,
+        credentialVersion: subject.version,
+        attempt: 1,
+        bootstrap: 'unavailable',
+        handoff: 'not-needed',
+        context: {
+          subject,
+          runtimeBinding:
+            entry?.binding.kind === 'local' ? entry.binding : null,
+          refreshErrorClearedAt: entry?.refreshErrorClearedAt ?? null,
+          quotaErrorClearedAt: entry?.quotaErrorClearedAt ?? null,
+          quotaErrorGeneration: entry?.quotaErrorGeneration ?? null,
+        },
+      }
+      const publish = (checkedAt: number) =>
+        publishNativeLocalRefreshFailure(paths, event, {
+          checkedAt,
+          nextRetryAt: checkedAt + 86_400_000,
+          retryCount: 1,
+        })
+      expect((await publish(now - 200_000)).status).toBe('published')
+      expect((await publish(now)).status).toBe('published')
+      const beforeStale = await readFile(paths.runtime, 'utf8')
+      expect(await publish(now - 300_000)).toEqual({
+        status: 'superseded',
+        reason: 'older-than-stored',
+      })
+      expect(await readFile(paths.runtime, 'utf8')).toBe(beforeStale)
+      const afterOlder = (await readAccountStorage())?.accounts.find(
+        (account): account is OAuthAccount =>
+          account.id === accountId && isOAuthAccount(account),
+      )
+      expect(afterOlder?.lastRefreshError).toMatchObject({
+        checkedAt: now,
+        status: 400,
+        permanent: true,
+      })
+    } finally {
+      runtime.close()
+    }
   })
 })
 
@@ -6021,11 +6153,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
 
 describe('meaningful trailing assistant history', () => {
   const originalFetch = globalThis.fetch
-  let restoreFallbackSelection: (() => void) | undefined
-
   afterEach(async () => {
-    restoreFallbackSelection?.()
-    restoreFallbackSelection = undefined
     globalThis.fetch = originalFetch
     __setLogTestSink(null)
     await drainSidebarWrites()
@@ -6127,11 +6255,9 @@ describe('meaningful trailing assistant history', () => {
       { models: {} },
     )
 
-    const fallbackSelection = spyOn(
-      FallbackAccountManager.prototype,
-      'getUsableFallbackAccounts',
-    )
-    restoreFallbackSelection = () => fallbackSelection.mockRestore()
+    const fallbackUseBefore = (await readAccountStorage())?.accounts.find(
+      (account) => account.id === 'fallback-1',
+    )?.lastUsed
     await expectLocalRefusal(
       await auth.fetch(MESSAGES_URL, {
         method: 'POST',
@@ -6140,7 +6266,11 @@ describe('meaningful trailing assistant history', () => {
       }),
     )
     expect(modelDispatches).toEqual([])
-    expect(fallbackSelection).not.toHaveBeenCalled()
+    expect(
+      (await readAccountStorage())?.accounts.find(
+        (account) => account.id === 'fallback-1',
+      )?.lastUsed,
+    ).toBe(fallbackUseBefore)
     await drainSidebarWrites()
     expect((await getSidebarState()).activeId).not.toBe('fallback-1')
     expect(logs).toContainEqual({
@@ -6170,7 +6300,13 @@ describe('meaningful trailing assistant history', () => {
       'Bearer sk-ant-oat01-main-access',
       'Bearer sk-ant-oat01-fallback-access',
     ])
-    expect(fallbackSelection).toHaveBeenCalled()
+    await drainSidebarWrites()
+    expect((await getSidebarState()).activeId).toBe('fallback-1')
+    expect(
+      (await readAccountStorage())?.accounts.find(
+        (account) => account.id === 'fallback-1',
+      )?.lastUsed,
+    ).toBeGreaterThan(0)
   })
 
   test('API-key route refuses locally without model dispatch', async () => {
@@ -7052,9 +7188,28 @@ describe('auth.loader', () => {
       )
       const pool = migratedPool
       if (!pool) throw new Error('Expected migrated pool')
+      // Sign-in verifies the account behind each new access token; answer
+      // that lookup from this map instead of the bootstrap endpoint.
+      const signInIdentities = new Map<string, string>([
+        [
+          'sk-ant-oat01-work-current-access',
+          '99999999-2222-4333-8444-555555555555',
+        ],
+      ])
       const peer = createNativeAccountRuntime({
         paths: pool.paths,
         host: 'opencode',
+        local: {
+          resolveIdentity: async (access) => {
+            const identity = signInIdentities.get(access)
+            if (!identity) throw new Error('Unknown synthetic sign-in token')
+            return {
+              deviceId: 'synthetic-device',
+              sessionId: 'synthetic-session',
+              accountUuid: identity as ProviderAccountUuid,
+            }
+          },
+        },
       })
       try {
         const witness = (await peer.read()).accounts.find(
@@ -7062,6 +7217,10 @@ describe('auth.loader', () => {
         )
         if (!witness?.accountIdentity)
           throw new Error('Expected known witness UUID')
+        signInIdentities.set(
+          'sk-ant-oat01-work-witness-current-access',
+          witness.accountIdentity,
+        )
         const staleSubject = requireKnownPoolSubject(
           await peer.captureLocalSubject('work-deleted'),
         )
@@ -7077,7 +7236,6 @@ describe('auth.loader', () => {
         await peer.loginOAuth({
           routeId: 'work-current',
           replace: false,
-          accountIdentity: '99999999-2222-4333-8444-555555555555',
           credential: {
             access: 'sk-ant-oat01-work-current-access',
             refresh: 'work-current-refresh',
@@ -7087,7 +7245,6 @@ describe('auth.loader', () => {
         await peer.loginOAuth({
           routeId: 'work-witness',
           replace: true,
-          accountIdentity: witness.accountIdentity,
           credential: {
             access: 'sk-ant-oat01-work-witness-current-access',
             refresh: 'work-witness-current-refresh',
@@ -10853,6 +11010,7 @@ describe('auth.loader', () => {
     await useTempAccountFile(createFallbackStorage())
     const mainProfile = heldResponse()
     const mainProfileStarted = lifetimeSignal()
+    const fallbackProfileStarted = lifetimeSignal()
     const firstFetchCalls: string[] = []
     globalThis.fetch = mock(
       withNativeAdmission(
@@ -10873,6 +11031,7 @@ describe('auth.loader', () => {
             mainProfileStarted.raise()
             return mainProfile.response
           }
+          fallbackProfileStarted.raise()
           return Promise.resolve(
             Response.json({
               organization: {
@@ -10895,7 +11054,13 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    // Each route's account lookup (bootstrap) runs before its profile request
+    // and goes through the global fetch of the moment, not the fetch the
+    // plugin captured for profiles. Replace the global fetch only once both
+    // profile requests have been sent, so the replacement can only be
+    // reached by work that does not keep the plugin's own fetch.
     await mainProfileStarted.raised
+    await fallbackProfileStarted.raised
 
     const nextTestFetch = mock(() => Promise.resolve(new Response('ok')))
     globalThis.fetch = nextTestFetch as unknown as typeof fetch
@@ -22113,6 +22278,30 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
   })
 })
 
+async function expirePoolCredentialForPrime(
+  runtime: ReturnType<typeof createNativeAccountRuntime>,
+  routeId: string,
+) {
+  if (!migratedPool) throw new Error('Missing native Prime fixture')
+  const before = await runtime.captureLocalSubject(routeId)
+  const store = createNativePoolStore({
+    paths: migratedPool.paths,
+    quota: nativeQuotaCodec,
+  })
+  const rotated = await store.refresh(
+    before.binding.rowId,
+    async (credential) => ({
+      access: `sk-ant-oat01-prime-expired-${routeId}`,
+      refresh: credential.refresh,
+      expires: Date.now() - 1_000,
+    }),
+  )
+  expect(rotated.status).toBe('rotated')
+  const after = await runtime.captureLocalSubject(routeId)
+  expect(after.binding).toEqual(before.binding)
+  expect(after.credentialFingerprint).toBe(before.credentialFingerprint)
+}
+
 async function primeWarningsAfterQuotaCheck(
   fallback: boolean,
   change: (
@@ -22242,16 +22431,7 @@ describe('claude-prime — warn dedup (R3)', () => {
     const { records, refreshRequests } = await primeWarningsAfterQuotaCheck(
       false,
       async (runtime) => {
-        await runtime.loginOAuth({
-          routeId: 'main',
-          replace: true,
-          accountIdentity: poolMainIdentity(),
-          credential: {
-            access: '',
-            refresh: 'main-refresh',
-            expires: Date.now() - 1_000,
-          },
-        })
+        await expirePoolCredentialForPrime(runtime, 'main')
       },
     )
     expect(refreshRequests).toBe(3)
@@ -22316,20 +22496,7 @@ describe('claude-prime — warn dedup (R3)', () => {
     const { records, refreshRequests } = await primeWarningsAfterQuotaCheck(
       true,
       async (runtime) => {
-        const identity = (await runtime.read()).accounts.find(
-          (account) => account.id === 'work-alt',
-        )?.accountIdentity
-        expect(identity).toBeDefined()
-        await runtime.loginOAuth({
-          routeId: 'work-alt',
-          replace: true,
-          accountIdentity: identity,
-          credential: {
-            access: '',
-            refresh: 'fb-refresh',
-            expires: Date.now() - 1_000,
-          },
-        })
+        await expirePoolCredentialForPrime(runtime, 'work-alt')
       },
     )
     expect(refreshRequests).toBe(3)
