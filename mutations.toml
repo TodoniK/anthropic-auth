@@ -486,3 +486,67 @@ expect_message = "error: expect(received).toBeUndefined()"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "killswitch-positive-floor-requires-standard-reading"
+guards = "Unknown standard quota cannot bypass an enabled user floor through soft fail-open policy."
+file = "packages/core/src/accounts.ts"
+old = "if (thresholds[key] > 0) return false"
+new = "if (false) return false /* NON-VACUITY BREAK: admit an unproved account floor */"
+test_file = "packages/core/src/tests/killswitch.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/killswitch.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["killswitch account floors require quota evidence > unknown quota cannot bypass an enabled floor through fail-open policy", "killswitch account floors require quota evidence > each enabled floor requires its own finite remaining reading", "killswitch account floors require quota evidence > an account override without floors does not inherit the main floor"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "killswitch-scoped-floor-requires-metadata"
+guards = "A positive model floor requires scoped quota metadata; an explicit empty list still proves no carve-out."
+file = "packages/core/src/accounts.ts"
+old = "if (thresholds.scoped > 0 && quota?.scoped === undefined) return false"
+new = "if (false) return false /* NON-VACUITY BREAK: admit missing model quota metadata */"
+test_file = "packages/core/src/tests/killswitch.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/killswitch.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["explicit scoped floors require model quota evidence > missing model metadata refuses but an explicit no-carve-out list passes"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "killswitch-scoped-floor-requires-finite-reading"
+guards = "A matching model quota must have finite remaining usage before it can satisfy a positive scoped floor."
+file = "packages/core/src/accounts.ts"
+old = "!Number.isFinite(scopedWindow.remainingPercent) &&\n        thresholds.scoped > 0"
+new = "false /* NON-VACUITY BREAK: admit non-finite model quota */"
+test_file = "packages/core/src/tests/killswitch.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/killswitch.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["explicit scoped floors require model quota evidence > a matching scoped floor needs finite remaining quota above its inclusive boundary"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "killswitch-refused-preflight-preserves-nofloor-policy"
+guards = "A refused fallback quota preflight must not exclude a coherent replacement with zero floors and explicit fail-open policy."
+file = "packages/opencode/src/index.ts"
+old = "killswitchPassesPolicy(\n                        undefined,\n                        storageArg,\n                        account.id,\n                        options.modelId,\n                      )"
+new = "false /* NON-VACUITY BREAK: exclude all refused preflight accounts */"
+test_file = "packages/opencode/src/tests/killswitch-preflight.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/killswitch-preflight.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a fallback with no killswitch floors stays routable after a torn cross-process replacement refuses its preflight"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"

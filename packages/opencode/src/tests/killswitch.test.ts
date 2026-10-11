@@ -241,13 +241,15 @@ describe('killswitchPassesPolicy', () => {
     expect(killswitchPassesPolicy({}, storage)).toBe(false)
   })
 
-  test('missing quota without failClosedOnUnknownQuota returns true', () => {
+  test('missing quota can fail open only without enabled account floors', () => {
     const storage = baseStorage()
     storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
     storage.killswitch = {
       enabled: true,
       main: { five_hour: 5, seven_day: 10 },
     }
+    expect(killswitchPassesPolicy(undefined, storage)).toBe(false)
+    storage.killswitch.main = { five_hour: 0, seven_day: 0 }
     expect(killswitchPassesPolicy(undefined, storage)).toBe(true)
   })
 
@@ -270,7 +272,7 @@ describe('killswitchPassesPolicy', () => {
     expect(killswitchPassesPolicy(quota, storage)).toBe(false)
   })
 
-  test('passes a present above-threshold window when the other is missing (failClosed=false)', () => {
+  test('a missing standard window blocks only when its account floor is enabled', () => {
     const storage = baseStorage()
     storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
     storage.killswitch = {
@@ -284,6 +286,8 @@ describe('killswitchPassesPolicy', () => {
         checkedAt: Date.now(),
       },
     }
+    expect(killswitchPassesPolicy(quota, storage)).toBe(false)
+    storage.killswitch.main = { five_hour: 0, seven_day: 10 }
     expect(killswitchPassesPolicy(quota, storage)).toBe(true)
   })
 })

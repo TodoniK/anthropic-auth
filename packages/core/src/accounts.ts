@@ -3626,14 +3626,12 @@ export function killswitchPassesPolicy(
   let sawUnknownWindow = false
   for (const key of ['five_hour', 'seven_day'] as const) {
     const window = quota?.[key]
-    // Defer the unknown-window decision: a quota snapshot can legally carry
-    // only one window, and a present window below its threshold must still
-    // block even if the other window is missing.
-    if (!window) {
-      sawUnknownWindow = true
-      continue
-    }
-    if (!Number.isFinite(window.remainingPercent)) {
+    // Each configured floor needs its own reading. A present window below
+    // its floor blocks even when the other window has no enabled floor.
+    if (!window || !Number.isFinite(window.remainingPercent)) {
+      // A user floor requires a reading that proves the account meets it.
+      // Unknown-quota fail-open cannot override an enabled account floor.
+      if (thresholds[key] > 0) return false
       sawUnknownWindow = true
       continue
     }
@@ -3648,11 +3646,15 @@ export function killswitchPassesPolicy(
   // PRESENT window at/below threshold blocks. The comparison is inclusive
   // (`<=`) so the default 0 fires at exhaustion.
   if (modelId) {
+    // An explicit empty scope list proves there is no model carve-out;
+    // absent scope metadata cannot prove a configured model floor is met.
+    if (thresholds.scoped > 0 && quota?.scoped === undefined) return false
     const scopedWindow = getScopedQuotaWindowForModel(quota, modelId)
     if (
       scopedWindow &&
-      Number.isFinite(scopedWindow.remainingPercent) &&
-      scopedWindow.remainingPercent <= thresholds.scoped
+      ((!Number.isFinite(scopedWindow.remainingPercent) &&
+        thresholds.scoped > 0) ||
+        scopedWindow.remainingPercent <= thresholds.scoped)
     ) {
       return false
     }

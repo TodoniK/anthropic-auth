@@ -385,15 +385,14 @@ describe('killswitchPassesPolicy — scoped model dimension', () => {
   // failClosedOnUnknownQuota=false, the function must STILL evaluate the
   // scoped check — an exhausted scoped window is its own block reason,
   // independent of the unknown 5h/7d fail-closed decision.
-  test('scoped check runs even when 5h/7d is unknown and fail-OPEN (MUST-1)', () => {
+  test('scoped exhaustion blocks unknown standard quota when standard floors are disabled', () => {
     const storage = baseStorage()
     storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
     storage.killswitch = {
       enabled: true,
-      main: { five_hour: 5, seven_day: 10, scoped: 0 },
+      main: { five_hour: 0, seven_day: 0, scoped: 0 },
     }
-    // Both 5h/7d absent → sawUnknownWindow=true. With fail-OPEN the old
-    // code would short-circuit to true and skip the scoped check.
+    // Disabled standard floors let this assertion isolate the scoped limit.
     const quota: OAuthQuotaSnapshot = {
       scoped: [
         scopeWindow(0, { name: 'Claude Fable 5', id: 'claude-fable-5' }),
@@ -404,14 +403,13 @@ describe('killswitchPassesPolicy — scoped model dimension', () => {
     ).toBe(false)
   })
 
-  test('scoped check runs when one 5h/7d window is non-finite + fail-OPEN (MUST-1 variant)', () => {
+  test('scoped exhaustion blocks non-finite standard quota when standard floors are disabled', () => {
     const storage = baseStorage()
     storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
     storage.killswitch = {
       enabled: true,
-      main: { five_hour: 5, seven_day: 10, scoped: 0 },
+      main: { five_hour: 0, seven_day: 0, scoped: 0 },
     }
-    // five_hour present + non-finite (sawUnknownWindow=true), seven_day absent.
     const quota: OAuthQuotaSnapshot = {
       five_hour: {
         usedPercent: 0,
@@ -427,16 +425,13 @@ describe('killswitchPassesPolicy — scoped model dimension', () => {
     ).toBe(false)
   })
 
-  test('healthy scoped window with unknown 5h/7d + fail-OPEN still passes (MUST-1 complement)', () => {
+  test('healthy scoped quota permits unknown standard quota only without standard floors', () => {
     const storage = baseStorage()
     storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
     storage.killswitch = {
       enabled: true,
-      main: { five_hour: 5, seven_day: 10, scoped: 0 },
+      main: { five_hour: 0, seven_day: 0, scoped: 0 },
     }
-    // Unknown 5h/7d, but the Fable window is HEALTHY (above threshold).
-    // The scoped check passes, then the unknown-5h/7d fail-OPEN decision
-    // also passes. Final: true.
     const quota: OAuthQuotaSnapshot = {
       scoped: [
         scopeWindow(50, { name: 'Claude Fable 5', id: 'claude-fable-5' }),
@@ -447,15 +442,13 @@ describe('killswitchPassesPolicy — scoped model dimension', () => {
     ).toBe(true)
   })
 
-  test('absent scoped window with unknown 5h/7d + fail-OPEN still passes (MUST-1 complement)', () => {
+  test('absent scoped quota permits unknown standard quota only without standard floors', () => {
     const storage = baseStorage()
     storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
     storage.killswitch = {
       enabled: true,
-      main: { five_hour: 5, seven_day: 10, scoped: 0 },
+      main: { five_hour: 0, seven_day: 0, scoped: 0 },
     }
-    // No scoped array at all (Sonnet-style: no carve-out). The scoped check
-    // doesn't fire, then the unknown-5h/7d fail-OPEN decision passes.
     const quota: OAuthQuotaSnapshot = {}
     expect(
       killswitchPassesPolicy(quota, storage, undefined, 'claude-sonnet-5'),
@@ -695,5 +688,142 @@ describe('killswitchRetryAfterSeconds — scoped resetsAt', () => {
       'claude-fable-5',
     )
     expect(seconds).toBe(300)
+  })
+})
+
+describe('killswitch account floors require quota evidence', () => {
+  const failOpenStorage = (): AccountStorage => ({
+    ...baseStorage(),
+    quota: { ...baseStorage().quota, failClosedOnUnknownQuota: false },
+    killswitch: { enabled: true, main: { five_hour: 50, seven_day: 10 } },
+  })
+
+  test('unknown quota cannot bypass an enabled floor through fail-open policy', () => {
+    const storage = failOpenStorage()
+    expect(killswitchPassesPolicy(undefined, storage, 'fallback-1')).toBe(false)
+    expect(killswitchPassesPolicy({}, storage, 'fallback-1')).toBe(false)
+    expect(killswitchPassesPolicy(healthy5h7d(), storage, 'fallback-1')).toBe(
+      true,
+    )
+    expect(
+      killswitchPassesPolicy(
+        {
+          ...healthy5h7d(),
+          five_hour: {
+            usedPercent: 70,
+            remainingPercent: 30,
+            checkedAt: Date.now(),
+          },
+        },
+        storage,
+        'fallback-1',
+      ),
+    ).toBe(false)
+  })
+
+  test('each enabled floor requires its own finite remaining reading', () => {
+    const storage = failOpenStorage()
+    expect(
+      killswitchPassesPolicy({ five_hour: healthy5h7d().five_hour }, storage),
+    ).toBe(false)
+    expect(
+      killswitchPassesPolicy({ seven_day: healthy5h7d().seven_day }, storage),
+    ).toBe(false)
+    expect(
+      killswitchPassesPolicy(
+        {
+          ...healthy5h7d(),
+          five_hour: {
+            usedPercent: 0,
+            remainingPercent: Number.NaN,
+            checkedAt: Date.now(),
+          },
+        },
+        storage,
+      ),
+    ).toBe(false)
+  })
+
+  test('unknown quota can fail open only when no account floor is enabled', () => {
+    const storage = failOpenStorage()
+    storage.killswitch = { enabled: true, main: { five_hour: 0, seven_day: 0 } }
+    expect(killswitchPassesPolicy(undefined, storage)).toBe(true)
+    storage.quota = { ...storage.quota, failClosedOnUnknownQuota: true }
+    expect(killswitchPassesPolicy(undefined, storage)).toBe(false)
+    storage.killswitch.enabled = false
+    expect(killswitchPassesPolicy(undefined, storage)).toBe(true)
+  })
+
+  test('an account override without floors does not inherit the main floor', () => {
+    const storage = failOpenStorage()
+    storage.killswitch = {
+      ...storage.killswitch,
+      enabled: true,
+      accounts: { 'fallback-1': { five_hour: 0, seven_day: 0 } },
+    }
+    expect(killswitchPassesPolicy(undefined, storage, 'fallback-1')).toBe(true)
+    expect(killswitchPassesPolicy(undefined, storage, 'fallback-2')).toBe(false)
+  })
+})
+
+describe('explicit scoped floors require model quota evidence', () => {
+  const scopedStorage = (): AccountStorage => ({
+    ...baseStorage(),
+    quota: { ...baseStorage().quota, failClosedOnUnknownQuota: false },
+    killswitch: {
+      enabled: true,
+      main: { five_hour: 0, seven_day: 0, scoped: 20 },
+    },
+  })
+
+  test('missing model metadata refuses but an explicit no-carve-out list passes', () => {
+    const storage = scopedStorage()
+    expect(
+      killswitchPassesPolicy(
+        healthy5h7d(),
+        storage,
+        undefined,
+        'claude-fable-5',
+      ),
+    ).toBe(false)
+    expect(
+      killswitchPassesPolicy(
+        { ...healthy5h7d(), scoped: [] },
+        storage,
+        undefined,
+        'claude-fable-5',
+      ),
+    ).toBe(true)
+    expect(
+      killswitchPassesPolicy(
+        {
+          ...healthy5h7d(),
+          scoped: [
+            scopeWindow(0, { name: 'Claude Fable 5', id: 'claude-fable-5' }),
+          ],
+        },
+        storage,
+        undefined,
+        'claude-sonnet-5',
+      ),
+    ).toBe(true)
+  })
+
+  test('a matching scoped floor needs finite remaining quota above its inclusive boundary', () => {
+    const storage = scopedStorage()
+    for (const remaining of [Number.NaN, 0, 20, 21]) {
+      const quota = {
+        ...healthy5h7d(),
+        scoped: [
+          scopeWindow(remaining, {
+            name: 'Claude Fable 5',
+            id: 'claude-fable-5',
+          }),
+        ],
+      }
+      expect(
+        killswitchPassesPolicy(quota, storage, undefined, 'claude-fable-5'),
+      ).toBe(remaining === 21)
+    }
   })
 })

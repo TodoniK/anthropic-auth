@@ -6313,26 +6313,25 @@ describe('NaN quota utilization guards', () => {
     expect(killswitchPassesPolicy(quotaBoth, loaded)).toBe(true)
   })
 
-  test('mapUsageWindow returns undefined for NaN utilization', () => {
-    // mapUsageWindow is internal, but we test the observable behaviour:
-    // a quota snapshot fetched with NaN utilization would produce an
-    // undefined window, which killswitchPassesPolicy treats as unknown
-    // (fail-closed blocking when failClosedOnUnknownQuota is true).
+  test('missing decoded windows cannot satisfy enabled account floors', () => {
+    // Invalid usage data can leave both decoded windows absent. This checks
+    // admission of that missing reading, not the wire decoder itself.
     const storage = baseStorage()
     storage.killswitch = {
       enabled: true,
       main: { five_hour: 5, seven_day: 10 },
     }
-    // Simulate the result of mapUsageWindow returning undefined for both windows
+    // Neither standard window provides evidence for its configured floor.
     const quota: OAuthQuotaSnapshot = {
       five_hour: undefined,
       seven_day: undefined,
     }
-    // Both windows unknown → failClosedOnUnknownQuota=true → blocked
+    // Enabled floors require readings even when soft quota policy fails open.
     expect(killswitchPassesPolicy(quota, storage)).toBe(false)
 
-    // When failClosedOnUnknownQuota=false, unknown windows pass
     storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }
+    expect(killswitchPassesPolicy(quota, storage)).toBe(false)
+    storage.killswitch.main = { five_hour: 0, seven_day: 0 }
     expect(killswitchPassesPolicy(quota, storage)).toBe(true)
   })
 })

@@ -13082,7 +13082,9 @@ describe('auth.loader', () => {
 
     const firstClient = createMockClient()
     const secondClient = createMockClient()
+    let secondTimerCalls = 0
     const secondRefreshWait = mock(() => {
+      secondTimerCalls += 1
       throw new Error('second plugin entered the cross-process refresh wait')
     }) as unknown as typeof setTimeout
     const firstPlugin = await getPlugin(firstClient, '/project-a')
@@ -13118,7 +13120,15 @@ describe('auth.loader', () => {
       ),
     )
 
-    const responses = await Promise.all([firstFetch, secondFetch])
+    const responses = await Promise.all([firstFetch, secondFetch]).catch(
+      (error) => {
+        console.error('shared native refresh mismatch', {
+          tokenRefreshCount,
+          secondTimerCalls,
+        })
+        throw error
+      },
+    )
     expect(responses.map((response) => response.status)).toEqual([200, 200])
     expect(tokenRefreshCount).toBe(1)
     expect(secondRefreshWait).not.toHaveBeenCalled()

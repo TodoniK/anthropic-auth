@@ -2646,20 +2646,27 @@ const anthropicAuthPlugin = async (
     const operation = fallbackQuotaRefreshQueue.then(() =>
       pollFallbackQuotas(force, requiredByPolicy),
     )
-    fallbackQuotaRefreshQueue = operation.catch(() => {})
+    fallbackQuotaRefreshQueue = operation.then(
+      () => {},
+      () => {},
+    )
     return operation
   }
   async function pollFallbackQuotas(force: boolean, requiredByPolicy: boolean) {
     const snapshot = await nativeAccounts.read()
+    const unavailable = new Set<string>()
     if (
       !force &&
       !requiredByPolicy &&
       snapshot.policyStorage.quota?.enabled === false
     )
-      return
+      return unavailable
     for (const account of snapshot.accounts) {
-      if (account.id === 'main' || account.type !== 'oauth' || !account.enabled)
+      if (account.id === 'main' || account.type !== 'oauth') continue
+      if (!account.enabled) {
+        if (requiredByPolicy) unavailable.add(account.id)
         continue
+      }
       if (
         !force &&
         getQuotaNextRefreshAt(
@@ -2670,7 +2677,7 @@ const anthropicAuthPlugin = async (
       )
         continue
       try {
-        await quotaManager.refreshFallback(
+        const reading = await quotaManager.refreshFallback(
           account.id,
           '',
           snapshot.policyStorage.accounts.find(
@@ -2678,19 +2685,37 @@ const anthropicAuthPlugin = async (
               candidate.id === account.id && isOAuthAccount(candidate),
           ) as OAuthAccount | undefined,
         )
+        if (!reading) {
+          unavailable.add(account.id)
+          logger.debug(
+            'quota',
+            'fallback quota preflight returned no reading',
+            { accountId: account.id, requiredByPolicy },
+          )
+        }
       } catch {
-        // The runtime already recorded the quota-fetch failure for its account.
-        // Keep any separate refresh-token rejection; a usage poll cannot fix it.
+        // A refused account read need not persist a quota error. Keep that
+        // missing reading visible to admission without poisoning token state.
+        unavailable.add(account.id)
+        logger.warn(
+          'quota',
+          'fallback quota preflight could not obtain a reading',
+          { accountId: account.id, requiredByPolicy },
+        )
       }
     }
     // Poll results and their backoff are already stored. Publish them without
     // waiting for sidebar I/O or changing the active request's route.
     void refreshSidebarQuota().catch(() => {})
+    return unavailable
   }
   const fallbackManager = {
-    refreshQuotaForDueAccounts: () => refreshFallbackQuotas(),
-    refreshQuotaForAllAccounts: (_options?: { force?: boolean }) =>
-      refreshFallbackQuotas(true),
+    refreshQuotaForDueAccounts: async () => {
+      await refreshFallbackQuotas()
+    },
+    refreshQuotaForAllAccounts: async (_options?: { force?: boolean }) => {
+      await refreshFallbackQuotas(true)
+    },
     refreshAccount: async (
       account: OAuthAccount,
       _storage: AccountStorage,
@@ -7338,10 +7363,24 @@ const anthropicAuthPlugin = async (
             // fallback quotas before applying hard limits, without acquiring
             // main credentials or polling accounts whose quotas are fresh.
             if (isKillswitchEnabled(storageArg)) {
-              await refreshFallbackQuotas(false, true)
+              const unavailable = await refreshFallbackQuotas(false, true)
               // Polling can also bind a newly discovered account UUID. Filter
               // the published quotas, not the request's earlier account view.
               storageArg = await loadAccounts(accountStoragePath)
+              if (storageArg && unavailable.size)
+                storageArg = {
+                  ...storageArg,
+                  accounts: storageArg.accounts.filter(
+                    (account) =>
+                      !unavailable.has(account.id) ||
+                      killswitchPassesPolicy(
+                        undefined,
+                        storageArg,
+                        account.id,
+                        options.modelId,
+                      ),
+                  ),
+                }
             }
             const usableOAuth = await fallbackManager.getUsableFallbackAccounts(
               storageArg,
