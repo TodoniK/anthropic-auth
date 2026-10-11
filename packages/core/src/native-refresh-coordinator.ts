@@ -715,6 +715,13 @@ export function createNativeRefreshCoordinator(
     let aliasKey: string | undefined
     let reconciliationFailed = false
 
+    // Read the lookup status through a function. The store callback assigns
+    // it, but TypeScript does not see that assignment, so a direct comparison
+    // after the callback would be type-checked against the earlier value.
+    function lookupRejectedCredential(): boolean {
+      return bootstrapStatus === 'unsupported-credential'
+    }
+
     function observation(): ObservationBase {
       return {
         binding,
@@ -1109,12 +1116,7 @@ export function createNativeRefreshCoordinator(
             case 'rotated':
               // The saved successor cannot be served or refreshed; report why
               // instead of the missing validation that admission would cite.
-              // The status is assigned inside the store callback above, so
-              // widen it: TypeScript does not track that assignment.
-              if (
-                (bootstrapStatus as NativeIdentityBootstrap) ===
-                'unsupported-credential'
-              )
+              if (lookupRejectedCredential())
                 return {
                   status: 'refused',
                   reason: 'unsupported-access',
