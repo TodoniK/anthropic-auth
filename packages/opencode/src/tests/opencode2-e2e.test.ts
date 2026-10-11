@@ -596,8 +596,14 @@ async function scenario(
     },
   })
   deferCleanup(async () => {
-    await upstream.stop(true)
-    await relay.stop(true)
+    const stopped = await Promise.allSettled([
+      Promise.resolve().then(() => upstream.stop(true)),
+      Promise.resolve().then(() => relay.stop(true)),
+    ])
+    if (stopped.some((result) => result.status === 'rejected')) {
+      clock.mark('fixture.cleanup_failure')
+      throw new Error('Synthetic transport cleanup failed (details redacted)')
+    }
   })
   const paths = await seed(
     env,
