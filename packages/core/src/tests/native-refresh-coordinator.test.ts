@@ -38,14 +38,12 @@ import {
   type PoolRow,
 } from '@cortexkit/common-auth/store'
 
-import {
-  ClaudeOAuthRefreshError,
-  type refreshClaudeOAuthToken,
-} from '../auth.ts'
+import { ClaudeOAuthRefreshError, refreshClaudeOAuthToken } from '../auth.ts'
 import type {
   ProviderAccountUuid,
   resolveClaudeCodeIdentity,
 } from '../claude-code.ts'
+import { custodyTombstoneKey } from '../claustrum.ts'
 import {
   type NativeLocalCredentialValidation,
   nativeLocalCredentialValidationMatches,
@@ -3894,5 +3892,56 @@ for (const initialStamp of ['absent', 'zero'] as const) {
       consumed: true,
     })
     expect(f.proofs.size).toBe(0)
+  })
+}
+
+for (const refreshToken of [
+  custodyTombstoneKey('anthropic'),
+  custodyTombstoneKey('openai'),
+  custodyTombstoneKey('unrecognized'),
+]) {
+  test(`native refresh refuses ${refreshToken} without provider failure bookkeeping`, async () => {
+    const f = await fixture()
+    await f.store.add({
+      id: 'sentinel',
+      identity: 'account-main',
+      credential: { ...credential('sentinel'), refresh: refreshToken },
+    })
+    const before = await Promise.all([
+      readFile(f.paths.config, 'utf8'),
+      readFile(f.paths.state, 'utf8'),
+    ])
+    let providerCalls = 0
+    const coordinator = f.coordinator({
+      refreshToken: async (input) => {
+        providerCalls++
+        return refreshClaudeOAuthToken(input)
+      },
+    })
+    const result = await coordinator.refresh({
+      mode: 'local',
+      binding: await f.binding('sentinel'),
+    })
+    expect(result).toEqual({
+      status: 'refused',
+      reason: 'custody-tombstone',
+      persisted: false,
+    })
+    expect(providerCalls).toBe(0)
+    expect(f.observations).toHaveLength(1)
+    expect(f.observations[0]).toMatchObject({
+      status: 'refused',
+      reason: 'custody-tombstone',
+      consumed: false,
+    })
+    expect(f.observations.some((event) => event.status === 'failed')).toBe(
+      false,
+    )
+    expect(
+      await Promise.all([
+        readFile(f.paths.config, 'utf8'),
+        readFile(f.paths.state, 'utf8'),
+      ]),
+    ).toEqual(before)
   })
 }

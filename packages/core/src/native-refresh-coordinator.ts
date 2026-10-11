@@ -18,6 +18,7 @@ import {
 
 import { ClaudeOAuthRefreshError, refreshClaudeOAuthToken } from './auth.ts'
 import { resolveClaudeCodeIdentity } from './claude-code.ts'
+import { isCustodyTombstoneValue } from './claustrum.ts'
 import {
   type NativeLocalCredentialValidation,
   type NativeLocalCredentialVersion,
@@ -913,6 +914,10 @@ export function createNativeRefreshCoordinator(
               captured = row
               fingerprint = row.fingerprint
               credentialVersion = dispatchVersion(credential)
+              // Activation markers are not refresh credentials. Refuse them
+              // before the provider call so they cannot create an auth backoff.
+              if (isCustodyTombstoneValue(credential.refresh))
+                throw new LocalRefreshRefusal('custody-tombstone')
               // This read is outside pool locks. Recheck policy after file-lock waits.
               policy = await readPolicy(subjectOf(binding, row))
               context = policy.context
