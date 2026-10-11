@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect } from 'bun:test'
 import {
   mkdir,
   mkdtemp,
@@ -11,8 +11,14 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse } from '@babel/parser'
-import { type TestGate, TestLifetime } from '../../core/src/tests/test-lifetime'
+import {
+  createTestLifetimeSuite,
+  type TestGate,
+  TestLifetime,
+} from '../../core/src/tests/test-lifetime'
 import { checkBundleGlobals } from './check-bundle-globals'
+
+const { test, gate, trackDetached } = createTestLifetimeSuite()
 
 async function fixture(run: (root: string) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), 'anthropic-bundle-check-'))
@@ -144,6 +150,41 @@ async function captureHostHarness(bindings: Record<string, unknown>) {
   )(bindings) as CapturedHostHarness
 }
 
+function withPrivateLifetime(
+  run: (
+    root: string,
+    lifetime: TestLifetime,
+    cancellation: TestGate,
+  ) => Promise<void>,
+) {
+  return async (root: string) => {
+    const lifetime = new TestLifetime()
+    const cancellation = gate()
+    const completed = Promise.withResolvers<void>()
+    let finished = false
+    const cancelWork = Promise.race([
+      cancellation.wait,
+      completed.promise,
+    ]).then(async () => {
+      if (!finished) await lifetime.finish()
+    })
+    trackDetached(cancelWork)
+    try {
+      await run(root, lifetime, cancellation)
+    } finally {
+      // The owning timeout must cancel the private child before joining it;
+      // fixture removal waits for the private lifetime and cancellation hook.
+      try {
+        await lifetime.finish()
+      } finally {
+        finished = true
+        completed.resolve()
+        await cancelWork
+      }
+    }
+  }
+}
+
 async function standInHost(
   mode: 'healthy' | 'failed' | 'cancelled' | 'deadline',
 ) {
@@ -157,8 +198,7 @@ async function standInHost(
         secrets: string[]
       }
     | undefined
-  await fixture(async (root) => {
-    const lifetime = new TestLifetime()
+  const run = withPrivateLifetime(async (root, lifetime, cancellation) => {
     const children = new Set<Bun.Subprocess>()
     const output: string[] = []
     const events: string[] = []
@@ -166,6 +206,7 @@ async function standInHost(
     const timerDelays: number[] = []
     let deadline: (() => void) | undefined
     let stdoutTail = ''
+    let spawned = false
     const observingBun = {
       spawn(
         args: string[],
@@ -177,6 +218,7 @@ async function standInHost(
         },
       ) {
         const child = Bun.spawn(args, options)
+        spawned = true
         const observe = (stream: ReadableStream<Uint8Array>, name: string) =>
           stream.pipeThrough(
             new TransformStream<Uint8Array, Uint8Array>({
@@ -266,6 +308,18 @@ async function standInHost(
         return { root: scenarioRoot, env, result }
       },
     })
+    lifetime.deferCleanup(() => {
+      if (
+        children.size ||
+        (spawned &&
+          (!events.includes('stdout.drained') ||
+            !events.includes('stderr.drained')))
+      )
+        throw new Error(
+          'Private stand-in lifetime did not drain its child and pipes',
+        )
+      events.push('private.drained')
+    })
     harness.installation.mark('dependencies.start')
     harness.installation.mark('dependencies.ready')
     const body = lifetime
@@ -278,11 +332,21 @@ async function standInHost(
         () => false,
         () => true,
       )
+    const waitForReady = () =>
+      Promise.race([
+        ready.promise,
+        body.then(() => {
+          throw new Error('Stand-in child ended before readiness')
+        }),
+        cancellation.wait.then(() => {
+          throw new Error('Owning test cancelled before stand-in readiness')
+        }),
+      ])
     if (mode === 'cancelled') {
-      await ready.promise
+      await waitForReady()
       await lifetime.finish()
     } else if (mode === 'deadline') {
-      await ready.promise
+      await waitForReady()
       // Fire the callback scheduled for the unchanged 60-second deadline;
       // no earlier watchdog or host process is needed for this branch.
       if (!deadline) throw new Error('Command did not schedule its deadline')
@@ -299,6 +363,7 @@ async function standInHost(
       secrets: harness.secrets,
     }
   })
+  await fixture(run)
   if (!evidence) throw new Error('Stand-in evidence missing')
   return evidence
 }
@@ -496,9 +561,13 @@ test('captured scenario cleanup drains both server stops before reporting failur
         return error
       },
     )
-  await Promise.race([relayStarted.promise, stopping.then(() => {})])
-  expect(events).toEqual(['upstream.stop', 'relay.stop'])
-  relayStopped.resolve()
+  try {
+    await Promise.race([relayStarted.promise, stopping.then(() => {})])
+    expect(events).toEqual(['upstream.stop', 'relay.stop'])
+  } finally {
+    relayStopped.resolve()
+    await stopping
+  }
   const error = await stopping
   expect(error).toBeInstanceOf(Error)
   expect(String(error)).toContain(
