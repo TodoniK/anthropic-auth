@@ -146,6 +146,7 @@ async function fetchClaudeCodeAccountUuid(
 
     const response = await fetch(url, {
       method: 'GET',
+      redirect: 'error',
       headers: {
         accept: 'application/json, text/plain, */*',
         authorization: `Bearer ${accessToken}`,
@@ -312,6 +313,38 @@ export async function resolveClaudeCodeIdentity(
   }
   cacheAccountIdentity(identity, stableAccountIdentity, accountUuid)
   return identity
+}
+
+/**
+ * The access value is not a Claude OAuth access token, so Claude cannot
+ * identify its account. Asking again will not help; only a new sign-in
+ * replaces it. The message never includes the rejected value.
+ */
+export class ClaudeUnsupportedAccessError extends Error {
+  readonly code = 'unsupported-access'
+
+  constructor() {
+    super(
+      'Claude OAuth access credential is not supported; sign in to this account again',
+    )
+    this.name = 'ClaudeUnsupportedAccessError'
+  }
+}
+
+/**
+ * Account lookup for credentials that must belong to a Claude account.
+ * Unlike resolveClaudeCodeIdentity, which returns an identity without an
+ * account UUID for any other access value, this rejects such a value with
+ * ClaudeUnsupportedAccessError before any network request.
+ */
+export async function resolveClaudeCodeAccountIdentity(
+  accessToken: string,
+  model: string | undefined,
+  accountIdentity: string | undefined,
+): Promise<ClaudeCodeIdentity> {
+  if (typeof accessToken !== 'string' || !accessToken.startsWith('sk-ant-oat'))
+    throw new ClaudeUnsupportedAccessError()
+  return resolveClaudeCodeIdentity(accessToken, model, accountIdentity)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

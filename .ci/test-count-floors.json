@@ -1,17 +1,17 @@
 {
   "floors": {
-    "core": 325,
-    "opencode": 1741,
-    "pi": 155
+    "core": 1508,
+    "opencode": 2010,
+    "pi": 220
   },
   "measurement": {
-    "head": "eb10f1479ff7fb91bdfbc2ce266666a569f41db5",
+    "head": "688a8becd40c25d851116f987b55707c99f3d870",
     "dirtyPaths": 0
   },
   "evidence": {
-    "_note": "Pinned Bun 1.3.14 runner totals after the mural cache anchor fix. The clean branch commit was measured locally; clean PR CI independently matched all totals. Runner counts, not source declaration counts, are the authority at the gate.",
-    "core": "325 passing at clean branch commit eb10f147; independently matched by clean CI run 37244390451",
-    "opencode": "1741 passing at clean branch commit eb10f147; independently matched by clean CI run 37244390451",
-    "pi": "155 passing at clean branch commit eb10f147; independently matched by clean CI run 37244390451"
+    "_note": "Pinned Bun 1.3.14 unit totals measured on native cutover head 688a8bec by CI run 38161601147. The unit census passed, including disposable packed hosts; the later E2E step failed separately. Runner counts, not source declaration counts, are the authority at the gate.",
+    "core": "1508 passing at head 688a8bec; CI run 38161601147 MEASURED: core 1508",
+    "opencode": "2010 passing at head 688a8bec, including packed host cases; CI run 38161601147 MEASURED: opencode 2010",
+    "pi": "220 passing at head 688a8bec; CI run 38161601147 MEASURED: pi 220"
   }
 }

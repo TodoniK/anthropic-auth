@@ -1,8 +1,7 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { loadAccounts, saveAccounts } from '@cortexkit/anthropic-auth-core'
 import {
   buildExplicitBaseMessagesUrl,
   configureApiRouteHeaders,
@@ -11,6 +10,7 @@ import {
   streamCortexKitAnthropic,
 } from '../stream.ts'
 import { normalizeContext } from '../transcript.ts'
+import { readNativePiFixture, saveNativePiFixture } from './native-fixture.ts'
 
 let tempDir: string | undefined
 const originalFetch = globalThis.fetch
@@ -41,11 +41,11 @@ afterEach(async () => {
 })
 
 describe('Pi API fallback routing helpers', () => {
-  test('mints the main account identity when Pi storage omits it', async () => {
+  test('keeps the admitted native main identity without recreating legacy storage', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-main-identity-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         main: { type: 'opencode', provider: 'anthropic' },
@@ -53,7 +53,8 @@ describe('Pi API fallback routing helpers', () => {
       },
       storagePath,
     )
-    expect((await loadAccounts(storagePath))?.mainAccountId).toBeUndefined()
+    const before = (await readNativePiFixture(storagePath)).mainAccountId
+    expect(before).toEqual(expect.any(String))
 
     globalThis.fetch = mock(async (input: string | URL | Request) => {
       const url = input.toString()
@@ -82,16 +83,18 @@ describe('Pi API fallback routing helpers', () => {
       // Drain the provider stream.
     }
 
-    expect((await loadAccounts(storagePath))?.mainAccountId).toEqual(
-      expect.any(String),
-    )
+    expect((await stream.result()).stopReason).toBe('stop')
+    expect((await readNativePiFixture(storagePath)).mainAccountId).toBe(before)
+    await expect(readFile(storagePath, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
   })
 
   test('sends Fable 5.1 thinking binding controls after compacted signed history', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-fable-51-binding-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         main: { type: 'opencode', provider: 'anthropic' },
@@ -271,7 +274,7 @@ describe('Pi API fallback routing helpers', () => {
       tempDir,
       'sticky-routes.json',
     )
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -311,14 +314,14 @@ describe('Pi API fallback routing helpers', () => {
     ) as unknown as typeof fetch
 
     const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
-      apiKey: 'main-access',
+      apiKey: 'sk-ant-oat01-main-access',
       sessionId: 'ses_pi_empty_quota',
     })
     for await (const _event of stream) {
       // Drain the provider stream.
     }
 
-    expect(authorizations).toEqual(['Bearer main-access'])
+    expect(authorizations).toEqual(['Bearer sk-ant-oat01-main-access'])
   })
 
   test('fallback-first admits an OAuth fallback whose quota is unknown', async () => {
@@ -326,7 +329,7 @@ describe('Pi API fallback routing helpers', () => {
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
     const expires = Date.now() + 5 * 60 * 60_000
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -343,7 +346,7 @@ describe('Pi API fallback routing helpers', () => {
           {
             id: 'unknown-fallback',
             type: 'oauth',
-            access: 'unknown-fallback-access',
+            access: 'sk-ant-oat01-unknown-fallback-access',
             refresh: 'unknown-fallback-refresh',
             expires,
           },
@@ -374,21 +377,23 @@ describe('Pi API fallback routing helpers', () => {
     ) as unknown as typeof fetch
 
     const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
-      apiKey: 'main-access',
+      apiKey: 'sk-ant-oat01-main-access',
       sessionId: 'ses_pi_fallback_unknown_quota',
     })
     for await (const _event of stream) {
       // Drain the provider stream.
     }
 
-    expect(authorizations).toEqual(['Bearer unknown-fallback-access'])
+    expect(authorizations).toEqual([
+      'Bearer sk-ant-oat01-unknown-fallback-access',
+    ])
   })
 
   test('main-first blocks an unknown main quota when the killswitch is fail-closed', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-killswitch-unknown-quota-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -432,7 +437,7 @@ describe('Pi API fallback routing helpers', () => {
 
     const events = []
     const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
-      apiKey: 'main-access',
+      apiKey: 'sk-ant-oat01-main-access',
       sessionId: 'ses_pi_killswitch_unknown_quota',
     })
     for await (const event of stream) events.push(event)
@@ -534,7 +539,7 @@ describe('Pi API fallback routing helpers', () => {
         },
       ],
     })
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -558,7 +563,7 @@ describe('Pi API fallback routing helpers', () => {
           {
             id: 'yiyi',
             type: 'oauth',
-            access: 'scarce-access',
+            access: 'sk-ant-oat01-scarce-access',
             refresh: 'scarce-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(13),
@@ -566,7 +571,7 @@ describe('Pi API fallback routing helpers', () => {
           {
             id: 'ufuk2',
             type: 'oauth',
-            access: 'abundant-access',
+            access: 'sk-ant-oat01-abundant-access',
             refresh: 'abundant-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(98),
@@ -596,13 +601,20 @@ describe('Pi API fallback routing helpers', () => {
             ),
           )
         }
+        if (url.includes('/oauth/token')) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ error: 'invalid_grant' }), {
+              status: 400,
+            }),
+          )
+        }
         if (!url.includes('/v1/messages')) {
           return Promise.resolve(new Response('{}', { status: 200 }))
         }
         const authorization =
           new Headers(init?.headers).get('authorization') ?? ''
         authorizations.push(authorization)
-        if (authorization === 'Bearer main-access') {
+        if (authorization === 'Bearer sk-ant-oat01-main-access') {
           return Promise.resolve(new Response('unauthorized', { status: 401 }))
         }
         return Promise.resolve(
@@ -623,7 +635,7 @@ describe('Pi API fallback routing helpers', () => {
         anthropicModel,
         anthropicContext,
         {
-          apiKey: 'main-access',
+          apiKey: 'sk-ant-oat01-main-access',
           sessionId: 'ses_pi_sticky',
         },
       )
@@ -636,7 +648,7 @@ describe('Pi API fallback routing helpers', () => {
       { ...anthropicModel, id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
       anthropicContext,
       {
-        apiKey: 'main-access',
+        apiKey: 'sk-ant-oat01-main-access',
         sessionId: 'ses_pi_sticky',
       },
     )
@@ -648,21 +660,24 @@ describe('Pi API fallback routing helpers', () => {
       { ...anthropicModel, id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
       anthropicContext,
       {
-        apiKey: 'main-access',
+        apiKey: 'sk-ant-oat01-main-access',
         sessionId: 'ses_pi_direct_opus',
       },
     )
     for await (const _event of directOpus) {
       // Drain the provider stream.
     }
+    expect((await directOpus.result()).errorMessage).toBeUndefined()
 
+    // The main account’s invalid_grant prevents its reuse. The next Opus
+    // session must select the usable fallback instead of sending the rejected
+    // main credential again.
     expect(authorizations).toEqual([
-      'Bearer abundant-access',
-      'Bearer abundant-access',
-      'Bearer main-access',
-      'Bearer abundant-access',
-      'Bearer main-access',
-      'Bearer abundant-access',
+      'Bearer sk-ant-oat01-abundant-access',
+      'Bearer sk-ant-oat01-abundant-access',
+      'Bearer sk-ant-oat01-main-access',
+      'Bearer sk-ant-oat01-abundant-access',
+      'Bearer sk-ant-oat01-abundant-access',
     ])
   })
 
@@ -700,7 +715,7 @@ describe('Pi API fallback routing helpers', () => {
         },
       ],
     })
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -730,7 +745,7 @@ describe('Pi API fallback routing helpers', () => {
           {
             id: 'fallback-a',
             type: 'oauth',
-            access: 'fallback-a-access',
+            access: 'sk-ant-oat01-fallback-a-access',
             refresh: 'fallback-a-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(0),
@@ -738,7 +753,7 @@ describe('Pi API fallback routing helpers', () => {
           {
             id: 'fallback-b',
             type: 'oauth',
-            access: 'fallback-b-access',
+            access: 'sk-ant-oat01-fallback-b-access',
             refresh: 'fallback-b-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(0),
@@ -762,7 +777,7 @@ describe('Pi API fallback routing helpers', () => {
 
     const events = []
     const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
-      apiKey: 'main-access',
+      apiKey: 'sk-ant-oat01-main-access',
       sessionId: 'ses_pi_sticky_no_fable_route',
     })
     for await (const event of stream) events.push(event)
@@ -807,7 +822,7 @@ describe('Pi API fallback routing helpers', () => {
         },
       ],
     })
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -826,7 +841,7 @@ describe('Pi API fallback routing helpers', () => {
           {
             id: 'oauth-fallback',
             type: 'oauth',
-            access: 'fallback-access',
+            access: 'sk-ant-oat01-fallback-access',
             refresh: 'fallback-refresh',
             expires: checkedAt + 5 * 60 * 60_000,
             quota: quota(100),
@@ -877,7 +892,7 @@ describe('Pi API fallback routing helpers', () => {
         const authorization =
           new Headers(init?.headers).get('authorization') ?? ''
         authorizations.push(authorization)
-        if (authorization === 'Bearer fallback-access') {
+        if (authorization === 'Bearer sk-ant-oat01-fallback-access') {
           return Promise.resolve(new Response('exhausted', { status: 429 }))
         }
         return Promise.resolve(
@@ -894,14 +909,17 @@ describe('Pi API fallback routing helpers', () => {
     ) as unknown as typeof fetch
 
     const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
-      apiKey: 'main-access',
+      apiKey: 'sk-ant-oat01-main-access',
       sessionId: 'ses_pi_sticky_api',
     })
     for await (const _event of stream) {
       // Drain the provider stream.
     }
 
-    expect(authorizations).toEqual(['Bearer fallback-access', 'Bearer api-key'])
+    expect(authorizations).toEqual([
+      'Bearer sk-ant-oat01-fallback-access',
+      'Bearer api-key',
+    ])
   })
 
   test('releases early-abandoned SSE readers without cancelling the stream', async () => {
@@ -931,6 +949,10 @@ describe('Pi Anthropic stream content blocks', () => {
   test('preserves redacted thinking for same-model replay', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-redacted-thinking-'))
     process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+    await saveNativePiFixture(
+      { version: 1, accounts: [] },
+      process.env.PI_ANTHROPIC_AUTH_FILE,
+    )
 
     globalThis.fetch = mock((input: string | URL | Request) => {
       const url =
@@ -961,7 +983,7 @@ describe('Pi Anthropic stream content blocks', () => {
       anthropicModel,
       anthropicContext,
       {
-        apiKey: 'main-access',
+        apiKey: 'sk-ant-oat01-main-access',
         sessionId: 'ses_pi_redacted_thinking',
       },
     )
@@ -985,7 +1007,7 @@ test('Pi 0.86 normalized transcript maps a returned Claude Code tool name back t
   tempDir = await mkdtemp(join(tmpdir(), 'pi-transcript-tool-roundtrip-'))
   const storagePath = join(tempDir, 'anthropic-auth.json')
   process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-  await saveAccounts(
+  await saveNativePiFixture(
     { version: 1, accounts: [], quota: { enabled: false } },
     storagePath,
   )

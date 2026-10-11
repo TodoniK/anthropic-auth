@@ -19,11 +19,16 @@ jobs:
           fetch-depth: 0
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       - run: bun install --frozen-lockfile
+      - name: Install the locked OC1 config dependency fixture
+        run: npm ci --prefix packages/e2e-tests/fixtures/opencode1-config-deps --ignore-scripts --no-audit --no-fund
       - run: bun run check:workspace-lock
       - run: bun run types
       - run: bun run build
+      - run: bun test --cwd packages/opencode scripts/check-bundle-globals.test.ts
       - run: bun test scripts/check-pi-dist-imports.test.ts
       - run: bun run check:pi-dist-imports
+      - run: bun run --cwd packages/core test:scripts
+      - run: bun test scripts/tests/run-mutation-ci.test.ts scripts/tests/run-mutation-bun.test.ts
       - run: bun run check:claustrum-golden
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -34,7 +39,8 @@ jobs:
         env:
           TUI_SMOKE_SKIP_BUILD: "1"
       - run: bun run test:pi-host
-      - run: npm install -g opencode-ai@1.18.18
       - run: bun run test:e2e
+        env:
+          ANTHROPIC_AUTH_E2E_OPENCODE_CONFIG_DEPS: ${{ github.workspace }}/packages/e2e-tests/fixtures/opencode1-config-deps
       - run: bun run format:check
       - run: bun run lint

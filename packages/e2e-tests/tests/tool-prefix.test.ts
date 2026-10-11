@@ -8,6 +8,17 @@ import { E2EHarness } from '../src/harness.ts'
 
 let harness: E2EHarness | null = null
 
+// The host chooses its title model independently of the conversation model.
+// Match its title prompt, not a model ID; zero-token requests are cache warms.
+function isConversationGeneration(request: { body: Record<string, unknown> }) {
+  return (
+    request.body.max_tokens !== 0 &&
+    !JSON.stringify(request.body).includes(
+      'Generate a title for this conversation',
+    )
+  )
+}
+
 afterEach(async () => {
   const finished = harness
   harness = null
@@ -15,6 +26,32 @@ afterEach(async () => {
 })
 
 describe('OpenCode Anthropic auth e2e', () => {
+  it('excludes title requests by role without excluding Haiku conversation turns', () => {
+    const request = (model: string, text: string, maxTokens = 1) => ({
+      body: {
+        model,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: text }],
+      },
+    })
+    const title = 'Generate a title for this conversation:\n'
+    const captured = [
+      request('claude-haiku-4-5-20251001', title),
+      request('claude-haiku-5-5', title),
+      request('claude-fable-5', 'conversation turn'),
+      request('claude-haiku-4-5-20251001', 'conversation turn'),
+      request('claude-haiku-5-5', 'conversation turn'),
+      request('claude-fable-5', 'cache warm', 0),
+    ]
+    expect(
+      captured.filter(isConversationGeneration).map((item) => item.body.model),
+    ).toEqual([
+      'claude-fable-5',
+      'claude-haiku-4-5-20251001',
+      'claude-haiku-5-5',
+    ])
+  })
+
   it('keeps sidebar state inside the isolated run directory', async () => {
     const fakeTmpDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-global-'))
     const globalStateDir = join(fakeTmpDir, 'opencode-anthropic-auth')
@@ -253,7 +290,23 @@ describe('OpenCode Anthropic auth e2e', () => {
   }, 90_000)
 
   it('continues a completed fallback tool call on Opus without replaying the side effect', async () => {
-    harness = await E2EHarness.create({ hybridCache: true })
+    harness = await E2EHarness.create({
+      hybridCache: true,
+      // Use Haiku 5.5 for titles: a filter that excludes only Haiku 4.5 must fail.
+      beforeSpawn: async (env) => {
+        const path = join(env.configDir, 'opencode.json')
+        const config: Record<string, unknown> = JSON.parse(
+          await Bun.file(path).text(),
+        )
+        await Bun.write(
+          path,
+          JSON.stringify({
+            ...config,
+            small_model: 'anthropic/claude-haiku-5-5',
+          }),
+        )
+      },
+    })
 
     const sideEffectPath = join(
       harness.opencode.env.tempDir,
@@ -306,13 +359,20 @@ describe('OpenCode Anthropic auth e2e', () => {
     )
 
     expect(await Bun.file(sideEffectPath).text()).toBe('x')
+    expect(
+      harness.anthropic
+        .requests()
+        .some(
+          (request) =>
+            request.body.model === 'claude-haiku-5-5' &&
+            JSON.stringify(request.body).includes(
+              'Generate a title for this conversation',
+            ),
+        ),
+    ).toBe(true)
     const generationRequests = harness.anthropic
       .requests()
-      .filter(
-        (request) =>
-          request.body.model !== 'claude-haiku-4-5-20251001' &&
-          request.body.max_tokens !== 0,
-      )
+      .filter(isConversationGeneration)
     expect(generationRequests.map((request) => request.body.model)).toEqual([
       'claude-fable-5',
       'claude-fable-5',

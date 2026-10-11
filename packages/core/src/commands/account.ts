@@ -364,11 +364,6 @@ export async function executeAccountCommand(input: {
     return input.transition(action.mode)
   }
   if (action.type === 'enrollment-reset') {
-    if (getClaustrumMode(input.storage) !== 'claustrum') {
-      return {
-        text: 'Claustrum enrollment is available only in Claustrum mode.',
-      }
-    }
     if (!input.resetEnrollment) {
       return { text: 'Claustrum enrollment reset is unavailable.' }
     }

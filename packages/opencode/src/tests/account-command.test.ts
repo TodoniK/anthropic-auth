@@ -15,18 +15,28 @@ import {
   __setLogTestSink,
   type AccountStorage,
   buildAccountList,
+  type CommandApplyRequest,
+  type CommandApplyResult,
+  createNativeAccountRuntime,
   custodyStatusLabel,
   executeAccountCommand,
   type LogTestRecord,
-  loadAccounts,
+  type ProviderAccountUuid,
   parseAccountCommandAction,
-  removeAccountPersistent,
-  reorderAccountsPersistent,
-  saveAccounts,
-  setAccountEnabledPersistent,
 } from '@cortexkit/anthropic-auth-core'
+import type { Hooks, PluginInput } from '@opencode-ai/plugin'
+import {
+  type Auth,
+  createOpencodeClient,
+  type Provider,
+} from '@opencode-ai/sdk'
+import { $ } from 'bun'
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { AnthropicAuthPlugin } from '../index'
 import { drainNotifications } from '../rpc/notifications'
+import { createRpcClient } from '../rpc/rpc-client'
+import { drainSidebarWrites } from '../sidebar-state'
+import { migrateNativeOpencodeFixture } from './native-fixture.ts'
 import { DEFAULT_FETCH_MOCK, installDefaultFetchMock } from './test-fetch'
 import {
   createTimerTracking,
@@ -38,6 +48,21 @@ let accountPath: string
 const tempDirs = new Set<string>()
 const originalFetch = globalThis.fetch
 const timerTracking = createTimerTracking()
+// Environment variables a test sets to point the plugin at its migrated
+// account pool; the test's cleanup puts back their previous values.
+const nativeEnvKeys = [
+  'OPENCODE_ANTHROPIC_AUTH_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
+  'CLAUDE_CONFIG_DIR',
+  'OPENCODE_AUTH_CONTENT',
+] as const
 const {
   activeIntervals,
   disabledPluginTimerOverrides,
@@ -91,6 +116,116 @@ const baseStorage = (): AccountStorage => ({
     },
   ],
 })
+
+/** Account UUIDs are branded once a provider reports them; any non-empty fixture value stands in for one. */
+function isProviderAccountUuid(value: string): value is ProviderAccountUuid {
+  return value.length > 0
+}
+
+/** The Anthropic provider entry OpenCode passes the auth loader; no models are configured. */
+const anthropicProvider: Provider = {
+  id: 'anthropic',
+  name: 'Anthropic',
+  source: 'custom',
+  env: [],
+  options: {},
+  models: {},
+}
+
+/**
+ * The context OpenCode passes a server plugin, with a real SDK client whose
+ * HTTP transport is answered in this process: message history is empty and
+ * prompts are accepted, so nothing leaves the test.
+ */
+function hostContext(directory: string): PluginInput {
+  const client = createOpencodeClient({
+    baseUrl: 'http://opencode.invalid',
+    fetch: async (request) => {
+      const path = new URL(request.url).pathname
+      if (request.method === 'GET' && /^\/session\/[^/]+\/message$/.test(path))
+        return Response.json([])
+      if (
+        request.method === 'POST' &&
+        /^\/session\/[^/]+\/prompt_async$/.test(path)
+      )
+        return new Response(null, { status: 204 })
+      return Response.json({ name: 'NotFound' }, { status: 404 })
+    },
+  })
+  return {
+    client,
+    project: {
+      id: 'account-command-fixture',
+      worktree: directory,
+      time: { created: Date.now() },
+    },
+    directory,
+    worktree: directory,
+    serverUrl: new URL('http://opencode.invalid'),
+    experimental_workspace: { register() {} },
+    $,
+  }
+}
+
+/** Plugin construction starts a fallback-account refresh and exposes its promise for tests. */
+function fallbackRefreshReady(hooks: Hooks): Promise<unknown> {
+  const ready =
+    '__fallbackRefreshReady' in hooks ? hooks.__fallbackRefreshReady : undefined
+  if (!(ready instanceof Promise))
+    throw new Error('Plugin did not expose its startup fallback refresh')
+  return ready
+}
+
+// Synthetic OpenCode auth.json: the main OAuth login the offline migration
+// moves into the native pool, beside an unrelated provider it must keep.
+function mainHostAuth() {
+  return {
+    anthropic: {
+      type: 'oauth',
+      access: 'synthetic-main-access',
+      refresh: 'synthetic-main-refresh',
+      expires: Date.now() + 8 * 60 * 60_000,
+    },
+    other: { type: 'api', key: 'synthetic-unrelated-provider' },
+  }
+}
+
+// Tests of stored account changes import their accounts through the real
+// offline migration into an isolated native pool, which is the only store the
+// account commands change; the old account file is only a migration source.
+const persistence = createTestLifetimeSuite()
+
+async function migratedAccounts(storage: AccountStorage) {
+  const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-acct-pool-'))
+  // A fixture that refuses the directory never registers its removal.
+  persistence.deferCleanup(() => rm(root, { recursive: true, force: true }))
+  const fixture = await migrateNativeOpencodeFixture({
+    root,
+    lifetime: persistence,
+    legacyConfig: { ...storage },
+    hostAuth: mainHostAuth(),
+  })
+  // The same runtime the plugin's enable, disable, remove and reorder
+  // commands write through.
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+  })
+  persistence.deferCleanup(() => runtime.close())
+  /** Every pool file's bytes, to show that a refused change wrote nothing. */
+  const files = () =>
+    Promise.all(
+      [
+        fixture.paths.config,
+        fixture.paths.state,
+        fixture.paths.runtime,
+        fixture.paths.journal,
+      ].map((path) => readFile(path, 'utf8')),
+    )
+  const fallbacks = async () =>
+    (await runtime.read()).accounts.filter((account) => account.id !== 'main')
+  return { fixture, runtime, files, fallbacks }
+}
 
 beforeEach(async () => {
   installDefaultFetchMock()
@@ -160,17 +295,18 @@ describe('parseAccountCommandAction', () => {
   })
 
   test('recognizes only global mode verbs and rejects retired custody vocabulary', async () => {
-    const cases = [
-      ['claustrum', { type: 'claustrum-mode', mode: 'claustrum' }],
-      ['local', { type: 'claustrum-mode', mode: 'local' }],
-      ['custody work-alt on', { type: 'usage' }],
-      ['claustrum on', { type: 'usage' }],
-      ['on', { type: 'usage' }],
-      ['off', { type: 'usage' }],
-    ]
+    const cases: Array<[string, ReturnType<typeof parseAccountCommandAction>]> =
+      [
+        ['claustrum', { type: 'claustrum-mode', mode: 'claustrum' }],
+        ['local', { type: 'claustrum-mode', mode: 'local' }],
+        ['custody work-alt on', { type: 'usage' }],
+        ['claustrum on', { type: 'usage' }],
+        ['on', { type: 'usage' }],
+        ['off', { type: 'usage' }],
+      ]
 
-    for (const [input, expected] of cases as Array<[string, unknown]>) {
-      expect(parseAccountCommandAction(input)).toEqual(expected as never)
+    for (const [input, expected] of cases) {
+      expect(parseAccountCommandAction(input)).toEqual(expected)
     }
   })
 
@@ -255,10 +391,7 @@ describe('parseAccountCommandAction', () => {
 // ---------------------------------------------------------------------------
 describe('buildAccountList', () => {
   test('builds list with main first, then fallbacks in order', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
-    const loaded = await loadAccounts(accountPath)
-    const list = buildAccountList(loaded!)
+    const list = buildAccountList(baseStorage())
 
     expect(list).toHaveLength(4)
     expect(list[0]).toEqual({
@@ -345,12 +478,8 @@ describe('executeAccountCommand status', () => {
     expect(custodyStatusLabel('on-vault-served')).toBe('vault-served')
     expect(custodyStatusLabel('on-vault-reauth')).toBe('vault reauth')
     expect(custodyStatusLabel('on-cold')).toBe('vault cold')
-    expect(custodyStatusLabel('on-identity-mismatch' as never)).toBe(
-      'identity mismatch',
-    )
-    expect(custodyStatusLabel('on-corrupt-binding' as never)).toBe(
-      'corrupt binding',
-    )
+    expect(custodyStatusLabel('on-identity-mismatch')).toBe('identity mismatch')
+    expect(custodyStatusLabel('on-corrupt-binding')).toBe('corrupt binding')
   })
 
   test('bare status returns account list in text', async () => {
@@ -506,24 +635,24 @@ describe('executeAccountCommand status', () => {
     expect(result.text).not.toContain('request`touch')
   })
 
-  test('routes enrollment-reset only in Claustrum mode', async () => {
-    const local = await executeAccountCommand({
+  test('terminal enrollment reset delegates to enrollment state without a stored custody-mode prerequisite', async () => {
+    const resetEnrollment = mock(async () => ({ text: 'reset' }))
+    for (const mode of ['local', 'claustrum'] as const) {
+      const storage = baseStorage()
+      storage.claustrum = { mode }
+      const result = await executeAccountCommand({
+        argumentsText: 'enrollment-reset',
+        storage,
+        resetEnrollment,
+      })
+      expect(result.text).toBe('reset')
+    }
+    expect(resetEnrollment).toHaveBeenCalledTimes(2)
+    const unavailable = await executeAccountCommand({
       argumentsText: 'enrollment-reset',
       storage: baseStorage(),
-      resetEnrollment: async () => ({ text: 'unexpected' }),
     })
-    expect(local.text).toContain('only in Claustrum mode')
-
-    const storage = baseStorage()
-    storage.claustrum = { mode: 'claustrum' }
-    const resetEnrollment = mock(async () => ({ text: 'reset' }))
-    const result = await executeAccountCommand({
-      argumentsText: 'enrollment-reset',
-      storage,
-      resetEnrollment,
-    })
-    expect(result.text).toBe('reset')
-    expect(resetEnrollment).toHaveBeenCalledTimes(1)
+    expect(unavailable.text).toBe('Claustrum enrollment reset is unavailable.')
   })
 
   test('projects a scoped fallback conservatively without a status projection', async () => {
@@ -532,7 +661,10 @@ describe('executeAccountCommand status', () => {
     const account = storage.accounts[0]
     if (account?.type !== 'oauth') throw new Error('missing OAuth fixture')
     account.claustrumScopedCredentialId = 'oauth:anthropic:work'
-    account.anthropicAccountUuid = 'account-work' as never
+    const accountUuid = 'account-work'
+    if (!isProviderAccountUuid(accountUuid))
+      throw new Error('missing account UUID fixture')
+    account.anthropicAccountUuid = accountUuid
     account.claustrumScopedState = 'active'
 
     const result = await executeAccountCommand({ argumentsText: '', storage })
@@ -562,19 +694,22 @@ describe('executeAccountCommand global Claustrum mode', () => {
     expect(result.text).toContain('/claude-account local')
   })
 
-  test('refuses to bypass the coordinator when no mode transition is supplied', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
+  persistence.test(
+    'refuses to bypass the coordinator when no mode transition is supplied',
+    async () => {
+      const { runtime, files } = await migratedAccounts(baseStorage())
+      const before = await files()
 
-    const result = await executeAccountCommand({
-      argumentsText: 'claustrum',
-      storage,
-      path: accountPath,
-    })
+      const result = await executeAccountCommand({
+        argumentsText: 'claustrum',
+        storage: (await runtime.read()).policyStorage,
+      })
 
-    expect(result.text).toBe('Claustrum mode transition is unavailable.')
-    expect((await loadAccounts(accountPath))?.claustrum?.mode).toBeUndefined()
-  })
+      expect(result.text).toBe('Claustrum mode transition is unavailable.')
+      expect(await files()).toEqual(before)
+      expect((await runtime.read()).mode).toBe('local')
+    },
+  )
 
   test('routes a requested global mode through its transition seam', async () => {
     const modes: string[] = []
@@ -654,23 +789,27 @@ describe('executeAccountCommand enable/disable', () => {
     expect(result.updated).toBeUndefined()
   })
 
-  test('persistent enable mutates store', async () => {
+  persistence.test('persistent enable mutates store', async () => {
     const storage = baseStorage()
     storage.accounts[2]!.enabled = false
-    await saveAccounts(storage, accountPath)
+    const { runtime, fallbacks } = await migratedAccounts(storage)
+    expect((await fallbacks())[2]?.enabled).toBe(false)
 
-    await setAccountEnabledPersistent('fallback-3', true, accountPath)
-    const loaded = await loadAccounts(accountPath)
-    expect(loaded?.accounts[2]?.enabled).toBe(true)
+    await runtime.setEnabled('fallback-3', true)
+    expect((await fallbacks())[2]).toMatchObject({
+      id: 'fallback-3',
+      enabled: true,
+    })
   })
 
-  test('persistent disable mutates store', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
+  persistence.test('persistent disable mutates store', async () => {
+    const { runtime, fallbacks } = await migratedAccounts(baseStorage())
 
-    await setAccountEnabledPersistent('fallback-1', false, accountPath)
-    const loaded = await loadAccounts(accountPath)
-    expect(loaded?.accounts[0]?.enabled).toBe(false)
+    await runtime.setEnabled('fallback-1', false)
+    expect((await fallbacks())[0]).toMatchObject({
+      id: 'fallback-1',
+      enabled: false,
+    })
   })
 })
 
@@ -729,24 +868,34 @@ describe('executeAccountCommand remove', () => {
     expect(result.updated).toBeUndefined()
   })
 
-  test('persistent remove mutates store', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
+  persistence.test('persistent remove mutates store', async () => {
+    const { runtime, fallbacks } = await migratedAccounts(baseStorage())
 
-    const existed = await removeAccountPersistent('fallback-1', accountPath)
-    expect(existed).toBe(true)
-    const loaded = await loadAccounts(accountPath)
-    expect(loaded?.accounts).toHaveLength(2)
-    expect(loaded?.accounts[0]?.id).toBe('fallback-2')
+    await runtime.remove('fallback-1')
+    const remaining = await fallbacks()
+    expect(remaining).toHaveLength(2)
+    expect(remaining[0]?.id).toBe('fallback-2')
   })
 
-  test('persistent remove non-existent returns false', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
+  persistence.test(
+    'persistent remove non-existent is refused and changes nothing',
+    async () => {
+      const { runtime, files, fallbacks } = await migratedAccounts(
+        baseStorage(),
+      )
+      const before = await files()
 
-    const existed = await removeAccountPersistent('nonexistent', accountPath)
-    expect(existed).toBe(false)
-  })
+      await expect(runtime.remove('nonexistent')).rejects.toMatchObject({
+        kind: 'unknown-row',
+      })
+      expect(await files()).toEqual(before)
+      expect((await fallbacks()).map((account) => account.id)).toEqual([
+        'fallback-1',
+        'fallback-2',
+        'fallback-3',
+      ])
+    },
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -813,16 +962,11 @@ describe('executeAccountCommand reorder', () => {
     expect(result.updated).toBeUndefined()
   })
 
-  test('persistent reorder mutates store', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
+  persistence.test('persistent reorder mutates store', async () => {
+    const { runtime, fallbacks } = await migratedAccounts(baseStorage())
 
-    await reorderAccountsPersistent(
-      ['fallback-2', 'fallback-1', 'fallback-3'],
-      accountPath,
-    )
-    const loaded = await loadAccounts(accountPath)
-    expect(loaded?.accounts.map((a) => a.id)).toEqual([
+    await runtime.reorder(['fallback-2', 'fallback-1', 'fallback-3'])
+    expect((await fallbacks()).map((a) => a.id)).toEqual([
       'fallback-2',
       'fallback-1',
       'fallback-3',
@@ -831,9 +975,13 @@ describe('executeAccountCommand reorder', () => {
 })
 
 // ---------------------------------------------------------------------------
-// INFO log emission via plugin command.execute.before
+// INFO log emission through the plugin's /claude menu after offline migration
 // ---------------------------------------------------------------------------
 describe('account command INFO logs (via plugin)', () => {
+  // Per-test lifetimes: fixture roots outlive the whole test body and any work
+  // the body registered, and are removed only after the plugins are disposed.
+  const lifetimes = createTestLifetimeSuite()
+  const test = lifetimes.test
   let capturedRecords: LogTestRecord[]
 
   beforeEach(() => {
@@ -847,54 +995,153 @@ describe('account command INFO logs (via plugin)', () => {
     __setLogTestSink(null)
   })
 
-  function createMockClient() {
+  // Synthetic OpenCode auth.json for the migration; see mainHostAuth.
+  const hostAuth = mainHostAuth
+
+  type Migrated = Awaited<ReturnType<typeof migrateNativeOpencodeFixture>> & {
+    getPlugin: (
+      timerOverrides?: PluginTimerOverrides,
+      runtimeOverrides?: Record<string, unknown>,
+    ) => Promise<Hooks>
+  }
+
+  /**
+   * Import `storage` through the real offline migration, point this process at
+   * the migrated pool, and return a plugin factory for that pool. Plugins are
+   * constructed only after the migration committed, as OpenCode would start
+   * them after offline setup.
+   */
+  async function migrate(storage: AccountStorage): Promise<Migrated> {
+    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-acct-native-'))
+    const plugins: Hooks[] = []
+    const savedEnv = new Map(
+      nativeEnvKeys.map((key) => [key, process.env[key]] as const),
+    )
+    // Registered before the migration fixture takes ownership of its
+    // directory (and registers that directory's removal), so this runs first:
+    // plugins stop (closing their RPC servers) and pending sidebar writes land
+    // before any fixture file is removed. The environment is restored even when
+    // a dispose fails.
+    lifetimes.deferCleanup(async () => {
+      const results = await Promise.allSettled(
+        plugins
+          .splice(0)
+          .map((plugin) => Promise.resolve().then(() => plugin.dispose?.())),
+      )
+      try {
+        await drainSidebarWrites()
+      } finally {
+        for (const [key, value] of savedEnv) {
+          if (value === undefined) delete process.env[key]
+          else process.env[key] = value
+        }
+      }
+      const failed = results.filter((result) => result.status === 'rejected')
+      if (failed.length)
+        throw new AggregateError(
+          failed.map((result) => result.reason),
+          'Plugin disposal failed',
+        )
+    })
+    // A fixture that refuses the directory never registers its removal, so
+    // remove it here as well.
+    lifetimes.deferCleanup(() => rm(root, { recursive: true, force: true }))
+    const fixture = await migrateNativeOpencodeFixture({
+      root,
+      lifetime: lifetimes,
+      legacyConfig: { ...storage },
+      hostAuth: hostAuth(),
+    })
+    for (const [key, value] of Object.entries(fixture.env))
+      process.env[key] = value
+    delete process.env.OPENCODE_AUTH_CONTENT
     return {
-      auth: { set: mock(() => Promise.resolve()) },
-      session: {
-        promptAsync: mock(() => Promise.resolve()),
+      ...fixture,
+      async getPlugin(timerOverrides, runtimeOverrides = {}) {
+        // A project directory starts the plugin's menu RPC server in the
+        // fixture's RPC directory.
+        const creation = AnthropicAuthPlugin(hostContext(fixture.root), {
+          ...disabledPluginTimerOverrides(),
+          ...timerOverrides,
+          ...runtimeOverrides,
+        })
+        lifetimes.trackDetached(creation)
+        const plugin = await creation
+        plugins.push(plugin)
+        await fallbackRefreshReady(plugin)
+        return plugin
       },
     }
   }
 
-  async function getPlugin(
-    timerOverrides?: PluginTimerOverrides,
-    runtimeOverrides: Record<string, unknown> = {},
-  ) {
-    const defaultTimerOverrides = disabledPluginTimerOverrides()
-    const plugin = (await (
-      AnthropicAuthPlugin as unknown as (
-        ctx: Parameters<typeof AnthropicAuthPlugin>[0],
-        timers?: PluginTimerOverrides,
-      ) => ReturnType<typeof AnthropicAuthPlugin>
-    )(
-      {
-        // @ts-expect-error: minimal mock for testing
-        client: createMockClient(),
-      },
-      { ...defaultTimerOverrides, ...timerOverrides, ...runtimeOverrides },
-    )) as any
-    await plugin.__fallbackRefreshReady
-    return plugin
-  }
-
-  async function executeCommand(
-    plugin: any,
-    command: string,
-    args: string,
-  ): Promise<void> {
+  /** Open /claude for a TUI-connected session, as the slash command does. */
+  async function openClaudeMenu(plugin: Hooks, sessionId: string) {
+    // The plugin counts a session's TUI as connected only while that session
+    // has recently drained its RPC notification queue, which the TUI polls as a
+    // heartbeat. Draining here makes /claude queue its menu as a notification
+    // for the TUI instead of replying in the chat with text.
+    drainNotifications(0, sessionId)
+    const execute = plugin['command.execute.before']
+    if (!execute) throw new Error('Plugin did not install its command hook')
     await expect(
-      plugin['command.execute.before']({
-        command,
-        arguments: args,
-        sessionID: 'ses_test',
-      }),
+      execute(
+        { command: 'claude', arguments: '', sessionID: sessionId },
+        { parts: [] },
+      ),
     ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    const notices = drainNotifications(0, sessionId)
+    const notice = notices.at(-1)
+    if (notice?.type !== 'open-menu')
+      throw new Error('Expected the /claude menu notification')
+    drainNotifications(notice.id, sessionId)
+    return notice.payload
   }
 
-  async function readConfigFile(): Promise<any> {
-    return JSON.parse(
-      await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+  /**
+   * Submit one Claude menu action through the plugin's RPC server, the way
+   * the TUI renderer does after the user picks it.
+   */
+  async function applyMenuAction(
+    fixture: Migrated,
+    plugin: Hooks,
+    request: Omit<CommandApplyRequest, 'command' | 'sessionId'>,
+    sessionId = 'ses_test',
+  ): Promise<CommandApplyResult> {
+    await openClaudeMenu(plugin, sessionId)
+    // globalThis.fetch is currently a mock for provider (Anthropic) requests
+    // that refuses loopback URLs. Send only the call to the plugin's local RPC
+    // server (127.0.0.1) through the fetch captured when this file loaded,
+    // which the test preload limits to loopback hosts.
+    const providerFetch = globalThis.fetch
+    globalThis.fetch = Object.assign(
+      (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+        new URL(input instanceof Request ? input.url : String(input))
+          .hostname === '127.0.0.1'
+          ? originalFetch(input, init)
+          : providerFetch(input, init),
+      { preconnect: providerFetch.preconnect },
     )
+    try {
+      return await createRpcClient(
+        fixture.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR,
+        process.pid,
+      ).applyMenu({ command: 'claude', sessionId, ...request })
+    } finally {
+      globalThis.fetch = providerFetch
+    }
+  }
+
+  /** Accounts as the native runtime reads them back from the migrated pool. */
+  async function readNativeAccounts(fixture: Migrated) {
+    const runtime = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
+    })
+    try {
+      return (await runtime.read()).accounts
+    } finally {
+      runtime.close()
+    }
   }
 
   function findCommandsLog(message: string): LogTestRecord | undefined {
@@ -907,10 +1154,15 @@ describe('account command INFO logs (via plugin)', () => {
   test('enable emits INFO log and persists', async () => {
     const storage = baseStorage()
     storage.accounts[2]!.enabled = false
-    await saveAccounts(storage, accountPath)
-    const plugin = await getPlugin()
+    const fixture = await migrate(storage)
+    const plugin = await fixture.getPlugin()
 
-    await executeCommand(plugin, 'claude-account', 'enable fallback-3')
+    const result = await applyMenuAction(fixture, plugin, {
+      sectionId: 'Accounts',
+      actionId: 'enable',
+      values: { id: 'fallback-3' },
+    })
+    expect(result.ok).toBe(true)
     const rec = findCommandsLog('account enabled')
     expect(rec).toBeDefined()
     expect(rec!.payload).toBeDefined()
@@ -923,31 +1175,40 @@ describe('account command INFO logs (via plugin)', () => {
     expect(payloadStr).not.toContain('access')
     expect(payloadStr).not.toContain('apiKey')
     // Persisted
-    const raw = await readConfigFile()
-    expect(raw.accounts[2].enabled).toBe(true)
+    const accounts = await readNativeAccounts(fixture)
+    expect(accounts.find((a) => a.id === 'fallback-3')?.enabled).toBe(true)
   })
 
   test('disable emits INFO log and persists', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
-    const plugin = await getPlugin()
+    const fixture = await migrate(baseStorage())
+    const plugin = await fixture.getPlugin()
 
-    await executeCommand(plugin, 'claude-account', 'disable fallback-1')
+    const result = await applyMenuAction(fixture, plugin, {
+      sectionId: 'Accounts',
+      actionId: 'disable',
+      values: { id: 'fallback-1' },
+    })
+    expect(result.ok).toBe(true)
     const rec = findCommandsLog('account disabled')
     expect(rec).toBeDefined()
     expect(rec!.payload!.id).toBe('fallback-1')
     expect(rec!.payload!.enabled).toBe(false)
     // Persisted
-    const raw = await readConfigFile()
-    expect(raw.accounts[0].enabled).toBe(false)
+    const accounts = await readNativeAccounts(fixture)
+    expect(accounts.find((a) => a.id === 'fallback-1')?.enabled).toBe(false)
   })
 
   test('remove emits INFO log and persists', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
-    const plugin = await getPlugin()
+    const fixture = await migrate(baseStorage())
+    const plugin = await fixture.getPlugin()
 
-    await executeCommand(plugin, 'claude-account', 'remove fallback-1')
+    const result = await applyMenuAction(fixture, plugin, {
+      sectionId: 'Accounts',
+      actionId: 'remove',
+      values: { id: 'fallback-1' },
+      confirmed: true,
+    })
+    expect(result.ok).toBe(true)
     const rec = findCommandsLog('account removed')
     expect(rec).toBeDefined()
     expect(rec!.payload!.id).toBe('fallback-1')
@@ -956,17 +1217,23 @@ describe('account command INFO logs (via plugin)', () => {
     expect(payloadStr).not.toContain('refresh')
     expect(payloadStr).not.toContain('token')
     // Persisted
-    const raw = await readConfigFile()
-    expect(raw.accounts).toHaveLength(2)
-    expect(raw.accounts[0].id).toBe('fallback-2')
+    const fallbacks = (await readNativeAccounts(fixture)).filter(
+      (a) => a.id !== 'main',
+    )
+    expect(fallbacks).toHaveLength(2)
+    expect(fallbacks[0]!.id).toBe('fallback-2')
   })
 
   test('reorder emits INFO log and persists', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
-    const plugin = await getPlugin()
+    const fixture = await migrate(baseStorage())
+    const plugin = await fixture.getPlugin()
 
-    await executeCommand(plugin, 'claude-account', 'move-up fallback-2')
+    const result = await applyMenuAction(fixture, plugin, {
+      sectionId: 'Accounts',
+      actionId: 'move-up',
+      values: { id: 'fallback-2' },
+    })
+    expect(result.ok).toBe(true)
     const rec = findCommandsLog('account reordered')
     expect(rec).toBeDefined()
     expect(rec!.payload!.id).toBe('fallback-2')
@@ -975,71 +1242,94 @@ describe('account command INFO logs (via plugin)', () => {
     expect(payloadStr).not.toContain('refresh')
     expect(payloadStr).not.toContain('token')
     // Persisted
-    const raw = await readConfigFile()
-    expect(raw.accounts.map((a: any) => a.id)).toEqual([
-      'fallback-2',
-      'fallback-1',
-      'fallback-3',
-    ])
+    expect(
+      (await readNativeAccounts(fixture))
+        .filter((a) => a.id !== 'main')
+        .map((a) => a.id),
+    ).toEqual(['fallback-2', 'fallback-1', 'fallback-3'])
   })
 
   test('status emits no setting-change log', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
-    const plugin = await getPlugin()
+    const fixture = await migrate(baseStorage())
+    const plugin = await fixture.getPlugin()
 
-    await executeCommand(plugin, 'claude-account', '')
+    // Opening /claude reads account status for its Accounts section.
+    const payload = await openClaudeMenu(plugin, 'ses_test')
+    const accounts = payload.menu.sections.find(
+      (section) => section.id === 'Accounts',
+    )
+    expect(accounts?.lines.join('\n')).toContain('Work account')
     expect(
       capturedRecords.filter((r) => r.channel === 'commands'),
     ).toHaveLength(0)
   })
 
-  test('retired custody syntax returns usage without touching the account file', async () => {
-    const storage = baseStorage()
-    await saveAccounts(storage, accountPath)
-    const before = await readFile(accountPath, 'utf8')
-    const beforeMtime = (await fs.stat(accountPath)).mtimeMs
-    const plugin = await getPlugin()
+  test('retired custody syntax is not handled and leaves native account storage untouched', async () => {
+    const fixture = await migrate(baseStorage())
+    const before = await Promise.all(
+      [fixture.paths.config, fixture.paths.state].map(async (path) => ({
+        bytes: await readFile(path, 'utf8'),
+        mtimeMs: (await fs.stat(path)).mtimeMs,
+      })),
+    )
+    const plugin = await fixture.getPlugin()
     drainNotifications(0, 'ses_test')
+    const execute = plugin['command.execute.before']
+    if (!execute) throw new Error('Plugin did not install its command hook')
 
-    await executeCommand(plugin, 'claude-account', 'custody fallback-1 on')
+    // The old /claude-account alias is no longer registered; the plugin
+    // passes it through without handling, notifying or mutating anything.
+    await expect(
+      execute(
+        {
+          command: 'claude-account',
+          arguments: 'custody fallback-1 on',
+          sessionID: 'ses_test',
+        },
+        { parts: [] },
+      ),
+    ).resolves.toBeUndefined()
 
-    const payload = drainNotifications(0, 'ses_test').at(-1)?.payload
-    expect(payload?.text).toContain('/claude-account claustrum')
-    expect(payload?.text).toContain('/claude-account local')
-    expect(await readFile(accountPath, 'utf8')).toBe(before)
-    expect((await fs.stat(accountPath)).mtimeMs).toBe(beforeMtime)
+    expect(drainNotifications(0, 'ses_test')).toEqual([])
+    const after = await Promise.all(
+      [fixture.paths.config, fixture.paths.state].map(async (path) => ({
+        bytes: await readFile(path, 'utf8'),
+        mtimeMs: (await fs.stat(path)).mtimeMs,
+      })),
+    )
+    expect(after).toEqual(before)
   })
 
   test('claustrum command gives scoped setup guidance without changing local storage', async () => {
-    await saveAccounts(baseStorage(), accountPath)
-    const plugin = await getPlugin()
-    await plugin.auth.loader(
-      async () => ({
-        type: 'oauth',
-        access: 'real-main-access',
-        refresh: 'real-main-refresh',
-        expires: Date.now() + 60_000,
-      }),
-      { models: {} },
-    )
-    const before = await readFile(accountPath, 'utf8')
-    drainNotifications(0, 'ses_test')
-    await executeCommand(plugin, 'claude-account', 'claustrum')
-    expect(drainNotifications(0, 'ses_test').at(-1)?.payload.text).toContain(
-      'setup',
-    )
-    expect(await readFile(accountPath, 'utf8')).toBe(before)
+    const fixture = await migrate(baseStorage())
+    const plugin = await fixture.getPlugin()
+    // The host passes the loader the Anthropic entry the migration left in
+    // OpenCode's auth.json: a placeholder login that holds no usable token.
+    const activation: Auth = JSON.parse(
+      await readFile(fixture.hostAuthPath, 'utf8'),
+    ).anthropic
+    const loader = plugin.auth?.loader
+    if (!loader) throw new Error('Plugin did not install its auth loader')
+    await loader(async () => activation, anthropicProvider)
+    const before = await readFile(fixture.paths.config, 'utf8')
+    const result = await applyMenuAction(fixture, plugin, {
+      sectionId: 'Accounts',
+      actionId: 'custody-mode',
+      values: { mode: 'claustrum' },
+    })
+    expect(result.ok).toBe(true)
+    expect(result.text).toContain('setup')
+    expect(await readFile(fixture.paths.config, 'utf8')).toBe(before)
   })
 
   test('does not retain a background interval unless the helper opts in', async () => {
-    await saveAccounts(baseStorage(), accountPath)
-    await getPlugin()
+    const fixture = await migrate(baseStorage())
+    await fixture.getPlugin()
     expect(timerTracking.disabledIntervalCalls).toBe(1)
     expect(activeIntervals.size).toBe(0)
 
     await timerTracking.withTrackedInterval(async () => {
-      await getPlugin({
+      await fixture.getPlugin({
         setInterval: trackedSetInterval,
         clearInterval: trackedClearInterval,
       })

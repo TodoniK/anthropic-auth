@@ -1,13 +1,23 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   type ClaustrumEnrollmentClient,
   ClaustrumScopedCredentialError,
+  createNativeAccountRuntime,
+  type ProviderAccountUuid,
+  readNativeMigrationJournal,
+  resetClaudeCodeIdentityCachesForTest,
+  runNativeMigration,
 } from '@cortexkit/anthropic-auth-core'
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { runSetupCommand } from '../setup/command.ts'
+import { resolveNativeSetupPaths } from '../setup/native-paths.ts'
 import type { CommandRunner, ProcessFence } from '../setup/types.ts'
+import { extractUrl } from './test-fetch'
+
+const lifetimes = createTestLifetimeSuite()
 
 const testDirs: string[] = []
 afterEach(async () => {
@@ -163,6 +173,9 @@ describe('setup wizard command', () => {
 
     const tuiConfig = await readFile(join(configDir, 'tui.jsonc'), 'utf8')
     expect(tuiConfig).toContain('@cortexkit/opencode-anthropic-auth@')
+    const plan = await resolveNativeSetupPaths('opencode', env)
+    const journal = await readNativeMigrationJournal(plan.paths)
+    expect(journal?.phase).toBe('retired')
   })
 })
 
@@ -675,5 +688,147 @@ test.each(['pending', 'blocked'] as const)(
     const state = JSON.parse(await readFile(paths.statePath, 'utf8'))
     expect(state.phase).toBe('approved')
     expect(JSON.stringify(state)).not.toContain(expiredSecret)
+  },
+)
+
+lifetimes.test(
+  'explicit offline recovery login is performed before setup reports completion',
+  async () => {
+    const FRESH_ACCESS = 'sk-ant-oat01-fresh-main'
+    const FRESH_UUID = 'aabbccdd-1122-3344-5566-778899001122'
+    const root = await mkdtemp(join(tmpdir(), 'setup-offline-login-'))
+    lifetimes.deferCleanup(() => rm(root, { recursive: true, force: true }))
+    // Setup saves the sign-in only after the account's identity is looked up
+    // for the exchanged token itself; the UUID the sign-in step reports is not
+    // proof. Setup has no identity-lookup override, so answer the real lookup
+    // (Claude Code's bootstrap request) for exactly the fresh synthetic token.
+    // Any other token is refused, and any other request fails the test.
+    const savedFetch = globalThis.fetch
+    const identityLookups: string[] = []
+    lifetimes.deferCleanup(() => {
+      globalThis.fetch = savedFetch
+      resetClaudeCodeIdentityCachesForTest()
+    })
+    resetClaudeCodeIdentityCachesForTest()
+    globalThis.fetch = Object.assign(
+      async (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ): Promise<Response> => {
+        const url = new URL(extractUrl(input))
+        if (
+          url.origin !== 'https://api.anthropic.com' ||
+          url.pathname !== '/api/claude_cli/bootstrap'
+        )
+          throw new Error(`Unexpected setup fetch: ${url.href}`)
+        const authorization =
+          new Headers(
+            init?.headers ??
+              (input instanceof Request ? input.headers : undefined),
+          ).get('authorization') ?? ''
+        identityLookups.push(authorization.replace(/^Bearer /, ''))
+        if (authorization !== `Bearer ${FRESH_ACCESS}`)
+          return new Response('unauthorized', { status: 401 })
+        return Response.json({ oauth_account: { account_uuid: FRESH_UUID } })
+      },
+      { preconnect: savedFetch.preconnect },
+    )
+    const env: NodeJS.ProcessEnv = {
+      HOME: root,
+      XDG_CONFIG_HOME: join(root, '.config'),
+      XDG_DATA_HOME: join(root, '.local', 'share'),
+      PI_CODING_AGENT_DIR: join(root, 'absent-pi'),
+      OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+        root,
+        'absent-connection',
+      ),
+    }
+    const plan = await resolveNativeSetupPaths('opencode', env)
+    await mkdir(dirname(plan.hostAuthPath), { recursive: true, mode: 0o700 })
+    const oldAuth = JSON.stringify({
+      anthropic: {
+        type: 'oauth',
+        access: 'sk-ant-oat01-old-unidentified',
+        refresh: 'old-refresh',
+        expires: Date.now() + 24 * 60 * 60_000,
+      },
+    })
+    await writeFile(plan.hostAuthPath, oldAuth, { mode: 0o600 })
+    await expect(
+      runNativeMigration({
+        ...plan,
+        env,
+        processFence: async () => {},
+        requestVaultActivation: true,
+        removePiAnthropicAuth: false,
+      }),
+    ).rejects.toThrow('setup --login --no-claustrum')
+    expect(await readFile(plan.hostAuthPath, 'utf8')).toBe(oldAuth)
+    expect(await readNativeMigrationJournal(plan.paths)).toBeUndefined()
+    let logins = 0
+    const options = {
+      env,
+      fence: createTestFence(),
+      runner: createMockRunner({
+        opencode: () => ({ exitCode: 0, stdout: '1.18.30\n', stderr: '' }),
+        pi: () => ({ exitCode: 1, stdout: '', stderr: '' }),
+        ck: () => ({ exitCode: 1, stdout: '', stderr: '' }),
+      }),
+      localLogin: async () => {
+        logins++
+        return {
+          accountIdentity: FRESH_UUID,
+          credential: {
+            type: 'oauth' as const,
+            access: FRESH_ACCESS,
+            refresh: 'fresh-refresh',
+            expires: Date.now() + 24 * 60 * 60_000,
+          },
+        }
+      },
+    }
+    expect(
+      await runSetupCommand(['--yes', '--no-claustrum', '--login'], options),
+    ).toBe(0)
+    expect(logins).toBe(1)
+    // The fresh token's identity was looked up while setup ran, before it
+    // reported completion. The offline migration itself sent no token anywhere,
+    // so the old unidentified login was never presented for lookup.
+    expect(identityLookups).toEqual([FRESH_ACCESS])
+    const runtime = createNativeAccountRuntime({
+      paths: plan.paths,
+      host: 'opencode',
+      local: {
+        refreshToken: async () => {
+          throw new Error('Unexpected token refresh after fresh sign-in')
+        },
+        resolveIdentity: async (access) => {
+          expect(access).toBe(FRESH_ACCESS)
+          return {
+            deviceId: 'synthetic-device',
+            sessionId: 'synthetic-session',
+            accountUuid: FRESH_UUID as ProviderAccountUuid,
+          }
+        },
+      },
+    })
+    try {
+      const snapshot = await runtime.read()
+      expect(
+        snapshot.accounts.find((account) => account.id === 'main')
+          ?.accountIdentity,
+      ).toBe(FRESH_UUID)
+      expect((await readNativeMigrationJournal(plan.paths))?.phase).toBe(
+        'retired',
+      )
+      const authorized = await runtime.authorizeLocal('main')
+      expect(authorized).toMatchObject({ status: 'usable' })
+      if (authorized.status !== 'usable')
+        throw new Error('Fresh login did not authorize')
+      expect(authorized.access).toBe(FRESH_ACCESS)
+      expect(authorized.subject.binding.identity).toBe(FRESH_UUID)
+    } finally {
+      runtime.close()
+    }
   },
 )

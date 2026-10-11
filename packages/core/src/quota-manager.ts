@@ -54,15 +54,31 @@ export type QuotaRefreshResult = {
   fetched: boolean
 }
 
+/** Pace a physical usage GET and verify the selected credential is still eligible before sending. */
+export type QuotaRequestDispatch = (
+  send: () => Promise<Response>,
+  revalidate: () => Promise<void>,
+) => Promise<Response>
+
 export type QuotaManagerOptions = {
   storage: AccountStorage | null
   fetchImpl?: typeof fetch
-  /** Resolve custody credentials at the actual HTTP boundary, after quota gates. */
-  fetchQuotaSnapshot?: (request: {
-    kind: 'main' | 'fallback'
-    accountId: string | undefined
-    accessToken: string
-  }) => Promise<OAuthQuotaSnapshot>
+  /**
+   * This callback checks or obtains credentials before its own HTTP request.
+   * accessToken may be empty when the host uses a native pool or vault instead
+   * of keeping a token in its quota settings snapshot. Pass dispatch into the
+   * native quota operation so every physical GET, including a retry, is paced
+   * only after admission and rechecks host custody and credential eligibility
+   * after the spacing wait.
+   */
+  fetchQuotaSnapshot?: (
+    request: {
+      kind: 'main' | 'fallback'
+      accountId: string | undefined
+      accessToken: string
+    },
+    dispatch: QuotaRequestDispatch,
+  ) => Promise<OAuthQuotaSnapshot>
   now?: () => number
   onMainQuotaFetched?: (
     quota: OAuthQuotaSnapshot,
@@ -156,7 +172,7 @@ export class QuotaManager {
 
   // --- Serial API gate (prevents concurrent quota API calls) ---
   private apiGate: Promise<unknown> = Promise.resolve()
-  private lastApiCallAt = 0
+  private lastApiCallAt: number | undefined
 
   // --- Config ---
   private storage: AccountStorage | null
@@ -214,13 +230,9 @@ export class QuotaManager {
     return this.fallbacks.get(accountId) ?? null
   }
 
-  /** A host transport resolves scoped credentials at dispatch time. */
+  /** A configured transport obtains its own credentials; policy snapshots need no tokens. */
   canFetchWithoutAccessToken(): boolean {
-    return Boolean(
-      this.fetchQuotaSnapshot &&
-        (this.storage === null ||
-          this.storage?.claustrum?.scopedRoster === true),
-    )
+    return Boolean(this.fetchQuotaSnapshot)
   }
 
   getAllFallbacks(): Map<string, QuotaEntry> {
@@ -910,29 +922,65 @@ export class QuotaManager {
   }
 
   /**
-   * Serialize API calls through a shared gate so only one
-   * quota API request runs at a time, with a minimum gap
-   * between calls. Prevents concurrent and rapid-fire calls
-   * from triggering Anthropic's rate limits.
+   * Serialize quota refresh work, including credential admission and locks.
+   * The transport separately paces physical GETs. A refresh refused before
+   * HTTP dispatch must not postpone the next usable account's poll.
    */
   private _enqueueApiFetch<T>(fn: () => Promise<T>): Promise<T> {
     const gatedFn = async (): Promise<T> => {
       if (this.isClosed) throw new Error('QuotaManager is closed')
-      // Wait until minimum gap since last API call
-      const elapsed = this.now() - this.lastApiCallAt
-      if (elapsed < QuotaManager.API_CALL_GAP_MS) {
-        await new Promise<void>((r) => {
-          const id = nativeSetTimeout(r, QuotaManager.API_CALL_GAP_MS - elapsed)
-          if (typeof id === 'object' && 'unref' in id) id.unref()
-        })
-      }
-      if (this.isClosed) throw new Error('QuotaManager is closed')
-      this.lastApiCallAt = this.now()
       return fn()
     }
     const queued = this.apiGate.then(gatedFn, gatedFn)
     this.apiGate = queued.catch(() => {})
     return queued
+  }
+
+  private _quotaDispatch(
+    onStart?: (at: number) => void,
+    requireOwnership?: () => Promise<void>,
+  ): QuotaRequestDispatch {
+    return async (send, revalidate) => {
+      if (this.lastApiCallAt !== undefined) {
+        const remaining =
+          QuotaManager.API_CALL_GAP_MS - (this.now() - this.lastApiCallAt)
+        if (remaining > 0)
+          await new Promise<void>((resolve) => {
+            const id = nativeSetTimeout(resolve, remaining)
+            if (typeof id === 'object' && 'unref' in id) id.unref()
+          })
+      }
+      if (this.isClosed) throw new Error('QuotaManager is closed')
+      // Authorization can precede the pacing wait. If custody changed or the
+      // captured credential is no longer eligible, send nothing and record
+      // neither spacing nor a poll timestamp.
+      await revalidate()
+      await requireOwnership?.()
+      if (this.isClosed) throw new Error('QuotaManager is closed')
+      const at = this.now()
+      onStart?.(at)
+      try {
+        return send()
+      } finally {
+        // Capture the start after invoking the transport, not before its
+        // synchronous setup. A failed physical attempt still consumes spacing.
+        this.lastApiCallAt = this.now()
+      }
+    }
+  }
+
+  private _quotaFetch(dispatch: QuotaRequestDispatch): typeof fetch {
+    return Object.assign(
+      (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) =>
+        dispatch(
+          () => this.fetchImpl(input, init),
+          async () => init?.signal?.throwIfAborted(),
+        ),
+      { preconnect: this.fetchImpl.preconnect },
+    )
   }
 
   private async _fetchMain(
@@ -977,23 +1025,28 @@ export class QuotaManager {
           throw new Error('Quota refresh is already in progress')
         }
         try {
-          const fetchStartedAt = this.now()
-          // Record only a physical usage request. Backed-off, superseded or
-          // lock-losing contenders return above without polling and must not
-          // defer the header-only poll this process still owes.
-          this.lastMainPollAttempt = {
-            accountId: mainAccountId,
-            at: fetchStartedAt,
-          }
+          let fetchStartedAt = this.now()
+          let dispatched = false
+          const dispatch = this._quotaDispatch(
+            (at) => {
+              if (!dispatched) fetchStartedAt = at
+              dispatched = true
+              this.lastMainPollAttempt = { accountId: mainAccountId, at }
+            },
+            async () => {
+              await fileLock.assertOwned()
+              if (this.mainGeneration !== generation)
+                throw new Error('Main quota identity changed before dispatch')
+            },
+          )
           const quota = this.fetchQuotaSnapshot
-            ? await this.fetchQuotaSnapshot({
-                kind: 'main',
-                accountId: mainAccountId,
-                accessToken,
-              })
+            ? await this.fetchQuotaSnapshot(
+                { kind: 'main', accountId: mainAccountId, accessToken },
+                dispatch,
+              )
             : await fetchOAuthQuotaSnapshot({
                 accessToken,
-                fetchImpl: this.fetchImpl,
+                fetchImpl: this._quotaFetch(dispatch),
                 now: this.now,
               })
           const now = this.now()
@@ -1097,16 +1150,29 @@ export class QuotaManager {
           throw new Error('Quota refresh is already in progress')
         }
         try {
-          const fetchStartedAt = this.now()
+          let fetchStartedAt = this.now()
+          let dispatched = false
+          const dispatch = this._quotaDispatch(
+            (at) => {
+              if (!dispatched) fetchStartedAt = at
+              dispatched = true
+            },
+            async () => {
+              await fileLock.assertOwned()
+              if ((this.fallbackGenerations.get(accountId) ?? 0) !== generation)
+                throw new Error(
+                  'Fallback quota identity changed before dispatch',
+                )
+            },
+          )
           const quota = this.fetchQuotaSnapshot
-            ? await this.fetchQuotaSnapshot({
-                kind: 'fallback',
-                accountId,
-                accessToken,
-              })
+            ? await this.fetchQuotaSnapshot(
+                { kind: 'fallback', accountId, accessToken },
+                dispatch,
+              )
             : await fetchOAuthQuotaSnapshot({
                 accessToken,
-                fetchImpl: this.fetchImpl,
+                fetchImpl: this._quotaFetch(dispatch),
                 now: this.now,
               })
           const now = this.now()

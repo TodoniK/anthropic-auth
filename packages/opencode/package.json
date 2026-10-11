@@ -18,6 +18,14 @@
       "types": "./dist/tui.d.ts",
       "import": "./src/tui/entry.mjs"
     },
+    "./server": {
+      "types": "./dist/v2/server.d.ts",
+      "import": "./dist/v2/server.js"
+    },
+    "./rpc": {
+      "types": "./dist/rpc/rpc-client.d.ts",
+      "import": "./dist/rpc/rpc-client.js"
+    },
     "./tui-prefs": {
       "types": "./dist/tui-preferences.d.ts",
       "import": "./dist/tui-preferences.js"
@@ -45,7 +53,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external jsonc-parser --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui && bun run check:bundle",
+    "build": "rm -rf dist && bun build src/index.ts src/v2/server.ts src/v2/tui.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --root src --target node --format esm --splitting --external @opencode-ai/plugin --external @opencode/plugin --external jsonc-parser --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui && bun run check:bundle",
     "build:tui": "bun scripts/build-tui.ts",
     "smoke:tui": "bun scripts/smoke-tui-pack-install.ts",
     "check:bundle": "bun scripts/check-bundle-globals.ts",
@@ -59,7 +67,13 @@
     "prepublishOnly": "bun run build"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opencode-ai/plugin": "*",
+    "@opencode/plugin": ">=2.0.21"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@clack/prompts": "^1.6.0",
@@ -70,6 +84,7 @@
     "solid-js": "1.9.12"
   },
   "devDependencies": {
-    "@ai-sdk/anthropic": "4.0.58"
+    "@ai-sdk/anthropic": "4.0.58",
+    "@opencode/plugin": "2.0.22"
   }
 }
