@@ -36,6 +36,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 
 import { nativeVaultPaths } from '../../core/src/native-vault-paths.ts'
+import { resolveOpencodeTestExecutable } from './opencode-executable.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '../../..')
 const PLUGIN_ENTRY = join(REPO_ROOT, 'packages/opencode/src/index.ts')
@@ -225,6 +226,8 @@ export type SpawnedOpencode = {
 
 export type SpawnOptions = {
   anthropicBaseURL: string
+  /** Stand-in child used by preparation tests; ordinary runs use the locked host binary. */
+  executable?: string
   hybridCache?: boolean
   fallbackMode?: 'server' | 'legacy'
   relay?: {
@@ -1084,7 +1087,7 @@ export async function spawnOpencode(
       await seedOpencodeConfigDependencies(env, childEnv, configDependencies)
 
     child = spawn(
-      'opencode',
+      options.executable ?? (await resolveOpencodeTestExecutable()),
       ['serve', '--port', String(requestedPort), '--hostname', '127.0.0.1'],
       { cwd: env.workdir, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] },
     )

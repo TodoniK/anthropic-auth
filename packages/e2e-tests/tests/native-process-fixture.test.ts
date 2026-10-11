@@ -73,9 +73,7 @@ async function prepareWithoutHost(
   )
   await chmod(recorder, 0o700)
   let env: IsolatedEnv | undefined
-  const savedPath = process.env.PATH
   const savedKeep = process.env.ANTHROPIC_AUTH_E2E_KEEP_TMP
-  process.env.PATH = `${bin}:${savedPath ?? ''}`
   process.env.ANTHROPIC_AUTH_E2E_KEEP_TMP = '1'
   const savedParent = Object.fromEntries(
     Object.keys(parentEnv).map((key) => [key, process.env[key]]),
@@ -85,6 +83,7 @@ async function prepareWithoutHost(
   try {
     await spawnOpencode({
       ...options,
+      executable: recorder,
       anthropicBaseURL: 'http://127.0.0.1:9',
       beforeSpawn: async (isolated) => {
         env = isolated
@@ -95,7 +94,6 @@ async function prepareWithoutHost(
   } catch (error) {
     failure = error
   } finally {
-    process.env.PATH = savedPath
     for (const [key, value] of Object.entries(savedParent)) {
       if (value === undefined) delete process.env[key]
       else process.env[key] = value
