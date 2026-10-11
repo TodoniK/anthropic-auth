@@ -569,3 +569,64 @@ test('release refuses a repository with no previous version tag', async () => {
   expect(result.exitCode).toBe(2)
   expect(result.output).toContain('no previous release tag to compare')
 })
+
+async function capturedCiFloorStep() {
+  const ci = await readFile(
+    resolve(import.meta.dir, '../.github/workflows/ci.yml'),
+    'utf8',
+  )
+  expect(ci).toContain('push:\n    branches: [main]')
+  const block = ci
+    .split('      - name: Verify unit-count floors\n')[1]
+    ?.split('\n      - ')[0]
+  if (!block) throw new Error('Missing CI floor step')
+  expect(block).toContain(
+    `FLOOR_BASE_SHA: \${{ github.event.pull_request.base.sha || github.event.before }}`,
+  )
+  const run = block.split('        run: |\n')[1]
+  if (!run) throw new Error('Missing CI floor shell')
+  return run
+    .split('\n')
+    .map((line) => line.replace(/^ {10}/, ''))
+    .join('\n')
+}
+
+test('CI floor shell refuses a zero, absent or malformed event base before measuring', async () => {
+  const shell = await capturedCiFloorStep()
+  for (const base of ['0'.repeat(40), '', 'not-a-commit']) {
+    const result = Bun.spawnSync(
+      ['bash', '-c', `bun() { echo FLOOR_CALLED; };\n${shell}`],
+      {
+        env: { ...process.env, FLOOR_BASE_SHA: base },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    )
+    const text = new TextDecoder().decode(result.stdout)
+    expect(result.exitCode).toBe(1)
+    expect(text).toContain(
+      'Unit-count floor verification requires a nonzero event base SHA.',
+    )
+    expect(text).not.toContain('FLOOR_CALLED')
+  }
+})
+
+test('CI floor shell measures against the PR base or previous main tip', async () => {
+  const shell = await capturedCiFloorStep()
+  const prBase = 'a'.repeat(40)
+  const previousMain = 'b'.repeat(40)
+  for (const base of [prBase, previousMain]) {
+    const result = Bun.spawnSync(
+      ['bash', '-c', `bun() { printf '%s\\n' "$*"; };\n${shell}`],
+      {
+        env: { ...process.env, FLOOR_BASE_SHA: base },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    )
+    expect(result.exitCode).toBe(0)
+    expect(new TextDecoder().decode(result.stdout).trim()).toBe(
+      `scripts/check-test-count-floors.ts --base-ref ${base}`,
+    )
+  }
+})

@@ -2,6 +2,8 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -34,7 +36,15 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
       - run: bun test scripts/check-test-count-floors.test.ts
       # UNCHECKED exits nonzero too: a missing merge target must not look green.
-      - run: bun scripts/check-test-count-floors.ts --base-ref "${{ github.event.pull_request.base.sha }}"
+      - name: Verify unit-count floors
+        env:
+          FLOOR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ ! "$FLOOR_BASE_SHA" =~ ^[0-9a-f]{40}$ || "$FLOOR_BASE_SHA" == 0000000000000000000000000000000000000000 ]]; then
+            echo "::error::Unit-count floor verification requires a nonzero event base SHA."
+            exit 1
+          fi
+          bun scripts/check-test-count-floors.ts --base-ref "$FLOOR_BASE_SHA"
       - run: bun run --cwd packages/opencode smoke:tui
         env:
           TUI_SMOKE_SKIP_BUILD: "1"
