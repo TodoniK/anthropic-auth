@@ -7,7 +7,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { resolve } from 'node:path'
+import { posix, resolve, win32 } from 'node:path'
 
 // Credential fixtures check every ancestor. Use system temporary storage,
 // not a checkout that may have a legitimate group-writable parent.
@@ -68,6 +68,12 @@ export function testEnvironment(
   return env
 }
 
+const PACKAGE_ROOTS = [
+  'packages/core',
+  'packages/opencode',
+  'packages/pi',
+] as const
+
 export function selectionFor(file: string, name: string) {
   if (
     !name ||
@@ -79,25 +85,23 @@ export function selectionFor(file: string, name: string) {
     )
   )
     throw new Error('Invalid full test name')
-  // Limit execution to the owning files and their reviewed package preloads.
-  // Accepting arbitrary paths could load a test with different safety setup.
+  // Canonical package-local test paths keep traversal away from other configs.
   if (
-    ![
-      'packages/core/src/tests/request-history.test.ts',
-      'packages/core/src/tests/fast.test.ts',
-      'packages/core/src/tests/native-runtime.test.ts',
-      'packages/core/src/tests/native-display-profile.test.ts',
-      'packages/core/src/tests/native-account-runtime.test.ts',
-      'packages/opencode/src/tests/index.test.ts',
-      'packages/pi/src/tests/convert.test.ts',
-    ].includes(file)
+    file !== posix.normalize(file) ||
+    posix.isAbsolute(file) ||
+    win32.isAbsolute(file) ||
+    file.includes('\\')
   )
     throw new Error(`Unsafe or unsupported test file: ${file}`)
-  const cwd = file.startsWith('packages/core/')
-    ? 'packages/core'
-    : file.startsWith('packages/opencode/')
-      ? 'packages/opencode'
-      : 'packages/pi'
+  const packageRoot = PACKAGE_ROOTS.find((root) => {
+    const testPrefix = `${root}/src/tests/`
+    return (
+      file.startsWith(testPrefix) &&
+      /^[^/]+\.test\.ts$/.test(file.slice(testPrefix.length))
+    )
+  })
+  if (!packageRoot) throw new Error(`Unsafe or unsupported test file: ${file}`)
+  const cwd = packageRoot
   return {
     cwd,
     file: file.slice(cwd.length + 1),
