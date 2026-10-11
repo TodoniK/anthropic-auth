@@ -1,4 +1,4 @@
-import { expect, test as registerTest } from 'bun:test'
+import { expect } from 'bun:test'
 import {
   cp,
   lstat,
@@ -6,11 +6,13 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  readlink,
   rm,
+  symlink,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse } from '@babel/parser'
 import {
@@ -21,7 +23,7 @@ import {
 import { seedOpencodeConfigDependencies } from '../../e2e-tests/src/opencode-runner'
 import { checkBundleGlobals } from './check-bundle-globals'
 
-const { test, gate, trackDetached, wrapBody } = createTestLifetimeSuite()
+const { test, gate, trackDetached } = createTestLifetimeSuite()
 
 async function fixture(run: (root: string) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), 'anthropic-bundle-check-'))
@@ -692,18 +694,41 @@ async function opencode1WouldSkipInstall(dir: string) {
 }
 
 // The genuine npm-installed OC1 1.18.18 SDK tree the process E2E suite uses.
-// Its committed manifest and lockfile are always present; a runner provisions
-// node_modules from that lockfile.
+// Its committed manifest and lockfile are always present; the runner must
+// provision node_modules from that lockfile before this suite runs.
 const genuineConfigDeps = resolve(
   import.meta.dir,
   '../../e2e-tests/fixtures/opencode1-config-deps',
 )
-const genuineConfigDepsInstalled = await lstat(
-  join(genuineConfigDeps, 'node_modules', '.package-lock.json'),
-).then(
-  () => true,
-  () => false,
-)
+
+/** Every symlink under `directory`, with its target exactly as written. */
+async function symlinksUnder(directory: string) {
+  const links: { path: string; target: string }[] = []
+  for (const entry of await readdir(directory, {
+    recursive: true,
+    withFileTypes: true,
+  }))
+    if (entry.isSymbolicLink()) {
+      const path = join(entry.parentPath, entry.name)
+      links.push({ path, target: await readlink(path) })
+    }
+  return links
+}
+/**
+ * Seeding copies symlinks verbatim, so each must be relative and resolve
+ * inside `root`. An absolute or escaping link would point the scenario at
+ * files outside the directory the test body removes.
+ */
+function expectLinksOwnedBy(
+  root: string,
+  links: { path: string; target: string }[],
+) {
+  for (const link of links) {
+    expect(isAbsolute(link.target)).toBe(false)
+    const inside = relative(root, resolve(dirname(link.path), link.target))
+    expect(inside.startsWith('..') || inside.startsWith(sep)).toBe(false)
+  }
+}
 
 /** An OC1 scenario root with every kind of config directory OC1 reads. */
 async function oc1Layout(root: string, pkg: string) {
@@ -734,6 +759,15 @@ async function oc1Layout(root: string, pkg: string) {
     join(packed, 'package.json'),
     JSON.stringify({ name: pkg, version: '0.0.0-packed' }),
   )
+  // npm links package binaries with relative .bin symlinks; give the packed
+  // stand-in one so the cache copy is checked for owned links too.
+  await mkdir(join(packed, 'dist'))
+  await writeFile(join(packed, 'dist', 'cli.js'), '')
+  await mkdir(join(project, 'node_modules', '.bin'))
+  await symlink(
+    join('..', pkg, 'dist', 'cli.js'),
+    join(project, 'node_modules', '.bin', 'opencode-anthropic-auth'),
+  )
   const cachedPlugin = join(
     env.XDG_CACHE_HOME,
     'opencode',
@@ -752,59 +786,73 @@ const present = (path: string) =>
     () => false,
   )
 
-registerTest.skipIf(!genuineConfigDepsInstalled)(
-  'captured OC1 seeding gives every config directory and the plugin cache a complete installed tree',
-  wrapBody(async () => {
-    const captured = await captureOc1Bootstrap()
-    await fixture(async (root) => {
-      const layout = await oc1Layout(root, captured.PACKAGE)
-      // Missing-dependency reproduction: unseeded, OC1 would run a registry
-      // install in each config directory and for the bare plugin name.
-      for (const directory of layout.configDirectories)
-        expect(await opencode1WouldSkipInstall(directory)).toBe(false)
-      expect(await present(layout.cachedPlugin)).toBe(false)
-      expect(await captured.hostBootstrapReport(layout.env)).toContain(
-        'config plugin SDK: missing',
-      )
+test('captured OC1 seeding gives every config directory and the plugin cache a complete installed tree', async () => {
+  const installed = join(
+    genuineConfigDeps,
+    'node_modules',
+    '.package-lock.json',
+  )
+  if (!(await present(installed)))
+    throw new Error(
+      `${installed} is missing: run npm ci in ${genuineConfigDeps} before this suite`,
+    )
+  const captured = await captureOc1Bootstrap()
+  await fixture(async (root) => {
+    const layout = await oc1Layout(root, captured.PACKAGE)
+    // Missing-dependency reproduction: unseeded, OC1 would run a registry
+    // install in each config directory and for the bare plugin name.
+    for (const directory of layout.configDirectories)
+      expect(await opencode1WouldSkipInstall(directory)).toBe(false)
+    expect(await present(layout.cachedPlugin)).toBe(false)
+    expect(await captured.hostBootstrapReport(layout.env)).toContain(
+      'config plugin SDK: missing',
+    )
 
-      const targets = await captured.seedOc1Bootstrap(
-        root,
-        layout.project,
-        layout.env,
-        captured.PACKAGE,
-        { fixture: genuineConfigDeps, version: '1.18.18' },
-      )
-      expect([...targets].sort()).toEqual(
-        layout.configDirectories.map((directory) => resolve(directory)).sort(),
-      )
-      const fixtureLock = JSON.parse(
-        await readFile(join(genuineConfigDeps, 'package-lock.json'), 'utf8'),
-      )
-      for (const directory of layout.configDirectories) {
-        expect(await opencode1WouldSkipInstall(directory)).toBe(true)
-        expect(
-          JSON.parse(
-            await readFile(join(directory, 'package-lock.json'), 'utf8'),
-          ),
-        ).toEqual(fixtureLock)
-        const sdk = join(directory, 'node_modules', '@opencode-ai', 'plugin')
-        const manifest = JSON.parse(
-          await readFile(join(sdk, 'package.json'), 'utf8'),
-        )
-        expect(manifest.version).toBe('1.18.18')
-        expect(
-          (await lstat(join(sdk, manifest.exports['.'].import))).size,
-        ).toBeGreaterThan(0)
-      }
+    const targets = await captured.seedOc1Bootstrap(
+      root,
+      layout.project,
+      layout.env,
+      captured.PACKAGE,
+      { fixture: genuineConfigDeps, version: '1.18.18' },
+    )
+    expect([...targets].sort()).toEqual(
+      layout.configDirectories.map((directory) => resolve(directory)).sort(),
+    )
+    const fixtureLock = JSON.parse(
+      await readFile(join(genuineConfigDeps, 'package-lock.json'), 'utf8'),
+    )
+    for (const directory of layout.configDirectories) {
+      expect(await opencode1WouldSkipInstall(directory)).toBe(true)
       expect(
-        JSON.parse(await readFile(layout.cachedPlugin, 'utf8')).version,
-      ).toBe('0.0.0-packed')
-      expect(await captured.hostBootstrapReport(layout.env)).toContain(
-        'config plugin SDK: 1.18.18',
+        JSON.parse(
+          await readFile(join(directory, 'package-lock.json'), 'utf8'),
+        ),
+      ).toEqual(fixtureLock)
+      const sdk = join(directory, 'node_modules', '@opencode-ai', 'plugin')
+      const manifest = JSON.parse(
+        await readFile(join(sdk, 'package.json'), 'utf8'),
       )
-    })
-  }),
-)
+      expect(manifest.version).toBe('1.18.18')
+      expect(
+        (await lstat(join(sdk, manifest.exports['.'].import))).size,
+      ).toBeGreaterThan(0)
+      // The fixture's npm .bin links arrive verbatim and stay relative.
+      const links = await symlinksUnder(join(directory, 'node_modules'))
+      expect(links.length).toBeGreaterThan(0)
+      expectLinksOwnedBy(directory, links)
+    }
+    expect(
+      JSON.parse(await readFile(layout.cachedPlugin, 'utf8')).version,
+    ).toBe('0.0.0-packed')
+    const cache = dirname(dirname(dirname(layout.cachedPlugin)))
+    const cacheLinks = await symlinksUnder(cache)
+    expect(cacheLinks.length).toBeGreaterThan(0)
+    expectLinksOwnedBy(cache, cacheLinks)
+    expect(await captured.hostBootstrapReport(layout.env)).toContain(
+      'config plugin SDK: 1.18.18',
+    )
+  })
+})
 
 test('captured OC1 seeding refuses an SDK tree from another OC1 version before copying', async () => {
   const captured = await captureOc1Bootstrap()
