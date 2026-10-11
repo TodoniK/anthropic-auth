@@ -1,28 +1,65 @@
 /// <reference types="bun-types" />
-import { afterEach, describe, expect, it } from 'bun:test'
+import { describe, expect } from 'bun:test'
 import { createNativeAccountRuntime, custodyTombstoneOAuth, type NativePoolPaths, readNativeMigrationJournal, resolveNativePoolPaths } from '@cortexkit/anthropic-auth-core'
+import { createTestLifetimeSuite } from '../../core/src/tests/test-lifetime.ts'
+import { nativeVaultPaths } from '../../core/src/native-vault-paths.ts'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { E2EHarness } from '../src/harness.ts'
 import { startFakeClaustrumDaemon, type FakeClaustrumCredential } from '../src/mock-claustrum.ts'
 
-let harness: E2EHarness | null = null
-const roots: string[] = []
-const daemons: Array<{ stop: () => Promise<void> }> = []
-async function disposeFixture() {
-  // A timed-out hook may finish after the next test has installed its own
-  // resources. Claim all of this test's slots before awaiting teardown so
-  // its eventual completion cannot erase a newer harness or stop its daemon.
-  const finished = harness
-  harness = null
-  const retiredDaemons = daemons.splice(0)
-  const retiredRoots = roots.splice(0)
-  await finished?.dispose()
-  await Promise.all(retiredDaemons.map((daemon) => daemon.stop()))
-  await Promise.all(retiredRoots.map((root) => rm(root, { recursive: true, force: true })))
+const { test: it, deferCleanup, trackDetached, gate } = createTestLifetimeSuite()
+type Fixture = {
+  harness: Pick<E2EHarness, 'dispose'> | null
+  roots: string[]
+  daemons: Array<{ stop: () => Promise<void> }>
 }
-afterEach(disposeFixture)
+function createFixture(): Fixture {
+  const fixture: Fixture = { harness: null, roots: [], daemons: [] }
+  deferCleanup(() => disposeFixture(fixture))
+  return fixture
+}
+function ownHarness(fixture: Fixture, harness: E2EHarness) {
+  fixture.harness = harness
+  // A prompt timeout does not cancel the SDK transport. Abort at teardown,
+  // then join the real request before disposing the child and its fixtures.
+  const prompt = harness.client.session.prompt.bind(harness.client.session)
+  harness.client.session.prompt = (options) => {
+    let settled = false
+    const stop = gate()
+    const cancellation = stop.wait.then(async () => {
+      if (!settled) await harness.abortSession(options.path.id)
+    })
+    trackDetached(cancellation)
+    const work = prompt(options).finally(() => {
+      settled = true
+      stop.open()
+    })
+    trackDetached(work)
+    return work
+  }
+  return harness
+}
+async function disposeFixture(fixture: Fixture) {
+  // Claim this fixture's slots before awaiting teardown; a late cleanup must
+  // not erase resources installed while its previous harness is draining.
+  const finished = fixture.harness
+  fixture.harness = null
+  const retiredDaemons = fixture.daemons.splice(0)
+  const retiredRoots = fixture.roots.splice(0)
+  const stopped = await Promise.allSettled([
+    Promise.resolve().then(() => finished?.dispose()),
+    ...retiredDaemons.map((daemon) => Promise.resolve().then(() => daemon.stop())),
+  ])
+  const removed = await Promise.allSettled(
+    retiredRoots.map((root) => rm(root, { recursive: true, force: true })),
+  )
+  const failed = [...stopped, ...removed].find(
+    (result): result is PromiseRejectedResult => result.status === 'rejected',
+  )
+  if (failed) throw failed.reason
+}
 
 const credential = (access: string, accountId: string, recordVersion: number): FakeClaustrumCredential => ({
   payload: access, account_id: accountId, record_version: recordVersion,
@@ -31,19 +68,18 @@ const credential = (access: string, accountId: string, recordVersion: number): F
 const mainId = 'oauth:anthropic'
 const workId = 'oauth:anthropic:work'
 
-// Read migrated account settings and cached quota/profile data through the
-// native account runtime, not the retired sidecar files. Reading this status
-// must not connect to Claustrum or retrieve an OAuth bearer token.
-async function readNativeAccounts(paths: NativePoolPaths) {
-  const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
+// Read vault account settings and cached metadata in the child's enrollment
+// namespace. Status reads must not connect to Claustrum or retrieve OAuth tokens.
+async function readNativeAccounts(paths: NativePoolPaths, env: NodeJS.ProcessEnv) {
+  const runtime = createNativeAccountRuntime({ paths, host: 'opencode', vault: { env } })
   try {
     return await runtime.read()
   } finally {
     runtime.close()
   }
 }
-async function setNativeRoutingMode(mode: string, paths: NativePoolPaths) {
-  const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
+async function setNativeRoutingMode(mode: string, paths: NativePoolPaths, env: NodeJS.ProcessEnv) {
+  const runtime = createNativeAccountRuntime({ paths, host: 'opencode', vault: { env } })
   try {
     await runtime.updateSettings((settings) => ({
       ...settings,
@@ -64,6 +100,8 @@ async function readIfPresent(path: string) {
 
 describe('zero-bind scoped custody', () => {
   it('discovers, authorizes and serves a new account without handles or a restart', async () => {
+    const fixture = createFixture()
+    const { roots, daemons } = fixture
     const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-scoped-e2e-'))
     roots.push(root)
     const credentials: Record<string, FakeClaustrumCredential> = {
@@ -71,15 +109,19 @@ describe('zero-bind scoped custody', () => {
     }
     const daemon = await startFakeClaustrumDaemon({ directory: root, scopedCredentials: credentials })
     daemons.push(daemon)
-    harness = await E2EHarness.create({
+    const childEnv: NodeJS.ProcessEnv = {
+      OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: daemon.connectionFile,
+    }
+    const harness = ownHarness(fixture, await E2EHarness.create({
       nativeAccounts: { kind: 'vault' },
-      childEnv: {
-        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: daemon.connectionFile,
-      },
+      childEnv,
       beforeSpawn: async (env) => {
-        await writeFile(join(env.configDir, 'claustrum-enrollment.json'), JSON.stringify({ token: 'aa'.repeat(32), token_generation: 1 }), { mode: 0o600 })
+        childEnv.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(env.configDir, 'claustrum-enrollment.json')
+        childEnv.HOME = env.homeDir
+        childEnv.XDG_CONFIG_HOME = env.configDir
+        await writeFile(childEnv.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE, JSON.stringify({ token: 'aa'.repeat(32), token_generation: 1 }), { mode: 0o600 })
       },
-    })
+    }))
     harness.script([{ type: 'text', text: 'main served' }, { type: 'text', text: 'new account served' }])
     const first = await harness.createSession()
     await harness.sendPrompt(first, 'serve main')
@@ -89,19 +131,22 @@ describe('zero-bind scoped custody', () => {
     expect(daemon.scopedLists).toBeGreaterThan(0)
     credentials[workId] = credential('scoped-work', 'account-work', 12)
     const pool = harness.opencode.native!.paths
+    const hostAuthBefore = await readFile(harness.opencode.native!.hostAuthPath, 'utf8')
     await harness.waitFor(async () => {
-      const snapshot = await readNativeAccounts(pool)
+      const snapshot = await readNativeAccounts(pool, childEnv)
       return hasVaultAccount(snapshot, workId) ? true : undefined
     }, { timeoutMs: 15_000, label: 'new scoped account persisted' })
-    const beforeMode = await readNativeAccounts(pool)
+    const beforeMode = await readNativeAccounts(pool, childEnv)
     expect(hasVaultAccount(beforeMode, workId),
       JSON.stringify({ rows: beforeMode.accounts.map((a) => [a.id, a.source === 'vault' ? a.credentialId : a.type]),
-        roster: await readIfPresent(pool.roster),
+        roster: await readIfPresent(nativeVaultPaths(pool).roster),
         scopedLists: daemon.scopedLists, vaultIds: Object.keys(credentials) }),
     ).toBe(true)
-    await setNativeRoutingMode('fallback-first', pool)
-    const afterMode = await readNativeAccounts(pool)
+    expect(beforeMode.mode).toBe('claustrum')
+    await setNativeRoutingMode('fallback-first', pool, childEnv)
+    const afterMode = await readNativeAccounts(pool, childEnv)
     expect(hasVaultAccount(afterMode, workId)).toBe(true)
+    expect(await readFile(harness.opencode.native!.hostAuthPath, 'utf8')).toBe(hostAuthBefore)
     const second = await harness.createSession()
     await harness.sendPrompt(second, 'serve new fallback')
     await harness.waitForSessionText(second, 'new account served')
@@ -112,22 +157,29 @@ describe('zero-bind scoped custody', () => {
     // token-exclusion assertion pass vacuously. Inspect configuration,
     // credential and roster files too when present; this vault-only fixture
     // does not require a file containing local OAuth credentials.
+    const vaultPaths = nativeVaultPaths(pool)
     const state = [
-      await readFile(pool.runtime, 'utf8'),
-      ...(await Promise.all([pool.config, pool.state, pool.roster].map(readIfPresent))),
+      await readFile(vaultPaths.runtime, 'utf8'),
+      await readFile(vaultPaths.roster, 'utf8'),
+      ...(await Promise.all([vaultPaths.config, vaultPaths.state].map(readIfPresent))),
     ].join('\n')
     expect(state).not.toContain('scoped-main')
     expect(state).not.toContain('scoped-work')
+    for (const path of [pool.config, pool.state, pool.runtime, pool.journal, pool.roster]) {
+      await expect(readFile(path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    }
   }, 120_000)
 
   it('refuses a legacy handle-only config with native migration-required authority until explicit setup', async () => {
+    const fixture = createFixture()
+    const { roots, daemons } = fixture
     const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-legacy-e2e-'))
     roots.push(root)
     const daemon = await startFakeClaustrumDaemon({ directory: root,
       scopedCredentials: { [mainId]: credential('must-not-send', 'account-main', 1) },
     })
     daemons.push(daemon)
-    harness = await E2EHarness.create({
+    const harness = ownHarness(fixture, await E2EHarness.create({
       // Deliberately unmigrated: offline setup refuses this handle-only config
       // (custody mode without a primary account). OpenCode's real auth.json
       // holds a non-secret OAuth-shaped marker that activates this plugin, and
@@ -141,7 +193,7 @@ describe('zero-bind scoped custody', () => {
       beforeSpawn: async (env) => {
         await writeFile(join(env.configDir, 'anthropic-auth.json'), JSON.stringify({ version: 1, accounts: [], claustrum: { mode: 'claustrum' } }), { mode: 0o600 })
       },
-    })
+    }))
     const session = await harness.createSession()
     await harness.startPrompt(session, 'must fail before transport')
     try {
@@ -181,6 +233,8 @@ describe('zero-bind scoped custody', () => {
 
 describe('scoped credential rotations in the OpenCode process', () => {
   it('replays only the refused turn when the vault rotates before the first 401 arrives', async () => {
+    const fixture = createFixture()
+    const { roots, daemons } = fixture
     const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-scoped-rotation-e2e-'))
     roots.push(root)
     const main = credential('scoped-main-v1', 'account-main', 11)
@@ -189,7 +243,7 @@ describe('scoped credential rotations in the OpenCode process', () => {
       scopedCredentials: { [mainId]: main },
     })
     daemons.push(daemon)
-    harness = await E2EHarness.create({
+    const harness = ownHarness(fixture, await E2EHarness.create({
       nativeAccounts: { kind: 'vault' },
       childEnv: {
         OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: daemon.connectionFile,
@@ -199,7 +253,7 @@ describe('scoped credential rotations in the OpenCode process', () => {
           JSON.stringify({ token: 'aa'.repeat(32), token_generation: 1 }),
           { mode: 0o600 })
       },
-    })
+    }))
     harness.script([
       {
         type: 'error',
@@ -228,25 +282,28 @@ describe('scoped credential rotations in the OpenCode process', () => {
 
 
 it('late fixture cleanup cannot dispose the next test’s harness, daemon or directory', async () => {
+  const fixture = createFixture()
+  const { roots, daemons } = fixture
   const previousRoot = await mkdtemp(join(tmpdir(), 'anthropic-auth-retired-'))
   const nextRoot = await mkdtemp(join(tmpdir(), 'anthropic-auth-next-'))
   let entered!: () => void
-  let release!: () => void
+  const cleanupGate = gate()
+  const release = () => cleanupGate.open()
   const started = new Promise<void>((resolve) => { entered = resolve })
-  const gate = new Promise<void>((resolve) => { release = resolve })
   let previousStops = 0
   let nextStops = 0
-  harness = {
-    dispose: async () => { entered(); await gate },
-  } as unknown as E2EHarness
+  fixture.harness = {
+    dispose: async () => { entered(); await cleanupGate.wait },
+  }
   roots.push(previousRoot)
   daemons.push({ stop: async () => { previousStops++ } })
-  const retiring = disposeFixture()
+  const retiring = disposeFixture(fixture)
+  trackDetached(retiring)
   try {
     await started
-    harness = {
+    fixture.harness = {
       dispose: async () => { nextStops++ },
-    } as unknown as E2EHarness
+    }
     await writeFile(join(nextRoot, 'marker'), 'new fixture')
     roots.push(nextRoot)
     daemons.push({ stop: async () => { nextStops++ } })
@@ -254,7 +311,7 @@ it('late fixture cleanup cannot dispose the next test’s harness, daemon or dir
     await retiring
     expect(previousStops).toBe(1)
     expect(nextStops).toBe(0)
-    expect(harness).not.toBeNull()
+    expect(fixture.harness).not.toBeNull()
     expect(await readFile(join(nextRoot, 'marker'), 'utf8')).toBe('new fixture')
   } finally {
     release()
@@ -262,7 +319,42 @@ it('late fixture cleanup cannot dispose the next test’s harness, daemon or dir
     await rm(previousRoot, { recursive: true, force: true })
     if (!roots.includes(nextRoot))
       await rm(nextRoot, { recursive: true, force: true })
-    // If nextRoot remains registered, afterEach stops its harness and daemon
-    // and removes that directory after this test.
+    // If nextRoot remains registered, the lifetime stops its harness and daemon
+    // and removes that directory after the body and detached work settle.
   }
+})
+
+it('fixture cleanup drains sibling stops before removing roots when another stop fails', async () => {
+  const fixture = createFixture()
+  const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-cleanup-failure-'))
+  fixture.roots.push(root)
+  const marker = join(root, 'marker')
+  await writeFile(marker, 'owned fixture')
+  const release = gate()
+  let entered!: () => void
+  const started = new Promise<void>((resolve) => { entered = resolve })
+  const sibling = release.wait.then(() => undefined)
+  trackDetached(sibling)
+  const failure = new Error('synthetic fixture shutdown failure')
+  fixture.daemons.push(
+    { stop: async () => { throw failure } },
+    { stop: async () => { entered(); await sibling } },
+  )
+  let settled = false
+  const retiring = disposeFixture(fixture).then(
+    () => ({ status: 'fulfilled' as const }),
+    (error: unknown) => ({ status: 'rejected' as const, error }),
+  ).finally(() => { settled = true })
+  trackDetached(retiring)
+  try {
+    await started
+    await Bun.sleep(0)
+    expect(settled).toBe(false)
+    expect(await readFile(marker, 'utf8')).toBe('owned fixture')
+  } finally {
+    release.open()
+  }
+  const outcome = await retiring
+  expect(outcome).toEqual({ status: 'rejected', error: failure })
+  await expect(readFile(marker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
 })
