@@ -39,6 +39,7 @@ export type {
   NativeAccountSnapshot,
   NativeAccountView,
 } from './native-account-view.ts'
+export { formatNativeAccountState } from './native-account-view.ts'
 export * from './native-credential-validation.ts'
 export type {
   NativeCustody,

@@ -14,6 +14,8 @@ import { lockPathFor } from '@cortexkit/common-auth/fs'
 import { fingerprintOf, type PoolRow } from '@cortexkit/common-auth/store'
 
 import { ClaudeOAuthRefreshError } from '../auth.ts'
+import { ClaudeUnsupportedAccessError } from '../claude-code.ts'
+import { CustodyTombstoneRefreshError } from '../claustrum.ts'
 import { createNativeLocalRuntimeReaders } from '../native-local-runtime-readers.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import {
@@ -1528,3 +1530,203 @@ test('failure classifier malformed actionable plain records stay inside the clos
     }),
   ).toEqual({ kind: 'none', reason: 'not-attributable' })
 })
+
+// Seed refresh and validation retry records for the predecessor credential.
+// Leave clear timestamps unchanged so this setup does not change the publication checks.
+async function seedRetryState(f: Fixture, checkedAt: number) {
+  await updateNativeRuntime(f.paths.runtime, f.paths.storageId, (current) => {
+    const entry = current.accounts.row!
+    entry.lastRefreshError = {
+      message: 'Local refresh failed',
+      credentialFingerprint: f.subject.credentialFingerprint,
+      accountIdentity: uuid,
+      permanent: false,
+      checkedAt,
+      nextRetryAt: checkedAt + 1_000,
+      retryCount: 2,
+    }
+    entry.validationRetry = {
+      subject: {
+        ...f.subject,
+        binding: { ...f.subject.binding, identity: uuid },
+      } as NonNullable<NativeRuntimeEntry['validationRetry']>['subject'],
+      checkedAt,
+      nextRetryAt: checkedAt + 1_000,
+    }
+    entry.lastQuotaRefreshError = {
+      message: 'synthetic-quota',
+      checkedAt: 3,
+      permanent: false,
+    }
+    entry.profile = {
+      tier: 'synthetic-tier',
+      orgType: 'synthetic-org',
+      checkedAt: 6,
+    }
+    return current
+  })
+  const read = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  if (read.status !== 'ready') throw new Error('Missing seeded runtime')
+  return read.state.accounts.row!
+}
+
+async function unsupportedSuccessor(
+  f: Fixture,
+): Promise<NativeRefreshObservation> {
+  return {
+    ...(await savedSuccessor(f)),
+    bootstrap: 'unsupported-credential',
+  }
+}
+
+for (const [label, seededAt, cleared] of [
+  ['older', 50, true],
+  ['same-time', 100, true],
+  ['newer', 150, false],
+] as const) {
+  test(`unsupported successor records no failure and ${cleared ? 'clears' : 'keeps'} ${label} retry state`, async () => {
+    const f = await fixture()
+    const seeded = await seedRetryState(f, seededAt)
+    const event = await unsupportedSuccessor(f)
+    if (event.status !== 'persisted')
+      throw new Error('Expected saved successor')
+    const successor = {
+      binding: f.subject.binding,
+      credentialFingerprint: event.committed.credentialFingerprint,
+      version: event.committed.version,
+    }
+    expect(classifyNativeLocalFailure(event)).toEqual({
+      kind: 'unsupported-successor',
+      target: 'committed',
+      subject: successor,
+    })
+    // Unsupported credentials do not receive the retry deadline supplied in policy.
+    const result = await publishNativeLocalRefreshFailure(
+      f.paths,
+      event,
+      policy,
+    )
+    expect(result).toMatchObject({
+      status: 'published',
+      attribution: { kind: 'unsupported-successor', subject: successor },
+    })
+    const saved = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+    if (saved.status !== 'ready') throw new Error('Missing runtime')
+    const expected = { ...seeded }
+    if (cleared) {
+      delete expected.lastRefreshError
+      delete expected.validationRetry
+      // Removing an error advances its clear marker to the check time.
+      expected.refreshErrorClearedAt = policy.checkedAt
+    }
+    expect(saved.state.accounts.row).toEqual(expected)
+    expect(saved.state.accounts.row?.credentialValidation).toBeUndefined()
+    expect(saved.state.accounts.unrelated).toEqual(f.runtime.accounts.unrelated)
+  })
+}
+
+test('unsupported successor publication refuses a stale reset context or credential', async () => {
+  const reset = await fixture()
+  await seedRetryState(reset, 50)
+  const resetEvent = await unsupportedSuccessor(reset)
+  await updateNativeRuntime(
+    reset.paths.runtime,
+    reset.paths.storageId,
+    (current) => {
+      // Change the error-clear timestamp after the event captured it. Keep it
+      // earlier than the seeded error so the runtime file remains valid; the
+      // changed timestamp must still prevent this older event from publishing.
+      current.accounts.row!.refreshErrorClearedAt = 40
+      return current
+    },
+  )
+  await unchanged(
+    reset,
+    () => publishNativeLocalRefreshFailure(reset.paths, resetEvent, policy),
+    { status: 'superseded', reason: 'reset-context' },
+  )
+
+  const rotated = await fixture()
+  await seedRetryState(rotated, 50)
+  const rotatedEvent = await unsupportedSuccessor(rotated)
+  await rotated.store.rotate('row', {
+    ...credential,
+    access: 'synthetic-later-access',
+    refresh: 'synthetic-later-refresh',
+  })
+  await unchanged(
+    rotated,
+    () => publishNativeLocalRefreshFailure(rotated.paths, rotatedEvent, policy),
+    { status: 'superseded', reason: 'row-credential' },
+  )
+})
+
+for (const [label, lookupError, unsupported] of [
+  ['Claude unsupported access', new ClaudeUnsupportedAccessError(), true],
+  ['custody marker', new CustodyTombstoneRefreshError('anthropic'), true],
+  ['lookup outage', new Error('synthetic lookup outage'), false],
+] as const) {
+  test(`coordinator saves a consumed successor after ${label} lookup error`, async () => {
+    const f = await fixture()
+    const observations: NativeRefreshObservation[] = []
+    let lookups = 0
+    const readers = createNativeLocalRuntimeReaders({
+      paths: f.paths,
+      now: () => 100,
+      externalPolicy: () => ({ status: 'allowed' }),
+    })
+    const c = createNativeRefreshCoordinator({
+      paths: f.paths,
+      quota: nativeQuotaCodec,
+      ...readers,
+      refreshToken: async () => ({
+        access: 'synthetic-unsupported-successor-access',
+        refresh: 'synthetic-unsupported-successor-refresh',
+        expires: credential.expires,
+        expiresIn: 3600,
+      }),
+      resolveIdentity: async () => {
+        lookups++
+        throw lookupError
+      },
+      reconcile: async (event) => {
+        observations.push(event)
+      },
+    })
+    const result = await c.authorize({
+      binding: f.subject.binding,
+      intent: 'refresh',
+      mode: 'local',
+    })
+    expect(lookups).toBe(1)
+    if (unsupported)
+      expect(result).toEqual({
+        status: 'refused',
+        reason: 'unsupported-access',
+        persisted: true,
+      })
+    else
+      expect(result).toEqual({
+        status: 'refused',
+        reason: 'proof-missing',
+        persisted: true,
+      })
+    expect(observations).toHaveLength(1)
+    expect(observations[0]).toMatchObject({
+      status: 'persisted',
+      bootstrap: unsupported ? 'unsupported-credential' : 'failed',
+    })
+    const read = await f.store.read()
+    if (read.status !== 'ready') throw new Error('Missing pool')
+    expect(read.rows[0]?.credential).toMatchObject({
+      type: 'oauth',
+      access: 'synthetic-unsupported-successor-access',
+      refresh: 'synthetic-unsupported-successor-refresh',
+    })
+    expect(read.rows[0]?.enabled).toBe(true)
+    expect(classifyNativeLocalFailure(observations[0]!)).toMatchObject({
+      kind: unsupported ? 'unsupported-successor' : 'validation-retry',
+      target: 'committed',
+    })
+  })
+}

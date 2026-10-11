@@ -8,6 +8,7 @@ import {
   executeCacheKeepCommand,
   executePrimeCommand,
   formatEnrollmentStatus,
+  formatNativeAccountState,
   formatOAuthAccountTier,
   getCache1hPersistentMode,
   getCacheKeepWindow,
@@ -335,7 +336,7 @@ export function createPiNativeCommands(
             `Custody: ${snapshot.mode}`,
             ...snapshot.accounts.map(
               (account) =>
-                `${account.id}: ${account.label ?? account.id} (${account.type}, ${account.enabled ? 'enabled' : 'disabled'}, ${account.source}${account.state ? `, ${account.state}` : ''}${formatOAuthAccountTier(account.profile) ? `, ${formatOAuthAccountTier(account.profile)}` : ''}); identity: ${account.accountIdentity ?? 'unverified'}${account.lastRefreshError ? `; refresh: ${account.lastRefreshError.permanent ? 'requires login' : 'backoff'}` : ''}`,
+                `${account.id}: ${account.label ?? account.id} (${account.type}, ${account.enabled ? 'enabled' : 'disabled'}, ${account.source}${account.state ? `, ${formatNativeAccountState(account)}` : ''}${formatOAuthAccountTier(account.profile) ? `, ${formatOAuthAccountTier(account.profile)}` : ''}); identity: ${account.accountIdentity ?? 'unverified'}${account.lastRefreshError ? `; refresh: ${account.lastRefreshError.permanent ? 'requires login' : 'backoff'}` : ''}`,
             ),
             ...formatEnrollmentStatus(
               await custody.status(),

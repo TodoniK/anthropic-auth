@@ -6,6 +6,7 @@ import {
   buildPrimeStatusSummary,
   CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
   exchange,
+  formatNativeAccountState,
   formatOAuthAccountTier,
   getHostClaustrumEnrollmentPaths,
   type NativeAccountRuntime,
@@ -255,7 +256,7 @@ export function createNativeMenuCapabilities(options: {
           snapshot.accounts
             .map(
               (account) =>
-                `${account.id}${account.label ? ` (${account.label})` : ''}: ${account.type}, ${account.source}, ${account.enabled ? 'enabled' : 'disabled'}${account.accountIdentity ? `, ${account.accountIdentity}` : ''}`,
+                `${account.id}${account.label ? ` (${account.label})` : ''}: ${account.type}, ${account.source}, ${account.enabled ? 'enabled' : 'disabled'}${account.state ? `, ${formatNativeAccountState(account)}` : ''}${account.accountIdentity ? `, ${account.accountIdentity}` : ''}`,
             )
             .join('\n') || 'No native Claude accounts.'
         )

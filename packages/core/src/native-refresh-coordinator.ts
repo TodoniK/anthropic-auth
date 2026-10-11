@@ -17,8 +17,15 @@ import {
 } from '@cortexkit/common-auth/store'
 
 import { ClaudeOAuthRefreshError, refreshClaudeOAuthToken } from './auth.ts'
-import { resolveClaudeCodeIdentity } from './claude-code.ts'
-import { isCustodyTombstoneValue } from './claustrum.ts'
+import {
+  ClaudeUnsupportedAccessError,
+  resolveClaudeCodeAccountIdentity,
+  type resolveClaudeCodeIdentity,
+} from './claude-code.ts'
+import {
+  CustodyTombstoneRefreshError,
+  isCustodyTombstoneValue,
+} from './claustrum.ts'
 import {
   type NativeLocalCredentialValidation,
   type NativeLocalCredentialVersion,
@@ -76,7 +83,26 @@ export type NativeRefreshRestriction =
       credentialFingerprint: string
     }
 
-export type NativeIdentityBootstrap = 'resolved' | 'unavailable' | 'failed'
+/**
+ * Outcome of the account lookup for a credential. 'unsupported-credential'
+ * means the lookup refused the access value itself (it is not a Claude OAuth
+ * access token, or it is a vault custody marker): no lookup request was made
+ * and no retry can succeed until the account is signed in again.
+ */
+export type NativeIdentityBootstrap =
+  | 'resolved'
+  | 'unavailable'
+  | 'failed'
+  | 'unsupported-credential'
+
+// Errors that reject the access value itself rather than report a failed
+// lookup. Retrying cannot help, so they must not start a refresh backoff.
+function unsupportedCredential(error: unknown): boolean {
+  return (
+    error instanceof ClaudeUnsupportedAccessError ||
+    error instanceof CustodyTombstoneRefreshError
+  )
+}
 export type NativeRefreshHandoff =
   | 'not-needed'
   | 'acquired'
@@ -514,7 +540,7 @@ export function createNativeRefreshCoordinator(
   const store = createNativePoolStore(options)
   const now = options.now ?? Date.now
   const provider = options.refreshToken ?? refreshClaudeOAuthToken
-  const bootstrap = options.resolveIdentity ?? resolveClaudeCodeIdentity
+  const bootstrap = options.resolveIdentity ?? resolveClaudeCodeAccountIdentity
   const onLockEvent = nativeLockObserver(options.onLockEvent)
 
   async function rowFor(binding: NativeLocalPoolBinding) {
@@ -689,6 +715,13 @@ export function createNativeRefreshCoordinator(
     let aliasKey: string | undefined
     let reconciliationFailed = false
 
+    // Read the lookup status through a function. The store callback assigns
+    // it, but TypeScript does not see that assignment, so a direct comparison
+    // after the callback would be type-checked against the earlier value.
+    function lookupRejectedCredential(): boolean {
+      return bootstrapStatus === 'unsupported-credential'
+    }
+
     function observation(): ObservationBase {
       return {
         binding,
@@ -842,6 +875,22 @@ export function createNativeRefreshCoordinator(
                   classification: 'transient',
                 }
             } catch (caught) {
+              if (unsupportedCredential(caught)) {
+                // The stored access value can never identify an account, so
+                // record no validation retry. Only a new sign-in replaces it.
+                bootstrapStatus = 'unsupported-credential'
+                await reconcile({
+                  ...observation(),
+                  status: 'refused',
+                  reason: 'unsupported-access',
+                  consumed: false,
+                })
+                return {
+                  status: 'refused',
+                  reason: 'unsupported-access',
+                  persisted: false,
+                }
+              }
               bootstrapStatus = 'failed'
               validationFailure = {
                 kind: 'validation',
@@ -948,8 +997,12 @@ export function createNativeRefreshCoordinator(
                     ? returnedIdentity
                     : undefined
                 bootstrapStatus = identity ? 'resolved' : 'unavailable'
-              } catch {
-                bootstrapStatus = 'failed'
+              } catch (caught) {
+                // An unsupported successor is still saved below: the provider
+                // has already consumed the previous refresh token.
+                bootstrapStatus = unsupportedCredential(caught)
+                  ? 'unsupported-credential'
+                  : 'failed'
               }
               if (binding.identity === undefined && identity) {
                 aliasKey = nativeLocalRefreshJobKey({ ...binding, identity })
@@ -1061,6 +1114,14 @@ export function createNativeRefreshCoordinator(
           )
           switch (outcome.status) {
             case 'rotated':
+              // The replacement access token is unsupported. Report that sign-in
+              // is required, rather than treating it as a pending account check.
+              if (lookupRejectedCredential())
+                return {
+                  status: 'refused',
+                  reason: 'unsupported-access',
+                  persisted: true,
+                }
               return {
                 status: 'completed',
                 source: 'rotated',

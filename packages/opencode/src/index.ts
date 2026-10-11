@@ -65,6 +65,7 @@ import {
   FALLBACK_BACKGROUND_TICK_MS,
   fallbackAccountUuidForLineage,
   formatEnrollmentStatus,
+  formatNativeAccountState,
   formatOAuthAccountTier,
   formatQuotaBackoffMessage,
   formatRefreshBackoffMessage,
@@ -5398,7 +5399,7 @@ const anthropicAuthPlugin = async (
           : []),
         ...snapshot.accounts.map(
           (account) =>
-            `${account.label ?? account.id} [${account.id === 'main' ? 'main' : 'fallback'}] ${account.enabled ? 'enabled' : 'disabled'} — ${account.source}${account.state ? ` (${account.state})` : ''}${formatOAuthAccountTier(account.profile) ? ` — ${formatOAuthAccountTier(account.profile)}` : ''}`,
+            `${account.label ?? account.id} [${account.id === 'main' ? 'main' : 'fallback'}] ${account.enabled ? 'enabled' : 'disabled'} — ${account.source}${account.state ? ` (${formatNativeAccountState(account)})` : ''}${formatOAuthAccountTier(account.profile) ? ` — ${formatOAuthAccountTier(account.profile)}` : ''}`,
         ),
       ].join('\n')
     }

@@ -6,6 +6,7 @@ import {
   authorize,
   createNativeAccountRuntime,
   exchange,
+  formatNativeAccountState,
   generateRelayToken,
   getAccountStoragePath,
   isValidApiBaseURL,
@@ -443,7 +444,9 @@ async function listAccounts() {
         fiveHour === undefined && sevenDay === undefined
           ? 'quota unknown'
           : `5h ${fiveHour ?? '?'}%, 1w ${sevenDay ?? '?'}% remaining`
-      console.log(`${index + 1}. ${label} (${status}) — ${quota}`)
+      console.log(
+        `${index + 1}. ${label} (${status}) — ${quota}${account.state ? ` — ${formatNativeAccountState(account)}` : ''}`,
+      )
     }
   })
 }

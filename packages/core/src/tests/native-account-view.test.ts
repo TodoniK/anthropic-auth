@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import { fingerprintOf, type PoolRow } from '@cortexkit/common-auth/store'
 import {
   applyNativeMetadataPatch,
+  formatNativeAccountState,
   nativeAccountReadError,
   nativeQuotaFailure,
   projectNativeAccountViews,
@@ -324,6 +325,35 @@ for (const access of ['sk-ant-oat01-synthetic', 'synthetic-api-key', '']) {
     expect(JSON.stringify(snapshot)).not.toContain('synthetic-refresh')
   })
 }
+
+test('account state text explains unsupported access and its remedy and keeps other states', () => {
+  const unsupported = projectNativeAccountViews({
+    paths,
+    rows: [
+      {
+        ...row,
+        credential: {
+          type: 'oauth',
+          access: 'claustrum-tombstone:v1:anthropic',
+          refresh: 'synthetic-refresh',
+          expires: 1000,
+        },
+      },
+    ],
+    settings: { mainAccountId: row.id },
+  }).accounts[0]
+  if (!unsupported) throw new Error('Missing projected account')
+  const text = formatNativeAccountState(unsupported)
+  expect(text).toBe(
+    'unsupported credential: the saved access token is not a Claude OAuth token; sign in to this account again',
+  )
+  expect(text).not.toContain('claustrum-tombstone')
+  expect(text).not.toContain('synthetic-refresh')
+  expect(formatNativeAccountState({})).toBe('')
+  expect(formatNativeAccountState({ state: '' })).toBe('')
+  expect(formatNativeAccountState({ state: 'active' })).toBe('active')
+  expect(formatNativeAccountState({ state: 'revoked' })).toBe('revoked')
+})
 
 for (const roster of [
   undefined,

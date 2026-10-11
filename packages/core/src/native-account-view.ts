@@ -55,6 +55,23 @@ export interface NativeAccountView {
   authHeader?: 'authorization-bearer' | 'x-api-key'
 }
 
+/**
+ * One-line status text for an account's state, shared by host status
+ * displays. A local account in 'unsupported-access' holds a saved access value
+ * that is not a Claude OAuth access token; it is never sent to Claude or
+ * refreshed, so the text names the remedy. Other states, such as vault
+ * credential states, are shown as recorded. Returns '' when there is no state.
+ */
+export function formatNativeAccountState(
+  view: Pick<NativeAccountView, 'state'>,
+): string {
+  const state = view.state
+  if (state === undefined || state === '') return ''
+  if (state === 'unsupported-access')
+    return 'unsupported credential: the saved access token is not a Claude OAuth token; sign in to this account again'
+  return state
+}
+
 export interface NativeAccountSnapshot {
   mode: 'local' | 'claustrum'
   settings: Record<string, unknown>
