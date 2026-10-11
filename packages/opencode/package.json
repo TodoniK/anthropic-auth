@@ -22,6 +22,10 @@
       "types": "./dist/v2/server.d.ts",
       "import": "./dist/v2/server.js"
     },
+    "./rpc": {
+      "types": "./dist/rpc/rpc-client.d.ts",
+      "import": "./dist/rpc/rpc-client.js"
+    },
     "./tui-prefs": {
       "types": "./dist/tui-preferences.d.ts",
       "import": "./dist/tui-preferences.js"
