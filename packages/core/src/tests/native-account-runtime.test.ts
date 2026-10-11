@@ -4,8 +4,13 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { disconnectClaustrumEnrollment } from '@cortexkit/common-auth/claustrum'
 import { ClaudeOAuthRefreshError } from '../auth.ts'
-import type { ProviderAccountUuid } from '../claude-code.ts'
+import {
+  type ProviderAccountUuid,
+  resetClaudeCodeIdentityCachesForTest,
+} from '../claude-code.ts'
+import { custodyTombstoneKey } from '../claustrum.ts'
 import { getHostClaustrumEnrollmentPaths } from '../claustrum-enrollment.ts'
+import { TOKEN_URL } from '../constants.ts'
 import {
   __setLogTestSink,
   getLogLevel,
@@ -1583,4 +1588,130 @@ test('enrollment rejects captured local metadata and Prime writes before reopeni
   ).toBeUndefined()
   expect(await f.runtime.incrementPrimeUsage('main', prior.subject)).toBe(false)
   expect(await Promise.all(files.map((path) => readFile(path)))).toEqual(before)
+})
+
+// The token endpoint can complete an exchange whose successor access is not a
+// Claude OAuth access token. The old refresh token is gone at that point, so
+// the successor must be kept, but it must never be served or retried.
+test('consumed unsupported OAuth successor is kept, refused without refresh backoff, and replaced by verified sign-in', async () => {
+  resetClaudeCodeIdentityCachesForTest()
+  deferCleanup(() => resetClaudeCodeIdentityCachesForTest())
+  const requests: string[] = []
+  const http = spyOn(globalThis, 'fetch').mockImplementation((async (
+    input: Parameters<typeof fetch>[0],
+    init?: RequestInit,
+  ) => {
+    const url = new URL(String(input))
+    requests.push(`${init?.method ?? 'GET'} ${url.origin}${url.pathname}`)
+    if (url.href === TOKEN_URL)
+      return Response.json({
+        access_token: custodyTombstoneKey('anthropic'),
+        refresh_token: 'synthetic-consumed-successor',
+        expires_in: 3600,
+      })
+    if (url.pathname === '/api/claude_cli/bootstrap')
+      return Response.json({ oauth_account: { account_uuid: uuid } })
+    return new Response('{}', { status: 404 })
+  }) as typeof fetch)
+  deferCleanup(() => http.mockRestore())
+  // Use the production token exchange and Claude account lookup; only the
+  // network is synthetic.
+  const f = await fixture({
+    refreshToken: undefined,
+    resolveIdentity: undefined,
+  })
+
+  const refreshed = await f.runtime.authorizeLocal('main', {
+    intent: 'refresh',
+  })
+  expect(refreshed).toEqual({
+    status: 'refused',
+    reason: 'unsupported-access',
+    persisted: true,
+  })
+  // One token exchange; an unsupported successor is never sent to Claude.
+  expect(requests).toEqual([`POST ${TOKEN_URL}`])
+
+  const saved = await f.store.read()
+  if (saved.status !== 'ready') throw new Error('Pool was not readable')
+  const row = saved.rows.find((candidate) => candidate.id === 'imported-main')
+  expect(row?.credential).toEqual({
+    type: 'oauth',
+    access: custodyTombstoneKey('anthropic'),
+    refresh: 'synthetic-consumed-successor',
+    expires: now + 3_600_000,
+    // The store records its own monotonic refresh time.
+    lastRefreshedAt: expect.any(Number),
+  })
+  expect(row?.identity).toBe(uuid)
+  expect(row?.enabled).toBe(true)
+
+  const view = (await f.runtime.read()).accounts.find(
+    (account) => account.id === 'main',
+  )
+  expect(view?.state).toBe('unsupported-access')
+  expect(view?.lastRefreshError).toBeUndefined()
+  const metadata = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  if (metadata.status !== 'ready') throw new Error('Runtime was not readable')
+  const entry = metadata.state.accounts['imported-main']
+  expect(entry?.lastRefreshError).toBeUndefined()
+  expect(entry?.validationRetry).toBeUndefined()
+  expect(entry?.credentialValidation).toBeUndefined()
+
+  for (const intent of ['serve', 'refresh'] as const)
+    expect(await f.runtime.authorizeLocal('main', { intent })).toEqual({
+      status: 'refused',
+      reason: 'unsupported-access',
+      persisted: false,
+    })
+  expect(requests).toEqual([`POST ${TOKEN_URL}`])
+
+  await f.runtime.loginOAuth({
+    routeId: 'main',
+    credential: {
+      access: 'sk-ant-oat01-synthetic-fresh-signin',
+      refresh: 'synthetic-fresh-signin-refresh',
+      expires: now + 18_000_000,
+    },
+  })
+  const replaced = (await f.runtime.read()).accounts.find(
+    (account) => account.id === 'main',
+  )
+  expect(replaced?.state).toBeUndefined()
+  expect(replaced?.lastRefreshError).toBeUndefined()
+  const served = await f.runtime.authorizeLocal('main')
+  if (served.status !== 'usable')
+    throw new Error(`Fresh sign-in was not served: ${JSON.stringify(served)}`)
+  expect(served.access).toBe('sk-ant-oat01-synthetic-fresh-signin')
+  expect(
+    requests.slice(1).every((request) => request.includes('/bootstrap')),
+  ).toBe(true)
+})
+
+// A supported successor whose account lookup fails keeps the existing recovery
+// path: the successor is saved, a validation retry is scheduled, and it is not
+// served until a later lookup proves the account.
+test('supported OAuth successor with a failed account lookup keeps validation recovery', async () => {
+  let lookups = 0
+  const f = await fixture({
+    resolveIdentity: async () => {
+      lookups++
+      throw new Error('synthetic lookup outage')
+    },
+  })
+  const refreshed = await f.runtime.authorizeLocal('main', {
+    intent: 'refresh',
+  })
+  expect(refreshed).toMatchObject({ status: 'refused', persisted: true })
+  expect(refreshed).not.toMatchObject({ reason: 'unsupported-access' })
+  expect(lookups).toBe(1)
+  const view = (await f.runtime.read()).accounts.find(
+    (account) => account.id === 'main',
+  )
+  expect(view?.state).toBeUndefined()
+  const metadata = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  if (metadata.status !== 'ready') throw new Error('Runtime was not readable')
+  const entry = metadata.state.accounts['imported-main']
+  expect(entry?.validationRetry?.nextRetryAt).toBeGreaterThan(now)
+  expect(entry?.credentialValidation).toBeUndefined()
 })

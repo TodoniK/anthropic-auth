@@ -1058,6 +1058,19 @@ export type NativeLocalFailureAttribution =
       readonly target: 'captured' | 'committed'
       readonly subject: NativeLocalValidationRetry['subject']
     }
+  | {
+      /**
+       * The exchange saved a successor whose access value is not a supported
+       * Claude OAuth credential. It is kept because the previous refresh token
+       * is consumed, but it is never validated or retried; only a new sign-in
+       * replaces it. Publishing it removes refresh-error and retry state no
+       * newer than its check, advancing the refresh-error clear marker to the
+       * check time when it removes any, and adds no error or backoff.
+       */
+      readonly kind: 'unsupported-successor'
+      readonly target: 'committed'
+      readonly subject: NativeRefreshSubject
+    }
 
 export type NativeLocalFailureSupersededReason =
   | 'row-binding'
@@ -1253,6 +1266,8 @@ function classifyCapturedLocalFailure(
     version: { ...material.version },
   }
   const target = saved ? 'committed' : 'captured'
+  if (saved && event.bootstrap === 'unsupported-credential')
+    return { kind: 'unsupported-successor', target: 'committed', subject }
   if (
     (saved && subject.binding.identity !== undefined) ||
     (event.status === 'failed' && event.failure.kind === 'validation')
@@ -1317,8 +1332,9 @@ function failureMaterialMatches(
 
 /**
  * Publish the failure only for its captured credential version or saved successor.
- * This write neither validates credentials nor repairs identity, clears earlier
- * errors, or changes their clear timestamps. Credentials and runtime metadata
+ * This write neither validates credentials nor repairs identity. Only an
+ * unsupported successor, which records no error of its own, clears earlier
+ * errors and advances the refresh-error clear timestamp. Credentials and runtime metadata
  * are saved separately; a thrown runtime write does not prove credential rollback.
  */
 export async function publishNativeLocalRefreshFailure(
@@ -1348,7 +1364,8 @@ export async function publishNativeLocalRefreshFailure(
         (!counter(policy.nextRetryAt) ||
           policy.nextRetryAt < policy.checkedAt)) ||
       (policy.retryCount !== undefined && !counter(policy.retryCount)) ||
-      ((attribution.kind === 'validation-retry' || !attribution.permanent) &&
+      ((attribution.kind === 'validation-retry' ||
+        (attribution.kind === 'refresh-error' && !attribution.permanent)) &&
         policy.nextRetryAt === undefined)
     )
       throw new NativeRuntimeError('publication-refused')
@@ -1376,7 +1393,37 @@ export async function publishNativeLocalRefreshFailure(
         const entry: NativeRuntimeEntry = old
           ? { ...old }
           : { binding: subject.binding }
-        if (attribution.kind === 'validation-retry') {
+        if (attribution.kind === 'unsupported-successor') {
+          // An unsupported successor is not a failure: the policy's retry
+          // time and count are not recorded, and only its check time is used.
+          // Remove refresh and validation retry state recorded no later than
+          // this check, so the account shows its unsupported credential, not
+          // a backoff. A newer record came from a later operation and stays.
+          // The runtime writer requires a clear marker covering any removed
+          // error, as an explicit backoff reset does.
+          // Validation evidence, quota and profile metadata are left as they
+          // are; nothing here validates the successor.
+          let cleared = false
+          if (
+            entry.lastRefreshError &&
+            entry.lastRefreshError.checkedAt <= policy.checkedAt
+          ) {
+            delete entry.lastRefreshError
+            cleared = true
+          }
+          if (
+            entry.validationRetry &&
+            entry.validationRetry.checkedAt <= policy.checkedAt
+          ) {
+            delete entry.validationRetry
+            cleared = true
+          }
+          if (cleared)
+            entry.refreshErrorClearedAt = Math.max(
+              entry.refreshErrorClearedAt ?? 0,
+              policy.checkedAt,
+            )
+        } else if (attribution.kind === 'validation-retry') {
           const nextRetryAt = policy.nextRetryAt
           if (nextRetryAt === undefined)
             throw new NativeRuntimeError('publication-refused')
