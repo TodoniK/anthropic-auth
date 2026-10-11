@@ -31,7 +31,7 @@ import {
 } from '../../../core/src/tests/test-lifetime'
 import { tokenFingerprint } from '../../../core/src/token-fingerprint'
 
-const { test, gate, trackDetached } = createTestLifetimeSuite()
+const { test, gate, trackDetached, deferCleanup } = createTestLifetimeSuite()
 
 const PACKAGE = '@cortexkit/opencode-anthropic-auth'
 const TOKEN = 'sk-ant-oat01-oc2-disposable-only'
@@ -43,6 +43,28 @@ let cli = ''
 let oc1 = ''
 let packedProject = ''
 const children = new Set<Bun.Subprocess>()
+
+function phaseClock() {
+  const started = performance.now()
+  const phases: Record<string, { at: string; elapsedMs: number }> = {}
+  return {
+    phases,
+    mark(name: string) {
+      phases[name] ??= {
+        at: new Date().toISOString(),
+        elapsedMs: Math.round(performance.now() - started),
+      }
+    },
+  }
+}
+const installation = phaseClock()
+type CommandClock = { clock: ReturnType<typeof phaseClock>; name: string }
+
+const redactFixtureSecrets = (text: string) =>
+  [TOKEN, PASSWORD, 'synthetic-refresh', 'relay-disposable-only'].reduce(
+    (redacted, secret) => redacted.replaceAll(secret, '[redacted]'),
+    text,
+  )
 /**
  * Host output is kept inside the fixture that ran it: the temporary directory
  * isolatedEnv gives each host as TMPDIR. Removing that fixture removes these
@@ -81,21 +103,32 @@ async function command(
   env: Record<string, string>,
   limit = 60_000,
   cancellation?: TestGate,
+  timing?: CommandClock,
 ) {
+  timing?.clock.mark(`${timing.name}.start`)
   const child = Bun.spawn(args, { cwd, env, stdout: 'pipe', stderr: 'pipe' })
   children.add(child)
   const stdoutWork = new Response(child.stdout).text()
   const stderrWork = new Response(child.stderr).text()
-  const exitWork = child.exited
+  const exitWork = child.exited.then((exit) => {
+    timing?.clock.mark(`${timing.name}.exit`)
+    return exit
+  })
   const completed = Promise.withResolvers<void>()
   let settled = false
   const stopWork = cancellation
     ? Promise.race([cancellation.wait, completed.promise]).then(() => {
-        if (!settled && child.exitCode === null) child.kill('SIGKILL')
+        if (!settled && child.exitCode === null) {
+          timing?.clock.mark(`${timing.name}.cancelled`)
+          child.kill('SIGKILL')
+        }
       })
     : Promise.resolve()
   if (cancellation) trackDetached(stopWork)
-  const timer = setTimeout(() => child.kill('SIGKILL'), limit)
+  const timer = setTimeout(() => {
+    timing?.clock.mark(`${timing.name}.deadline`)
+    child.kill('SIGKILL')
+  }, limit)
   try {
     const [stdout, stderr, exit] = await Promise.all([
       stdoutWork,
@@ -106,8 +139,14 @@ async function command(
     if (logs && (args[0] === cli || args[0] === oc1)) {
       await mkdir(logs, { recursive: true })
       const prefix = `${Date.now()}-${args[0] === cli ? 'oc2' : 'oc1'}`
-      await writeFile(join(logs, `${prefix}-stdout.log`), stdout)
-      await writeFile(join(logs, `${prefix}-stderr.log`), stderr)
+      await writeFile(
+        join(logs, `${prefix}-stdout.log`),
+        redactFixtureSecrets(stdout),
+      )
+      await writeFile(
+        join(logs, `${prefix}-stderr.log`),
+        redactFixtureSecrets(stderr),
+      )
     }
     return { stdout, stderr, exit }
   } finally {
@@ -123,16 +162,19 @@ async function requireCommand(
   args: string[],
   cwd: string,
   env: Record<string, string>,
+  timing?: CommandClock,
 ) {
-  const result = await command(args, cwd, env)
+  const result = await command(args, cwd, env, 60_000, undefined, timing)
   if (result.exit !== 0)
     throw new Error(
-      `Disposable command failed: ${args[0]} ${args[1]}\n${result.stdout}\n${result.stderr}`,
+      redactFixtureSecrets(
+        `Disposable command failed: ${args[0]} ${args[1]}\n${result.stdout}\n${result.stderr}`,
+      ),
     )
   return result
 }
 
-beforeAll(async () => {
+async function installPackedHosts() {
   const cache = join(workspace, 'node_modules', '.cache', 'opencode2-e2e')
   await mkdir(cache, { recursive: true })
   scratch = await mkdtemp(join(cache, 'fixture-'))
@@ -153,6 +195,8 @@ beforeAll(async () => {
     install,
     env,
     10_000,
+    undefined,
+    { clock: installation, name: 'registry' },
   )
   if (registry.exit !== 0)
     throw new Error(
@@ -166,6 +210,7 @@ beforeAll(async () => {
     ['npm', 'install', '--no-audit', '--no-fund', '@opencode/cli@2.0.22'],
     install,
     env,
+    { clock: installation, name: 'oc2.install' },
   )
   cli = join(install, 'node_modules', '.bin', 'opencode')
   const version = await requireCommand([cli, '--version'], install, env)
@@ -180,6 +225,7 @@ beforeAll(async () => {
     ['npm', 'install', '--no-audit', '--no-fund', 'opencode-ai@1.18.31'],
     install1,
     await isolatedEnv(install1),
+    { clock: installation, name: 'oc1.install' },
   )
   oc1 = join(install1, 'node_modules', '.bin', 'opencode')
   packedProject = join(scratch, 'packed')
@@ -191,6 +237,7 @@ beforeAll(async () => {
       ['bun', 'pm', 'pack', '--destination', pack],
       join(workspace, 'packages', pkg),
       env,
+      { clock: installation, name: `${pkg}.pack` },
     )
   }
   const archives = (await readdir(pack))
@@ -205,7 +252,22 @@ beforeAll(async () => {
     ['npm', 'install', '--no-audit', '--no-fund', ...archives],
     packedProject,
     env,
+    { clock: installation, name: 'packed.install' },
   )
+}
+
+beforeAll(async () => {
+  installation.mark('dependencies.start')
+  try {
+    await installPackedHosts()
+    installation.mark('dependencies.ready')
+  } catch (error) {
+    installation.mark('dependencies.failed')
+    console.error(
+      JSON.stringify({ phaseClocks: { installation: installation.phases } }),
+    )
+    throw error
+  }
 }, 180_000)
 afterAll(async () => {
   for (const child of children)
@@ -431,12 +493,18 @@ interface RelayEnvelope extends Record<string, unknown> {
   }
   readonly body: string
 }
-async function scenario(
+type ScenarioArgs = [
   transport: 'direct' | 'http' | 'websocket',
-  host: 'oc1' | 'oc2' = 'oc2',
-  entry: 'package' | 'main' = 'package',
+  host?: 'oc1' | 'oc2',
+  entry?: 'package' | 'main',
   mode?: 'tool' | 'structured',
+]
+async function scenario(
+  args: ScenarioArgs,
+  clock: ReturnType<typeof phaseClock>,
 ) {
+  const [transport, host = 'oc2', entry = 'package', mode] = args
+  clock.mark('fixture.start')
   const root = await mkdtemp(join(scratch, 'scenario-'))
   const project = join(root, 'project')
   await mkdir(project)
@@ -461,49 +529,81 @@ async function scenario(
     hostname: '127.0.0.1',
     port: 0,
     async fetch(request) {
-      const body = await request.text()
-      wire.push({
-        body,
-        headers: new Headers(request.headers),
-        url: request.url,
-      })
-      const payload = JSON.parse(body)
-      if (
-        mode === 'tool' &&
-        payload.tool_choice?.type === 'tool' &&
-        !usedTool
-      ) {
-        usedTool = true
-        const tool = payload.tools.find(
-          (tool: { name: string }) => tool.name === payload.tool_choice.name,
-        )
-        const key = tool?.input_schema?.properties?.path ? 'path' : 'filePath'
-        return toolReply(payload.model, payload.tool_choice.name, {
-          [key]: join(project, 'fixture.txt'),
+      clock.mark('upstream.first_request')
+      try {
+        const body = await request.text()
+        wire.push({
+          body,
+          headers: new Headers(request.headers),
+          url: request.url,
         })
+        const payload = JSON.parse(body)
+        if (
+          mode === 'tool' &&
+          payload.tool_choice?.type === 'tool' &&
+          !usedTool
+        ) {
+          usedTool = true
+          const tool = payload.tools.find(
+            (tool: { name: string }) => tool.name === payload.tool_choice.name,
+          )
+          const key = tool?.input_schema?.properties?.path ? 'path' : 'filePath'
+          const response = toolReply(payload.model, payload.tool_choice.name, {
+            [key]: join(project, 'fixture.txt'),
+          })
+          clock.mark('upstream.first_response')
+          return response
+        }
+        const response = reply(
+          payload.model,
+          mode === 'structured'
+            ? '{"answer":"OC2_SYNTHETIC_OK"}'
+            : 'OC2_SYNTHETIC_OK',
+        )
+        clock.mark('upstream.first_response')
+        return response
+      } catch {
+        clock.mark('upstream.transport_failure')
+        throw new Error(
+          'Synthetic upstream transport failed (details redacted)',
+        )
       }
-      return reply(
-        payload.model,
-        mode === 'structured'
-          ? '{"answer":"OC2_SYNTHETIC_OK"}'
-          : 'OC2_SYNTHETIC_OK',
-      )
     },
   })
   const relay = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
     async fetch(request) {
-      const envelope = (await request.json()) as RelayEnvelope
-      envelopes.push(envelope)
-      expect(request.headers.get('authorization')).toBeNull()
-      expect(request.headers.get('x-relay-token')).toBe('relay-disposable-only')
-      return fetch(envelope.upstream.url, {
-        method: envelope.upstream.method,
-        headers: envelope.upstream.headers,
-        body: envelope.body,
-      })
+      clock.mark('relay.first_request')
+      try {
+        const envelope = (await request.json()) as RelayEnvelope
+        envelopes.push(envelope)
+        expect(request.headers.get('authorization')).toBeNull()
+        expect(request.headers.get('x-relay-token')).toBe(
+          'relay-disposable-only',
+        )
+        const response = await fetch(envelope.upstream.url, {
+          method: envelope.upstream.method,
+          headers: envelope.upstream.headers,
+          body: envelope.body,
+        })
+        clock.mark('relay.first_response')
+        return response
+      } catch {
+        clock.mark('relay.transport_failure')
+        throw new Error('Synthetic relay transport failed (details redacted)')
+      }
     },
+  })
+  deferCleanup(async () => {
+    const stopped = await Promise.allSettled([
+      Promise.resolve().then(() => upstream.stop(true)),
+      Promise.resolve().then(() => relay.stop(true)),
+    ])
+    if (stopped.some((result) => result.status === 'rejected')) {
+      clock.mark('fixture.cleanup_failure')
+      throw new Error('Synthetic transport cleanup failed (details redacted)')
+    }
   })
   const paths = await seed(
     env,
@@ -590,55 +690,58 @@ export default {id:'cortexkit-anthropic-auth',async setup(ctx){appendFileSync('$
     env,
     60_000,
     gate(),
+    { clock, name: 'host' },
   )
-  if (result.exit !== 0)
-    console.error(JSON.stringify({ host, entry, mode, ...result }))
-  if (mode)
-    console.error(
-      JSON.stringify({
-        mode,
-        audit: await readFile(join(project, 'hook-audit.jsonl'), 'utf8').catch(
-          () => 'not-created',
-        ),
-        stdout: result.stdout,
-        stderr: result.stderr,
-        models: wire.map((send) => ({
-          model: JSON.parse(send.body).model,
-          toolChoice: JSON.parse(send.body).tool_choice,
-          outputConfig: JSON.parse(send.body).output_config,
-        })),
-      }),
-    )
-  try {
-    return { result, wire, envelopes, paths, root, env }
-  } finally {
-    await upstream.stop(true)
-    await relay.stop(true)
-  }
+  return { result, wire, envelopes, paths, root, env }
 }
 
 /**
- * Runs one host scenario and hands it to `body`, then deletes the scenario's
- * temporary directory, including its host logs. If `body` fails, the logs are
- * printed first so the failure can still be diagnosed after the deletion.
+ * Keep failure evidence until lifetime cancellation has drained the host.
+ * Successful scenarios stay quiet; deadline failures retain their last phase.
  */
 async function withScenario(
-  args: Parameters<typeof scenario>,
+  args: ScenarioArgs,
   body: (run: Awaited<ReturnType<typeof scenario>>) => Promise<void> | void,
 ) {
-  const run = await scenario(...args)
-  try {
-    await body(run)
-  } catch (error) {
-    const logs = hostLogDirectory(run.env)
-    for (const name of logs ? await readdir(logs).catch(() => []) : [])
+  const clock = phaseClock()
+  let passed = false
+  let run: Awaited<ReturnType<typeof scenario>> | undefined
+  deferCleanup(async () => {
+    if (
+      !passed ||
+      clock.phases['host.cancelled'] ||
+      clock.phases['host.deadline']
+    ) {
+      clock.mark('failure.report')
       console.error(
-        `${name}:\n${await readFile(join(logs ?? '', name), 'utf8')}`,
+        JSON.stringify({
+          scenario: args,
+          phaseClocks: {
+            installation: installation.phases,
+            scenario: clock.phases,
+          },
+        }),
       )
-    throw error
-  } finally {
-    await rm(run.root, { recursive: true, force: true })
-  }
+      if (run) {
+        const logs = hostLogDirectory(run.env)
+        for (const name of logs ? await readdir(logs).catch(() => []) : [])
+          console.error(
+            `${name}:\n${await readFile(join(logs ?? '', name), 'utf8')}`,
+          )
+        if (args[3])
+          console.error(
+            await readFile(
+              join(run.root, 'project/hook-audit.jsonl'),
+              'utf8',
+            ).catch(() => 'audit not created'),
+          )
+      }
+    }
+    if (run) await rm(run.root, { recursive: true, force: true })
+  })
+  run = await scenario(args, clock)
+  await body(run)
+  passed = true
 }
 
 describe('packed Anthropic plugin on pinned real hosts', () => {
