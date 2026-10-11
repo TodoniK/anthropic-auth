@@ -2,6 +2,7 @@
 // CLI installation failure is a failure, not a skipped interoperability test.
 import { afterAll, beforeAll, describe, expect } from 'bun:test'
 import {
+  cp,
   mkdir,
   mkdtemp,
   readdir,
@@ -30,6 +31,7 @@ import {
   type TestGate,
 } from '../../../core/src/tests/test-lifetime'
 import { tokenFingerprint } from '../../../core/src/token-fingerprint'
+import { seedOpencodeConfigDependencies } from '../../../e2e-tests/src/opencode-runner'
 
 const { test, gate, trackDetached, deferCleanup } = createTestLifetimeSuite()
 
@@ -42,6 +44,8 @@ let scratch = ''
 let cli = ''
 let oc1 = ''
 let packedProject = ''
+/** The plugin SDK tree OpenCode 1 (OC1) expects in each config directory, at OC1's own version. */
+let oc1ConfigDependencies = { fixture: '', version: '' }
 const children = new Set<Bun.Subprocess>()
 
 function phaseClock() {
@@ -221,13 +225,38 @@ async function installPackedHosts() {
     join(install1, 'package.json'),
     JSON.stringify({ private: true }),
   )
+  const env1 = await isolatedEnv(install1)
   await requireCommand(
     ['npm', 'install', '--no-audit', '--no-fund', 'opencode-ai@1.18.31'],
     install1,
-    await isolatedEnv(install1),
+    env1,
     { clock: installation, name: 'oc1.install' },
   )
   oc1 = join(install1, 'node_modules', '.bin', 'opencode')
+  const oc1Version = JSON.parse(
+    await readFile(
+      join(install1, 'node_modules', 'opencode-ai', 'package.json'),
+      'utf8',
+    ),
+  ).version
+  expect(oc1Version).toBe('1.18.31')
+  // OC1 installs @opencode-ai/plugin at its own version into each config
+  // directory before it loads plugins. Install that tree once here, while
+  // the registry is reachable, the same way OC1 does (npm, no install
+  // scripts), so each OC1 scenario can be given a complete copy.
+  const sdk = join(scratch, 'oc1-config-deps')
+  await mkdir(sdk, { recursive: true })
+  await writeFile(
+    join(sdk, 'package.json'),
+    JSON.stringify({ dependencies: { '@opencode-ai/plugin': oc1Version } }),
+  )
+  await requireCommand(
+    ['npm', 'install', '--no-audit', '--no-fund', '--ignore-scripts'],
+    sdk,
+    env1,
+    { clock: installation, name: 'oc1.sdk.install' },
+  )
+  oc1ConfigDependencies = { fixture: sdk, version: oc1Version }
   packedProject = join(scratch, 'packed')
   await mkdir(packedProject, { recursive: true })
   const pack = join(scratch, 'archives')
@@ -381,6 +410,112 @@ async function seed(
   return paths
 }
 
+/**
+ * OpenCode 1.18.31 prepares two dependency trees before it loads plugins and
+ * sends the model request, and installs either one from the npm registry
+ * when it is missing. The scenario's proxy blocks the registry, and npm's
+ * retry backoff can outlast the 60-second host deadline, so the host never
+ * reaches the synthetic upstream. Seed both trees from packages installed
+ * earlier in this run, only inside the scenario root the test body removes:
+ *
+ * - Every config directory OC1 reads gets @opencode-ai/plugin at OC1's own
+ *   version as a manifest, lockfile and installed tree. OC1 skips its install
+ *   when node_modules exists and the lockfile root names every dependency.
+ * - OC1 installs a plugin named by bare package name into its own package
+ *   cache, never resolving it from the project's node_modules, and reuses an
+ *   existing install there. That cache gets the packed plugin and its
+ *   dependencies, so OC1 loads the packed build rather than fetching the
+ *   published `latest` one.
+ */
+async function seedOc1Bootstrap(
+  root: string,
+  project: string,
+  env: Record<string, string>,
+  plugin: string,
+  dependencies: { fixture: string; version: string },
+) {
+  const declared = JSON.parse(
+    await readFile(join(dependencies.fixture, 'package.json'), 'utf8'),
+  ).dependencies?.['@opencode-ai/plugin']
+  if (declared !== dependencies.version)
+    throw new Error(
+      `OC1 ${dependencies.version} needs @opencode-ai/plugin ${dependencies.version}; the config dependency fixture declares ${declared}`,
+    )
+  const configDirectory = join(env.XDG_CONFIG_HOME!, 'opencode')
+  const seeded = await seedOpencodeConfigDependencies(
+    {
+      tempDir: root,
+      workdir: project,
+      homeDir: env.HOME!,
+      configDir: env.XDG_CONFIG_HOME!,
+      dataDir: env.XDG_DATA_HOME!,
+      cacheDir: env.XDG_CACHE_HOME!,
+      quotaFeedDir: join(root, 'quota-feed'),
+    },
+    // OC1 runs here without OPENCODE_CONFIG_DIR, but the shared helper always
+    // adds that variable's directory as a target. Name the XDG config
+    // directory, which is already a target, so an unset value cannot resolve
+    // to the test process's working directory.
+    { ...env, OPENCODE_CONFIG_DIR: configDirectory },
+    dependencies.fixture,
+  )
+  if (plugin === PACKAGE)
+    await cp(
+      join(project, 'node_modules'),
+      join(
+        env.XDG_CACHE_HOME!,
+        'opencode',
+        'packages',
+        `${PACKAGE}@latest`,
+        'node_modules',
+      ),
+      {
+        recursive: true,
+        errorOnExist: true,
+        force: false,
+        verbatimSymlinks: true,
+      },
+    )
+  return seeded.targets
+}
+
+/**
+ * Startup evidence that host stdout and stderr do not carry. OC1 writes its
+ * own log, including any failed background dependency install, under
+ * XDG_DATA_HOME/opencode/log. Report that log with fixture secrets redacted,
+ * and the plugin SDK version installed in the isolated config directory.
+ */
+async function hostBootstrapReport(env: Record<string, string>) {
+  const lines: string[] = []
+  if (env.XDG_CONFIG_HOME)
+    lines.push(
+      `config plugin SDK: ${await readFile(
+        join(
+          env.XDG_CONFIG_HOME,
+          'opencode',
+          'node_modules',
+          '@opencode-ai',
+          'plugin',
+          'package.json',
+        ),
+        'utf8',
+      ).then(
+        (text) => String(JSON.parse(text).version),
+        () => 'missing',
+      )}`,
+    )
+  const logs = env.XDG_DATA_HOME
+    ? join(env.XDG_DATA_HOME, 'opencode', 'log')
+    : undefined
+  for (const name of logs ? await readdir(logs).catch(() => []) : [])
+    lines.push(
+      `host log ${name}:\n${redactFixtureSecrets(
+        await readFile(join(logs ?? '', name), 'utf8'),
+      )}`,
+    )
+  return lines
+}
+
 const frame = (type: string, data: unknown) =>
   `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`
 function reply(model: string, text = 'OC2_SYNTHETIC_OK') {
@@ -506,6 +641,9 @@ async function scenario(
   const [transport, host = 'oc2', entry = 'package', mode] = args
   clock.mark('fixture.start')
   const root = await mkdtemp(join(scratch, 'scenario-'))
+  // Remove everything this scenario seeds even if setup fails before it
+  // returns; withScenario reports failure evidence before this runs.
+  deferCleanup(() => rm(root, { recursive: true, force: true }))
   const project = join(root, 'project')
   await mkdir(project)
   await requireCommand(['git', 'init', '-q'], project, {
@@ -672,6 +810,8 @@ export default {id:'cortexkit-anthropic-auth',async setup(ctx){appendFileSync('$
     ),
   )
   const executable = host === 'oc2' ? cli : oc1
+  if (host === 'oc1')
+    await seedOc1Bootstrap(root, project, env, plugin, oc1ConfigDependencies)
   const result = await command(
     [
       executable,
@@ -735,6 +875,8 @@ async function withScenario(
               'utf8',
             ).catch(() => 'audit not created'),
           )
+        for (const line of await hostBootstrapReport(run.env))
+          console.error(line)
       }
     }
     if (run) await rm(run.root, { recursive: true, force: true })

@@ -20565,6 +20565,37 @@ describe('killswitch fetch gate', () => {
     const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(200)
+    if (!servedAuth?.includes('sk-ant-oat01-main-access')) {
+      // Capture policy state only after a wrong route; diagnostics must not
+      // change the ordering of a successful quota preflight.
+      if (!migratedPool) throw new Error('Missing native killswitch fixture')
+      const reader = createNativeAccountRuntime({
+        paths: migratedPool.paths,
+        host: 'opencode',
+      })
+      try {
+        const snapshot = await reader.read()
+        console.error('killswitch route mismatch', {
+          usageCalls: quotaAuthorizations.map((value) =>
+            value.includes('sk-ant-oat01-main-access')
+              ? 'main'
+              : value.includes('sk-ant-oat01-fallback-access')
+                ? 'fallback'
+                : 'other',
+          ),
+          killswitch: snapshot.policyStorage.killswitch,
+          accounts: snapshot.accounts.map((account) => ({
+            id: account.id,
+            fiveHourUsed: account.quota?.five_hour?.usedPercent,
+            fiveHourRemaining: account.quota?.five_hour?.remainingPercent,
+            quotaCheckedAt: account.quota?.checkedAt,
+            state: account.state,
+          })),
+        })
+      } finally {
+        reader.close()
+      }
+    }
     expect(servedAuth).toContain('sk-ant-oat01-main-access')
     expect(servedAuth).not.toContain('sk-ant-oat01-fallback-access')
     const again = await result.fetch(MESSAGES_URL, EMPTY_POST)

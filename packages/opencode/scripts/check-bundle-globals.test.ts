@@ -1,14 +1,18 @@
 import { expect } from 'bun:test'
 import {
+  cp,
+  lstat,
   mkdir,
   mkdtemp,
   readdir,
   readFile,
+  readlink,
   rm,
+  symlink,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse } from '@babel/parser'
 import {
@@ -16,6 +20,7 @@ import {
   type TestGate,
   TestLifetime,
 } from '../../core/src/tests/test-lifetime'
+import { seedOpencodeConfigDependencies } from '../../e2e-tests/src/opencode-runner'
 import { checkBundleGlobals } from './check-bundle-globals'
 
 const { test, gate, trackDetached } = createTestLifetimeSuite()
@@ -73,7 +78,12 @@ interface CapturedHostHarness {
   ): Promise<void>
 }
 
-async function captureHostHarness(bindings: Record<string, unknown>) {
+/**
+ * Read the real-host E2E source and return the named top-level declarations
+ * as runnable code. Evaluating current source, rather than importing the E2E
+ * module, never registers its real-host installation and execution hooks.
+ */
+async function captureDeclarations(wanted: string[]) {
   const source = await readFile(
     resolve(import.meta.dir, '../src/tests/opencode2-e2e.test.ts'),
     'utf8',
@@ -82,16 +92,7 @@ async function captureHostHarness(bindings: Record<string, unknown>) {
     sourceType: 'module',
     plugins: ['typescript'],
   }).program
-  const names = new Set([
-    'TOKEN',
-    'PASSWORD',
-    'phaseClock',
-    'installation',
-    'redactFixtureSecrets',
-    'hostLogDirectory',
-    'command',
-    'withScenario',
-  ])
+  const names = new Set(wanted)
   const declarations: string[] = []
   const slice = (node: { start?: number | null; end?: number | null }) => {
     if (node.start == null || node.end == null)
@@ -116,12 +117,33 @@ async function captureHostHarness(bindings: Record<string, unknown>) {
   )
   if (scenario?.type !== 'FunctionDeclaration')
     throw new Error('Missing scenario declaration')
-  const cleanup = scenario.body.body.find(
+  const code = new Bun.Transpiler({ loader: 'ts' }).transformSync(
+    declarations.join('\n'),
+  )
+  return { code, scenario: scenario.body.body, slice }
+}
+
+async function captureHostHarness(bindings: Record<string, unknown>) {
+  const { code, scenario, slice } = await captureDeclarations([
+    'TOKEN',
+    'PASSWORD',
+    'phaseClock',
+    'installation',
+    'redactFixtureSecrets',
+    'hostLogDirectory',
+    'hostBootstrapReport',
+    'command',
+    'withScenario',
+  ])
+  // scenario() also defers removal of its root directory, so select the
+  // cleanup that stops the synthetic upstream and relay servers.
+  const cleanup = scenario.find(
     (node) =>
       node.type === 'ExpressionStatement' &&
       node.expression.type === 'CallExpression' &&
       node.expression.callee.type === 'Identifier' &&
-      node.expression.callee.name === 'deferCleanup',
+      node.expression.callee.name === 'deferCleanup' &&
+      slice(node).includes('relay.stop'),
   )
   if (
     cleanup?.type !== 'ExpressionStatement' ||
@@ -132,17 +154,12 @@ async function captureHostHarness(bindings: Record<string, unknown>) {
   if (callback?.type !== 'ArrowFunctionExpression')
     throw new Error('Missing server cleanup callback')
 
-  // Evaluate the current declarations, not an imported E2E module: importing
-  // that module would register real-host installation and execution hooks.
-  const captured = new Bun.Transpiler({ loader: 'ts' }).transformSync(
-    declarations.join('\n'),
-  )
   return new Function(
     'bindings',
     `
     const { Bun, mkdir, readFile, readdir, rm, writeFile, join, children, cli, oc1,
       trackDetached, deferCleanup, scenario, console, setTimeout, clearTimeout } = bindings;
-    ${captured}
+    ${code}
     return { installation, command, withScenario, phaseClock,
       secrets: [TOKEN, PASSWORD, 'synthetic-refresh', 'relay-disposable-only'],
       stopServers: (upstream, relay, clock) => (${slice(callback)})() };
@@ -581,4 +598,324 @@ test('captured scenario cleanup drains both server stops before reporting failur
     'failure.report',
   ])
   expect(clock.phases['fixture.cleanup_failure']).toBeDefined()
+})
+
+interface CapturedOc1Bootstrap {
+  PACKAGE: string
+  secrets: string[]
+  seedOc1Bootstrap(
+    root: string,
+    project: string,
+    env: Record<string, string>,
+    plugin: string,
+    dependencies: { fixture: string; version: string },
+  ): Promise<string[]>
+  hostBootstrapReport(env: Record<string, string>): Promise<string[]>
+}
+
+/**
+ * Capture the OC1 startup seeding and failure report from the real-host E2E
+ * source, with the shared config-dependency helper it calls. Refuse a
+ * scenario that does not seed OC1 before it starts the host command.
+ */
+async function captureOc1Bootstrap() {
+  const { code, scenario, slice } = await captureDeclarations([
+    'PACKAGE',
+    'TOKEN',
+    'PASSWORD',
+    'redactFixtureSecrets',
+    'seedOc1Bootstrap',
+    'hostBootstrapReport',
+  ])
+  const seedAt = scenario.findIndex(
+    (node) =>
+      node.type === 'IfStatement' &&
+      slice(node.test) === "host === 'oc1'" &&
+      slice(node.consequent).includes('seedOc1Bootstrap('),
+  )
+  const hostAt = scenario.findIndex(
+    (node) =>
+      node.type === 'VariableDeclaration' &&
+      slice(node).includes("name: 'host'"),
+  )
+  if (seedAt < 0 || hostAt < 0 || seedAt > hostAt)
+    throw new Error('The E2E scenario does not seed OC1 before starting it')
+  return new Function(
+    'bindings',
+    `
+    const { cp, readFile, readdir, join, seedOpencodeConfigDependencies } = bindings;
+    ${code}
+    return { PACKAGE, seedOc1Bootstrap, hostBootstrapReport,
+      secrets: [TOKEN, PASSWORD, 'synthetic-refresh', 'relay-disposable-only'] };
+  `,
+  )({
+    cp,
+    readFile,
+    readdir,
+    join,
+    seedOpencodeConfigDependencies,
+  }) as CapturedOc1Bootstrap
+}
+
+/**
+ * OpenCode 1.18.31 skips installing @opencode-ai/plugin into a config
+ * directory only when node_modules exists and the package-lock.json root
+ * names every dependency the manifest declares, plus the SDK itself
+ * (Npm.install in packages/core/src/npm.ts of opencode v1.18.31). Otherwise
+ * it installs from the registry, which these isolated fixtures cannot reach.
+ */
+async function opencode1WouldSkipInstall(dir: string) {
+  const exists = await lstat(join(dir, 'node_modules')).then(
+    () => true,
+    () => false,
+  )
+  if (!exists) return false
+  const json = (name: string) =>
+    readFile(join(dir, name), 'utf8').then(
+      (text) => JSON.parse(text) as Record<string, unknown>,
+      () => ({}) as Record<string, unknown>,
+    )
+  const names = (value: Record<string, unknown> | undefined) =>
+    [
+      'dependencies',
+      'devDependencies',
+      'peerDependencies',
+      'optionalDependencies',
+    ].flatMap((field) =>
+      Object.keys((value?.[field] as Record<string, string> | undefined) ?? {}),
+    )
+  const lock = (await json('package-lock.json')) as {
+    packages?: Record<string, Record<string, unknown>>
+  }
+  const locked = new Set(names(lock.packages?.['']))
+  return [...names(await json('package.json')), '@opencode-ai/plugin'].every(
+    (name) => locked.has(name),
+  )
+}
+
+// The genuine npm-installed OC1 1.18.18 SDK tree the process E2E suite uses.
+// Its committed manifest and lockfile are always present; the runner must
+// provision node_modules from that lockfile before this suite runs.
+const genuineConfigDeps = resolve(
+  import.meta.dir,
+  '../../e2e-tests/fixtures/opencode1-config-deps',
+)
+
+/** Every symlink under `directory`, with its target exactly as written. */
+async function symlinksUnder(directory: string) {
+  const links: { path: string; target: string }[] = []
+  for (const entry of await readdir(directory, {
+    recursive: true,
+    withFileTypes: true,
+  }))
+    if (entry.isSymbolicLink()) {
+      const path = join(entry.parentPath, entry.name)
+      links.push({ path, target: await readlink(path) })
+    }
+  return links
+}
+/**
+ * Seeding copies symlinks verbatim, so each must be relative and resolve
+ * inside `root`. An absolute or escaping link would point the scenario at
+ * files outside the directory the test body removes.
+ */
+function expectLinksOwnedBy(
+  root: string,
+  links: { path: string; target: string }[],
+) {
+  for (const link of links) {
+    expect(isAbsolute(link.target)).toBe(false)
+    const inside = relative(root, resolve(dirname(link.path), link.target))
+    expect(inside.startsWith('..') || inside.startsWith(sep)).toBe(false)
+  }
+}
+
+/** An OC1 scenario root with every kind of config directory OC1 reads. */
+async function oc1Layout(root: string, pkg: string) {
+  const env = {
+    PATH: '',
+    HOME: join(root, 'home'),
+    XDG_CONFIG_HOME: join(root, 'config'),
+    XDG_DATA_HOME: join(root, 'data'),
+    XDG_CACHE_HOME: join(root, 'cache'),
+    TMPDIR: join(root, 'tmp'),
+  }
+  const project = join(root, 'project')
+  const configDirectories = [
+    join(env.XDG_CONFIG_HOME, 'opencode'),
+    join(project, '.opencode'),
+    join(env.HOME, '.opencode'),
+  ]
+  for (const directory of [
+    ...configDirectories,
+    env.XDG_DATA_HOME,
+    env.XDG_CACHE_HOME,
+    env.TMPDIR,
+  ])
+    await mkdir(directory, { recursive: true })
+  const packed = join(project, 'node_modules', pkg)
+  await mkdir(packed, { recursive: true })
+  await writeFile(
+    join(packed, 'package.json'),
+    JSON.stringify({ name: pkg, version: '0.0.0-packed' }),
+  )
+  // npm links package binaries with relative .bin symlinks; give the packed
+  // stand-in one so the cache copy is checked for owned links too.
+  await mkdir(join(packed, 'dist'))
+  await writeFile(join(packed, 'dist', 'cli.js'), '')
+  await mkdir(join(project, 'node_modules', '.bin'))
+  await symlink(
+    join('..', pkg, 'dist', 'cli.js'),
+    join(project, 'node_modules', '.bin', 'opencode-anthropic-auth'),
+  )
+  const cachedPlugin = join(
+    env.XDG_CACHE_HOME,
+    'opencode',
+    'packages',
+    `${pkg}@latest`,
+    'node_modules',
+    pkg,
+    'package.json',
+  )
+  return { env, project, configDirectories, cachedPlugin }
+}
+
+const present = (path: string) =>
+  lstat(path).then(
+    () => true,
+    () => false,
+  )
+
+test('captured OC1 seeding gives every config directory and the plugin cache a complete installed tree', async () => {
+  const installed = join(
+    genuineConfigDeps,
+    'node_modules',
+    '.package-lock.json',
+  )
+  if (!(await present(installed)))
+    throw new Error(
+      `${installed} is missing: run npm ci in ${genuineConfigDeps} before this suite`,
+    )
+  const captured = await captureOc1Bootstrap()
+  await fixture(async (root) => {
+    const layout = await oc1Layout(root, captured.PACKAGE)
+    // Missing-dependency reproduction: unseeded, OC1 would run a registry
+    // install in each config directory and for the bare plugin name.
+    for (const directory of layout.configDirectories)
+      expect(await opencode1WouldSkipInstall(directory)).toBe(false)
+    expect(await present(layout.cachedPlugin)).toBe(false)
+    expect(await captured.hostBootstrapReport(layout.env)).toContain(
+      'config plugin SDK: missing',
+    )
+
+    const targets = await captured.seedOc1Bootstrap(
+      root,
+      layout.project,
+      layout.env,
+      captured.PACKAGE,
+      { fixture: genuineConfigDeps, version: '1.18.18' },
+    )
+    expect([...targets].sort()).toEqual(
+      layout.configDirectories.map((directory) => resolve(directory)).sort(),
+    )
+    const fixtureLock = JSON.parse(
+      await readFile(join(genuineConfigDeps, 'package-lock.json'), 'utf8'),
+    )
+    for (const directory of layout.configDirectories) {
+      expect(await opencode1WouldSkipInstall(directory)).toBe(true)
+      expect(
+        JSON.parse(
+          await readFile(join(directory, 'package-lock.json'), 'utf8'),
+        ),
+      ).toEqual(fixtureLock)
+      const sdk = join(directory, 'node_modules', '@opencode-ai', 'plugin')
+      const manifest = JSON.parse(
+        await readFile(join(sdk, 'package.json'), 'utf8'),
+      )
+      expect(manifest.version).toBe('1.18.18')
+      expect(
+        (await lstat(join(sdk, manifest.exports['.'].import))).size,
+      ).toBeGreaterThan(0)
+      // The fixture's npm .bin links arrive verbatim and stay relative.
+      const links = await symlinksUnder(join(directory, 'node_modules'))
+      expect(links.length).toBeGreaterThan(0)
+      expectLinksOwnedBy(directory, links)
+    }
+    expect(
+      JSON.parse(await readFile(layout.cachedPlugin, 'utf8')).version,
+    ).toBe('0.0.0-packed')
+    const cache = dirname(dirname(dirname(layout.cachedPlugin)))
+    const cacheLinks = await symlinksUnder(cache)
+    expect(cacheLinks.length).toBeGreaterThan(0)
+    expectLinksOwnedBy(cache, cacheLinks)
+    expect(await captured.hostBootstrapReport(layout.env)).toContain(
+      'config plugin SDK: 1.18.18',
+    )
+  })
+})
+
+test('captured OC1 seeding refuses an SDK tree from another OC1 version before copying', async () => {
+  const captured = await captureOc1Bootstrap()
+  await fixture(async (root) => {
+    const layout = await oc1Layout(root, captured.PACKAGE)
+    // The committed fixture holds the SDK for OpenCode 1.18.18. The E2E host
+    // is pinned to 1.18.31, so seeding must refuse an older SDK tree rather
+    // than silently pair the host with another version's plugin SDK.
+    await expect(
+      captured.seedOc1Bootstrap(
+        root,
+        layout.project,
+        layout.env,
+        captured.PACKAGE,
+        { fixture: genuineConfigDeps, version: '1.18.31' },
+      ),
+    ).rejects.toThrow('the config dependency fixture declares 1.18.18')
+    for (const directory of layout.configDirectories) {
+      expect(await present(join(directory, 'node_modules'))).toBe(false)
+      expect(await opencode1WouldSkipInstall(directory)).toBe(false)
+    }
+    expect(await present(layout.cachedPlugin)).toBe(false)
+  })
+})
+
+test('captured OC1 seeding refuses a manifest and lockfile without the installed tree', async () => {
+  const captured = await captureOc1Bootstrap()
+  await fixture(async (root) => {
+    const layout = await oc1Layout(root, captured.PACKAGE)
+    const incomplete = join(root, 'incomplete-deps')
+    await mkdir(join(incomplete, 'node_modules'), { recursive: true })
+    for (const name of ['package.json', 'package-lock.json'])
+      await cp(join(genuineConfigDeps, name), join(incomplete, name))
+    await expect(
+      captured.seedOc1Bootstrap(
+        root,
+        layout.project,
+        layout.env,
+        captured.PACKAGE,
+        { fixture: incomplete, version: '1.18.18' },
+      ),
+    ).rejects.toThrow('has no npm-installed node_modules')
+    for (const directory of layout.configDirectories)
+      expect(await present(join(directory, 'node_modules'))).toBe(false)
+    expect(await present(layout.cachedPlugin)).toBe(false)
+  })
+})
+
+test('captured OC1 failure report includes the host bootstrap log with fixture secrets redacted', async () => {
+  const captured = await captureOc1Bootstrap()
+  await fixture(async (root) => {
+    const layout = await oc1Layout(root, captured.PACKAGE)
+    const logs = join(layout.env.XDG_DATA_HOME, 'opencode', 'log')
+    await mkdir(logs, { recursive: true })
+    await writeFile(
+      join(logs, '2026-10-11T135743.log'),
+      `WARN service=config background dependency install failed dir=${layout.configDirectories[0]}\n${captured.secrets.join('\n')}\n`,
+    )
+    const report = (await captured.hostBootstrapReport(layout.env)).join('\n')
+    expect(report).toContain('config plugin SDK: missing')
+    expect(report).toContain('host log 2026-10-11T135743.log:')
+    expect(report).toContain('background dependency install failed')
+    expect(report).toContain('[redacted]')
+    for (const secret of captured.secrets) expect(report).not.toContain(secret)
+  })
 })

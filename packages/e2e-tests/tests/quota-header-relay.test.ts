@@ -2,7 +2,7 @@
 
 import { describe, expect } from 'bun:test'
 import { createNativeAccountRuntime, type NativeAccountSnapshot } from '@cortexkit/anthropic-auth-core'
-import { readFile, readdir } from 'node:fs/promises'
+import { readFile, readdir, stat } from 'node:fs/promises'
 import { createTestLifetimeSuite } from '../../core/src/tests/test-lifetime.ts'
 import { join } from 'node:path'
 import { E2EHarness, type E2EHarnessOptions } from '../src/harness.ts'
@@ -75,17 +75,22 @@ async function assertNativeHeaderQuota(harness: E2EHarness, state: NativeAccount
   expect(requests.length).toBeGreaterThan(0)
   expect(requests.map((request) => request.headers.authorization))
     .toEqual(requests.map(() => `Bearer ${FIXTURE_ADMITTED_ACCESS_TOKEN}`))
-  await assertSecretFreeMetadata(harness)
+  await assertPrivateMetadataBoundary(harness)
 }
 
-async function assertSecretFreeMetadata(harness: E2EHarness) {
+async function assertPrivateMetadataBoundary(harness: E2EHarness) {
   // A missing metadata file must fail rather than pass secret-exclusion checks.
   const metadata = await readFile(harness.opencode.native!.paths.runtime, 'utf8')
   expect(metadata).not.toContain('quotaToken')
   expect(metadata).not.toContain(FIXTURE_ADMITTED_ACCESS_TOKEN)
   expect(metadata).not.toContain('sk-ant-oat01-test-access-token')
   expect(metadata).not.toContain('test-refresh-token')
-  expect(metadata).not.toContain('relay-token')
+  // The owner-only runtime file deliberately stores the relay's private secret.
+  // Public account/settings projections must not expose it or OAuth credentials.
+  expect((await stat(harness.opencode.native!.paths.runtime)).mode & 0o777).toBe(0o600)
+  const projection = JSON.stringify(await readQuotaState(harness))
+  for (const secret of [FIXTURE_ADMITTED_ACCESS_TOKEN, 'sk-ant-oat01-test-access-token', 'test-refresh-token', 'relay-token'])
+    expect(projection).not.toContain(secret)
 }
 
 async function waitForHeaderQuotaState(harness: E2EHarness) {
@@ -216,6 +221,6 @@ describe('quota headers through relay', () => {
 
     const state = await readQuotaState(harness)
     expect(mainAccount(state).quota).toBeUndefined()
-    await assertSecretFreeMetadata(harness)
+    await assertPrivateMetadataBoundary(harness)
   }, 90_000)
 })
