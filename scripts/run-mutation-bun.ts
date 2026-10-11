@@ -129,6 +129,109 @@ export type ExecutionEvent = {
   occurrence: number
 }
 
+const TEST_FILE_HEADER = /^(?:::group::)?(src\/tests\/[^:\r\n]+\.test\.ts):$/
+
+// Bun 1.3.14 reports a .rejects/.resolves matcher whose promise settled the
+// other way with a blank "error: " title instead of the usual
+// "error: expect(received).matcher(...)" line:
+//
+//    7 |   ).rejects.toMatchObject({ code: 'invalid-source' })
+//                  ^
+//   error: <blank>
+//
+//   Expected promise that rejects
+//   Received promise that resolved: Promise { <resolved> }
+//
+//         at <anonymous> (/checkout/packages/core/src/tests/x.test.ts:7:13)
+//   (fail) selected test [1.00ms]
+//
+// A blank title is also what any thrown error named "error" with an empty
+// message prints, so the text alone is not enough. Accept it only when every
+// part agrees: the exact expected/received pair names opposite outcomes, the
+// stack frames all sit in the test file printed in the current file header,
+// the first frame is the line and column that Bun's source excerpt marks with
+// its caret, the marked column starts a matcher call chained directly after
+// .rejects. or .resolves. (optionally .not.) for the expected outcome, and the
+// block ends at its owning (fail) line. Under GitHub Actions Bun inserts a
+// blank line and an ::error annotation repeating the same message and frames.
+// Hook failures and timeouts are still refused by the checks after this one.
+function isPromiseOutcomeFailure(
+  lines: readonly string[],
+  index: number,
+  end: number,
+) {
+  const line = (offset: number) => lines[index + offset] ?? ''
+  const expected = /^Expected promise that (rejects|resolves)$/.exec(line(2))
+  const kind = expected?.[1]
+  if (!kind || line(0) !== 'error: ' || line(1) !== '' || line(4) !== '')
+    return false
+  const settled = kind === 'rejects' ? 'resolved' : 'rejected'
+  if (line(3) !== `Received promise that ${settled}: Promise { <${settled}> }`)
+    return false
+  let testFile: string | undefined
+  for (let position = index - 1; position >= 0 && !testFile; position--) {
+    const header = lines[position] ?? ''
+    if (header === '::endgroup::') return false
+    testFile = TEST_FILE_HEADER.exec(header)?.[1]
+  }
+  if (!testFile) return false
+  const frames: string[] = []
+  const locations: { line: number; column: number }[] = []
+  for (let position = index + 5; ; position++) {
+    const frame =
+      /^ {6}at (?:<anonymous>|[A-Za-z_$][\w$.]*) \((\/[^()\r\n]+):([1-9]\d*):([1-9]\d*)\)$/.exec(
+        lines[position] ?? '',
+      )
+    if (!frame) break
+    if (!frame[1]?.endsWith(`/${testFile}`)) return false
+    frames.push(lines[position] ?? '')
+    locations.push({ line: Number(frame[2]), column: Number(frame[3]) })
+  }
+  const location = locations[0]
+  if (!location) return false
+  let next = index + 5 + frames.length
+  if (!lines[next]?.startsWith('(fail) ')) {
+    const annotation =
+      /^::error file=([^,\r\n]+),line=(\d+),col=(\d+),title=error: ::(.*)$/.exec(
+        lines[next + 1] ?? '',
+      )
+    if (
+      lines[next] !== '' ||
+      !annotation ||
+      (annotation[1] !== testFile &&
+        !annotation[1]?.endsWith(`/${testFile}`)) ||
+      Number(annotation[2]) !== location.line ||
+      Number(annotation[3]) !== location.column ||
+      annotation[4] !== [line(2), line(3), '', ...frames].join('%0A')
+    )
+      return false
+    next += 2
+  }
+  if (next >= end || !lines[next]?.startsWith('(fail) ')) return false
+  const caret = /^ *\^$/.exec(line(-1))
+  const source = /^( *([1-9]\d*) \| )(.*)$/.exec(line(-2))
+  if (
+    !caret ||
+    !source ||
+    Number(source[2]) !== location.line ||
+    line(-1).length - (source[1] ?? '').length !== location.column
+  )
+    return false
+  const text = source[3] ?? ''
+  if (!/^[A-Za-z]+\(/.test(text.slice(location.column - 1))) return false
+  // A matcher on its own line belongs to a chain started on earlier excerpt
+  // lines, so join the consecutively numbered lines that precede it.
+  const chain = [text.slice(0, location.column - 1)]
+  for (let offset = 3; ; offset++) {
+    const earlier = /^ *([1-9]\d*) \| (.*)$/.exec(line(-offset))
+    if (!earlier || Number(earlier[1]) !== location.line - offset + 2) break
+    chain.unshift(earlier[2] ?? '')
+  }
+  return new RegExp(`\\.${kind}\\.(?:not\\.)?$`).test(
+    chain.join('').replace(/\s+/g, ''),
+  )
+}
+
 // Count Bun's (pass) and (fail) lines, excluding filtered or discovered tests.
 // A command selecting one named test must produce one matching result.
 export function parseExecution(
@@ -175,8 +278,7 @@ export function parseExecution(
   const ordinals = new Map<string, number>()
   const events: ExecutionEvent[] = []
   for (const line of eventLines) {
-    const fileHeader =
-      /^(?:::group::)?(src\/tests\/[^:\r\n]+\.test\.ts):$/.exec(line)
+    const fileHeader = TEST_FILE_HEADER.exec(line)
     if (fileHeader) {
       testFile = fileHeader[1]
       continue
@@ -240,14 +342,16 @@ export function parseExecution(
     !/^ (?:\d+ snapshots?, )?[1-9]\d* expect\(\) calls$/.test(expects[0] ?? '')
   )
     throw new Error('No verified assertion executed')
-  const errors = matches(/^error:/)
+  const errors = lines.flatMap((line, index) =>
+    /^error:/.test(line) ? [index] : [],
+  )
   if (
     errors.length !== failed ||
     errors.some(
-      (line) =>
+      (index) =>
         !/^error: expect\(received\)\.(?:not\.)?[A-Za-z]+\([^\r\n]*\)$/.test(
-          line,
-        ),
+          lines[index] ?? '',
+        ) && !isPromiseOutcomeFailure(lines, index, recapIndex ?? lines.length),
     )
   )
     throw new Error('Not a genuine selected expect assertion failure')

@@ -1,8 +1,18 @@
 import { expect, test } from 'bun:test'
-import { readFile, realpath, rm, stat } from 'node:fs/promises'
+import {
+  mkdir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, resolve } from 'node:path'
-import { createTestLifetimeSuite } from '../../packages/core/src/tests/test-lifetime.ts'
+import {
+  createTestLifetimeSuite,
+  TestLifetime,
+} from '../../packages/core/src/tests/test-lifetime.ts'
 import {
   createMutationSandbox,
   type ExecutionEvent,
@@ -1241,3 +1251,507 @@ test('genuine negated assertion failures retain the normal selected-test contrac
     }),
   ).toThrow('genuine selected expect assertion')
 })
+
+// Byte-exact stderr from the pinned Bun 1.3.14 mutation CI child that selected
+// this native-host-auth-read test after the mutation made its expected
+// rejection resolve; that child's stdout held only the version header.
+const promiseOutcomeName =
+  'group-readable authentication refuses even when the process can physically read it'
+const promiseOutcomeStack =
+  '      at <anonymous> (/home/runner/work/anthropic-auth/anthropic-auth/packages/core/src/tests/native-host-auth-read.test.ts:100:13)'
+function promiseOutcomeEvidence(): Transcript {
+  return {
+    stdout: header,
+    stderr: [
+      '',
+      '::group::src/tests/native-host-auth-read.test.ts:',
+      ' 95 |   const f = await fixture()',
+      " 96 |   await writeFile(f.path, '{}', { mode: 0o600 })",
+      ' 97 |   await chmod(f.path, 0o640)',
+      ' 98 |   await expect(',
+      " 99 |     readNativeHostAuthKind('opencode', f.path),",
+      "100 |   ).rejects.toMatchObject({ code: 'invalid-source' })",
+      '                  ^',
+      'error: ',
+      '',
+      'Expected promise that rejects',
+      'Received promise that resolved: Promise { <resolved> }',
+      '',
+      promiseOutcomeStack,
+      '',
+      `::error file=packages/core/src/tests/native-host-auth-read.test.ts,line=100,col=13,title=error: ::Expected promise that rejects%0AReceived promise that resolved: Promise { <resolved> }%0A%0A${promiseOutcomeStack}`,
+      `(fail) ${promiseOutcomeName} [6.23ms]`,
+      '',
+      '::endgroup::',
+      '',
+      ' 0 pass',
+      ' 11 filtered out',
+      ' 1 fail',
+      ' 1 expect() calls',
+      'Ran 1 test across 1 file. [41.00ms]',
+      '',
+    ].join('\n'),
+    exitCode: 1,
+    signal: null,
+  }
+}
+// The same failure as Bun prints it outside GitHub Actions: no group markers,
+// and the (fail) line follows the stack frame directly without an annotation.
+function plainPromiseOutcomeEvidence(): Transcript {
+  const evidence = promiseOutcomeEvidence()
+  return {
+    ...evidence,
+    stderr: evidence.stderr
+      .replace('::group::', '')
+      .replace(/\n\n::error [^\n]+\n/, '\n')
+      .replace('\n::endgroup::\n', ''),
+  }
+}
+function edited(transcript: Transcript, from: string | RegExp, to: string) {
+  const stderr = transcript.stderr.replace(from, to)
+  if (stderr === transcript.stderr)
+    throw new Error(`Fixture edit did not apply: ${String(from)}`)
+  return { ...transcript, stderr }
+}
+
+test('accepts the pinned Bun promise-outcome failure bound to its matcher, stack and owning result', async () => {
+  for (const transcript of [
+    promiseOutcomeEvidence(),
+    plainPromiseOutcomeEvidence(),
+  ]) {
+    expect(parseExecution(promiseOutcomeName, transcript)).toEqual({
+      count: 1,
+      events: [
+        {
+          name: promiseOutcomeName,
+          file: 'src/tests/native-host-auth-read.test.ts',
+          status: 'fail',
+          occurrence: 1,
+        },
+      ],
+    })
+    const output = sinks()
+    expect(
+      await runTest(
+        'packages/core/src/tests/native-host-auth-read.test.ts',
+        promiseOutcomeName,
+        { ...output, spawn: () => childFor(transcript) },
+        new AbortController().signal,
+      ),
+    ).toBe(1)
+    expect(output.err()).toBe(transcript.stderr)
+    expect(output.out()).toBe(`${header}CKDEV executed 1 tests\n`)
+  }
+})
+
+test('refuses promise-outcome text without its exact labels, source matcher, stack or owning result', () => {
+  const grouped = promiseOutcomeEvidence()
+  const plain = plainPromiseOutcomeEvidence()
+  const variants: [string, Transcript][] = [
+    [
+      'arbitrary blank error and prose without a source excerpt',
+      edited(plain, /\n 95 \|[\s\S]*?\n {18}\^\n/, '\n'),
+    ],
+    ['missing stack frame', edited(plain, `${promiseOutcomeStack}\n`, '')],
+    [
+      'promise outcome matched by an expected-label substring only',
+      edited(
+        plain,
+        'Expected promise that rejects',
+        'Expected promise that rejects or resolves',
+      ),
+    ],
+    [
+      'expected label naming the other matcher',
+      edited(
+        edited(
+          plain,
+          'Expected promise that rejects',
+          'Expected promise that resolves',
+        ),
+        'Received promise that resolved: Promise { <resolved> }',
+        'Received promise that rejected: Promise { <rejected> }',
+      ),
+    ],
+    [
+      'received outcome matching the expected outcome',
+      edited(
+        plain,
+        'Received promise that resolved: Promise { <resolved> }',
+        'Received promise that rejected: Promise { <rejected> }',
+      ),
+    ],
+    [
+      'received promise state contradicting its label',
+      edited(plain, 'Promise { <resolved> }', 'Promise { <rejected> }'),
+    ],
+    [
+      'stack frame in another test file',
+      edited(plain, '/native-host-auth-read.test.ts:100', '/other.test.ts:100'),
+    ],
+    ['stack frame on another line', edited(plain, ':100:13)', ':99:13)')],
+    [
+      'caret at another column',
+      edited(plain, '\n                  ^\n', '\n                   ^\n'),
+    ],
+    [
+      'matcher not chained after .rejects',
+      edited(plain, ').rejects.toMatchObject', ').catches.toMatchObject'),
+    ],
+    [
+      'expected text displaced after its owning result',
+      edited(
+        plain,
+        /(error: \n\nExpected[\s\S]*?\.test\.ts:100:13\)\n)(\(fail\) [^\n]+\n)/,
+        '$2$1',
+      ),
+    ],
+    [
+      'unrelated output between the stack and the owning result',
+      edited(
+        plain,
+        `${promiseOutcomeStack}\n`,
+        `${promiseOutcomeStack}\nnoise\n`,
+      ),
+    ],
+    [
+      'annotation at another column',
+      edited(grouped, 'line=100,col=13', 'line=100,col=14'),
+    ],
+    [
+      'annotation repeating a different message',
+      edited(
+        grouped,
+        '::Expected promise that rejects%0A',
+        '::Expected promise%0A',
+      ),
+    ],
+    [
+      'annotation missing after its blank separator',
+      edited(grouped, /\n::error [^\n]+\n/, '\n'),
+    ],
+    [
+      'runtime error title instead of the blank assertion title',
+      edited(plain, '\nerror: \n', '\nError: \n'),
+    ],
+    [
+      'timeout reported in the owning block',
+      edited(
+        plain,
+        `${promiseOutcomeStack}\n`,
+        `${promiseOutcomeStack.replace('<anonymous>', 'timeout')}\n`,
+      ),
+    ],
+  ]
+  const refusal = (transcript: Transcript) => {
+    try {
+      parseExecution(promiseOutcomeName, transcript)
+      return 'accepted'
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+  }
+  const genuine = 'Not a genuine selected expect assertion failure'
+  expect(
+    variants.map(([label, transcript]) => [label, refusal(transcript)]),
+  ).toEqual(
+    variants.map(([label]) => [
+      label,
+      label.startsWith('timeout')
+        ? 'Timeout, hook or unhandled error'
+        : genuine,
+    ]),
+  )
+})
+
+// Real pinned Bun children print the promise-outcome format end to end. Each
+// test body owns a private sandbox holding its fixture test files, and joins
+// both pipes and the exit status of every child before the sandbox is removed.
+const promiseOutcomeFixture = `import { expect, test } from 'bun:test'
+
+const resolved = async () => ({ code: 'fine' })
+const rejected = async () => {
+  throw Object.assign(new Error('refused'), { code: 'invalid-source' })
+}
+
+test('rejects receives a resolved promise', async () => {
+  await expect(
+    resolved(),
+  ).rejects.toMatchObject({ code: 'invalid-source' })
+})
+
+test('resolves receives a rejected promise', async () => {
+  await expect(rejected())
+    .resolves
+    .toEqual({ code: 'fine' })
+})
+
+test('negated rejects receives a resolved promise after a counted assertion', async () => {
+  expect(await resolved()).toEqual({ code: 'fine' })
+  await expect(resolved()).rejects.not.toBeNull()
+})
+
+test('rejects companion receives a rejected promise', async () => {
+  await expect(rejected()).rejects.toMatchObject({ code: 'invalid-source' })
+})
+
+test('resolves companion receives a resolved promise', async () => {
+  await expect(resolved()).resolves.toEqual({ code: 'fine' })
+})
+`
+const promiseRefusalFixture = `import { beforeEach, describe, expect, test } from 'bun:test'
+
+const resolved = async () => ({ code: 'fine' })
+
+describe('hooked', () => {
+  beforeEach(async () => {
+    await expect(resolved()).rejects.toThrow()
+  })
+  test('inner companion', () => {
+    expect(1).toBe(1)
+  })
+})
+
+test('runtime error repeating promise outcome prose', async () => {
+  expect(await resolved()).toEqual({ code: 'fine' })
+  const error = new Error(
+    '\\n\\nExpected promise that rejects\\nReceived promise that resolved: Promise { <resolved> }\\n',
+  )
+  error.name = 'error'
+  throw error
+})
+
+test('negated rejects receives a resolved promise without a counted assertion', async () => {
+  await expect(resolved()).rejects.not.toBeNull()
+})
+`
+async function promiseFixtureSandbox() {
+  const sandbox = await createMutationSandbox()
+  filesystemTests.deferCleanup(() =>
+    rm(sandbox, { recursive: true, force: true }),
+  )
+  await mkdir(resolve(sandbox, 'src/tests'), { recursive: true })
+  await writeFile(
+    resolve(sandbox, 'src/tests/promise-outcome.test.ts'),
+    promiseOutcomeFixture,
+  )
+  await writeFile(
+    resolve(sandbox, 'src/tests/promise-refusal.test.ts'),
+    promiseRefusalFixture,
+  )
+  return sandbox
+}
+async function pinnedChild(
+  sandbox: string,
+  file: string,
+  selected: string | undefined,
+  github: boolean,
+  lifetime: Pick<TestLifetime, 'gate' | 'trackDetached'> = filesystemTests,
+): Promise<Transcript> {
+  const env = testEnvironment(sandbox, process.env)
+  delete env.GITHUB_ACTIONS
+  if (github) env.GITHUB_ACTIONS = 'true'
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      'test',
+      '--no-orphans',
+      `./src/tests/${file}`,
+      ...(selected === undefined
+        ? []
+        : [
+            '--test-name-pattern',
+            exactPattern(selected.replaceAll(' > ', ' ')),
+          ]),
+    ],
+    { cwd: sandbox, env, stdout: 'pipe', stderr: 'pipe' },
+  )
+  // Register cancellation before waiting: when Bun tears down a timed-out
+  // body, the lifetime opens this gate and kills the child if it is still
+  // running, so the pipe and exit joins below finish before sandbox cleanup.
+  const cancel = lifetime.gate()
+  const cancellation = cancel.wait.then(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill()
+  })
+  lifetime.trackDetached(cancellation)
+  const [stdout, stderr, exited] = await Promise.allSettled([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ])
+  cancel.open()
+  await cancellation
+  if (stdout.status === 'rejected') throw stdout.reason
+  if (stderr.status === 'rejected') throw stderr.reason
+  if (exited.status === 'rejected') throw exited.reason
+  return {
+    stdout: stdout.value,
+    stderr: stderr.value,
+    exitCode: exited.value,
+    signal: child.signalCode,
+  }
+}
+
+filesystemTests.test(
+  'real pinned Bun promise-outcome failures count beside healthy companions',
+  async () => {
+    const sandbox = await promiseFixtureSandbox()
+    const file = 'src/tests/promise-outcome.test.ts'
+    for (const github of [false, true]) {
+      for (const [selected, status] of [
+        ['rejects receives a resolved promise', 'fail'],
+        ['resolves receives a rejected promise', 'fail'],
+        [
+          'negated rejects receives a resolved promise after a counted assertion',
+          'fail',
+        ],
+        ['rejects companion receives a rejected promise', 'pass'],
+        ['resolves companion receives a resolved promise', 'pass'],
+      ] as const) {
+        const transcript = await pinnedChild(
+          sandbox,
+          'promise-outcome.test.ts',
+          selected,
+          github,
+        )
+        expect(transcript.exitCode).toBe(status === 'fail' ? 1 : 0)
+        expect(transcript.stderr).toContain(
+          status === 'fail' ? '\nerror: \n\nExpected promise that ' : '(pass) ',
+        )
+        expect(parseExecution(selected, transcript)).toEqual({
+          count: 1,
+          events: [{ name: selected, file, status, occurrence: 1 }],
+        })
+      }
+      const whole = await pinnedChild(
+        sandbox,
+        'promise-outcome.test.ts',
+        undefined,
+        github,
+      )
+      expect(whole.exitCode).toBe(1)
+      expect(parseExecution(undefined, whole).events).toEqual([
+        {
+          name: 'rejects receives a resolved promise',
+          file,
+          status: 'fail',
+          occurrence: 1,
+        },
+        {
+          name: 'resolves receives a rejected promise',
+          file,
+          status: 'fail',
+          occurrence: 1,
+        },
+        {
+          name: 'negated rejects receives a resolved promise after a counted assertion',
+          file,
+          status: 'fail',
+          occurrence: 1,
+        },
+        {
+          name: 'rejects companion receives a rejected promise',
+          file,
+          status: 'pass',
+          occurrence: 1,
+        },
+        {
+          name: 'resolves companion receives a resolved promise',
+          file,
+          status: 'pass',
+          occurrence: 1,
+        },
+      ])
+    }
+  },
+)
+
+filesystemTests.test(
+  'real pinned Bun hook and runtime errors with promise-outcome text still refuse',
+  async () => {
+    const sandbox = await promiseFixtureSandbox()
+    for (const github of [false, true]) {
+      for (const [selected, reason] of [
+        ['hooked > inner companion', 'Timeout, hook or unhandled error'],
+        [
+          'runtime error repeating promise outcome prose',
+          'Not a genuine selected expect assertion failure',
+        ],
+        // Bun 1.3.14 does not count a negated promise matcher whose promise
+        // settled the other way, so the positive expect-count guard refuses.
+        [
+          'negated rejects receives a resolved promise without a counted assertion',
+          'No verified assertion executed',
+        ],
+      ] as const) {
+        const transcript = await pinnedChild(
+          sandbox,
+          'promise-refusal.test.ts',
+          selected,
+          github,
+        )
+        expect(transcript.exitCode).toBe(1)
+        expect(transcript.stderr).toContain(
+          '\nerror: \n\nExpected promise that rejects\nReceived promise that resolved: Promise { <resolved> }\n\n      at <anonymous> (/',
+        )
+        expect(() => parseExecution(selected, transcript)).toThrow(reason)
+      }
+    }
+  },
+)
+
+// A fixture that never finishes on its own, so only cancellation ends its child.
+const heldFixture = `import { test } from 'bun:test'
+
+test('held until cancelled', async () => {
+  await new Promise(() => setInterval(() => {}, 1_000))
+}, 600_000)
+`
+
+filesystemTests.test(
+  'a held pinned Bun child is killed by its cancelled test lifetime before cleanup',
+  async () => {
+    const sandbox = await promiseFixtureSandbox()
+    await writeFile(
+      resolve(sandbox, 'src/tests/promise-held.test.ts'),
+      heldFixture,
+    )
+    // finish() opens cancellation gates before it joins the body and cleans up.
+    // The child's gate kills it so its body and pipe joins can finish. Calling
+    // finish() after registration reproduces timeout teardown without a timer.
+    const lifetime = new TestLifetime()
+    const events: string[] = []
+    lifetime.deferCleanup(() => {
+      events.push('cleanup')
+    })
+    let registered!: () => void
+    const cancellationRegistered = new Promise<void>((resolve) => {
+      registered = resolve
+    })
+    const body = lifetime.runBody(async () => {
+      const transcript = await pinnedChild(
+        sandbox,
+        'promise-held.test.ts',
+        'held until cancelled',
+        false,
+        {
+          gate: () => {
+            const gate = lifetime.gate()
+            registered()
+            return gate
+          },
+          trackDetached: (work) => lifetime.trackDetached(work),
+        },
+      )
+      events.push('joined')
+      return transcript
+    })
+    await cancellationRegistered
+    events.push('cancel')
+    await lifetime.finish()
+    const transcript = await body
+    expect(events).toEqual(['cancel', 'joined', 'cleanup'])
+    expect(transcript.signal).toBe('SIGTERM')
+    expect(transcript.stderr).not.toContain('(pass) held until cancelled')
+  },
+)
