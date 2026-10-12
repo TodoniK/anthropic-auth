@@ -16,6 +16,7 @@ import {
   CLAUDE_SONNET_5_5_PRICING,
   isClaudeFableOrMythos51Model,
   type MidConversationEffortTransition,
+  type NativeAccountSnapshot,
   type NativeCustodyClient,
 } from '@cortexkit/anthropic-auth-core'
 import type { Provider, SimpleStreamOptions } from '@earendil-works/pi-ai'
@@ -29,13 +30,36 @@ import {
   collectPiEffortHistory,
   deriveContextEntries,
 } from './effort-history.ts'
-import { closePiNativeRuntime, getPiNativeRuntime } from './native.ts'
+import {
+  closePiNativeRuntime,
+  getPiNativeRuntime,
+  isNativeMigrationRequired,
+} from './native.ts'
 import { createPiNativeCommands } from './native-commands.ts'
 import { getPiAccountStoragePath, requirePiNativeHostAuth } from './paths.ts'
 import { streamCortexKitAnthropic } from './stream.ts'
 
 function textImageInput(): Array<'text' | 'image'> {
   return ['text', 'image']
+}
+
+/**
+ * Refuses every Anthropic prompt with Core's migration message. Registered
+ * only when startup found an install that offline setup has never migrated.
+ * Pi checks a prompt's credentials after its input handlers run. Handling the
+ * input here stops it before that check, which would otherwise answer with
+ * Pi's generic missing-key text for a 1.x install whose Pi login is still
+ * stored. Extension commands such as /claude run before input handlers, so
+ * they stay reachable.
+ */
+function refuseUnmigratedPrompts(pi: ExtensionAPI, refusal: string) {
+  pi.on('input', (_event, ctx) => {
+    // Prompts for other providers do not use this install's accounts.
+    if (ctx.model?.provider !== 'anthropic') return { action: 'continue' }
+    if (ctx.hasUI) ctx.ui.notify(refusal, 'error')
+    else process.stderr.write(`${refusal}\n`)
+    return { action: 'handled' }
+  })
 }
 
 export default async function cortexKitPiAnthropicAuth(
@@ -231,13 +255,36 @@ export default async function cortexKitPiAnthropicAuth(
     if (!streamSimple)
       throw new Error('Anthropic stream implementation is unavailable')
     // Read the account list installed by offline migration before registering
-    // the provider. Token authorization happens separately for each request.
-    await getPiNativeRuntime(storagePath).view()
+    // the provider, so a vault account list is loaded before Pi first checks
+    // whether this provider is configured. Token authorization happens
+    // separately for each request.
+    try {
+      await getPiNativeRuntime(storagePath).view()
+    } catch (error) {
+      // An install that offline setup has never migrated, such as a 1.x
+      // install upgraded in place, must still load: a failed load drops the
+      // /claude menu and Pi exits at startup. Its prompts are refused instead.
+      // Any other failure stops the load as before.
+      const refusal = await getPiNativeRuntime(storagePath).migrationRefusal()
+      if (!refusal) throw error
+      refuseUnmigratedPrompts(pi, refusal.message)
+    }
     const configured = async () => {
       await requirePiNativeHostAuth()
-      const snapshot = await (
-        await getPiNativeRuntime(storagePath).service()
-      ).read()
+      let snapshot: NativeAccountSnapshot
+      try {
+        snapshot = await (
+          await getPiNativeRuntime(storagePath).service()
+        ).read()
+      } catch (error) {
+        // An unmigrated install still reports the provider as configured, so
+        // Pi keeps its Anthropic models selectable and its prompts reach the
+        // refusal above (or, from any other caller, the stream, which refuses
+        // with the same Core message). If this check threw instead, Pi would
+        // record the refusal as a startup availability error.
+        if (isNativeMigrationRequired(error)) return true
+        throw error
+      }
       return snapshot.accounts.some(
         (account) =>
           account.type === 'oauth' &&

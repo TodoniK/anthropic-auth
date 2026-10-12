@@ -80,6 +80,19 @@ function requestPolicy(routeId: string, modelId?: string) {
 const runtimes = new Map<string, PiNativeRuntime>()
 const RUNTIME_LIMIT = 16
 
+/**
+ * Core's refusal for an install that offline setup has never migrated, such
+ * as a 1.x install upgraded in place. Core does not export the error class,
+ * so it is matched by name and code; no other error matches.
+ */
+export function isNativeMigrationRequired(error: unknown): error is Error {
+  return (
+    error instanceof Error &&
+    error.name === 'NativeAuthorityError' &&
+    Reflect.get(error, 'code') === 'migration-required'
+  )
+}
+
 /** Checks Pi host authentication and enrollment before delegating credential authorization and metadata writes to the shared account runtime. */
 export class PiNativeRuntime {
   private readonly paths: Promise<NativePoolPaths>
@@ -140,6 +153,22 @@ export class PiNativeRuntime {
     )
       throw new Error('Pi native routing requires committed offline migration')
     return journal.routingPaths.destination
+  }
+
+  /**
+   * Core's own refusal when offline setup has never migrated this install,
+   * otherwise undefined. This asks Core's account runtime directly, skipping
+   * the Pi login check that service() runs first, so a 1.x install whose Pi
+   * login is still stored is recognized too. It only reads.
+   */
+  async migrationRefusal(): Promise<Error | undefined> {
+    if (this.closed) return undefined
+    try {
+      await (await this.initialization).read()
+      return undefined
+    } catch (error) {
+      return isNativeMigrationRequired(error) ? error : undefined
+    }
   }
 
   async view(): Promise<NativeAccountSnapshot> {
