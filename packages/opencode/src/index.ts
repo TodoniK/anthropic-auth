@@ -44,10 +44,13 @@ import {
   configuredAnthropicOAuthAccountCount,
   createEmptyStorage,
   createNativeAccountRuntime,
+  createProviderErrorResponseScope,
+  createSseFramer,
   createStickyNoRouteResponse,
   custodyTombstoneOAuth,
   type DumpHandle,
   decideStickyQuotaFailure,
+  decodeSseFrame,
   detectClaustrumConnection,
   dumpDirectRequest,
   dumpResponseArtifact,
@@ -142,6 +145,7 @@ import {
   type PrimeRefreshResult,
   type PrimeSendResult,
   type ProviderAccountUuid,
+  type ProviderErrorResponseScope,
   parseAccountCommandAction,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
@@ -151,6 +155,7 @@ import {
   parseLoggingCommandAction,
   parsePrimeCommandAction,
   parseRoutingCommandAction,
+  parseSseFrame,
   QUOTA_HEADER_FEED_SCHEMA_VERSION,
   type QuotaAccountSummary,
   type QuotaEntry,
@@ -282,6 +287,9 @@ import {
   rewriteUrl,
   setOAuthHeaders,
 } from './transform.ts'
+
+/** Dump label for a physical send that failed before any response arrived. */
+const PHYSICAL_SEND_FAILED = 'physical send failed before a response'
 
 const HANDLED_SENTINEL = '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__'
 const HTTP_SERVER_RESPONSE_TYPE_ID = '~effect/http/HttpServerResponse'
@@ -537,10 +545,6 @@ async function fetchBody(
   } catch {
     return undefined
   }
-}
-
-function errorText(error: unknown) {
-  return error instanceof Error ? error.message : String(error)
 }
 
 function startEventLoopLagMonitor() {
@@ -3457,6 +3461,10 @@ const anthropicAuthPlugin = async (
     let accessToken: string | undefined
     let resolvedModel: string | undefined
     let scopedAttempt: NativeCustodyReceipt | undefined
+    // Token sent on the latest Prime network attempt, kept for error redaction.
+    let primeSecret = ''
+    // The response scope of the latest physical Prime send.
+    let physicalScope: ProviderErrorResponseScope | undefined
     try {
       // The manager already checked current quota. Validate the account and
       // tokens for this Haiku send without another quota poll. An upstream 401
@@ -3518,11 +3526,18 @@ const anthropicAuthPlugin = async (
       )
         throw new Error('Prime credential authority changed before dispatch')
       scopedAttempt = physicalAuthorization.scopedAttempt
-      headers.set(
-        'authorization',
-        `Bearer ${physicalAuthorization.accessToken}`,
-      )
-      let response = await fetch(primeUrl, primeInit)
+      primeSecret = physicalAuthorization.accessToken
+      headers.set('authorization', `Bearer ${primeSecret}`)
+      // Each Prime network attempt gets a redaction scope holding its
+      // sent token before dispatch. Redact a rejected 401 before retry
+      // handling; cancellation clears the copied token before cancelling
+      // the underlying connection. Prime uses a non-streaming HTTP body.
+      const sendPhysical = async () => {
+        const scope = createProviderErrorResponseScope([primeSecret], 'http')
+        physicalScope = scope
+        return scope.redactResponse(await fetch(primeUrl, primeInit))
+      }
+      let response = await sendPhysical()
       if (response.status === 401 && scopedAttempt && !signal.aborted) {
         let current: NativeCustodyReceipt | undefined
         try {
@@ -3532,6 +3547,7 @@ const anthropicAuthPlugin = async (
           // the vault confirms a newer version of this same account.
         }
         if (current) {
+          physicalScope?.dispose()
           await response.body?.cancel().catch(() => {})
           logger.info(
             'claustrum',
@@ -3557,8 +3573,9 @@ const anthropicAuthPlugin = async (
           )
             throw new Error('Prime vault retry lost its strict newer receipt')
           scopedAttempt = successor
-          headers.set('authorization', `Bearer ${successor.accessToken}`)
-          response = await fetch(primeUrl, primeInit)
+          primeSecret = successor.accessToken
+          headers.set('authorization', `Bearer ${primeSecret}`)
+          response = await sendPhysical()
         }
       }
       if (
@@ -3580,6 +3597,7 @@ const anthropicAuthPlugin = async (
             initialAuthorization.accountIdentity &&
           !replacement.scopedAttempt
         ) {
+          physicalScope?.dispose()
           await response.body?.cancel().catch(() => {})
           physicalAuthorization = await authorizeOAuth(
             accountId,
@@ -3593,17 +3611,23 @@ const anthropicAuthPlugin = async (
               initialAuthorization.accountIdentity
           )
             throw new Error('Prime local authority changed before retry')
-          headers.set(
-            'authorization',
-            `Bearer ${physicalAuthorization.accessToken}`,
-          )
-          response = await fetch(primeUrl, primeInit)
+          primeSecret = physicalAuthorization.accessToken
+          headers.set('authorization', `Bearer ${primeSecret}`)
+          response = await sendPhysical()
         }
       }
       const ms = Math.round(performance.now() - start)
       if (!response.ok) {
-        const reason =
-          (await response.text().catch(() => '')) || `HTTP ${response.status}`
+        // Prime reports this text as its failure reason. The final send's
+        // scope scrubs its token, including JSON-escaped spellings, and
+        // replaces an oversized body with a fixed message.
+        let reason: string
+        try {
+          reason =
+            (await response.text().catch(() => '')) || `HTTP ${response.status}`
+        } finally {
+          physicalScope?.dispose()
+        }
         if (response.status === 401 && scopedAttempt) {
           await reportVault401(scopedAttempt, 'direct')
         }
@@ -3631,11 +3655,16 @@ const anthropicAuthPlugin = async (
           : undefined
       primePhysicalAttempts.set(accountId, physicalAuthorization)
       return { ok: true, status: response.status, ms, ...(usage && { usage }) }
-    } catch (error) {
+    } catch (caught) {
+      // No response will clear this attempt's copied token; clear it here.
+      physicalScope?.dispose()
+      const scope = createProviderErrorResponseScope([primeSecret], 'http')
+      const error = scope.redactError(caught)
+      scope.dispose()
       return {
         ok: false,
-        ...(error instanceof NativeCredentialUnavailableError &&
-          error.tokenRefreshFailed && { reason: 'token-refresh' as const }),
+        ...(caught instanceof NativeCredentialUnavailableError &&
+          caught.tokenRefreshFailed && { reason: 'token-refresh' as const }),
         ms: Math.round(performance.now() - start),
         error: error instanceof Error ? error.message : String(error),
       }
@@ -6294,10 +6323,25 @@ const anthropicAuthPlugin = async (
             return headers.has('x-parent-session-id')
           }
 
-          function isStreamingRateLimitText(text: string) {
+          /**
+           * A streamed rate limit is an `error` event whose `error.type` is
+           * `rate_limit_error`. Parsing the event's JSON also reads escaped
+           * spellings; reply text that merely mentions rate limits is not one.
+           */
+          function isStreamingRateLimitEvent(data: string) {
+            let parsed: unknown
+            try {
+              parsed = JSON.parse(data)
+            } catch {
+              return false
+            }
+            if (typeof parsed !== 'object' || parsed === null) return false
+            const error: unknown = Reflect.get(parsed, 'error')
             return (
-              text.includes('rate_limit_error') ||
-              /exceed your account'?s rate limit/i.test(text)
+              Reflect.get(parsed, 'type') === 'error' &&
+              typeof error === 'object' &&
+              error !== null &&
+              Reflect.get(error, 'type') === 'rate_limit_error'
             )
           }
 
@@ -6328,20 +6372,41 @@ const anthropicAuthPlugin = async (
             const start = nowMs()
             const reader = response.body.getReader()
             const chunks: Uint8Array[] = []
-            const decoder = new TextDecoder()
-            let text = ''
             let bytes = 0
-
-            while (!text.includes('\n\n') && text.length < 65_536) {
+            // Classify the first event, skipping comments and heartbeats that
+            // carry no data. The shared framer handles CRLF, LF and CR line
+            // endings and frames split across reads.
+            const framer = createSseFramer({ maxFrameBytes: 65_536 })
+            let rateLimited = false
+            let decided = false
+            // Only the stream's first frame may drop a leading byte-order mark.
+            let streamStart = true
+            while (!decided && bytes < 65_536) {
               const { done, value } = await reader.read()
               if (done) break
               chunks.push(value)
               bytes += value.byteLength
-              text += decoder.decode(value, { stream: true })
-              if (isStreamingRateLimitText(text)) break
+              let frames: Uint8Array[]
+              try {
+                frames = framer.push(value)
+              } catch {
+                // The first frame exceeded the 64 KiB inspection limit; leave
+                // the response unclassified rather than read further.
+                break
+              }
+              for (const frame of frames) {
+                const event = parseSseFrame(
+                  decodeSseFrame(frame, { streamStart }),
+                )
+                streamStart = false
+                if (event.data === undefined) continue
+                rateLimited = isStreamingRateLimitEvent(event.data)
+                decided = true
+                break
+              }
             }
 
-            if (isStreamingRateLimitText(text)) {
+            if (rateLimited) {
               await reader.cancel().catch(() => {})
               try {
                 reader.releaseLock()
@@ -6588,20 +6653,34 @@ const anthropicAuthPlugin = async (
             configureApiRouteHeaders(requestHeaders, account)
             const rewritten = rewriteUrl(input, { baseURL: account.baseURL })
             const sendStart = nowMs()
+            // Keep the sent API key only to redact provider errors. Clear that
+            // copy when the body ends, is cancelled or fails; clear it immediately
+            // when a successful non-streaming body bypasses redaction. The request's
+            // stream flag selects the pipeline, never the response's content type.
+            const scope = createProviderErrorResponseScope(
+              [account.apiKey ?? ''],
+              streaming ? 'event-stream' : 'http',
+            )
             let response: Response
             try {
-              response = await fetch(rewritten.input, {
-                ...init,
-                body,
-                headers: requestHeaders,
-                ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-              })
-            } catch (error) {
+              // Redact the sent API key before response dumps, diagnostics or routing.
+              response = scope.redactResponse(
+                await fetch(rewritten.input, {
+                  ...init,
+                  body,
+                  headers: requestHeaders,
+                  ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+                }),
+              )
+            } catch (caught) {
+              const error = scope.redactError(caught)
+              scope.dispose()
               if (typeof body === 'string') {
                 await dumpDirectRequest({
                   affinity: directAffinity,
                   route,
-                  error: errorText(error),
+                  // A fixed label: the error text can repeat provider output or a credential.
+                  error: PHYSICAL_SEND_FAILED,
                   bodyText: body,
                   url:
                     rewritten.url?.toString() ?? fetchInputUrl(rewritten.input),
@@ -6642,9 +6721,16 @@ const anthropicAuthPlugin = async (
               baseURL: account.baseURL,
             })
             if (response.ok)
-              await nativeAccounts.publishApi(apiCredential.subject, {
-                lastUsed: Date.now(),
-              })
+              await nativeAccounts
+                .publishApi(apiCredential.subject, {
+                  lastUsed: Date.now(),
+                })
+                .catch(async (error: unknown) => {
+                  // A lastUsed write failure still fails the request. Cancel
+                  // the reply first to clear its copied redaction key.
+                  await response.body?.cancel().catch(() => {})
+                  throw error
+                })
             return response
           }
 
@@ -6996,13 +7082,22 @@ const anthropicAuthPlugin = async (
                 localSubject: nativeAuthorization.localSubject,
                 scopedAttempt: nativeAuthorization.scopedAttempt,
               }
+              // Keep the sent token only to redact provider errors before dumps,
+              // diagnostics, routing or host reads. Clear that copy when the
+              // response finishes, errors or is cancelled.
+              const scope = createProviderErrorResponseScope(
+                [nativeAuthorization.accessToken],
+                streaming ? 'event-stream' : 'http',
+              )
               try {
-                const response = await fetch(rewritten.input, {
-                  ...init,
-                  body,
-                  headers: requestHeaders,
-                  ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-                })
+                const response = scope.redactResponse(
+                  await fetch(rewritten.input, {
+                    ...init,
+                    body,
+                    headers: requestHeaders,
+                    ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+                  }),
+                )
                 if (typeof body === 'string') {
                   directDump = await dumpDirectRequest({
                     affinity: relayAffinity,
@@ -7018,12 +7113,15 @@ const anthropicAuthPlugin = async (
                   })
                 }
                 return response
-              } catch (error) {
+              } catch (caught) {
+                const error = scope.redactError(caught)
+                scope.dispose()
                 if (typeof body === 'string') {
                   await dumpDirectRequest({
                     affinity: relayAffinity,
                     route,
-                    error: errorText(error),
+                    // A fixed label: the error text can repeat provider output or a credential.
+                    error: PHYSICAL_SEND_FAILED,
                     bodyText: body,
                     url:
                       rewritten.url?.toString() ??
@@ -7073,6 +7171,9 @@ const anthropicAuthPlugin = async (
             // still replay on a newer version, which makes this one obsolete.
             let relayReturned = false
             const reportScoped401 = reportVault401
+            // The relay scrubs each physical relay attempt's responses and
+            // errors with that attempt's own credentials and the relay token;
+            // a direct fallback is scrubbed by directFetch.
             const sendOnce = () =>
               sendViaRelay({
                 config: relayConfig,
@@ -7103,6 +7204,7 @@ const anthropicAuthPlugin = async (
                   )
                   return {
                     headers: relayHeaders,
+                    errorSecrets: [nextAuthorization.accessToken],
                     onUpstreamStatus: (status: number) => {
                       if (status !== 401 || !nextAttempt) return
                       relay401Attempt = nextAttempt
@@ -7257,14 +7359,22 @@ const anthropicAuthPlugin = async (
               await reportScoped401(relay401Attempt, 'relay_status_field')
             }
             if (response.ok) {
-              if (served.scopedAttempt)
-                await nativeAccounts.vault.publish(served.scopedAttempt, {
-                  lastUsed: Date.now(),
-                })
-              else if (served.localSubject)
-                await nativeAccounts.publishLocal(served.localSubject, {
-                  lastUsed: Date.now(),
-                })
+              try {
+                if (served.scopedAttempt)
+                  await nativeAccounts.vault.publish(served.scopedAttempt, {
+                    lastUsed: Date.now(),
+                  })
+                else if (served.localSubject)
+                  await nativeAccounts.publishLocal(served.localSubject, {
+                    lastUsed: Date.now(),
+                  })
+              } catch (error) {
+                // A lastUsed publication failure still fails the request.
+                // Cancel the reply first to clear its copied redaction material
+                // and close the provider connection.
+                await response.body?.cancel().catch(() => {})
+                throw error
+              }
             }
             return response
           }

@@ -2278,8 +2278,8 @@ export function createStrippedStream(
                   options.onRelayUpstreamError,
                 ) ?? updateFinish(laneStartRewritten))
             if (retryableStreamError) {
+              // The provider's message stays out of logs; its type is enough.
               logProgress('stream_tool_prefix_retryable_error', {
-                error: retryableStreamError.message,
                 providerErrorType: retryableStreamError.providerErrorType,
               })
               await cancelReader(retryableStreamError)
@@ -2359,7 +2359,6 @@ export function createStrippedStream(
               ) ?? updateFinish(laneStartRewritten))
           if (retryableStreamError) {
             logProgress('stream_tool_prefix_retryable_error', {
-              error: retryableStreamError.message,
               providerErrorType: retryableStreamError.providerErrorType,
               readMs,
               lastChunkBytes: value.byteLength,
@@ -2391,18 +2390,15 @@ export function createStrippedStream(
           }
           if (rewritten.ready) return
         } catch (error) {
-          logProgress('stream_tool_prefix_error', {
-            error: error instanceof Error ? error.message : String(error),
-          })
+          // Only the stage is logged: the error text can repeat provider output.
+          logProgress('stream_tool_prefix_error')
           releaseReader()
           throw error
         }
       }
     },
     async cancel(reason) {
-      logProgress('stream_tool_prefix_cancel', {
-        reason: reason instanceof Error ? reason.message : String(reason),
-      })
+      logProgress('stream_tool_prefix_cancel')
       try {
         await reader.cancel(reason)
       } finally {

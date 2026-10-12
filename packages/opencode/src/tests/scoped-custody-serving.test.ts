@@ -1032,6 +1032,7 @@ test('optimistic WebSocket reports only the scoped version used by its real upst
     )
     const response = await loader.fetch(MESSAGES_URL, {
       ...EMPTY_POST,
+      body: JSON.stringify({ ...JSON.parse(EMPTY_POST.body), stream: true }),
       headers: { 'x-session-affinity': `ws-scoped-401-${root}` },
     })
     expect(response.status).toBe(200) // local optimistic status, not Anthropic's 401

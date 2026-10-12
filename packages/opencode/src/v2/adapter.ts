@@ -9,7 +9,12 @@ import {
   applyCustomHeaders,
   assertNotCustodyTombstone,
   type ClaudeCodeIdentity,
+  createProviderErrorRedactor,
+  createProviderErrorResponseScope,
   mergeAnthropicBetas,
+  type ProviderErrorRedactor,
+  type ProviderErrorResponseScope,
+  type ProviderResponseMode,
   remapModelId,
   remapRequestBodyModel,
   stripEmptyTrailingAssistantMessages,
@@ -100,6 +105,20 @@ export const DEFAULT_ATTEMPT_END_TIMEOUT_MS = 5_000
 
 /** Longest provider error text kept in an attempt's failure message. */
 const MAX_STREAM_ERROR_MESSAGE = 500
+
+/** The error `type` values Anthropic documents for its API errors. */
+const ANTHROPIC_ERROR_TYPES: ReadonlySet<string> = new Set([
+  'invalid_request_error',
+  'authentication_error',
+  'billing_error',
+  'permission_error',
+  'not_found_error',
+  'request_too_large',
+  'rate_limit_error',
+  'timeout_error',
+  'api_error',
+  'overloaded_error',
+])
 
 /** Which kind of credential one send goes out with. */
 export type NativeAnthropicRoute = 'oauth' | 'api'
@@ -355,6 +374,12 @@ export interface NativeAnthropicAdapter<Q, P> {
   readonly pendingSendCount: number
   /** Number of OAuth access tokens held for sends not yet rewritten. */
   readonly heldCredentialCount: number
+  /**
+   * Number of sends whose credentials are still held to scrub their errors:
+   * kept until the send ends cleanly, the retry hook has classified its
+   * failure, its session is forgotten, or maxPendingSends evicts the oldest.
+   */
+  readonly heldRedactorCount: number
   /** Number of choices, authorizations and rewrites still in progress. */
   readonly operationsInProgress: number
 }
@@ -492,6 +517,29 @@ function localRefusalFrom(error: unknown) {
 }
 
 /**
+ * The secrets one request is sent with: its OAuth access token or API key
+ * header values, plus the HTTP relay's own token when a relay carries it.
+ * A provider or relay error may repeat any of them. `physical` holds the
+ * headers as they leave: setting a header drops leading and trailing
+ * whitespace, so a configured value can differ from the one the provider
+ * receives and echoes. Both spellings are kept.
+ */
+function sendSecrets(send: PendingSend, physical: Headers): string[] {
+  const secrets: string[] = []
+  if (send.oauth) secrets.push(send.oauth.accessToken)
+  for (const [name, value] of Object.entries(send.apiHeaders ?? {})) {
+    if (value === null || !CREDENTIAL_HEADERS.has(name)) continue
+    secrets.push(value.replace(/^Bearer\s+/i, ''))
+  }
+  for (const name of CREDENTIAL_HEADERS) {
+    const value = physical.get(name)
+    if (value !== null) secrets.push(value.replace(/^Bearer\s+/i, ''))
+  }
+  if (send.dispatch?.kind === 'http-relay') secrets.push(send.dispatch.token)
+  return [...new Set(secrets.filter(Boolean))]
+}
+
+/**
  * Betas that this plugin itself adds to its OAuth sends: the OAuth beta, the
  * Claude Code persona beta, and the server-side fallback opt-in that goes
  * with the `fallbacks` body field the API route also removes. They are
@@ -579,7 +627,108 @@ export function createNativeAnthropicAdapter<Q, P>(
   // A relay's own failure is not a provider credential failure. Only a
   // provider request-id proves that its response came from Anthropic.
   const relayUpstream = new WeakMap<Data, boolean>()
+  // Each sent request privately holds its own credentials, so errors about
+  // it can be scrubbed after rewriteSend has dropped the pending credential:
+  // a response scope for the one response the request gets, and a redactor
+  // for the classifier inputs read while the request is live. Entries are
+  // keyed by the per-send data object, so concurrent and retried sends never
+  // share them, and are bounded like `pending`. Both are disposed when the
+  // response scope settles (its body ended, was cancelled or failed, or a
+  // success was left untouched), when the send ends cleanly, is cancelled or
+  // abandoned, after the retry hook classified it, when its session is
+  // forgotten, or on disposal. No credential is kept past that point.
+  const owned = new Map<
+    Data,
+    {
+      readonly sessionID: string
+      readonly redactor: ProviderErrorRedactor
+      readonly scope: ProviderErrorResponseScope
+    }
+  >()
+  // What the retry hook may still read about a send after its credentials
+  // were retired: the status or the already-scrubbed stream error.
+  const safeSummaries = new WeakMap<Data, string>()
+  // Used once a send's credentials are gone, or for a send this adapter never
+  // rewrote: successful frames pass unchanged, while error text and error
+  // bodies are replaced with a generic message.
+  const withheld = createProviderErrorRedactor([])
+  withheld.dispose()
+  const scrubberFor = (data: Data | undefined) =>
+    (data && owned.get(data)?.redactor) ?? withheld
+  const release = (data: Data) => {
+    const entry = owned.get(data)
+    if (!entry) return
+    owned.delete(data)
+    entry.redactor.dispose()
+    entry.scope.dispose()
+  }
+  const holdRedactor = (
+    data: Data,
+    send: PendingSend,
+    mode: ProviderResponseMode,
+    physical: Headers,
+  ) => {
+    const secrets = sendSecrets(send, physical)
+    const scope = createProviderErrorResponseScope(secrets, mode)
+    modes.set(data, mode)
+    owned.set(data, {
+      sessionID: send.sessionID,
+      redactor: createProviderErrorRedactor(secrets),
+      scope,
+    })
+    void scope.settled.then(() => release(data))
+    while (owned.size > maxPending) {
+      const oldest = owned.keys().next().value
+      if (oldest === undefined) break
+      release(oldest)
+    }
+  }
+  // Each sent request's response mode, which holds no secret, so a response
+  // arriving after its credentials were retired is still read the way its
+  // request asked for (a streamed request's error frames are withheld even
+  // when the response has no event-stream content type).
+  const modes = new WeakMap<Data, ProviderResponseMode>()
+  /**
+   * Fails closed for a response whose credentials are gone. A successful
+   * response is read by a secretless scope in the request's mode, retired
+   * before any byte is read: successful bytes are unchanged and error frames
+   * are replaced with a generic message.
+   */
+  const scrubLate = (data: Data | undefined, response: Response) => {
+    const mode = data ? modes.get(data) : undefined
+    // A non-2xx response is an HTTP error in either mode. The disposed
+    // redactor drops its status text and keeps only headers whose values it
+    // can still verify (retry and rate-limit fields), so a credential in the
+    // status text or a custom header never passes.
+    if (!mode || !response.ok) return withheld.redactResponse(response)
+    const late = createProviderErrorResponseScope([], mode)
+    const safe = late.redactResponse(response)
+    late.dispose()
+    return safe
+  }
+  /** Scrubs the send's one response with its live scope, or fails closed. */
+  const scrubResponse = (data: Data | undefined, response: Response) => {
+    const scope = data ? owned.get(data)?.scope : undefined
+    if (!scope) return scrubLate(data, response)
+    try {
+      return scope.redactResponse(response)
+    } catch {
+      return scrubLate(data, response)
+    }
+  }
   let disposed = false
+
+  // The headers object of each failed response this adapter rewrote, mapped
+  // to its send. Holding no secret and only weak references, it lets the
+  // response classifier recognize that exact rewritten response: its body
+  // went through the send's response scope, so it is already scrubbed and
+  // bounded even after that scope has ended. A copy of the headers, or any
+  // other response, is not recognized and is scrubbed as raw text.
+  const rewrittenFailures = new WeakMap<Headers, Data>()
+  const rewrittenFailure = (data: Data | undefined, response: Response) => {
+    if (data && !response.ok) rewrittenFailures.set(response.headers, data)
+    return response
+  }
 
   const fromUpstream = (headers: Headers, data: Data) => {
     if (data.dispatch !== 'http-relay') return true
@@ -863,6 +1012,17 @@ export function createNativeAnthropicAdapter<Q, P>(
     // Recheck session revocation after rewriting and signing before the
     // authenticated request can be returned to the caller.
     ensureLive()
+    // Dispatch begins here; use this send's copied secrets to redact its errors.
+    // The request's own stream flag decides how its response is read, never
+    // the response's content type.
+    holdRedactor(
+      data,
+      send,
+      isRecord(finalPayload) && finalPayload.stream === true
+        ? 'event-stream'
+        : 'http',
+      headers,
+    )
     const url =
       rewriteUrl(
         request.url,
@@ -926,7 +1086,11 @@ export function createNativeAnthropicAdapter<Q, P>(
       if (data && !fromUpstream(response.headers, data)) {
         // Relay authentication errors must not appear as an OAuth 401 to the
         // host or the native credential service.
-        if (response.status === 401)
+        if (response.status === 401) {
+          // Replace the relay's own 401 with a fixed 502. Clear the copied
+          // credentials and cancel its unread network body before returning.
+          release(data)
+          void response.body?.cancel().catch(() => {})
           return Response.json(
             {
               type: 'error',
@@ -938,21 +1102,31 @@ export function createNativeAnthropicAdapter<Q, P>(
             },
             { status: 502 },
           )
-        return undefined
+        }
+        // The relay's own failure can repeat the relay token or the
+        // credential in the envelope it was given.
+        return scrubResponse(data, response)
       }
+      // Remove this send's secrets from provider errors before any other
+      // reader; successful bytes pass through unchanged.
+      const safe = scrubResponse(data, response)
       // Only the OAuth route prefixes tool names, so only its responses are
       // mapped back. An API response reaches the host byte for byte.
-      if (data?.route !== 'oauth' || !response.body) return undefined
+      if (data?.route !== 'oauth' || !safe.body)
+        return rewrittenFailure(data, safe)
       const context = { ...contextOf(attempt, data), status: response.status }
       const options = source.responseOptions?.(context) ?? {}
       const json = (response.headers.get('content-type') ?? '').includes(
         'application/json',
       )
-      return createStrippedStream(response, {
-        ...options,
-        laneStartOAuthServed: true,
-        ...(json ? { responseMode: 'json' as const } : {}),
-      })
+      return rewrittenFailure(
+        data,
+        createStrippedStream(safe, {
+          ...options,
+          laneStartOAuthServed: true,
+          ...(json ? { responseMode: 'json' as const } : {}),
+        }),
+      )
     },
     quotaFromHeaders(headers, status, attempt) {
       const data = attempt.data
@@ -970,12 +1144,20 @@ export function createNativeAnthropicAdapter<Q, P>(
           ...contextOf(attempt, data),
           status,
         })
+      safeSummaries.set(data, `provider responded with HTTP ${status}`)
       if (!source.limitFromResponse) return undefined
+      // A failed response this adapter rewrote is read through its own
+      // response scope, which scrubbed it while the credentials were live.
+      // Once that read reaches the end the credentials are gone, so its text
+      // is passed on as it is. Anything else is scrubbed here.
+      const rewritten = rewrittenFailures.get(headers) === data
+      const scrubber = scrubberFor(data)
       return source.limitFromResponse({
         ...contextOf(attempt, data),
         status,
         headers,
-        body,
+        body: async () =>
+          rewritten ? await body() : scrubber.redactText(await body()),
       })
     },
     inspectEvent({ data: payload, event, attempt }) {
@@ -989,11 +1171,26 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       if (type === 'message_stop') return { done: true }
       if (type !== 'error') return undefined
-      const error = isRecord(parsed.error) ? parsed.error : {}
-      const errorType = typeof error.type === 'string' ? error.type : undefined
-      const message =
-        typeof error.message === 'string' ? error.message : undefined
       const data = attempt.data
+      // The error type and message reach both the source's classifier and
+      // the host's failure record, so neither may carry this send's secrets.
+      const scrubber = scrubberFor(data)
+      const error = isRecord(parsed.error) ? parsed.error : {}
+      // A documented Anthropic error type is kept as is, so a rate limit is
+      // classified the same even after this send's redactor was disposed
+      // (its send ended, its session was forgotten, or it was evicted). Any
+      // other value is scrubbed like the message; once the redactor is
+      // disposed it is replaced by a generic message.
+      const errorType =
+        typeof error.type !== 'string'
+          ? undefined
+          : ANTHROPIC_ERROR_TYPES.has(error.type)
+            ? error.type
+            : scrubber.redactText(error.type)
+      const message =
+        typeof error.message === 'string'
+          ? scrubber.redactText(error.message)
+          : undefined
       if (data?.dispatch === 'http-relay' && relayUpstream.get(data) === false)
         return undefined
       const limit = data
@@ -1010,6 +1207,7 @@ export function createNativeAnthropicAdapter<Q, P>(
           .slice(0, MAX_STREAM_ERROR_MESSAGE),
         ...(limit ? { limit } : {}),
       }
+      if (data && verdict.error) safeSummaries.set(data, verdict.error)
       return verdict
     },
     limitFromError(error, attempt) {
@@ -1017,14 +1215,39 @@ export function createNativeAnthropicAdapter<Q, P>(
       // A local refusal is about the request, not the account: answering it
       // with a limit would move the same broken request to another account.
       if (!data || localRefusals.has(data)) return undefined
+      // The host's error text is never re-scrubbed here: the send's
+      // credentials may already be retired. The source gets the status, a
+      // documented error type, and safe text recorded while the send was live.
+      const safe: HostError = {
+        type: ANTHROPIC_ERROR_TYPES.has(error.type)
+          ? error.type
+          : 'provider_error',
+        message: safeSummaries.get(data) ?? 'provider request failed',
+        ...(error.status !== undefined ? { status: error.status } : {}),
+      }
+      // This hook has copied the failed send's classification into safe data.
+      // It no longer needs the redactor's credentials to classify the error.
+      release(data)
       if (data.dispatch === 'http-relay' && relayUpstream.get(data) === false)
         return undefined
-      return source.limitFromHostError?.(error, contextOf(attempt, data))
+      return source.limitFromHostError?.(safe, contextOf(attempt, data))
     },
     async onAttemptEnd(attempt, outcome) {
       const data = attempt.data
       if (!data) return
       pending.delete(data)
+      // A send that completed, was cancelled or can no longer be observed
+      // has no error left to read. An error status or a failed stream keeps
+      // its redactor: the host still reads that error after this call, and
+      // the retry hook judges it.
+      const reason = outcome.error?.reason
+      if (
+        reason === 'cancelled' ||
+        reason === 'abandoned' ||
+        (reason === undefined &&
+          (outcome.status === undefined || outcome.status < 400))
+      )
+        release(data)
       const check = localRefusals.get(data)
       const { status, ...rest } = outcome
       const ended = source.onAttemptEnd?.(contextOf(attempt, data), {
@@ -1053,6 +1276,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       inProgress.clear()
       pending.clear()
+      for (const data of [...owned.keys()]) release(data)
     },
     forgetSession(sessionID) {
       for (const operation of inProgress.get(sessionID) ?? []) {
@@ -1061,6 +1285,9 @@ export function createNativeAnthropicAdapter<Q, P>(
       inProgress.delete(sessionID)
       for (const [data, send] of pending) {
         if (send.sessionID === sessionID) pending.delete(data)
+      }
+      for (const [data, entry] of [...owned]) {
+        if (entry.sessionID === sessionID) release(data)
       }
       source.forgetSession?.(sessionID)
     },
@@ -1071,6 +1298,9 @@ export function createNativeAnthropicAdapter<Q, P>(
       let count = 0
       for (const send of pending.values()) if (send.oauth) count++
       return count
+    },
+    get heldRedactorCount() {
+      return owned.size
     },
     get operationsInProgress() {
       let count = 0

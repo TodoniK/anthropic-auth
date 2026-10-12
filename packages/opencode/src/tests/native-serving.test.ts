@@ -679,6 +679,7 @@ async function sendNative(
   plugin: PluginHooks,
   model = 'claude-sonnet-4-6',
   sessionId = `synthetic-session-${directory}`,
+  stream = false,
 ) {
   const options = await load(plugin, async () =>
     custodyTombstoneOAuth('anthropic'),
@@ -692,6 +693,7 @@ async function sendNative(
     body: JSON.stringify({
       model,
       max_tokens: 16,
+      ...(stream && { stream: true }),
       messages: [{ role: 'user', content: 'Synthetic native serving probe' }],
     }),
   })
@@ -1676,8 +1678,14 @@ test('optimistic websocket late 401 reports the exact served receipt, not a newe
   const plugin = await createPlugin({
     claustrumScopedConnect: async () => fixture.scopedClient,
   })
-  const response = await sendNative(plugin)
+  const response = await sendNative(
+    plugin,
+    'claude-sonnet-4-6',
+    `synthetic-late-401-${directory}`,
+    true,
+  )
   expect(response.status).toBe(200)
+  expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
   expect(await response.text()).toContain('Relay upstream returned HTTP 401')
   await reported
   expect(

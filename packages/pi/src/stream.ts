@@ -6,8 +6,11 @@ import {
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
+  createProviderErrorResponseScope,
+  createSseFramer,
   createStickyNoRouteResponse,
   decideStickyQuotaFailure,
+  decodeSseFrame,
   dumpDirectRequest,
   FAST_MODE_BETA,
   getCache1hPersistentMode,
@@ -38,6 +41,8 @@ import {
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
+  type ProviderErrorResponseScope,
+  parseSseFrame,
   QuotaManager,
   type QuotaState,
   quotaBackoffActive,
@@ -85,9 +90,8 @@ import {
   requirePiOAuthOrigin,
 } from './transport.ts'
 
-function errorText(error: unknown) {
-  return error instanceof Error ? error.message : String(error)
-}
+/** Dump label for a physical send that failed before any response arrived. */
+const PHYSICAL_SEND_FAILED = 'physical send failed before a response'
 
 let cacheKeepRegistry: CacheKeepSessionRegistry | undefined
 let cacheKeepRegistryDirectory: string | undefined
@@ -379,6 +383,7 @@ type AnthropicEvent = {
   index?: number
   content_block?: Record<string, unknown>
   delta?: Record<string, unknown>
+  error?: Record<string, unknown>
   message?: { usage?: Record<string, number> }
   usage?: Record<string, number>
 }
@@ -454,34 +459,29 @@ export async function* parseSse(
 ): AsyncGenerator<AnthropicEvent> {
   if (!response.body) return
   const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
+  // Core's byte framer ends frames at blank lines with CRLF, LF or CR line
+  // endings and keeps a multibyte character split across reads in one frame,
+  // so each frame is decoded once, whole. A frame without its closing blank
+  // line at end of stream is incomplete and dispatches nothing, as in
+  // EventSource.
+  const framer = createSseFramer()
+  // Only the stream's first frame may drop a leading byte-order mark.
+  let streamStart = true
 
   try {
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let boundary = buffer.indexOf('\n\n')
-      while (boundary !== -1) {
-        const frame = buffer.slice(0, boundary)
-        buffer = buffer.slice(boundary + 2)
-        boundary = buffer.indexOf('\n\n')
-        for (const line of frame.split('\n')) {
-          if (!line.startsWith('data:')) continue
-          const data = line.slice(5).trim()
-          if (!data || data === '[DONE]') continue
-          yield JSON.parse(data) as AnthropicEvent
-        }
+      for (const frame of framer.push(value)) {
+        const data = parseSseFrame(decodeSseFrame(frame, { streamStart })).data
+        streamStart = false
+        if (!data || data === '[DONE]') continue
+        yield JSON.parse(data) as AnthropicEvent
       }
     }
   } finally {
-    // Do not cancel the reader on early abandon. `firstStreamingError()` peeks
-    // the first SSE event from a `response.clone()` and then abandons this
-    // generator; cancelling the cloned (tee'd) reader tears down the shared
-    // underlying body, so the real `parseSse(response)` that streams the reply
-    // reads zero events and the assistant message comes back empty. Releasing
-    // the lock is enough — the abandoned clone branch is garbage-collected.
+    // Only the lock is released when the consumer stops early: cancelling the
+    // body on abandonment is the consumer's decision, not the parser's.
     reader.releaseLock()
   }
 }
@@ -606,9 +606,23 @@ async function sendAnthropicRequest(options: {
   const markUsed = async (attempt: PiNativeAttempt) => {
     if (used.has(attempt)) return
     used.add(attempt)
-    await native.markUsed(attempt).catch(() => {
+    try {
+      await native.markUsed(attempt)
+    } catch (error) {
+      if (usagePublicationRefusalIsFatal(error)) throw error
       logger.warn('native-auth', 'Pi account usage publication unavailable')
-    })
+    }
+  }
+  // Publish lastUsed for the attempt whose response is about to be returned.
+  // A custody, lease or integrity refusal cancels the reply to clear its copied
+  // redaction material, then fails the request. Ordinary I/O only warns.
+  const markServed = async (attempt: PiNativeAttempt, response: Response) => {
+    try {
+      await markUsed(attempt)
+    } catch (error) {
+      await response.body?.cancel().catch(() => {})
+      throw error
+    }
   }
   const takeAttempt = async () => {
     const attempt =
@@ -626,12 +640,15 @@ async function sendAnthropicRequest(options: {
   const directFetch = async () => {
     let attempt: PiNativeAttempt | undefined
     let apiSubject: NativeApiSubject | undefined
+    // The secret this physical send goes out with; a provider error may repeat it.
+    let secret = ''
     if (options.apiAccount) {
       const credential = await (await native.service()).authorizeApi(
         options.apiAccount.id,
         init.signal ?? undefined,
       )
       apiSubject = credential.subject
+      secret = credential.apiKey ?? ''
       input = buildExplicitBaseMessagesUrl(credential.baseURL)
       const authorized = configureApiRouteHeaders(
         {
@@ -643,11 +660,22 @@ async function sendAnthropicRequest(options: {
       init.headers = authorized
     } else {
       attempt = await takeAttempt()
-      headers.set('authorization', `Bearer ${piAttemptAccessToken(attempt)}`)
+      secret = piAttemptAccessToken(attempt)
+      headers.set('authorization', `Bearer ${secret}`)
     }
     lastTransport = 'direct'
+    // The response scope of the latest physical send. Each send gets its own
+    // before the request leaves, so a rejected 401 is already scrubbed when
+    // it is reported, dumped or cancelled.
+    const physical: { scope?: ProviderErrorResponseScope } = {}
+    const send = async () => {
+      const scope = createProviderErrorResponseScope([secret], 'event-stream')
+      physical.scope = scope
+      return scope.redactResponse(await fetch(input, init))
+    }
+    let response: Response
     try {
-      let response = await fetch(input, init)
+      response = await send()
       if (attempt && response.status === 401) {
         // Report the rejected credential version before retrying, even if its replacement later succeeds.
         await report(attempt, response.status, 'direct')
@@ -673,19 +701,17 @@ async function sendAnthropicRequest(options: {
             method: init.method,
             headers,
           })
+          // Retire the rejected send's credentials before cancelling its
+          // body, since that cancellation may never settle.
+          physical.scope?.dispose()
           await response.body?.cancel().catch(() => {})
           attempt = rotated
-          headers.set(
-            'authorization',
-            `Bearer ${piAttemptAccessToken(rotated)}`,
-          )
-          response = await fetch(input, init)
+          secret = piAttemptAccessToken(rotated)
+          headers.set('authorization', `Bearer ${secret}`)
+          response = await send()
         }
       }
-      if (attempt) {
-        await report(attempt, response.status, 'direct')
-        if (response.ok) await markUsed(attempt)
-      }
+      if (attempt) await report(attempt, response.status, 'direct')
       if (apiSubject && response.ok)
         await (await native.service())
           .publishApi(apiSubject, { lastUsed: Date.now() })
@@ -706,14 +732,19 @@ async function sendAnthropicRequest(options: {
         method: init.method,
         headers: init.headers,
       })
-      return response
-    } catch (error) {
+    } catch (caught) {
+      // No response leaves this send, so its credentials retire here.
+      physical.scope?.dispose()
+      const scope = createProviderErrorResponseScope([secret], 'event-stream')
+      const error = scope.redactError(caught)
+      scope.dispose()
       await dumpDirectRequest({
         affinity: relayAffinity,
         route:
           options.route ??
           (options.apiAccount ? `api:${options.apiAccount.id}` : 'oauth'),
-        error: errorText(error),
+        // A fixed label: the error text can repeat provider output or a credential.
+        error: PHYSICAL_SEND_FAILED,
         bodyText,
         url: input.toString(),
         method: init.method,
@@ -721,12 +752,17 @@ async function sendAnthropicRequest(options: {
       })
       throw error
     }
+    if (attempt && response.ok) await markServed(attempt, response)
+    return response
   }
   if (options.apiAccount) return directFetch()
 
   let relay401Attempt: PiNativeAttempt | undefined
   let relayAttempt: PiNativeAttempt | undefined
   const relayReports: Promise<void>[] = []
+  // The relay scrubs each physical relay attempt's responses and errors with
+  // that attempt's own credentials and the relay token; a direct fallback is
+  // scrubbed by directFetch.
   const sendRelayAttempt = async () =>
     sendViaRelay({
       config: await (await native.service()).getRelayConfig(),
@@ -741,12 +777,11 @@ async function sendAnthropicRequest(options: {
         relayAttempt = attempt
         lastTransport = 'relay'
         const authorizedHeaders = new Headers(headers)
-        authorizedHeaders.set(
-          'authorization',
-          `Bearer ${piAttemptAccessToken(attempt)}`,
-        )
+        const access = piAttemptAccessToken(attempt)
+        authorizedHeaders.set('authorization', `Bearer ${access}`)
         return {
           headers: authorizedHeaders,
+          errorSecrets: [access],
           onUpstreamStatus: (status) => {
             if (status === 401) {
               relay401Attempt = attempt
@@ -785,8 +820,28 @@ async function sendAnthropicRequest(options: {
     }
   }
   if (response.ok && lastTransport === 'relay' && relayAttempt)
-    await markUsed(relayAttempt)
+    await markServed(relayAttempt, response)
   return response
+}
+
+/**
+ * Whether a lastUsed publication failure must fail the request. Custody
+ * refusals (receipt, enrollment, route or pin no longer valid) and runtime
+ * refusals on ownership, lease or file-integrity grounds are fatal. Ordinary
+ * runtime storage I/O (`runtime-io`), a newer persisted observation
+ * (`runtime-conflict`) and any other error only warn. Core exports neither
+ * error class at runtime, so they are matched by name and code.
+ */
+function usagePublicationRefusalIsFatal(error: unknown) {
+  if (!(error instanceof Error)) return false
+  if (error.name === 'NativeCustodyError') return true
+  if (error.name !== 'NativeRuntimeError') return false
+  const code: unknown = Reflect.get(error, 'code')
+  return (
+    code === 'publication-refused' ||
+    code === 'unsafe-runtime' ||
+    code === 'invalid-runtime'
+  )
 }
 
 function quotaSnapshotIsExhausted(
@@ -804,26 +859,114 @@ export function primaryResponseAllowsApiFallback(preflight: Response | string) {
   )
 }
 
-async function firstStreamingError(
+/**
+ * Bytes read while looking for a successful stream's first event. Comments
+ * and heartbeats carry no event, so a stream of them alone must not keep the
+ * inspection reading (and buffering) without end.
+ */
+const FIRST_EVENT_INSPECTION_BYTES = 65_536
+
+/**
+ * Classify a successful stream by its first event without a tee: the bytes
+ * read are replayed in front of the rest of the body, so cancelling the
+ * returned response cancels the provider body itself. `preflight` is
+ * `rate_limit_error` for a streamed rate limit (the provider body is then
+ * cancelled and only the bytes read are replayed), else the returned
+ * response. A stream whose first event does not arrive within the budget, or
+ * cannot be read, is returned unclassified.
+ */
+export async function firstStreamingError(
   response: Response,
-): Promise<Response | string> {
-  if (!response.ok) return response
-  const clone = response.clone()
+): Promise<{ response: Response; preflight: Response | 'rate_limit_error' }> {
+  if (!response.ok || !response.body) return { response, preflight: response }
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  const framer = createSseFramer({
+    maxFrameBytes: FIRST_EVENT_INSPECTION_BYTES,
+  })
+  let bytes = 0
+  let rateLimited = false
+  let decided = false
+  // Only the stream's first frame may drop a leading byte-order mark.
+  let streamStart = true
   try {
-    for await (const event of parseSse(clone as unknown as Response)) {
-      if (
-        event.type === 'error' &&
-        typeof event.delta?.type === 'string' &&
-        event.delta.type === 'rate_limit_error'
-      ) {
-        return 'rate_limit_error'
+    while (!decided && bytes < FIRST_EVENT_INSPECTION_BYTES) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      bytes += value.byteLength
+      for (const frame of framer.push(value)) {
+        const data = parseSseFrame(decodeSseFrame(frame, { streamStart })).data
+        streamStart = false
+        if (!data || data === '[DONE]') continue
+        const event = JSON.parse(data) as AnthropicEvent
+        // Anthropic reports a streamed rate limit as an `error` event whose
+        // `error.type` is `rate_limit_error`; only that event is a rate limit.
+        rateLimited =
+          event.type === 'error' && event.error?.type === 'rate_limit_error'
+        decided = true
+        break
       }
-      return response
     }
   } catch {
-    return response
+    // An unreadable body, an oversized first frame or a first event that is
+    // not JSON is not treated as a rate limit: the response is returned for
+    // the consumer to read, and an unreadable body fails that read too.
   }
-  return response
+  // The provider reader is released as soon as nothing will read it again:
+  // at end of stream, after a read failure, or once a cancellation settles.
+  const release = () => {
+    try {
+      reader.releaseLock()
+    } catch {
+      // Already released.
+    }
+  }
+  const replay = (rest: boolean) =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(chunk)
+          if (!rest) controller.close()
+        },
+        async pull(controller) {
+          let next: Awaited<ReturnType<typeof reader.read>>
+          try {
+            next = await reader.read()
+          } catch (error) {
+            release()
+            throw error
+          }
+          if (next.done) {
+            release()
+            controller.close()
+          } else controller.enqueue(next.value)
+        },
+        async cancel(reason) {
+          if (!rest) return
+          try {
+            await reader.cancel(reason)
+          } finally {
+            release()
+          }
+        },
+      }),
+      {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      },
+    )
+  if (rateLimited) {
+    // Routing replaces this response. Cancel the provider body and clear its
+    // copied redaction material; retain the inspected error event for callers
+    // that still return the replay response.
+    await reader.cancel().catch(() => {})
+    release()
+    return { response: replay(false), preflight: 'rate_limit_error' }
+  }
+  const inspected = replay(true)
+  return { response: inspected, preflight: inspected }
 }
 
 async function executeWithFallback(options: {
@@ -1139,14 +1282,15 @@ async function executeWithFallback(options: {
         })
       }
       if (!response) continue
-      const preflight = await firstStreamingError(response)
+      const inspected = await firstStreamingError(response)
+      const preflight = inspected.preflight
       if (preflight instanceof Response && preflight.ok) return preflight
       if (
         preflight instanceof Response &&
         !shouldFallbackStatus(preflight.status, storage)
       )
         return preflight
-      await response.body?.cancel().catch(() => {})
+      await inspected.response.body?.cancel().catch(() => {})
     }
     return null
   }
@@ -1255,8 +1399,9 @@ async function executeWithFallback(options: {
         )
       }
 
-      const response = await sendRoute(route)
-      const preflight = await firstStreamingError(response)
+      const { response, preflight } = await firstStreamingError(
+        await sendRoute(route),
+      )
       if (preflight instanceof Response && preflight.ok) {
         return completeRoute(route, preflight)
       }
@@ -1438,11 +1583,13 @@ async function executeWithFallback(options: {
     }
   }
 
-  const primary = await sendAnthropicRequest({
-    ...options,
-    oauthAccountId: STICKY_ROUTING_MAIN_ACCOUNT_ID,
-  })
-  const primaryPreflight = await firstStreamingError(primary)
+  const { response: primary, preflight: primaryPreflight } =
+    await firstStreamingError(
+      await sendAnthropicRequest({
+        ...options,
+        oauthAccountId: STICKY_ROUTING_MAIN_ACCOUNT_ID,
+      }),
+    )
   if (primaryPreflight instanceof Response) {
     if (!shouldFallbackStatus(primaryPreflight.status, storage))
       return primaryPreflight
