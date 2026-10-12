@@ -1,3 +1,4 @@
+import { heapStats } from 'bun:jsc'
 import { expect } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
@@ -6,6 +7,7 @@ import { join } from 'node:path'
 import type { ServerWebSocket } from 'bun'
 import {
   createProviderErrorRedactor,
+  PROVIDER_ERROR_OVERSIZED_MESSAGE,
   PROVIDER_ERROR_REDACTION,
 } from '../provider-error.ts'
 import {
@@ -13,9 +15,23 @@ import {
   type RelayConfig,
   sendViaRelay,
 } from '../relay.ts'
-import { createTestLifetimeSuite } from './test-lifetime.ts'
+import {
+  createTestLifetimeSuite,
+  type TestGate,
+  TestLifetime,
+} from './test-lifetime.ts'
 
 const { test, gate, trackDetached, deferCleanup } = createTestLifetimeSuite()
+
+/**
+ * Fixture teardown hooks for the running test. Teardown-order tests supply
+ * their own TestLifetime so they can trigger and inspect its finish.
+ */
+type FixtureLifetime = {
+  gate(): TestGate
+  trackDetached(work: Promise<unknown>): void
+}
+const suiteLifetime: FixtureLifetime = { gate, trackDetached }
 
 // Opaque credentials: none of them has a shape (Bearer prefix, sk- key, JWT)
 // that the redactor's generic patterns would catch, so only exact
@@ -32,7 +48,7 @@ type SentPayload = {
   id?: string
   mode: string
   body?: string
-  upstream: { headers: Record<string, string> }
+  upstream: { url?: string; method?: string; headers: Record<string, string> }
 }
 
 function readPayload(text: string): SentPayload {
@@ -77,25 +93,34 @@ type HttpScript = (
  * gate created inside the body before the body awaits any relay I/O. Test
  * teardown opens every such gate, so if the body hangs on the relay, the
  * shutdown closes the relay's sockets and the hung read in the body settles.
- * Each socket's close callback is awaited individually.
+ * Each socket's close callback and each HTTP handler are awaited
+ * individually. `close` runs the same shutdown on demand.
  */
-function startRelay(script: { ws?: WsScript; http?: HttpScript }) {
+function startRelay(
+  script: { ws?: WsScript; http?: HttpScript },
+  life: FixtureLifetime = suiteLifetime,
+) {
   const sent: SentPayload[] = []
   const sockets = new Map<ServerWebSocket<undefined>, Promise<void>>()
   const closers = new Map<ServerWebSocket<undefined>, () => void>()
+  const handlers: Promise<unknown>[] = []
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
-    fetch: async (request, owner) => {
+    fetch: (request, owner) => {
       if (request.headers.get('upgrade') === 'websocket')
         return owner.upgrade(request)
           ? undefined
           : new Response('upgrade failed', { status: 500 })
-      const payload = readPayload(await request.text())
-      sent.push(payload)
-      if (!script.http)
-        return new Response('unexpected HTTP relay', { status: 500 })
-      return script.http(payload, sent.length - 1)
+      const handled = (async () => {
+        const payload = readPayload(await request.text())
+        sent.push(payload)
+        if (!script.http)
+          return new Response('unexpected HTTP relay', { status: 500 })
+        return script.http(payload, sent.length - 1)
+      })()
+      handlers.push(handled)
+      return handled
     },
     websocket: {
       open(socket) {
@@ -118,14 +143,16 @@ function startRelay(script: { ws?: WsScript; http?: HttpScript }) {
   let stopping: Promise<void> | undefined
   const stop = () => {
     stopping ??= (async () => {
-      // A forced stop closes every relay socket; each socket's close callback
-      // is joined separately. The stop promise itself is not joined: Bun can
-      // leave it pending after upgraded sockets close (see the same note in
-      // relay-authorization.test.ts), so shutdown is joined through every
-      // socket's close callback.
+      // Bun can leave stop pending after upgraded sockets close. In that case,
+      // join each socket's close callback and HTTP handler instead. An HTTP-only
+      // server has no such residual, so its stop promise is joined too.
       const closes = [...sockets.values()]
-      void server.stop(true)
-      const results = await Promise.allSettled(closes)
+      const stopped = server.stop(true)
+      const results = await Promise.allSettled([
+        ...closes,
+        ...handlers,
+        ...(closes.length ? [] : [stopped]),
+      ])
       const failures = results.flatMap((result) =>
         result.status === 'rejected' ? [result.reason] : [],
       )
@@ -134,9 +161,9 @@ function startRelay(script: { ws?: WsScript; http?: HttpScript }) {
     })()
     return stopping
   }
-  const shutdown = gate()
-  trackDetached(shutdown.wait.then(stop))
-  return { url: server.url.href, sent }
+  const shutdown = life.gate()
+  life.trackDetached(shutdown.wait.then(stop))
+  return { url: server.url.href, sent, close: stop }
 }
 
 function sseFrame(event: string, data: unknown) {
@@ -185,14 +212,18 @@ function startResponse(
   socket.send(JSON.stringify({ type: 'response_start', id, status, headers }))
 }
 
-function authorizer(tokens: string[], withErrorSecrets: boolean) {
+function authorizer(
+  tokens: string[],
+  withErrorSecrets: boolean,
+  refs?: WeakRef<object>[],
+) {
   const observed: Array<[number, number]> = []
   let calls = 0
   const authorize = async (): Promise<RelayAttemptAuthorization> => {
     const attempt = ++calls
     const token = tokens[attempt - 1]
     if (token === undefined) throw new Error('Unexpected relay authorization')
-    return {
+    const authorization: RelayAttemptAuthorization = {
       headers: new Headers({
         authorization: `Bearer ${token}`,
         'content-type': 'application/json',
@@ -202,12 +233,16 @@ function authorizer(tokens: string[], withErrorSecrets: boolean) {
         observed.push([attempt, status])
       },
     }
+    refs?.push(new WeakRef(authorization))
+    return authorization
   }
   return { authorize, observed, calls: () => calls }
 }
 
 async function send(options: {
   relay: { url: string }
+  /** Upstream URL the relay forwards to; the Anthropic URL when omitted. */
+  input?: string
   transport: 'http' | 'websocket'
   authorize: () => Promise<RelayAttemptAuthorization>
   optimistic?: boolean
@@ -218,7 +253,7 @@ async function send(options: {
 }) {
   return sendViaRelay({
     config: config(options.relay.url, options.transport),
-    input: 'https://api.anthropic.com/v1/messages',
+    input: options.input ?? 'https://api.anthropic.com/v1/messages',
     init: { method: 'POST' },
     headers: new Headers(),
     body: options.body ?? requestBody(options.suffix ?? 'first'),
@@ -1294,3 +1329,1386 @@ test('an optimistic streaming attempt that closes after response_start but befor
     [2, 200],
   ])
 })
+
+// Shaped like a real OAuth access token. Lowercase, so a header name that
+// echoes it (HTTP lowercases header names) is still the exact credential.
+const OAT_V1 = `sk-ant-oat01-${'q7lm2vb9x4'.repeat(8)}aa`
+const OAT_V2 = `sk-ant-oat01-${'r8kn3wc0y5'.repeat(8)}bb`
+
+type ProviderReply = {
+  status: number
+  reason: string
+  headers: Record<string, string>
+  body?: string
+  /**
+   * Send the status line, the headers (with the full content length) and
+   * the first `heldAfter` body bytes, then hold the connection open.
+   */
+  heldAfter?: number
+}
+
+/** Hold the request open: never answer it. */
+const HOLD = 'hold' as const
+
+type ProviderSocket = {
+  buffered: Buffer
+  unsent?: Buffer
+  /** End the connection once the unsent bytes are written. */
+  endAfterWrite: boolean
+}
+
+/**
+ * Loopback HTTP/1.1 provider on a raw socket, so it can echo the credential
+ * it received in its status line (Bun.serve always writes the standard
+ * reason phrase). Each connection carries one request and then closes,
+ * unless the reply holds it open. `credentials` lists the bearer credential
+ * of every request it answered; `connections` counts the TCP connections it
+ * accepted and saw close. `close` stops the listener, which closes every
+ * connection, and joins each connection's close callback on its own.
+ */
+function startProvider(
+  reply: (credential: string, index: number) => ProviderReply | typeof HOLD,
+  life: FixtureLifetime = suiteLifetime,
+) {
+  const credentials: string[] = []
+  const connections = { opened: 0, closed: 0 }
+  const closes: Promise<void>[] = []
+  const closers = new WeakMap<object, () => void>()
+  let requested!: () => void
+  const firstRequest = new Promise<void>((resolve) => {
+    requested = resolve
+  })
+  const write = (
+    socket: { write(data: Buffer): number; end(): void; data: ProviderSocket },
+    bytes: Buffer,
+  ) => {
+    const written = Math.max(0, socket.write(bytes))
+    socket.data.unsent =
+      written < bytes.byteLength ? bytes.subarray(written) : undefined
+    if (!socket.data.unsent && socket.data.endAfterWrite) socket.end()
+  }
+  const listener = Bun.listen<ProviderSocket>({
+    hostname: '127.0.0.1',
+    port: 0,
+    socket: {
+      open(socket) {
+        connections.opened += 1
+        socket.data = { buffered: Buffer.alloc(0), endAfterWrite: false }
+        closes.push(
+          new Promise<void>((resolve) => closers.set(socket, resolve)),
+        )
+      },
+      close(socket) {
+        connections.closed += 1
+        closers.get(socket)?.()
+      },
+      // A large reply is written as the socket drains.
+      drain(socket) {
+        if (socket.data.unsent) write(socket, socket.data.unsent)
+      },
+      data(socket, chunk) {
+        const buffered = Buffer.concat([socket.data.buffered, chunk])
+        socket.data.buffered = buffered
+        const headEnd = buffered.indexOf('\r\n\r\n')
+        if (headEnd < 0) return
+        const head = buffered.subarray(0, headEnd).toString('latin1')
+        const length = Number(
+          /^content-length:\s*(\d+)\s*$/im.exec(head)?.[1] ?? 0,
+        )
+        if (buffered.byteLength < headEnd + 4 + length) return
+        socket.data.buffered = Buffer.alloc(0)
+        const credential =
+          /^authorization:\s*Bearer (\S+)\s*$/im.exec(head)?.[1] ?? ''
+        credentials.push(credential)
+        requested()
+        const answer = reply(credential, credentials.length - 1)
+        if (answer === HOLD) return
+        const lines = [
+          `HTTP/1.1 ${answer.status} ${answer.reason}`,
+          ...Object.entries(answer.headers).map(
+            ([name, value]) => `${name}: ${value}`,
+          ),
+        ]
+        if (answer.body !== undefined)
+          lines.push(`content-length: ${Buffer.byteLength(answer.body)}`)
+        lines.push('connection: close')
+        const body = Buffer.from(answer.body ?? '')
+        const sent =
+          answer.heldAfter === undefined
+            ? body
+            : body.subarray(0, answer.heldAfter)
+        socket.data.endAfterWrite = answer.heldAfter === undefined
+        write(
+          socket,
+          Buffer.concat([Buffer.from(`${lines.join('\r\n')}\r\n\r\n`), sent]),
+        )
+      },
+    },
+  })
+  let stopping: Promise<void> | undefined
+  const close = () => {
+    stopping ??= (async () => {
+      listener.stop(true)
+      const results = await Promise.allSettled(closes)
+      const failures = results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      )
+      if (failures.length)
+        throw new AggregateError(failures, 'Loopback provider shutdown failed')
+    })()
+    return stopping
+  }
+  const shutdown = life.gate()
+  life.trackDetached(shutdown.wait.then(close))
+  return {
+    url: `http://127.0.0.1:${listener.port}/v1/messages`,
+    credentials,
+    connections,
+    firstRequest,
+    close,
+  }
+}
+
+type ForwardedStart = {
+  status: number
+  statusText: string
+  headers: Record<string, string>
+}
+
+/**
+ * How the loopback relay answers one physical attempt after forwarding it
+ * to the provider: like the bundled Worker (`response_start`, the body,
+ * then `done`, the body cut into `pieceBytes` frames when given); sending
+ * the body before `response_start` and then dying; or replacing the
+ * forwarded `response_start` fields with ones no Response can carry, and
+ * sending nothing after it.
+ */
+type RelayPlan =
+  | { kind: 'conforming'; pieceBytes?: number }
+  | { kind: 'bytes-before-start'; cut: number }
+  | { kind: 'malformed'; start: (forwarded: ForwardedStart) => object }
+
+function piecesOf(bytes: Uint8Array, pieceBytes: number | undefined) {
+  if (bytes.byteLength === 0) return []
+  if (!pieceBytes) return splitAt(bytes, [Math.floor(bytes.byteLength / 2)])
+  const offsets: number[] = []
+  for (let at = pieceBytes; at < bytes.byteLength; at += pieceBytes)
+    offsets.push(at)
+  return splitAt(bytes, offsets)
+}
+
+/**
+ * Loopback relay (WebSocket, and HTTP when `http` is set) that really
+ * forwards every payload over HTTP to the provider, each forward under one
+ * AbortController. `starts` records the status line and headers the
+ * provider actually sent, before any plan alters them; `delivered` records,
+ * per conforming WebSocket attempt, the body frames and bytes it sent.
+ *
+ * `close` is the shutdown that test teardown also runs: abort every
+ * forward, stop the relay and the provider, then join each forward, the
+ * relay and the provider on its own. `outcomes` then says how each forward
+ * ended; a forward ended by the abort is expected, any other failure is
+ * reported.
+ */
+function startForwardingRelay(
+  provider: ReturnType<typeof startProvider>,
+  plan: (index: number) => RelayPlan,
+  http = false,
+  life: FixtureLifetime = suiteLifetime,
+) {
+  const starts: ForwardedStart[] = []
+  const delivered: Array<{ frames: number; bytes: number }> = []
+  const forwards: Promise<void>[] = []
+  const outcomes: string[] = []
+  const abort = new AbortController()
+  const forward = async (payload: SentPayload) => {
+    if (payload.upstream.url !== provider.url)
+      throw new Error('Relay asked to reach a non-loopback URL')
+    const upstream = await fetch(payload.upstream.url, {
+      method: payload.upstream.method ?? 'POST',
+      headers: payload.upstream.headers,
+      body: payload.body,
+      signal: abort.signal,
+    })
+    const forwarded: ForwardedStart = {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: Object.fromEntries(upstream.headers.entries()),
+    }
+    starts.push(forwarded)
+    return { upstream, forwarded }
+  }
+  const track = (work: Promise<void>) => {
+    forwards.push(
+      work.then(
+        () => {
+          outcomes.push('completed')
+        },
+        (error: unknown) => {
+          if (!abort.signal.aborted) throw error
+          outcomes.push('aborted')
+        },
+      ),
+    )
+  }
+  const relay = startRelay(
+    {
+      ws: (socket, payload, index) => {
+        const step = plan(index)
+        track(
+          (async () => {
+            const { upstream, forwarded } = await forward(payload)
+            const bytes = new Uint8Array(await upstream.arrayBuffer())
+            if (step.kind === 'bytes-before-start') {
+              sendChunks(socket, payload.id, splitAt(bytes, [step.cut]))
+              socket.close(1011, 'interrupted before response_start')
+              return
+            }
+            const start = {
+              type: 'response_start',
+              id: payload.id,
+              ...forwarded,
+            }
+            if (step.kind === 'malformed') {
+              socket.send(
+                JSON.stringify({ ...start, ...step.start(forwarded) }),
+              )
+              return
+            }
+            socket.send(JSON.stringify(start))
+            const pieces = piecesOf(bytes, step.pieceBytes)
+            sendChunks(socket, payload.id, pieces)
+            socket.send(JSON.stringify({ type: 'done', id: payload.id }))
+            delivered.push({ frames: pieces.length, bytes: bytes.byteLength })
+          })(),
+        )
+      },
+      http: http
+        ? (payload) => {
+            // The upstream body is piped through under the same abort, so the
+            // forward ends only when its body does; that pipe is what
+            // `track` joins.
+            const handled = forward(payload).then(({ upstream }) => {
+              const pass = new TransformStream<Uint8Array, Uint8Array>()
+              const piped = upstream.body
+                ? upstream.body.pipeTo(pass.writable, { signal: abort.signal })
+                : pass.writable.close()
+              return {
+                piped,
+                response: new Response(upstream.body ? pass.readable : null, {
+                  status: upstream.status,
+                  statusText: upstream.statusText,
+                  headers: upstream.headers,
+                }),
+              }
+            })
+            track(handled.then(({ piped }) => piped))
+            // An aborted forward answers the relay's caller with a plain 502;
+            // the forward's own outcome is joined through `track`.
+            return handled.then(
+              ({ response }) => response,
+              () => new Response('forward aborted', { status: 502 }),
+            )
+          }
+        : undefined,
+    },
+    life,
+  )
+  let closing: Promise<void> | undefined
+  const close = () => {
+    closing ??= (async () => {
+      abort.abort()
+      const results = await Promise.allSettled([
+        ...forwards,
+        relay.close(),
+        provider.close(),
+      ])
+      const failures = results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      )
+      if (failures.length)
+        throw new AggregateError(failures, 'Loopback forwarding relay failed')
+    })()
+    return closing
+  }
+  const shutdown = life.gate()
+  life.trackDetached(shutdown.wait.then(close))
+  return { ...relay, starts, delivered, outcomes, close }
+}
+
+type Settled<T> =
+  | { state: 'fulfilled'; value: T }
+  | { state: 'rejected'; message: string }
+
+/** `work` settled only after test teardown cancelled it through `close`. */
+type CancelledThenSettled<T> = { state: 'cancelled'; after: Settled<T> }
+
+/**
+ * Wait for `work`, an owned request or body read. When test teardown opens
+ * the gate first, cancel before joining: `close` shuts the owned relay and
+ * provider (aborting their forwards), so `work` can only settle from what
+ * really happened on the network. Then `work` itself is joined, with no
+ * bound: teardown never moves on while the request is still running.
+ */
+async function settleOrCancel<T>(
+  work: Promise<T>,
+  close: () => Promise<void>,
+  life: FixtureLifetime = suiteLifetime,
+): Promise<Settled<T> | CancelledThenSettled<T>> {
+  const cancellation = life.gate()
+  const outcome: Promise<Settled<T>> = work.then(
+    (value) => ({ state: 'fulfilled' as const, value }),
+    (error: unknown) => ({
+      state: 'rejected' as const,
+      message: error instanceof Error ? error.message : String(error),
+    }),
+  )
+  try {
+    const first = await Promise.race([
+      outcome,
+      cancellation.wait.then(() => undefined),
+    ])
+    if (first) return first
+    let closeFailure: unknown
+    let closeFailed = false
+    try {
+      await close()
+    } catch (error) {
+      closeFailed = true
+      closeFailure = error
+    }
+    // The request is joined even when the shutdown itself failed.
+    const after = await outcome
+    if (closeFailed) throw closeFailure
+    return { state: 'cancelled', after }
+  } finally {
+    cancellation.open()
+  }
+}
+
+/**
+ * Read a body to its end or failure, keeping every byte that arrived. When
+ * test teardown opens the gate while a read is pending, the reader is
+ * cancelled, which settles that read; the drain is then joined normally.
+ */
+async function drainBody(
+  response: Response,
+  life: FixtureLifetime = suiteLifetime,
+  onChunk?: (chunk: Uint8Array) => void,
+) {
+  const body = response.body
+  if (!body) return { text: '', failure: undefined }
+  const reader = body.getReader()
+  const chunks: Uint8Array[] = []
+  let finished = false
+  const cancellation = life.gate()
+  const cancelled = cancellation.wait.then(() =>
+    finished ? undefined : reader.cancel().catch(() => {}),
+  )
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      onChunk?.(value)
+    }
+    return { text: Buffer.concat(chunks).toString('utf8'), failure: undefined }
+  } catch (error) {
+    return {
+      text: Buffer.concat(chunks).toString('utf8'),
+      failure: error instanceof Error ? error.message : String(error),
+    }
+  } finally {
+    finished = true
+    cancellation.open()
+    await cancelled
+    reader.releaseLock()
+  }
+}
+
+const deltaFrame = (text: string) =>
+  sseFrame('content_block_delta', {
+    type: 'content_block_delta',
+    index: 0,
+    delta: { type: 'text_delta', text },
+  })
+
+test('an optimistic attempt whose upstream bytes arrive before response_start is never replayed', async () => {
+  const provider = startProvider((_credential, index) => ({
+    status: 200,
+    reason: 'OK',
+    headers: { 'content-type': 'text/event-stream', 'request-id': 'req_bytes' },
+    body: successPrefix + deltaFrame(`physical attempt ${index}`),
+  }))
+  // The first attempt's body arrives as one binary frame and one base64
+  // chunk, both before any response_start, and then the relay dies.
+  const relay = startForwardingRelay(provider, (index) =>
+    index === 0
+      ? { kind: 'bytes-before-start', cut: successPrefix.length }
+      : { kind: 'conforming' },
+  )
+  const auth = authorizer([OAT_V1, OAT_V2], true)
+  const response = await send({
+    relay,
+    input: provider.url,
+    transport: 'websocket',
+    optimistic: true,
+    body: streamingBody('first'),
+    authorize: auth.authorize,
+  })
+  expectOptimistic(response)
+  const outcome = await settleOrCancel(drainBody(response), relay.close)
+  expect({
+    outcome,
+    providerRequests: provider.credentials,
+    physicalAttempts: relay.sent.length,
+    authorizations: auth.calls(),
+  }).toEqual({
+    outcome: {
+      state: 'fulfilled',
+      value: {
+        text: successPrefix + deltaFrame('physical attempt 0'),
+        failure: 'relay websocket closed during response stream',
+      },
+    },
+    providerRequests: [OAT_V1],
+    physicalAttempts: 1,
+    authorizations: 1,
+  })
+})
+
+const QUOTA_RESET = '1767225600'
+
+function providerErrorReply(credential: string): ProviderReply {
+  return {
+    status: 401,
+    reason: `rejected ${credential}`,
+    headers: {
+      'content-type': 'application/json',
+      'request-id': 'req_provider_401',
+      'x-provider-detail': `rejected ${credential}`,
+      [credential]: 'echoed as a header name',
+      'anthropic-ratelimit-unified-status': 'rejected',
+      'anthropic-ratelimit-unified-reset': QUOTA_RESET,
+    },
+    body: JSON.stringify(echoFor(credential)),
+  }
+}
+
+/** The headers onResponseHeaders may see of a `providerErrorReply` response. */
+const safeProviderErrorHeaders = {
+  'content-type': 'application/json',
+  'request-id': 'req_provider_401',
+  'x-provider-detail': `rejected ${PROVIDER_ERROR_REDACTION}`,
+  'anthropic-ratelimit-unified-status': 'rejected',
+  'anthropic-ratelimit-unified-reset': QUOTA_RESET,
+}
+
+const websocketHeaderCases = [
+  { name: 'non-optimistic non-streaming', optimistic: false, streaming: false },
+  { name: 'non-optimistic streaming', optimistic: false, streaming: true },
+  { name: 'optimistic streaming', optimistic: true, streaming: true },
+] as const
+
+for (const { name, optimistic, streaming } of websocketHeaderCases) {
+  test(`WebSocket onResponseHeaders sees a real provider error's headers scrubbed by the attempt that sent the credential (${name})`, async () => {
+    const provider = startProvider((credential) =>
+      providerErrorReply(credential),
+    )
+    const relay = startForwardingRelay(provider, () => ({ kind: 'conforming' }))
+    const auth = authorizer([OAT_V1], true)
+    const harvested: Array<Record<string, string>> = []
+    const response = await send({
+      relay,
+      input: provider.url,
+      transport: 'websocket',
+      optimistic,
+      body: streaming ? streamingBody('first') : requestBody('first'),
+      authorize: auth.authorize,
+      onResponseHeaders: (headers) =>
+        harvested.push(Object.fromEntries(headers.entries())),
+    })
+    const outcome = await settleOrCancel(drainBody(response), relay.close)
+    // Precondition: the provider really echoed the credential it received in
+    // a header value, a header name and the status line.
+    expect(relay.starts).toHaveLength(1)
+    expect(relay.starts[0]?.statusText).toBe(`rejected ${OAT_V1}`)
+    expect(relay.starts[0]?.headers[OAT_V1]).toBe('echoed as a header name')
+    expect(relay.starts[0]?.headers['x-provider-detail']).toBe(
+      `rejected ${OAT_V1}`,
+    )
+    expect(outcome.state).toBe('fulfilled')
+    expect(harvested).toEqual([
+      { connection: 'close', ...safeProviderErrorHeaders },
+    ])
+    expect(JSON.stringify(harvested)).not.toContain(OAT_V1)
+    expect(provider.credentials).toEqual([OAT_V1])
+    expect(auth.observed).toEqual([[1, 401]])
+    if (optimistic) {
+      expectOptimistic(response)
+      return
+    }
+    // The host's response carries the same scrubbed status line and headers.
+    expect(response.status).toBe(401)
+    expect(response.statusText).toBe(`rejected ${PROVIDER_ERROR_REDACTION}`)
+    expect([Object.fromEntries(response.headers.entries())]).toEqual(harvested)
+  })
+
+  test(`WebSocket onResponseHeaders sees a real provider success's request-id and quota headers exactly (${name})`, async () => {
+    const provider = startProvider(() => ({
+      status: 200,
+      reason: 'OK',
+      headers: {
+        'content-type': streaming ? 'text/event-stream' : 'application/json',
+        'request-id': 'req_provider_200',
+        'anthropic-ratelimit-unified-status': 'allowed',
+        'anthropic-ratelimit-unified-reset': QUOTA_RESET,
+        'anthropic-ratelimit-unified-5h-utilization': '0.25',
+      },
+      body: streaming ? successPrefix : '{"id":"msg_ok"}',
+    }))
+    const relay = startForwardingRelay(provider, () => ({ kind: 'conforming' }))
+    const auth = authorizer([OAT_V1], true)
+    const harvested: Array<Record<string, string>> = []
+    const response = await send({
+      relay,
+      input: provider.url,
+      transport: 'websocket',
+      optimistic,
+      body: streaming ? streamingBody('first') : requestBody('first'),
+      authorize: auth.authorize,
+      onResponseHeaders: (headers) =>
+        harvested.push(Object.fromEntries(headers.entries())),
+    })
+    const outcome = await settleOrCancel(drainBody(response), relay.close)
+    expect(outcome).toEqual({
+      state: 'fulfilled',
+      value: {
+        text: streaming ? successPrefix : '{"id":"msg_ok"}',
+        failure: undefined,
+      },
+    })
+    expect(relay.starts).toHaveLength(1)
+    expect(harvested).toEqual(relay.starts.map((start) => start.headers))
+    expect(harvested[0]?.['request-id']).toBe('req_provider_200')
+    expect(harvested[0]?.['anthropic-ratelimit-unified-reset']).toBe(
+      QUOTA_RESET,
+    )
+    expect(auth.observed).toEqual([[1, 200]])
+  })
+}
+
+test('HTTP onResponseHeaders sees a real provider error scrubbed the same way', async () => {
+  const provider = startProvider((credential) => providerErrorReply(credential))
+  const relay = startForwardingRelay(
+    provider,
+    () => ({ kind: 'conforming' }),
+    true,
+  )
+  const auth = authorizer([OAT_V1], true)
+  const harvested: Array<Record<string, string>> = []
+  const response = await send({
+    relay,
+    input: provider.url,
+    transport: 'http',
+    authorize: auth.authorize,
+    onResponseHeaders: (headers) =>
+      harvested.push(Object.fromEntries(headers.entries())),
+  })
+  expect(response.status).toBe(401)
+  expect(await response.text()).toBe(JSON.stringify(scrubbedEcho))
+  expect(harvested).toHaveLength(1)
+  expect(harvested[0]).toMatchObject(safeProviderErrorHeaders)
+  expect(JSON.stringify(harvested)).not.toContain(OAT_V1)
+  expect(provider.credentials).toEqual([OAT_V1])
+})
+
+const MALFORMED_START = 'relay websocket response_start metadata is invalid'
+
+for (const [status, expectedText] of [
+  [200, '{"id":"msg_ok"}'],
+  [204, ''],
+  [205, ''],
+  [304, ''],
+  [400, JSON.stringify(scrubbedEcho)],
+] as const) {
+  for (const streaming of [false, true]) {
+    test(`a real provider ${status} settles the non-optimistic WebSocket response and retires its attempt (streaming=${streaming})`, async () => {
+      const bodiless = status === 204 || status === 205 || status === 304
+      const provider = startProvider((credential) => ({
+        status,
+        reason: status === 400 ? 'Bad Request' : 'Provider',
+        headers: {
+          'request-id': `req_provider_${status}`,
+          ...(bodiless ? {} : { 'content-type': 'application/json' }),
+        },
+        ...(bodiless
+          ? {}
+          : {
+              body:
+                status === 400
+                  ? JSON.stringify(echoFor(credential))
+                  : '{"id":"msg_ok"}',
+            }),
+      }))
+      const relay = startForwardingRelay(provider, () => ({
+        kind: 'conforming',
+      }))
+      const refs: WeakRef<object>[] = []
+      const auth = authorizer([OAT_V1], true, refs)
+      const settled = await settleOrCancel(
+        send({
+          relay,
+          input: provider.url,
+          transport: 'websocket',
+          body: streaming ? streamingBody('first') : requestBody('first'),
+          authorize: auth.authorize,
+        }),
+        relay.close,
+      )
+      if (settled.state !== 'fulfilled')
+        throw new Error(`Relay response did not settle: ${settled.state}`)
+      const response = settled.value
+      expect(response.status).toBe(status)
+      expect(response.headers.get('request-id')).toBe(`req_provider_${status}`)
+      if (bodiless) expect(response.body).toBeNull()
+      expect(await settleOrCancel(drainBody(response), relay.close)).toEqual({
+        state: 'fulfilled',
+        value: { text: expectedText, failure: undefined },
+      })
+      expect(provider.credentials).toEqual([OAT_V1])
+      expect(relay.sent).toHaveLength(1)
+      expect(auth.observed).toEqual([[1, status]])
+      expect(refs).toHaveLength(1)
+      expect(await collected(refs)).toBe(true)
+    })
+  }
+}
+
+for (const [kind, start] of [
+  ['status 600', () => ({ status: 600 })],
+  ['status 99', () => ({ status: 99 })],
+  [
+    'a header value with a line break',
+    (forwarded: ForwardedStart) => ({
+      headers: {
+        ...forwarded.headers,
+        'x-provider-detail': `rejected\n${OAT_V1}`,
+      },
+    }),
+  ],
+] as const) {
+  for (const { name, optimistic, streaming } of websocketHeaderCases) {
+    test(`a response_start with ${kind} fails the WebSocket request closed without another attempt (${name})`, async () => {
+      const provider = startProvider(() => ({
+        status: 200,
+        reason: 'OK',
+        headers: {
+          'content-type': 'application/json',
+          'request-id': 'req_malformed',
+        },
+        body: '{"id":"msg_ok"}',
+      }))
+      const relay = startForwardingRelay(provider, () => ({
+        kind: 'malformed',
+        start,
+      }))
+      const refs: WeakRef<object>[] = []
+      const auth = authorizer([OAT_V1, OAT_V2], true, refs)
+      const harvested: Array<Record<string, string>> = []
+      const settled = await settleOrCancel(
+        send({
+          relay,
+          input: provider.url,
+          transport: 'websocket',
+          optimistic,
+          body: streaming ? streamingBody('first') : requestBody('first'),
+          authorize: auth.authorize,
+          onResponseHeaders: (headers) =>
+            harvested.push(Object.fromEntries(headers.entries())),
+        }),
+        relay.close,
+      )
+      let failure: string | undefined
+      if (optimistic) {
+        if (settled.state !== 'fulfilled')
+          throw new Error(`Optimistic response missing: ${settled.state}`)
+        expectOptimistic(settled.value)
+        const drained = await settleOrCancel(
+          drainBody(settled.value),
+          relay.close,
+        )
+        if (drained.state !== 'fulfilled')
+          throw new Error(`Optimistic body did not settle: ${drained.state}`)
+        expect(drained.value.text).toBe('')
+        failure = drained.value.failure
+      } else {
+        if (settled.state !== 'rejected')
+          throw new Error(`Relay request did not fail: ${settled.state}`)
+        failure = settled.message
+      }
+      expect({
+        failure,
+        harvested,
+        providerRequests: provider.credentials,
+        physicalAttempts: relay.sent.length,
+        authorizations: auth.calls(),
+      }).toEqual({
+        failure: MALFORMED_START,
+        harvested: [],
+        providerRequests: [OAT_V1],
+        physicalAttempts: 1,
+        authorizations: 1,
+      })
+      expect(await collected(refs)).toBe(true)
+    })
+  }
+}
+
+const MIB = 1024 * 1024
+
+/** Fixed JSON that replaces a provider error body above Core's size limit. */
+const OVERSIZED_ERROR_BODY = JSON.stringify({
+  type: 'error',
+  error: { message: PROVIDER_ERROR_OVERSIZED_MESSAGE },
+})
+
+/** Memory held outside the JS heap (ArrayBuffers among it), after a full GC. */
+function retainedExternalBytes() {
+  Bun.gc(true)
+  return heapStats().extraMemorySize
+}
+
+function bigErrorReply(credential: string, mib: number): ProviderReply {
+  return {
+    status: 401,
+    reason: 'Unauthorized',
+    headers: {
+      'content-type': 'application/json',
+      'request-id': 'req_big_401',
+      'anthropic-ratelimit-unified-status': 'rejected',
+      'anthropic-ratelimit-unified-reset': QUOTA_RESET,
+    },
+    body: JSON.stringify(
+      anthropicError(
+        'authentication_error',
+        `rejected ${credential} ${'e'.repeat(mib * MIB)}`,
+      ),
+    ),
+  }
+}
+
+for (const streaming of [false, true]) {
+  test(`an unread real 12 MiB WebSocket 401 holds no more than the 1 MiB bound and ends with one fixed oversized body (streaming=${streaming})`, async () => {
+    const provider = startProvider((credential, index) =>
+      index === 0
+        ? bigErrorReply(credential, 12)
+        : {
+            status: 200,
+            reason: 'OK',
+            headers: {
+              'content-type': 'application/json',
+              'request-id': 'req_after_oversized',
+            },
+            body: '{"id":"msg_after"}',
+          },
+    )
+    const relay = startForwardingRelay(provider, () => ({
+      kind: 'conforming',
+      pieceBytes: 256 * 1024,
+    }))
+    const affinity = randomUUID()
+    const auth = authorizer([OAT_V1, OAT_V2], true)
+    const harvested: Array<Record<string, string>> = []
+    const request = (suffix: string) =>
+      send({
+        relay,
+        input: provider.url,
+        transport: 'websocket',
+        affinity,
+        body: streaming ? streamingBody(suffix) : requestBody(suffix),
+        authorize: auth.authorize,
+        onResponseHeaders: (headers) =>
+          harvested.push(Object.fromEntries(headers.entries())),
+      })
+    const before = retainedExternalBytes()
+    const first = await settleOrCancel(request('first'), relay.close)
+    if (first.state !== 'fulfilled')
+      throw new Error(`Oversized response missing: ${first.state}`)
+    const response = first.value
+    // The next request on the same affinity starts only once the first one
+    // has ended, so its completion shows the first request stopped while its
+    // body is still unread.
+    const next = await settleOrCancel(request('second'), relay.close)
+    if (next.state !== 'fulfilled')
+      throw new Error(`Follow-up response missing: ${next.state}`)
+    expect(await next.value.text()).toBe('{"id":"msg_after"}')
+    // Every forward has finished and the relay and provider are shut down,
+    // so their send buffers are gone; only the host's unread response can
+    // still hold error bytes.
+    await relay.close()
+    expect(relay.outcomes).toEqual(['completed', 'completed'])
+    expect(relay.delivered[0]?.bytes).toBeGreaterThan(12 * MIB)
+    const held = retainedExternalBytes() - before
+    expect(held).toBeLessThan(MIB + MIB / 2)
+    expect(response.status).toBe(401)
+    expect(response.headers.get('request-id')).toBe('req_big_401')
+    expect(response.headers.get('anthropic-ratelimit-unified-reset')).toBe(
+      QUOTA_RESET,
+    )
+    expect(await settleOrCancel(drainBody(response), relay.close)).toEqual({
+      state: 'fulfilled',
+      value: { text: OVERSIZED_ERROR_BODY, failure: undefined },
+    })
+    expect(harvested.map((headers) => headers['request-id'])).toEqual([
+      'req_big_401',
+      'req_after_oversized',
+    ])
+    expect(harvested[0]?.['anthropic-ratelimit-unified-status']).toBe(
+      'rejected',
+    )
+    expect(provider.credentials).toEqual([OAT_V1, OAT_V2])
+    expect(relay.sent).toHaveLength(2)
+    expect(auth.observed).toEqual([
+      [1, 401],
+      [2, 200],
+    ])
+  })
+
+  test(`a real 0.5 MiB WebSocket 401 under the bound is still scrubbed whole (streaming=${streaming})`, async () => {
+    const provider = startProvider((credential) =>
+      bigErrorReply(credential, 0.5),
+    )
+    const relay = startForwardingRelay(provider, () => ({
+      kind: 'conforming',
+      pieceBytes: 64 * 1024,
+    }))
+    const auth = authorizer([OAT_V1], true)
+    const response = await send({
+      relay,
+      input: provider.url,
+      transport: 'websocket',
+      body: streaming ? streamingBody('first') : requestBody('first'),
+      authorize: auth.authorize,
+    })
+    expect(response.status).toBe(401)
+    expect(await settleOrCancel(drainBody(response), relay.close)).toEqual({
+      state: 'fulfilled',
+      value: {
+        text: JSON.stringify(
+          anthropicError(
+            'authentication_error',
+            `rejected ${PROVIDER_ERROR_REDACTION} ${'e'.repeat(MIB / 2)}`,
+          ),
+        ),
+        failure: undefined,
+      },
+    })
+    expect(provider.credentials).toEqual([OAT_V1])
+  })
+
+  test(`a real 3 MiB WebSocket JSON success passes through byte-identical (streaming=${streaming})`, async () => {
+    const body = JSON.stringify({
+      id: 'msg_large_success',
+      content: [
+        { type: 'text', text: `about ${OAT_V1} ${'s'.repeat(3 * MIB)}` },
+      ],
+    })
+    const provider = startProvider(() => ({
+      status: 200,
+      reason: 'OK',
+      headers: {
+        'content-type': 'application/json',
+        'request-id': 'req_large_success',
+      },
+      body,
+    }))
+    const relay = startForwardingRelay(provider, () => ({
+      kind: 'conforming',
+      pieceBytes: 256 * 1024,
+    }))
+    const auth = authorizer([OAT_V1], true)
+    const response = await send({
+      relay,
+      input: provider.url,
+      transport: 'websocket',
+      body: streaming ? streamingBody('first') : requestBody('first'),
+      authorize: auth.authorize,
+    })
+    expect(response.status).toBe(200)
+    expect(await settleOrCancel(drainBody(response), relay.close)).toEqual({
+      state: 'fulfilled',
+      value: { text: body, failure: undefined },
+    })
+    expect(auth.observed).toEqual([[1, 200]])
+  })
+}
+
+/** A private TestLifetime: finish it explicitly or through outer-test cancellation. */
+function privateLifetime(outer: FixtureLifetime = suiteLifetime) {
+  const lifetime = new TestLifetime()
+  let finishing: Promise<void> | undefined
+  const finish = () => {
+    finishing ??= lifetime.finish()
+    return finishing
+  }
+  const closing = outer.gate()
+  outer.trackDetached(closing.wait.then(finish))
+  const life: FixtureLifetime = {
+    gate: () => lifetime.gate(),
+    trackDetached: (work) => lifetime.trackDetached(work),
+  }
+  return { lifetime, life, finish }
+}
+
+test('outer cancellation finishes a private control before its body is joined', async () => {
+  const outer = new TestLifetime()
+  let outerFinish: Promise<void> | undefined
+  const finishOuter = () => {
+    outerFinish ??= outer.finish()
+    return outerFinish
+  }
+  let gates = 0
+  let tracked = 0
+  const { lifetime, life, finish } = privateLifetime({
+    gate() {
+      gates += 1
+      return outer.gate()
+    },
+    trackDetached(work) {
+      tracked += 1
+      outer.trackDetached(work)
+    },
+  })
+  // This gate makes enclosing-test teardown finish the private and outer
+  // lifetimes, even if an assertion fails.
+  const closing = gate()
+  trackDetached(
+    closing.wait.then(async () => {
+      const results = await Promise.allSettled([finish(), finishOuter()])
+      const failures = results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      )
+      if (failures.length)
+        throw new AggregateError(failures, 'Control teardown failed')
+    }),
+  )
+  let body: Promise<void> | undefined
+  let parentBody: Promise<void> | undefined
+  const log: string[] = []
+  try {
+    // Register the outer gate and detached finish before any private await,
+    // so outer cancellation can release a stalled private body.
+    expect(gates).toBe(1)
+    expect(tracked).toBe(1)
+    const held = life.gate()
+    lifetime.deferCleanup(() => {
+      log.push('cleanup')
+    })
+    body = lifetime.runBody(async () => {
+      await held.wait
+      log.push('body settled')
+    })
+    parentBody = outer.runBody(async () => {
+      await body
+    })
+    expect(log).toEqual([])
+    await finishOuter()
+    expect(log).toEqual(['body settled', 'cleanup'])
+  } finally {
+    await Promise.allSettled([finish(), finishOuter(), body, parentBody])
+  }
+})
+
+/** Return the work's final outcome, including settlement after cancellation. */
+function joinedResult<T>(
+  outcome: Settled<T> | CancelledThenSettled<T> | undefined,
+) {
+  return outcome?.state === 'cancelled' ? outcome.after : outcome
+}
+
+test('private TestLifetime.finish ends a WebSocket request whose provider never answers, and joins it', async () => {
+  const { lifetime, life, finish } = privateLifetime()
+  const provider = startProvider(() => HOLD, life)
+  const relay = startForwardingRelay(
+    provider,
+    () => ({ kind: 'conforming' }),
+    false,
+    life,
+  )
+  const auth = authorizer([OAT_V1, OAT_V2], true)
+  let request: Settled<Response> | CancelledThenSettled<Response> | undefined
+  const body = lifetime.runBody(async () => {
+    request = await settleOrCancel(
+      send({
+        relay,
+        input: provider.url,
+        transport: 'websocket',
+        body: requestBody('held request'),
+        authorize: auth.authorize,
+      }),
+      relay.close,
+      life,
+    )
+  })
+  // The provider really holds the forwarded request before teardown starts.
+  await provider.firstRequest
+  await finish()
+  await body
+  // Teardown closed the relay under the waiting request. Its WebSocket
+  // retry could not reconnect, its HTTP relay fallback (the second
+  // authorization) could not connect either, and only then did the request
+  // itself reject; the body joined that rejection before finish returned.
+  expect(request?.state).toBe('cancelled')
+  const after = request?.state === 'cancelled' ? request.after : undefined
+  expect(after?.state).toBe('rejected')
+  expect(JSON.stringify(after)).not.toContain(OAT_V1)
+  expect(JSON.stringify(after)).not.toContain(OAT_V2)
+  expect({
+    forwards: relay.outcomes,
+    providerConnections: provider.connections,
+    providerRequests: provider.credentials,
+    physicalAttempts: relay.sent.length,
+    authorizations: auth.calls(),
+  }).toEqual({
+    forwards: ['aborted'],
+    providerConnections: { opened: 1, closed: 1 },
+    providerRequests: [OAT_V1],
+    physicalAttempts: 1,
+    authorizations: 2,
+  })
+})
+
+test('private TestLifetime.finish cancels an optimistic body whose provider never answers, and joins request and read', async () => {
+  const { lifetime, life, finish } = privateLifetime()
+  const provider = startProvider(() => HOLD, life)
+  const relay = startForwardingRelay(
+    provider,
+    () => ({ kind: 'conforming' }),
+    false,
+    life,
+  )
+  const auth = authorizer([OAT_V1, OAT_V2], true)
+  let request: Settled<Response> | CancelledThenSettled<Response> | undefined
+  let drained:
+    | Settled<Awaited<ReturnType<typeof drainBody>>>
+    | CancelledThenSettled<Awaited<ReturnType<typeof drainBody>>>
+    | undefined
+  const body = lifetime.runBody(async () => {
+    request = await settleOrCancel(
+      send({
+        relay,
+        input: provider.url,
+        transport: 'websocket',
+        optimistic: true,
+        body: streamingBody('held provider'),
+        authorize: auth.authorize,
+      }),
+      relay.close,
+      life,
+    )
+    if (request.state !== 'fulfilled') return
+    drained = await settleOrCancel(
+      drainBody(request.value, life),
+      relay.close,
+      life,
+    )
+  })
+  // The provider really holds the forwarded request before teardown starts.
+  await provider.firstRequest
+  await finish()
+  await body
+  expect({
+    request: request?.state,
+    drained: joinedResult(drained),
+    forwards: relay.outcomes,
+    providerConnections: provider.connections,
+    providerRequests: provider.credentials,
+    physicalAttempts: relay.sent.length,
+    authorizations: auth.calls(),
+  }).toEqual({
+    request: 'fulfilled',
+    drained: { state: 'fulfilled', value: { text: '', failure: undefined } },
+    forwards: ['aborted'],
+    providerConnections: { opened: 1, closed: 1 },
+    providerRequests: [OAT_V1],
+    physicalAttempts: 1,
+    authorizations: 1,
+  })
+})
+
+test('private TestLifetime.finish cancels an HTTP body the provider never finishes, and joins request, read and handler', async () => {
+  const { lifetime, life, finish } = privateLifetime()
+  const total = 64 * 1024
+  const sentBytes = 4096
+  const provider = startProvider(
+    () => ({
+      status: 200,
+      reason: 'OK',
+      headers: {
+        'content-type': 'application/json',
+        'request-id': 'req_held_body',
+      },
+      body: 'b'.repeat(total),
+      heldAfter: sentBytes,
+    }),
+    life,
+  )
+  const relay = startForwardingRelay(
+    provider,
+    () => ({ kind: 'conforming' }),
+    true,
+    life,
+  )
+  const auth = authorizer([OAT_V1], true)
+  let received = 0
+  let allPartialBytes!: () => void
+  const partialReceived = new Promise<void>((resolve) => {
+    allPartialBytes = resolve
+  })
+  let request: Settled<Response> | CancelledThenSettled<Response> | undefined
+  let drained:
+    | Settled<Awaited<ReturnType<typeof drainBody>>>
+    | CancelledThenSettled<Awaited<ReturnType<typeof drainBody>>>
+    | undefined
+  const body = lifetime.runBody(async () => {
+    request = await settleOrCancel(
+      send({
+        relay,
+        input: provider.url,
+        transport: 'http',
+        authorize: auth.authorize,
+      }),
+      relay.close,
+      life,
+    )
+    if (request.state !== 'fulfilled') return
+    drained = await settleOrCancel(
+      drainBody(request.value, life, (chunk) => {
+        received += chunk.byteLength
+        if (received === sentBytes) allPartialBytes()
+      }),
+      relay.close,
+      life,
+    )
+  })
+  // Every byte the provider sent reached the host's reader before teardown.
+  await partialReceived
+  await finish()
+  await body
+  expect({
+    request: request?.state,
+    drained: joinedResult(drained),
+    forwards: relay.outcomes,
+    providerConnections: provider.connections,
+    providerRequests: provider.credentials,
+  }).toEqual({
+    request: 'fulfilled',
+    drained: {
+      state: 'fulfilled',
+      value: { text: 'b'.repeat(sentBytes), failure: undefined },
+    },
+    forwards: ['aborted'],
+    providerConnections: { opened: 1, closed: 1 },
+    providerRequests: [OAT_V1],
+  })
+})
+
+/**
+ * Run a real Node child against this test's Bun loopback relay and provider.
+ * Register teardown's child-kill callback before awaiting the process or its
+ * pipes, so a stalled child cannot prevent cancellation. Join each separately.
+ */
+async function nodeRelayClient(options: {
+  relay: { url: string }
+  provider: { url: string }
+  streaming: boolean
+}) {
+  const node = Bun.which('node')
+  if (!node) throw new Error('Node is required for the Node relay controls')
+  const root = await mkdtemp(join(tmpdir(), 'anthropic-relay-node-'))
+  deferCleanup(() => rm(root, { recursive: true, force: true }))
+  const request = {
+    relayUrl: options.relay.url,
+    relayToken: RELAY_TOKEN,
+    providerUrl: options.provider.url,
+    token: OAT_V1,
+    affinity: randomUUID(),
+    body: options.streaming ? streamingBody('node') : requestBody('node'),
+  }
+  const script = `
+    const { sendViaRelay } = await import(${JSON.stringify(relayPath)})
+    const { setDumpEnabled } = await import(${JSON.stringify(dumpPath)})
+    setDumpEnabled(false)
+    const request = ${JSON.stringify(request)}
+    let authorizations = 0
+    let result
+    try {
+      const response = await sendViaRelay({
+        config: { enabled: true, url: request.relayUrl, token: request.relayToken, transport: 'websocket', fallbackToDirect: false },
+        input: request.providerUrl,
+        init: { method: 'POST' },
+        headers: new Headers(),
+        body: request.body,
+        affinity: request.affinity,
+        fallback: async () => { throw new Error('Unexpected direct fallback') },
+        authorizeAttempt: async () => {
+          authorizations += 1
+          return { headers: new Headers({ authorization: 'Bearer ' + request.token, 'content-type': 'application/json' }), errorSecrets: [request.token] }
+        },
+      })
+      result = { state: 'fulfilled', status: response.status, requestId: response.headers.get('request-id'), bodyNull: response.body === null, text: await response.text() }
+    } catch (error) {
+      result = { state: 'rejected', message: error instanceof Error ? error.message : String(error) }
+    }
+    console.log('NODE_RELAY_RESULT ' + JSON.stringify({ node: process.version, authorizations, ...result }))
+    process.exit(0)
+  `
+  const child = Bun.spawn(
+    [
+      node,
+      '--experimental-transform-types',
+      '--no-warnings',
+      '--input-type=module',
+      '-e',
+      script,
+    ],
+    {
+      env: {
+        ...process.env,
+        NODE_ENV: 'production',
+        TMPDIR: root,
+        OPENCODE_ANTHROPIC_AUTH_LOG_FILE: join(root, 'relay.log'),
+        OPENCODE_ANTHROPIC_AUTH_DUMP_DIR: join(root, 'dumps'),
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  )
+  let exited = false
+  const cancellation = gate()
+  trackDetached(
+    cancellation.wait.then(() => {
+      if (!exited) child.kill()
+    }),
+  )
+  const stdout = new Response(child.stdout).text()
+  const stderr = new Response(child.stderr).text()
+  try {
+    const [exit, out, err] = await Promise.allSettled([
+      child.exited,
+      stdout,
+      stderr,
+    ])
+    exited = true
+    if (
+      exit.status !== 'fulfilled' ||
+      out.status !== 'fulfilled' ||
+      err.status !== 'fulfilled'
+    )
+      throw new AggregateError(
+        [exit, out, err].flatMap((result) =>
+          result.status === 'rejected' ? [result.reason] : [],
+        ),
+        'Node relay child drainage failed',
+      )
+    const line = out.value
+      .split('\n')
+      .find((entry) => entry.startsWith('NODE_RELAY_RESULT '))
+    return {
+      exit: exit.value,
+      stderr: err.value,
+      result: line
+        ? (JSON.parse(line.slice('NODE_RELAY_RESULT '.length)) as Record<
+            string,
+            unknown
+          >)
+        : undefined,
+    }
+  } finally {
+    cancellation.open()
+  }
+}
+
+/** The child's outcome with its Node version cut to the major release. */
+function majorVersionOnly(child: Awaited<ReturnType<typeof nodeRelayClient>>) {
+  const node = child.result?.node
+  const result: Record<string, unknown> | undefined = child.result && {
+    ...child.result,
+    node: typeof node === 'string' ? node.split('.')[0] : node,
+  }
+  return { ...child, result }
+}
+
+for (const status of [204, 205, 304] as const) {
+  for (const streaming of [false, true]) {
+    test(`a real Node 24 relay client settles a real provider ${status} as an empty response (streaming=${streaming})`, async () => {
+      const provider = startProvider(() => ({
+        status,
+        reason: 'Provider',
+        headers: { 'request-id': `req_node_${status}` },
+      }))
+      const relay = startForwardingRelay(provider, () => ({
+        kind: 'conforming',
+      }))
+      const child = await nodeRelayClient({ relay, provider, streaming })
+      expect(majorVersionOnly(child)).toEqual({
+        exit: 0,
+        stderr: '',
+        result: {
+          node: 'v24',
+          authorizations: 1,
+          state: 'fulfilled',
+          status,
+          requestId: `req_node_${status}`,
+          bodyNull: true,
+          text: '',
+        },
+      })
+      expect(provider.credentials).toEqual([OAT_V1])
+      expect(relay.sent).toHaveLength(1)
+    })
+  }
+}
+
+for (const [kind, start] of [
+  ['status 600', () => ({ status: 600 })],
+  [
+    'a header value with a line break',
+    (forwarded: ForwardedStart) => ({
+      headers: {
+        ...forwarded.headers,
+        'x-provider-detail': `rejected\n${OAT_V1}`,
+      },
+    }),
+  ],
+] as const) {
+  test(`a real Node 24 relay client fails a response_start with ${kind} closed, without another attempt`, async () => {
+    const provider = startProvider(() => ({
+      status: 200,
+      reason: 'OK',
+      headers: {
+        'content-type': 'application/json',
+        'request-id': 'req_node_malformed',
+      },
+      body: '{"id":"msg_ok"}',
+    }))
+    const relay = startForwardingRelay(provider, () => ({
+      kind: 'malformed',
+      start,
+    }))
+    const child = await nodeRelayClient({ relay, provider, streaming: false })
+    expect(majorVersionOnly(child)).toEqual({
+      exit: 0,
+      stderr: '',
+      result: {
+        node: 'v24',
+        authorizations: 1,
+        state: 'rejected',
+        message: MALFORMED_START,
+      },
+    })
+    expect(provider.credentials).toEqual([OAT_V1])
+    expect(relay.sent).toHaveLength(1)
+  })
+}

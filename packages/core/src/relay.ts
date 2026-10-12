@@ -7,7 +7,9 @@ import { relayLog } from './logger.ts'
 import {
   createProviderErrorResponseScope,
   createProviderErrorStreamScope,
+  PROVIDER_ERROR_MAX_BODY_BYTES,
   type ProviderErrorResponseScope,
+  ProviderErrorSourceOversizedError,
   type ProviderErrorStreamScope,
   type ProviderResponseMode,
 } from './provider-error.ts'
@@ -207,6 +209,21 @@ function requestResponseMode(bodyText: string): ProviderResponseMode {
 }
 
 class RelayStateMismatchError extends Error {}
+
+/**
+ * The upstream already answered, but the relay forwarded a status, status
+ * text or header that no Response can carry. The upstream request has run,
+ * so neither the HTTP relay nor a direct request may send it again.
+ */
+class RelayResponseMetadataError extends Error {}
+
+const RELAY_RESPONSE_METADATA_MESSAGE =
+  'relay websocket response_start metadata is invalid'
+
+/** Statuses whose Response must have a null body (Fetch standard). */
+const NULL_BODY_STATUSES: ReadonlySet<number> = new Set([
+  101, 103, 204, 205, 304,
+])
 
 class RelayWebSocketConnectionResetError extends Error {
   readonly code = 'ECONNRESET'
@@ -709,33 +726,33 @@ type RelayTimerImplementations = {
 /**
  * Redaction for one physical WebSocket attempt, built from that attempt's
  * exact credentials. The stream scope scrubs event-stream bytes and errors.
- * A non-optimistic attempt also gets a response scope, created for the
- * request's protocol. It is used for every response except a successful one
- * to a streaming request, which the stream scope handles; so a successful
- * non-streaming body stays untouched whatever its content type, and error
- * bodies (which are not SSE frames) are scrubbed. When unused it is retired.
- * An optimistic response is always an event stream, so it gets none.
+ * The response scope, created for the request's protocol, is used for every
+ * non-optimistic response except a successful one to a streaming request,
+ * which the stream scope handles; so a successful non-streaming body stays
+ * untouched whatever its content type, and error bodies (which are not SSE
+ * frames) are scrubbed. An optimistic response is always an event stream,
+ * so there the response scope only scrubs the status line and headers of a
+ * non-2xx `response_start` before `onResponseHeaders` sees them. When
+ * unused it is retired.
  */
 type WebSocketAttemptScopes = {
   stream: ProviderErrorStreamScope
-  response?: ProviderErrorResponseScope
+  response: ProviderErrorResponseScope
 }
 
 function createWebSocketAttemptScopes(
   secrets: readonly string[],
-  responseMode: ProviderResponseMode | undefined,
+  responseMode: ProviderResponseMode,
 ): WebSocketAttemptScopes {
-  const stream = createProviderErrorStreamScope(secrets)
-  if (responseMode === undefined) return { stream }
   return {
-    stream,
+    stream: createProviderErrorStreamScope(secrets),
     response: createProviderErrorResponseScope(secrets, responseMode),
   }
 }
 
 function disposeWebSocketAttemptScopes(scopes: WebSocketAttemptScopes) {
   scopes.stream.dispose()
-  scopes.response?.dispose()
+  scopes.response.dispose()
 }
 
 type PendingWebSocketRequest = {
@@ -757,8 +774,9 @@ type PendingWebSocketRequest = {
   streamChunkCount: number
   /**
    * Raw upstream bytes received, counted before redaction. A partial frame
-   * held by the scope still counts, so the retry guard never replays an
-   * attempt that has already produced upstream bytes.
+   * held by the scope still counts, and so do bytes a relay sent before its
+   * `response_start`, so the retry guard never replays an attempt that has
+   * already produced upstream bytes.
    */
   streamByteCount: number
   retryAttempts: number
@@ -769,12 +787,17 @@ type PendingWebSocketRequest = {
   authorization?: RelayAttemptAuthorization
   /** Current physical attempt's stream scope; cleared when it is retired. */
   scope?: ProviderErrorStreamScope
-  /** Current attempt's response scope until the response shape is known. */
+  /** Current attempt's response scope until its response_start is handled. */
   responseScope?: ProviderErrorResponseScope
-  /** Request protocol for response scopes; undefined for optimistic sends. */
-  responseMode?: ProviderResponseMode
+  /** Request protocol for response scopes; always an event stream when optimistic. */
+  responseMode: ProviderResponseMode
   /** True when the body is a raw upstream body read through a response scope. */
   rawBody: boolean
+  /**
+   * For a raw non-2xx body: the response scope that wraps the host's body,
+   * and the raw bytes received for it so far.
+   */
+  errorBody?: { scope: ProviderErrorResponseScope; bytes: number }
   /** Set once the host cancelled or the request ended; no attempt may follow. */
   retired: boolean
   responseHeadersDelivered: boolean
@@ -817,10 +840,10 @@ class PersistentRelaySession {
   send(
     payload: RelayPayload,
     bodyText: string,
-    optimisticResponse = false,
-    onResponseHeaders?: (headers: Headers) => void,
-    authorizeAttempt?: AuthorizeRelayAttempt,
-    responseMode?: ProviderResponseMode,
+    optimisticResponse: boolean,
+    onResponseHeaders: ((headers: Headers) => void) | undefined,
+    authorizeAttempt: AuthorizeRelayAttempt | undefined,
+    responseMode: ProviderResponseMode,
   ): Promise<RelaySendResult> {
     this.touch()
     const enqueuedAt = perfNowMs()
@@ -856,9 +879,9 @@ class PersistentRelaySession {
     bodyText: string,
     enqueuedAt: number,
     optimisticResponse: boolean,
-    onResponseHeaders?: (headers: Headers) => void,
-    authorizeAttempt?: AuthorizeRelayAttempt,
-    responseMode?: ProviderResponseMode,
+    onResponseHeaders: ((headers: Headers) => void) | undefined,
+    authorizeAttempt: AuthorizeRelayAttempt | undefined,
+    responseMode: ProviderResponseMode,
   ) {
     const createScopes = (secrets: readonly string[]) =>
       createWebSocketAttemptScopes(secrets, responseMode)
@@ -1006,10 +1029,16 @@ class PersistentRelaySession {
           this.serverState = undefined
           this.connecting = undefined
         }
+        // A socket that was already replaced (a retry, or a request that
+        // ended early) has no say over the request now in flight.
+        if (this.socket !== undefined) return
         if (this.pending) {
           if (this.pending.retryingBeforeResponse) return
+          // Any upstream bytes forbid replay, even when the relay sent them
+          // before response_start. Report that close as an already-started response.
           const closedAfterResponseStart =
-            this.pending.responseStartedAt != null
+            this.pending.responseStartedAt != null ||
+            this.pending.streamByteCount > 0
           const reason = closedAfterResponseStart
             ? 'closed after response_start before stream bytes'
             : 'closed before response'
@@ -1041,7 +1070,7 @@ class PersistentRelaySession {
     onResponseHeaders: ((headers: Headers) => void) | undefined,
     authorizeAttempt: AuthorizeRelayAttempt | undefined,
     attempt: PhysicalAttempt<WebSocketAttemptScopes>,
-    responseMode: ProviderResponseMode | undefined,
+    responseMode: ProviderResponseMode,
   ) {
     const socket = this.socket
     if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -1112,8 +1141,11 @@ class PersistentRelaySession {
     reason: string,
     closeEvent?: Event,
   ) {
-    if (pending.responseStartedAt != null && pending.streamByteCount > 0)
-      return false
+    // Upstream bytes mean the upstream request has run. A replay would send it
+    // again, and on an optimistic stream it would append a second attempt's
+    // bytes to the first's, so bytes forbid a retry even when a relay sent
+    // them before its response_start.
+    if (pending.streamByteCount > 0) return false
     if (pending.streamDone) return false
     // A non-optimistic response has already handed the host its real status,
     // headers and a body bound to this attempt's credentials. A replay could
@@ -1217,12 +1249,9 @@ class PersistentRelaySession {
     pending.responseScope?.dispose()
     pending.authorization = attempt.authorization
     pending.scope = attempt.scope.stream
-    // An optimistic response already exists, so only the stream scope can
-    // apply to the new attempt.
-    if (pending.responseStarted) {
-      attempt.scope.response?.dispose()
-      pending.responseScope = undefined
-    } else pending.responseScope = attempt.scope.response
+    // An optimistic retry keeps its response scope too: the new attempt's
+    // response_start headers still need it.
+    pending.responseScope = attempt.scope.response
   }
 
   /**
@@ -1235,6 +1264,9 @@ class PersistentRelaySession {
     pending.scope = undefined
     pending.responseScope?.dispose()
     pending.responseScope = undefined
+    // The response handed to the host still owns its error-body redactor.
+    // Reading or cancelling that body retires it; drop only this reference.
+    pending.errorBody = undefined
     pending.authorization = undefined
   }
 
@@ -1270,6 +1302,15 @@ class PersistentRelaySession {
     // No stream yet (bytes before response_start) or the attempt is retired.
     if (!controller || !scope) return
     if (pending.rawBody) {
+      const errorBody = pending.errorBody
+      if (errorBody) {
+        // Counted before enqueue, so no more than the bound is ever queued.
+        errorBody.bytes += bytes.byteLength
+        if (errorBody.bytes > PROVIDER_ERROR_MAX_BODY_BYTES) {
+          this.endOversizedErrorBody(pending, controller, errorBody.scope)
+          return
+        }
+      }
       controller.enqueue(bytes)
       return
     }
@@ -1286,6 +1327,41 @@ class PersistentRelaySession {
       return
     }
     for (const chunk of output) controller.enqueue(chunk)
+  }
+
+  /**
+   * A non-2xx body grew past the bound its response scope accepts. Erroring
+   * the source drops every byte already queued, and the source-oversized
+   * error makes the scope's body emit only its fixed oversized message,
+   * which needs no credentials, so the scope retires now instead of when
+   * the host reads or drops the response. The status and headers the host
+   * already holds stay as they are. The request ends without a replay, and
+   * the socket closes so the relay stops sending the rest of the body.
+   */
+  private endOversizedErrorBody(
+    pending: PendingWebSocketRequest,
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    responseScope: ProviderErrorResponseScope,
+  ) {
+    controller.error(new ProviderErrorSourceOversizedError())
+    responseScope.dispose()
+    relayLog(
+      `websocket error body exceeded the redaction bound; ending request session=${shortAffinity(this.affinity)} request=${pending.payload.id} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}`,
+    )
+    this.timers.clearTimeout(pending.timeout)
+    pending.streamDone = true
+    this.retireAttempt(pending)
+    pending.authorizeAttempt = undefined
+    pending.onResponseHeaders = undefined
+    pending.resolveDone()
+    if (this.pending === pending) this.pending = undefined
+    // Detach the socket before closing it, so the next queued request opens
+    // a new connection instead of reusing one that is closing.
+    const socket = this.socket
+    this.socket = undefined
+    this.serverState = undefined
+    this.connecting = undefined
+    socket?.close()
   }
 
   private deliverResponseHeaders(pending: PendingWebSocketRequest) {
@@ -1306,6 +1382,13 @@ class PersistentRelaySession {
     this.enqueueStreamChunk(pending, toBinaryChunk(data))
   }
 
+  /**
+   * Hand the host its response: the synthetic optimistic one, or the real
+   * one from a non-optimistic response_start. The Response is built before
+   * the request is marked as started, because its constructor rejects a
+   * status, status text or header that the relay forwarded but no Response
+   * can carry; the request then fails instead of never being answered.
+   */
   private resolvePendingResponse(
     pending: PendingWebSocketRequest,
     status: number,
@@ -1313,33 +1396,49 @@ class PersistentRelaySession {
     headers?: Record<string, string>,
   ) {
     if (pending.responseStarted) return
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined
+    // A null-body status gets no stream (some runtimes refuse to build such a
+    // Response with one); bytes a relay still sends for it are dropped.
+    const stream = NULL_BODY_STATUSES.has(status)
+      ? null
+      : new ReadableStream<Uint8Array>({
+          start: (streamController) => {
+            controller = streamController
+          },
+          cancel: () => {
+            this.retireAttempt(pending)
+            this.socket?.close()
+          },
+        })
+    let response: Response
+    try {
+      response = new Response(stream, { status, statusText, headers })
+    } catch {
+      this.failInvalidResponseStart()
+      return
+    }
     pending.responseStarted = true
-    const stream = new ReadableStream<Uint8Array>({
-      start: (controller) => {
-        pending.streamController = controller
-      },
-      cancel: () => {
-        this.retireAttempt(pending)
-        this.socket?.close()
-      },
-    })
-    const response = new Response(stream, {
-      status,
-      statusText,
-      headers,
-    })
+    pending.streamController = controller
+    // Resolving the optimistic placeholder must not clear responseScope.
+    // The real response_start still needs it to scrub error headers.
+    if (pending.optimisticResponse) {
+      pending.resolve(response)
+      return
+    }
     const responseScope = pending.responseScope
     pending.responseScope = undefined
     // The request's protocol decides the pipeline, never the response's
-    // content type. An optimistic response is the caller's event stream, and
-    // a successful response to a streaming request goes through the stream
-    // scope; everything else goes through the response scope, which leaves a
-    // successful non-streaming body untouched and scrubs error responses.
-    const streamed =
-      pending.optimisticResponse ||
-      (response.ok && pending.responseMode === 'event-stream')
+    // content type. A successful response to a streaming request goes
+    // through the stream scope; everything else goes through the response
+    // scope, which leaves a successful non-streaming body untouched and
+    // scrubs error responses.
+    const streamed = response.ok && pending.responseMode === 'event-stream'
     if (streamed || !responseScope) {
       responseScope?.dispose()
+      // The scope is gone once the attempt was retired (cancelled or ended);
+      // then non-2xx headers cannot be checked, so onResponseHeaders gets none.
+      if (headers && response.ok)
+        pending.stagedResponseHeaders = new Headers(response.headers)
       pending.resolve(response)
       return
     }
@@ -1355,7 +1454,74 @@ class PersistentRelaySession {
       this.socket?.close()
       return
     }
+    // onResponseHeaders sees exactly the headers the host's response carries:
+    // untouched on success, scrubbed by this attempt's scope otherwise.
+    if (headers) pending.stagedResponseHeaders = new Headers(scrubbed.headers)
+    if (!response.ok && stream)
+      pending.errorBody = { scope: responseScope, bytes: 0 }
     pending.resolve(scrubbed)
+  }
+
+  /**
+   * An optimistic response has already gone out, so a real response_start
+   * only supplies the headers for onResponseHeaders. A success's headers are
+   * kept exactly; a non-2xx response's status line and headers go through
+   * this attempt's response scope, as a non-optimistic error response's do.
+   * Returns false when the metadata cannot form a Response and the request
+   * has been failed.
+   */
+  private stageOptimisticResponseHeaders(
+    pending: PendingWebSocketRequest,
+    message: RelayResponseStart,
+  ) {
+    const responseScope = pending.responseScope
+    pending.responseScope = undefined
+    let upstream: Response
+    try {
+      upstream = new Response(null, {
+        status: message.status,
+        statusText: message.statusText,
+        headers: message.headers,
+      })
+    } catch {
+      responseScope?.dispose()
+      this.failInvalidResponseStart()
+      return false
+    }
+    if (!message.headers) {
+      responseScope?.dispose()
+      return true
+    }
+    if (upstream.ok) {
+      responseScope?.dispose()
+      pending.stagedResponseHeaders = new Headers(upstream.headers)
+      return true
+    }
+    // The scope is gone once the attempt was retired (cancelled or ended);
+    // then non-2xx headers cannot be checked, so onResponseHeaders gets none.
+    if (!responseScope) return true
+    try {
+      pending.stagedResponseHeaders = new Headers(
+        responseScope.redactResponse(upstream).headers,
+      )
+    } catch {
+      // If redactResponse throws, the scope retires itself and the headers
+      // are withheld.
+    }
+    return true
+  }
+
+  /**
+   * End the request with a fixed error: the rejected metadata may echo
+   * credentials, and the upstream has already answered, so nothing may
+   * resend it.
+   */
+  private failInvalidResponseStart() {
+    this.failPending(
+      new RelayResponseMetadataError(RELAY_RESPONSE_METADATA_MESSAGE),
+      false,
+    )
+    this.socket?.close()
   }
 
   private handleMessage(message: RelayControlMessage) {
@@ -1396,15 +1562,17 @@ class PersistentRelaySession {
         `perf websocket response_start session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(responseStartedAt - pending.sentAt)} upstreamMs=${pending.acceptedAt == null ? 'unknown' : formatMs(responseStartedAt - pending.acceptedAt)} status=${logNumber(message.status)}`,
       )
       this.timers.clearTimeout(pending.timeout)
-      if (message.headers)
-        pending.stagedResponseHeaders = new Headers(message.headers)
-      this.resolvePendingResponse(
-        pending,
-        message.status,
-        message.statusText,
-        message.headers,
-      )
-      if (pending.optimisticResponse && message.status >= 400) {
+      if (!pending.optimisticResponse) {
+        this.resolvePendingResponse(
+          pending,
+          message.status,
+          message.statusText,
+          message.headers,
+        )
+        return
+      }
+      if (!this.stageOptimisticResponseHeaders(pending, message)) return
+      if (message.status >= 400) {
         this.deliverResponseHeaders(pending)
         this.forwardStreamBytes(
           pending,
@@ -1671,10 +1839,14 @@ export async function sendViaRelay(options: {
           optimistic,
           onResponseHeaders,
           authorizeAttempt,
-          optimistic ? undefined : requestMode(),
+          requestMode(),
         )
       } catch (error) {
-        if (error instanceof RelayAuthorizationError) throw error
+        if (
+          error instanceof RelayAuthorizationError ||
+          error instanceof RelayResponseMetadataError
+        )
+          throw error
         relayLog(
           `websocket relay failed session=${shortAffinity(affinity)}; trying http relay code=relay_transport_error`,
         )
@@ -1761,6 +1933,9 @@ export async function sendViaRelay(options: {
     return result.response
   } catch (error) {
     if (error instanceof RelayAuthorizationError) throw error.failure
+    // The upstream already answered this request; a direct fallback would
+    // send it a second time.
+    if (error instanceof RelayResponseMetadataError) throw error
     if (!config.fallbackToDirect) {
       relayLog(
         `relay failed session=${shortAffinity(affinity)} and fallbackToDirect=false code=relay_transport_error`,
