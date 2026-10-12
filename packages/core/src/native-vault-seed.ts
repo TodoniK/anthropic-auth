@@ -44,6 +44,9 @@ const preferenceFields: Record<string, readonly string[]> = {
     'minimumRemaining',
     'failClosedOnUnknownQuota',
   ],
+  // Exclude per-account floors: their keys name legacy local accounts, and the
+  // first settings write may not yet know which vault accounts have those UUIDs.
+  killswitch: ['enabled', 'main'],
   claudeFast: ['enabled'],
   prime: ['enabled'],
   logging: ['level'],
@@ -65,13 +68,17 @@ export async function readNativeVaultLegacySettings(
     for (const field of fields) {
       const item = value[field]
       if (item === undefined) continue
-      if (field === 'minimumRemaining' && record(item)) {
+      if (
+        (field === 'minimumRemaining' ||
+          (section === 'killswitch' && field === 'main')) &&
+        record(item)
+      ) {
         const thresholds: Record<string, unknown> = {}
         for (const name of ['five_hour', 'seven_day', '5h', '1w', 'scoped']) {
           if (item[name] === undefined) continue
           try {
             validateNativeMigrationSettings({
-              quota: { minimumRemaining: { [name]: item[name] } },
+              [section]: { [field]: { [name]: item[name] } },
             })
             thresholds[name] = item[name]
           } catch {

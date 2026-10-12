@@ -25,7 +25,7 @@ afterEach(() => {
   for (const runtime of runtimes) runtime.close()
   runtimes.clear()
 })
-const { test, deferCleanup } = createTestLifetimeSuite()
+const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
 function ownRuntime<T extends { close(): void }>(runtime: T): T {
   runtimes.add(runtime)
   deferCleanup(() => runtime.close())
@@ -53,6 +53,10 @@ const preferences = {
     minimumRemaining: { five_hour: 12, seven_day: 13, scoped: 14 },
     failClosedOnUnknownQuota: true,
   },
+  killswitch: {
+    enabled: true,
+    main: { five_hour: 20, seven_day: 25, scoped: 30 },
+  },
   fallbackOn: [429, 529],
   claudeFast: { enabled: true },
   prime: { enabled: false },
@@ -69,6 +73,10 @@ async function fixture(verified = true) {
   const config = {
     version: 1,
     ...preferences,
+    killswitch: {
+      ...preferences.killswitch,
+      accounts: { 'old-work': { five_hour: 33, seven_day: 34 } },
+    },
     mainAccountId: mainUuid,
     claustrum: {
       mode: 'claustrum',
@@ -249,6 +257,7 @@ test('first vault snapshot seeds validated preferences and UUID-translated pins 
   expect(settings).not.toHaveProperty('accounts')
   expect(settings).not.toHaveProperty('relay')
   expect(settings).not.toHaveProperty('refresh')
+  expect(settings.killswitch).not.toHaveProperty('accounts')
   const routing = JSON.parse(await readFile(f.vault.routing, 'utf8'))
   expect(routing.vaultLegacySeed).toBe('complete')
   expect(Object.keys(routing.assignments).sort()).toEqual(
@@ -432,6 +441,11 @@ test('invalid settings fields are dropped while valid siblings survive and no cr
         failClosedOnUnknownQuota: false,
         mainQuotaToken: 'synthetic-secret',
       },
+      killswitch: {
+        enabled: 'invalid',
+        main: { five_hour: 101, scoped: 15 },
+        accounts: { 'old-work': { seven_day: 90 } },
+      },
       logging: { level: 'invalid' },
       fallbackOn: [429, 'bad', 529],
     }),
@@ -445,6 +459,7 @@ test('invalid settings fields are dropped while valid siblings survive and no cr
     minimumRemaining: { scoped: 10 },
     failClosedOnUnknownQuota: false,
   })
+  expect(settings.killswitch).toEqual({ main: { scoped: 15 } })
   expect(settings).not.toHaveProperty('logging')
   expect(settings.fallbackOn).toEqual([429, 529])
   expect(await readFile(f.vault.config, 'utf8')).not.toContain(
@@ -540,3 +555,38 @@ test('existing malformed routing is left untouched by the importer while ordinar
   expect(await readFile(f.vault.routing, 'utf8')).toBe(bytes)
   await f.assertLegacy()
 })
+
+test('first snapshot with existing settings completes while another writer still holds the roster lock', async () => {
+  const f = await fixture()
+  const existing = JSON.stringify({
+    mainAccountId: f.mainRoute,
+    claustrum: {
+      primaryAccount: { credentialId: 'oauth:anthropic', accountId: mainUuid },
+    },
+    routing: { mode: 'fallback-first' },
+  })
+  await writeFile(f.vault.config, existing, { mode: 0o600 })
+  const entered = gate()
+  const release = gate()
+  let holding = false
+  const holder = mutateVaultRoster(f.vault.roster, async () => {
+    holding = true
+    entered.open()
+    await release.wait
+    holding = false
+    return { result: undefined }
+  })
+  trackDetached(holder)
+  await entered.wait
+  try {
+    const snapshot = await f.runtime.read()
+    expect(holding).toBe(true)
+    expect(snapshot.settings.routing).toEqual({ mode: 'fallback-first' })
+    expect(await readFile(f.vault.config, 'utf8')).toBe(existing)
+  } finally {
+    release.open()
+    await holder
+  }
+  expect(holding).toBe(false)
+  await f.assertLegacy()
+}, 15_000)

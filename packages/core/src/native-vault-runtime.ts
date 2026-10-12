@@ -344,6 +344,9 @@ export function createNativeVaultRuntime(
   }
   async function publishPrimaryPin(signal?: AbortSignal, absentOnly = false) {
     await requireActive(signal)
+    // Existing settings need no initialization. Avoid the shared roster write
+    // lock so concurrent plugin starts cannot delay reads of that complete file.
+    if (absentOnly && !(await nativeVaultFileAbsent(paths.config))) return
     await mutateVaultRoster(paths.roster, async (roster, lease) => {
       if (absentOnly && !(await nativeVaultFileAbsent(paths.config)))
         return { result: undefined }
