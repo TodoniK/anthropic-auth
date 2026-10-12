@@ -707,6 +707,42 @@ export async function updateNativeRuntime(
   return writeNativeRuntime(path, storageId, change, hooks)
 }
 
+/**
+ * Result of a write whose final check may withdraw it. `skipped` means the
+ * staged file was discarded and the runtime file was left as it was.
+ */
+export type NativeRuntimeOptionalPublication =
+  | { status: 'published'; state: NativeRuntimeState }
+  | { status: 'skipped' }
+
+export interface NativeRuntimeOptionalWriteHooks {
+  /**
+   * Same checks as NativeRuntimeWriteHooks.beforeRename, run at the same
+   * point. Resolve 'skip' to discard the staged write without an error; throw
+   * to refuse it exactly as a strict write would.
+   */
+  beforeRename: () => Promise<'publish' | 'skip'>
+}
+
+/**
+ * For writes that only record information a newer observation makes
+ * redundant. The final check can withdraw such a write instead of failing it.
+ * The runtime lock is still asserted before a skip is reported, so a lost
+ * lock refuses the write either way.
+ */
+export async function updateNativeRuntimeOptional(
+  path: string,
+  storageId: string,
+  change: (
+    current: NativeRuntimeState,
+  ) => NativeRuntimeState | Promise<NativeRuntimeState>,
+  hooks: NativeRuntimeOptionalWriteHooks,
+): Promise<NativeRuntimeOptionalPublication> {
+  return writeNativeRuntimeOutcome(path, storageId, change, {
+    beforeRename: hooks.beforeRename,
+  })
+}
+
 // All runtime writes use the same lock, validation and atomic file replacement.
 // Only the first-identity path can attach an account UUID to an unidentified
 // entry. Known-account validation and generic writes cannot change that UUID.
@@ -719,6 +755,39 @@ async function writeNativeRuntime(
   hooks: NativeRuntimeWriteHooks,
   firstIdentity?: FirstIdentityPublication,
 ): Promise<NativeRuntimeState> {
+  const outcome = await writeNativeRuntimeOutcome(
+    path,
+    storageId,
+    change,
+    {
+      // A strict write cannot be withdrawn: whatever its check returns, a
+      // check that does not throw lets the replacement proceed.
+      beforeRename: async () => {
+        await hooks.beforeRename?.()
+        return 'publish'
+      },
+      beforePublish: hooks.beforePublish,
+      afterRename: hooks.afterRename,
+    },
+    firstIdentity,
+  )
+  // Unreachable with the check above; kept so a strict caller can never
+  // receive a withdrawn write as if it had been published.
+  if (outcome.status !== 'published')
+    throw new NativeRuntimeError('publication-refused')
+  return outcome.state
+}
+
+async function writeNativeRuntimeOutcome(
+  path: string,
+  storageId: string,
+  change: (
+    current: NativeRuntimeState,
+  ) => NativeRuntimeState | Promise<NativeRuntimeState>,
+  hooks: Omit<NativeRuntimeWriteHooks, 'beforeRename'> &
+    NativeRuntimeOptionalWriteHooks,
+  firstIdentity?: FirstIdentityPublication,
+): Promise<NativeRuntimeOptionalPublication> {
   checkPath(path)
   try {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 })
@@ -751,8 +820,9 @@ async function writeNativeRuntime(
           } finally {
             await file.close()
           }
+          let decision: 'publish' | 'skip'
           try {
-            await hooks.beforeRename?.()
+            decision = await hooks.beforeRename()
           } catch {
             throw new NativeRuntimeError('publication-refused')
           }
@@ -761,6 +831,8 @@ async function writeNativeRuntime(
           } catch {
             throw new NativeRuntimeError('publication-refused')
           }
+          // The finally block below removes the staged file.
+          if (decision === 'skip') return { status: 'skipped' }
           try {
             await hooks.beforePublish?.()
           } catch {
@@ -773,7 +845,7 @@ async function writeNativeRuntime(
           } catch {
             throw new NativeRuntimeError('publication-refused')
           }
-          return next
+          return { status: 'published', state: next }
         } finally {
           if (ownsStage) await rm(stage, { force: true })
         }

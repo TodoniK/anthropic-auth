@@ -53,6 +53,7 @@ import {
   type NativeRuntimeState,
   readNativeRuntime,
   updateNativeRuntime,
+  updateNativeRuntimeOptional,
 } from './native-runtime.ts'
 import type { NativeVaultPaths } from './native-vault-paths.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
@@ -538,8 +539,10 @@ export function createNativeVaultRuntime(
     },
     publish(receipt, rawPatch) {
       const patch = captureNativeMetadataPatch(rawPatch)
-      return mutateReceipt(receipt, (old) =>
-        applyNativeMetadataPatch(old, patch),
+      return mutateReceipt(
+        receipt,
+        (old) => applyNativeMetadataPatch(old, patch),
+        recencyOnly(patch) ? 'skip' : 'refuse',
       )
     },
     resetBackoff(receipt, kind = 'all') {
@@ -758,9 +761,16 @@ export function createNativeVaultRuntime(
     }
   }
 
+  /**
+   * `onSuperseded` chooses what happens when this process issues a newer
+   * version of the receipt's credential while the write is staged: 'refuse'
+   * fails the write, 'skip' resolves false without writing. Account, custody
+   * and lease checks refuse the write in both cases.
+   */
   async function mutateReceipt(
     receipt: NativeCustodyReceipt,
     change: (old: NativeRuntimeEntry) => NativeRuntimeEntry,
+    onSuperseded: 'refuse' | 'skip' = 'refuse',
   ): Promise<boolean> {
     const route = requireIssued(receipt)
     await requireActive()
@@ -783,7 +793,7 @@ export function createNativeVaultRuntime(
       const accountIdentity = row.accountIdentity
       let kept = false
       try {
-        await updateNativeRuntime(
+        const outcome = await updateNativeRuntimeOptional(
           paths.runtime,
           paths.storageId,
           (current) => {
@@ -823,14 +833,20 @@ export function createNativeVaultRuntime(
                 pinned.accountIdentity !== receipt.assertedAccountIdentity
               )
                 throw new NativeRuntimeError('publication-refused')
-              if ((versions.get(key) ?? 0) > receipt.recordVersion)
+              const superseded =
+                (versions.get(key) ?? 0) > receipt.recordVersion
+              if (superseded && onSuperseded === 'refuse')
                 throw new NativeRuntimeError('runtime-conflict')
               // The roster lease is held across the runtime write. Check it after
               // all other work, immediately before the writer's final rename.
+              // A superseded write that will be skipped still checks it, so a
+              // lost lease is reported rather than hidden by the skip.
               await lease.assertOwned()
+              return superseded ? 'skip' : 'publish'
             },
           },
         )
+        if (outcome.status === 'skipped') return { result: false }
       } catch (error) {
         if (
           error instanceof NativeRuntimeError &&
@@ -971,6 +987,22 @@ export function createNativeVaultRuntime(
     )
   }
   return runtime
+}
+
+/**
+ * True when a metadata patch records only when the account was last used.
+ * That time is advisory: if a newer credential version is issued while the
+ * write is staged, dropping the write loses nothing a later write needs, so
+ * such a write is skipped rather than failed. Any other field keeps the strict
+ * behaviour, even when combined with lastUsed.
+ */
+function recencyOnly(patch: NativeAccountMetadataPatch): boolean {
+  const keys = Object.keys(patch)
+  return (
+    keys.length === 1 &&
+    keys[0] === 'lastUsed' &&
+    typeof patch.lastUsed === 'number'
+  )
 }
 
 function waitFor<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
