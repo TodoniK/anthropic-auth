@@ -546,7 +546,7 @@ function formatCloseEvent(event: Event) {
     `code=${close.code ?? 'unknown'}`,
     `wasClean=${close.wasClean ?? 'unknown'}`,
   ]
-  if (close.reason) parts.push(`reason=${JSON.stringify(close.reason)}`)
+  // Peer-supplied close reasons can echo credentials. Keep only protocol metadata.
   return parts.join(' ')
 }
 
@@ -1093,7 +1093,7 @@ class PersistentRelaySession {
       // inject an SSE error event and close cleanly.
       if (pending.optimisticResponse && pending.responseStartedAt != null) {
         relayLog(
-          `websocket relay error during optimistic response session=${shortAffinity(this.affinity)} request=${pending.payload.id} status=${message.status} message=${message.message || 'unknown'} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}`,
+          `websocket relay error during optimistic response session=${shortAffinity(this.affinity)} request=${pending.payload.id} status=${Number.isFinite(message.status) ? message.status : 'unknown'} code=relay_stream_error chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}`,
         )
         this.deliverResponseHeaders(pending)
         pending.streamController?.enqueue(
@@ -1300,7 +1300,7 @@ export async function sendViaRelay(options: {
       } catch (error) {
         if (error instanceof RelayAuthorizationError) throw error
         relayLog(
-          `websocket relay failed session=${shortAffinity(affinity)}; trying http relay: ${error instanceof Error ? error.message : String(error)}`,
+          `websocket relay failed session=${shortAffinity(affinity)}; trying http relay code=relay_transport_error`,
         )
         result = await sendRelayHttp({
           config,
@@ -1385,12 +1385,12 @@ export async function sendViaRelay(options: {
     if (error instanceof RelayAuthorizationError) throw error.failure
     if (!config.fallbackToDirect) {
       relayLog(
-        `relay failed session=${shortAffinity(affinity)} and fallbackToDirect=false: ${error instanceof Error ? error.message : String(error)}`,
+        `relay failed session=${shortAffinity(affinity)} and fallbackToDirect=false code=relay_transport_error`,
       )
       throw error
     }
     relayLog(
-      `relay failed; falling back direct session=${shortAffinity(affinity)}: ${error instanceof Error ? error.message : String(error)}`,
+      `relay failed; falling back direct session=${shortAffinity(affinity)} code=relay_transport_error`,
     )
     return fallback()
   }
@@ -1558,13 +1558,13 @@ function checkpointWebSocketState(env, payload, body, nextState) {
         throw new Error('hash mismatch')
       }
       await writeState(env, payload.affinity, nextState)
-    } catch (error) {
+    } catch {
       console.log(JSON.stringify({
         relay: 'opencode-anthropic-auth',
         transport: 'websocket',
         event: 'checkpoint_write_failed',
         affinity: String(payload.affinity).slice(0, 12),
-        message: error instanceof Error ? error.message : String(error),
+        code: 'checkpoint_write_error',
       }))
     }
   })
