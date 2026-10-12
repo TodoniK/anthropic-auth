@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/anthropic-auth-core",
-  "version": "1.23.0",
+  "version": "2.0.0",
   "type": "module",
   "repository": {
     "type": "git",

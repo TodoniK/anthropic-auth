@@ -2,37 +2,41 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.0.0
+
+### Breaking Changes
+
+- Store Claude logins, fallback accounts and plugin settings in a shared native account store instead of the old `anthropic-auth.json` / `anthropic-auth-state.json` sidecars. Upgrading requires one offline step: quit every OpenCode, LiteCode and Pi process, then run `bunx @cortexkit/opencode-anthropic-auth@2.0.0 setup`. Until it completes, OpenCode and Pi refuse Anthropic requests with that remedy and never serve, refresh or rewrite the old credentials. Migration preserves session routing. There is no reverse migration; returning to 1.23.0 requires a fresh configuration and new sign-ins.
+- Replace the separate `/claude-*` commands with one `/claude` menu in OpenCode and Pi.
+- Remove the handle-based Claustrum serving path, manifest bindings and per-account gates. Vault custody now comes only from this host's setup enrollment and uses a separate vault account namespace; while connected, only vault accounts serve and local accounts remain unchanged. Disconnecting returns to the local accounts, restoring any Pi login that setup moved aside. Remove Core's process-shared enrollment-registry export.
 
 ### Features
 
+- Support OpenCode 2 with direct requests and HTTP relay. OpenCode 2 refuses a selected WebSocket relay before sending; OpenCode 1 and Pi keep WebSocket relay support.
 - Add Claude Haiku 5.5 (`claude-haiku-5-5`) to Core, OpenCode, and Pi with a 1M context, 128K output and native `low` through `max` adaptive effort. Preserve supported forced tool choice, remove rejected manual thinking budgets and sampling parameters, and honor OpenCode thinking opt-outs at high effort or below. Standard input/output pricing is $0.10/$0.50 per million tokens; all rates increase fivefold above 100K total input tokens, including cached input. OpenCode and Pi apply the selected pricing tier to all input, output and cached tokens in the request, not just the tokens above the threshold. `thinkingBinding.prefixMismatchBehavior` set to `error` or `drop_block` also covers replayed Haiku 5.5 thinking after earlier conversation content changes. Subscription OAuth requests continue to show zero API cost in the host. Haiku 5.5 does not enable fast mode or automatic safety fallback, and quota priming continues to use Haiku 4.5.
 
 - Add Claude Sonnet 5.5 (`claude-sonnet-5-5`) to Core, OpenCode, and Pi with its 1M context, 128K output, and official pricing. OpenCode and Pi request readable adaptive thinking. OpenCode maps explicit thinking opt-outs to Sonnet 5.5's `between_tools` mode, removes unsupported forced tool choice, and offers native `low` through `max` effort variants. Apply configured `error` or `drop_block` behavior to replayed Sonnet 5.5 and Opus 5.5 thinking when earlier messages, instructions, or tools have changed; the default account behavior stays unchanged. Pi exposes the model's supported `low`–`max` effort levels while refusing unsupported `minimal` and unavailable `off`.
 
 ### Fixes
 
+- Remove account tokens from provider errors, stream errors, relay failures, background logs and setup or CLI failures, including encoded and split forms, while leaving successful model responses unchanged.
+- Wait briefly for an account's first identity update during startup instead of silently sending the request through another account; a request that still cannot use the account refuses with a retryable connection error.
+- Require a quota reading before admitting an account under an enabled killswitch floor, even when unknown quota is otherwise allowed.
 - Fix OpenCode's hybrid 1-hour prompt caching when Magic Context adds an image of project memories. Place one cache breakpoint after the stable context and image, and another after the following history updates, so both prefixes can be reused. Requests without the image and the four-breakpoint limit remain unchanged.
 - Stop silently discarding meaningful trailing assistant turns in OpenCode and Pi, which could replay the previous question. A shared Core guard removes only provably empty trailers and refuses other tails before billing, caching, signing, or model dispatch. OpenCode reports a terminal local 400 that cannot trigger account fallback, even when upstream 400 responses are configured for fallback; genuine provider responses retain that policy. Pi reports a terminal provider error without sending a model request.
-
-## 2.0.0
-
-### Breaking Changes
-
-- Remove the handle-based Claustrum serving path, manifest bindings and per-account gates. OpenCode and Pi now require enrolled, zero-bind scoped custody; an older Claustrum configuration without a scoped roster refuses serving until `setup` completes. Remove Core's process-shared enrollment-registry export; host path resolution remains available through the Core enrollment module. Local OAuth and API-key routes are unaffected.
 
 ### Patch Changes
 
 - Stop sending `speed: "fast"` to Opus 4.7, where it returns 400, and Opus 4.6, where it has no effect. Fast mode now applies only to Opus 4.8, Opus 5, and Opus 5.5 in OpenCode and Pi (#267).
 - Remove Opus 5.5's unsupported forced `tool_choice` for OpenCode structured-output requests while retaining the schema tool. OpenCode still records validated structured output and reports an error if the model does not call it. Keep named `tool_choice` references aligned with prefixed tool definitions on other models (#268).
 - Isolate OpenCode tests from live account files, sidebar state, CacheKeep leases, RPC directories, and Claustrum sockets even when a test clears a feature-specific override. Setup detection now uses the supplied environment for its connection file (#264, #265).
-- Persist scoped main quota under the discovered primary account rather than the local host slot, and let `/claude-quota` poll with a freshly authorized scoped credential. A header-only main quota remains due for its first usage poll; failed polls are spaced by account without treating usage 403 as rate-limit backoff or counting requests that lose the cross-process refresh lock.
+- Persist scoped main quota under the discovered primary account rather than the local host slot, and let quota refresh poll with a freshly authorized scoped credential. A header-only main quota remains due for its first usage poll; failed polls are spaced by account without treating usage 403 as rate-limit backoff or counting requests that lose the cross-process refresh lock.
 - Load the Pi extension through Oh My Pi's legacy SDK compatibility layer by keeping transcript system-prompt and tool replay in the extension instead of importing helpers absent from the host. Check built Pi imports with a syntax-aware allowlist in CI and release workflows.
 - Add debug diagnostics for scoped 401 retry decisions and delivered failure reports across OpenCode and Pi, recording served and current record versions and a non-secret decision reason without logging bearer material.
 - Update the shared Claustrum client to 0.4.0 (with Subc client 0.16.x) for scoped custody. The client no longer reconnects on a terminal `unknown_module` response from a daemon without the Claustrum module.
-- Show an approved Claustrum enrollment as active in `/claude-account` and the account modal when the main account is vault-served; stop telling already configured users to rerun setup or request a grant. Clarify that `enrollment-reset` only clears terminal state.
+- Show an approved Claustrum enrollment as active in account status when the main account is vault-served; stop telling already configured users to rerun setup or request a grant. Clarify that `enrollment-reset` only clears terminal state.
 - Fix packed OpenCode CLI startup under Node: keep `jsonc-parser` external so its CommonJS `./impl/*` modules resolve from the installed dependency, and run the packed CLI's `--help` path alongside the TUI smoke gate (#257).
-- Stop unsolicited Claustrum enrollment on OpenCode boot and account-status views: only explicit offline setup proposes and polls, while `/claude-account enrollment-reset` clears terminal state under lock without starting another request. Setup resumes crash-persisted secrets and replaces one daemon-confirmed dead request; all producer-permanent refusal codes stop polling even when older client transports mislabel them retryable. This removes the per-process enrollment poll loop (#255) without changing scoped account-discovery polling.
+- Stop unsolicited Claustrum enrollment on OpenCode boot and account-status views: only explicit offline setup proposes and polls, while the locked enrollment reset clears terminal state under lock without starting another request. Setup resumes crash-persisted secrets and replaces one daemon-confirmed dead request; all producer-permanent refusal codes stop polling even when older client transports mislabel them retryable. This removes the per-process enrollment poll loop (#255) without changing scoped account-discovery polling.
 - Update OpenCode plugin and SDK test dependencies together to 1.18.31, plus Biome 2.5.14, Lefthook 2.1.14 and the dev-only Anthropic SDK 4.0.58; preserve packed TUI and custom-fetch compatibility checks.
 - Remove Core's unused direct `@cortexkit/subc-client` dependency and declare it where the E2E mock uses it. Synchronize `bun.lock` workspace versions and dependency declarations during version bumps, and fail CI or release preparation when the lock disagrees with package manifests (which Bun's frozen install alone did not detect).
 - Enforce Core/OpenCode/Pi unit-test count floors in CI and releases with one measured test pass, a PR merge-target ratchet and a release ratchet against the previous version tag rather than only the release commit's parent. A reduction requires an explicit from/to marker and reason; release checks reject stale tags or missing floor provenance, with v1.23.0's verified floorless baseline seeded at 290/1672/140. Both workflows check canonical Claustrum fixture provenance and the real Pi host tool-call round-trip.
