@@ -209,6 +209,16 @@ export * from './pool-paths.ts'
 export * from './pool-store.ts'
 export * from './prime.ts'
 export * from './provider.ts'
+export type {
+  ProviderErrorRedactor,
+  ProviderErrorResponseScope,
+  ProviderResponseMode,
+  ProviderResponseSettlement,
+} from './provider-error.ts'
+export {
+  createProviderErrorRedactor,
+  createProviderErrorResponseScope,
+} from './provider-error.ts'
 export * from './quota-header-feed.ts'
 export * from './quota-headers.ts'
 export * from './quota-manager.ts'
@@ -216,6 +226,16 @@ export * from './quotas.ts'
 export * from './relay.ts'
 export * from './request-history.ts'
 export * from './routing.ts'
+export type { SseEvent, SseFramer, SseFramerOptions } from './sse.ts'
+export {
+  createSseFramer,
+  DEFAULT_SSE_MAX_FRAME_BYTES,
+  decodeSseFrame,
+  isSseCandidateFrame,
+  isTerminatedSseFrame,
+  parseSseFrame,
+  SseFrameTooLargeError,
+} from './sse.ts'
 export * from './start.ts'
 export * from './sticky-routing.ts'
 export * from './thinking-binding.ts'
