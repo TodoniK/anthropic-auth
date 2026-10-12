@@ -4,6 +4,7 @@ import { signRequestBody, stripBillingLineageFromBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
 import { dumpDirectRequest, dumpResponseArtifact } from './dump.ts'
 import { logger } from './logger.ts'
+import { createProviderErrorResponseScope } from './provider-error.ts'
 
 export const CLAUDE_CACHE_KEEP_COMMAND_NAME = 'claude-cachekeep'
 export const CACHE_KEEP_TTL_MS = 60 * 60_000
@@ -366,6 +367,25 @@ function cacheKeepRetryDelayMs(targetId: string, failureCount: number) {
   return exponential + jitter
 }
 
+/**
+ * Credentials one prewarm send actually carried: the whole authorization
+ * value, its token without the `Bearer` scheme, and any x-api-key. Read from
+ * the headers handed to that send, so a rotated replay is scrubbed with its
+ * own credential rather than an earlier or later one.
+ */
+function cacheKeepSentCredentials(headers: Headers): string[] {
+  const credentials: string[] = []
+  const authorization = headers.get('authorization')
+  if (authorization) {
+    credentials.push(authorization)
+    const token = /^Bearer\s+(.+)$/i.exec(authorization)?.[1]?.trim()
+    if (token) credentials.push(token)
+  }
+  const apiKey = headers.get('x-api-key')
+  if (apiKey) credentials.push(apiKey)
+  return credentials
+}
+
 export type CacheKeepPrewarmResult =
   | {
       ok: true
@@ -711,13 +731,31 @@ export class CacheKeepManager {
       headers.delete('content-length')
       headers.delete('transfer-encoding')
       let response: Response
-      const send = (attemptHeaders: Headers) =>
-        fetchImpl(target.url, {
-          method: 'POST',
-          headers: attemptHeaders,
-          body: prewarm.bodyText,
-          signal: attempt.signal,
-        })
+      // Every physical send gets its own response scope holding exactly the
+      // credentials that send carried, so a provider error or transport
+      // exception echoing them is scrubbed before anything reads it: the
+      // status check, onResponse data, dumps and the returned reason. The
+      // scope retires itself when the error body is read or cancelled; a
+      // successful body is passed through untouched.
+      const send = async (attemptHeaders: Headers): Promise<Response> => {
+        const scope = createProviderErrorResponseScope(
+          cacheKeepSentCredentials(attemptHeaders),
+          'http',
+        )
+        try {
+          const sent = await fetchImpl(target.url, {
+            method: 'POST',
+            headers: attemptHeaders,
+            body: prewarm.bodyText,
+            signal: attempt.signal,
+          })
+          return scope.redactResponse(sent)
+        } catch (error) {
+          const redacted = scope.redactError(error)
+          scope.dispose()
+          throw redacted
+        }
+      }
       try {
         response = await send(headers)
         if (
