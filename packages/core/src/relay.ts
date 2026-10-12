@@ -692,7 +692,9 @@ function toBinaryChunk(data: unknown): Uint8Array {
   if (ArrayBuffer.isView(data)) {
     return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
   }
-  return new Uint8Array(Buffer.from(String(data)))
+  throw new TypeError(
+    'relay websocket binary frame must be an ArrayBuffer or byte view',
+  )
 }
 
 function parseRelayControlMessage(data: string): RelayControlMessage {
@@ -983,6 +985,8 @@ class PersistentRelaySession {
       const parsed = new URL(url)
       parsed.searchParams.set('affinity', this.affinity)
       const socket = new WebSocket(parsed.toString())
+      // Node defaults to Blob frames, which cannot enter the synchronous byte pipeline.
+      socket.binaryType = 'arraybuffer'
       this.socket = socket
       this.serverState = undefined
 

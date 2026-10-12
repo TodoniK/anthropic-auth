@@ -2523,6 +2523,8 @@ async function nodeRelayClient(options: {
   relay: { url: string }
   provider: { url: string }
   streaming: boolean
+  captureBytes?: boolean
+  forceBlob?: boolean
 }) {
   const node = Bun.which('node')
   if (!node) throw new Error('Node is required for the Node relay controls')
@@ -2535,12 +2537,23 @@ async function nodeRelayClient(options: {
     token: OAT_V1,
     affinity: randomUUID(),
     body: options.streaming ? streamingBody('node') : requestBody('node'),
+    captureBytes: options.captureBytes === true,
+    forceBlob: options.forceBlob === true,
   }
   const script = `
     const { sendViaRelay } = await import(${JSON.stringify(relayPath)})
     const { setDumpEnabled } = await import(${JSON.stringify(dumpPath)})
     setDumpEnabled(false)
     const request = ${JSON.stringify(request)}
+    if (request.forceBlob) {
+      const NativeWebSocket = globalThis.WebSocket
+      globalThis.WebSocket = class extends NativeWebSocket {
+        constructor(...args) {
+          super(...args)
+          Object.defineProperty(this, 'binaryType', { get: () => 'blob', set() {} })
+        }
+      }
+    }
     let authorizations = 0
     let result
     try {
@@ -2557,7 +2570,8 @@ async function nodeRelayClient(options: {
           return { headers: new Headers({ authorization: 'Bearer ' + request.token, 'content-type': 'application/json' }), errorSecrets: [request.token] }
         },
       })
-      result = { state: 'fulfilled', status: response.status, requestId: response.headers.get('request-id'), bodyNull: response.body === null, text: await response.text() }
+      const bytes = new Uint8Array(await response.arrayBuffer())
+      result = { state: 'fulfilled', status: response.status, requestId: response.headers.get('request-id'), bodyNull: response.body === null, text: new TextDecoder().decode(bytes), ...(request.captureBytes ? { bodyBase64: Buffer.from(bytes).toString('base64') } : {}) }
     } catch (error) {
       result = { state: 'rejected', message: error instanceof Error ? error.message : String(error) }
     }
@@ -2712,3 +2726,92 @@ for (const [kind, start] of [
     expect(relay.sent).toHaveLength(1)
   })
 }
+
+for (const streaming of [false, true]) {
+  test(`a real Node relay client preserves every successful binary response byte (streaming=${streaming})`, async () => {
+    const body = streaming
+      ? `: keepalive\r\n\r\n${sseFrame('content_block_delta', { type: 'content_block_delta', delta: { type: 'text_delta', text: `αβ ${OAT_V1}` } })}`
+      : JSON.stringify({ text: `αβ ${OAT_V1}`, newline: '\r\n' })
+    const provider = startProvider(() => ({
+      status: 200,
+      reason: 'OK',
+      headers: {
+        'content-type': streaming ? 'text/event-stream' : 'application/json',
+        'request-id': 'req_node_bytes',
+      },
+      body,
+    }))
+    const relay = startForwardingRelay(provider, () => ({ kind: 'conforming' }))
+    const child = await nodeRelayClient({
+      relay,
+      provider,
+      streaming,
+      captureBytes: true,
+    })
+    expect(child.exit).toBe(0)
+    expect(child.stderr).toBe('')
+    expect(child.result?.state).toBe('fulfilled')
+    expect(child.result?.status).toBe(200)
+    expect(child.result?.bodyBase64).toBe(Buffer.from(body).toString('base64'))
+    expect(provider.credentials).toEqual([OAT_V1])
+    expect(relay.sent).toHaveLength(1)
+  })
+}
+
+test('a real Node relay client scrubs a binary SSE error frame', async () => {
+  const body = sseFrame('error', {
+    type: 'error',
+    error: { type: 'api_error', message: `provider echoed ${OAT_V1}` },
+  })
+  const provider = startProvider(() => ({
+    status: 200,
+    reason: 'OK',
+    headers: {
+      'content-type': 'text/event-stream',
+      'request-id': 'req_node_error',
+    },
+    body,
+  }))
+  const relay = startForwardingRelay(provider, () => ({ kind: 'conforming' }))
+  const child = await nodeRelayClient({
+    relay,
+    provider,
+    streaming: true,
+    captureBytes: true,
+  })
+  expect(child.exit).toBe(0)
+  expect(child.stderr).toBe('')
+  expect(child.result?.state).toBe('fulfilled')
+  expect(child.result?.text).toContain('api_error')
+  expect(child.result?.text).toContain(PROVIDER_ERROR_REDACTION)
+  expect(child.result?.text).not.toContain(OAT_V1)
+  expect(provider.credentials).toEqual([OAT_V1])
+  expect(relay.sent).toHaveLength(1)
+})
+
+test('a real Node relay client refuses forced Blob frames rather than stringify them', async () => {
+  const provider = startProvider(() => ({
+    status: 200,
+    reason: 'OK',
+    headers: {
+      'content-type': 'application/json',
+      'request-id': 'req_node_blob',
+    },
+    body: '{"text":"actual provider bytes"}',
+  }))
+  const relay = startForwardingRelay(provider, () => ({ kind: 'conforming' }))
+  const child = await nodeRelayClient({
+    relay,
+    provider,
+    streaming: false,
+    forceBlob: true,
+  })
+  expect(child.exit).toBe(0)
+  expect(child.stderr).toBe('')
+  expect(child.result?.state).toBe('rejected')
+  expect(child.result?.message).toBe(
+    'relay websocket binary frame must be an ArrayBuffer or byte view',
+  )
+  expect(provider.credentials).toEqual([OAT_V1])
+  expect(relay.sent).toHaveLength(1)
+})
