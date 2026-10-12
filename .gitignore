@@ -34,6 +34,8 @@ anthropic-auth.json.*
 coverage/
 tmp/
 temp/
+# Local verification captures can include synthetic or credential-derived data.
+verification-inputs/
 
 # mitmproxy capture/extract artifacts (local diagnostics)
 *.flow
