@@ -88,9 +88,9 @@ async function createPiFixture(): Promise<PiFixture> {
     },
     { preconnect: originalFetch.preconnect },
   )
-  lifetime.deferCleanup(() => {
+  lifetime.deferCleanup(async () => {
     for (const session of fixture.sessions) session.dispose()
-    closePiNativeRuntime(fixture.storagePath)
+    await closePiNativeRuntime(fixture.storagePath)
   })
   lifetime.deferCleanup(() => {
     globalThis.fetch = originalFetch

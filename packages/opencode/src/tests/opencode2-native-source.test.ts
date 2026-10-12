@@ -10,22 +10,27 @@ import {
 } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import {
+  __setLogTestSink,
   captureNativeLocalPoolBinding,
   createNativeAccountRuntime,
   createNativePoolStore,
+  getLogLevel,
   getStickyRoutingStatePath,
+  type LogTestRecord,
   type NativeAccountRuntime,
   type NativeCustodyClient,
   type NativePoolPaths,
   readNativeEnrollmentMode,
   resolveNativePoolPaths,
   runNativeMigration,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import { registerOpenCode2AuthMethods } from '@cortexkit/common-auth/opencode2'
 import { fingerprintOf } from '@cortexkit/common-auth/store'
 import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promise/integration'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { tokenFingerprint } from '../../../core/src/token-fingerprint'
 import {
   CLAUDE_POOL_LOGIN_METHOD_ID,
@@ -66,15 +71,76 @@ const cleanups: Array<() => Promise<void> | void> = []
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })
+const usageTests = createTestLifetimeSuite()
 
-async function storage() {
+usageTests.test(
+  'OC2 attempt-end lastUsed refusal is detached and drained without rejecting the completed attempt',
+  async () => {
+    const owned: Array<() => Promise<void> | void> = []
+    usageTests.deferCleanup(async () => {
+      for (const cleanup of owned.reverse()) await cleanup()
+    })
+    const fixture = await local(undefined, owned)
+    const native = source(fixture.runtime, fixture.paths, owned)
+    const auth = await native.authorizeAccount(scope, 'main')
+    if (!auth) throw new Error('Native authorization refused')
+    const entered = usageTests.gate()
+    const release = usageTests.gate()
+    const records: LogTestRecord[] = []
+    const previous = getLogLevel()
+    setLogLevel('debug')
+    __setLogTestSink((record) => records.push(record))
+    owned.push(() => {
+      __setLogTestSink(null)
+      setLogLevel(previous)
+    })
+    const publication = spyOn(
+      fixture.runtime,
+      'publishLocal',
+    ).mockImplementation(async () => {
+      entered.open()
+      await release.wait
+      throw Object.assign(new Error('/private/secret'), {
+        name: 'NativeRuntimeError',
+        code: 'publication-refused',
+      })
+    })
+    owned.push(() => publication.mockRestore())
+    await native.onAttemptEnd?.(context(auth.provenance), {
+      status: 200,
+      outputStarted: true,
+    })
+    await entered.wait
+    let closed = false
+    const closing = native.close().then(() => {
+      closed = true
+    })
+    usageTests.trackDetached(closing)
+    await Promise.resolve()
+    expect(closed).toBe(false)
+    release.open()
+    await closing
+    expect(
+      records.filter(
+        (record) => record.message === 'Account usage publication unavailable',
+      ),
+    ).toMatchObject([
+      {
+        level: 'error',
+        payload: { name: 'NativeRuntimeError', code: 'publication-refused' },
+      },
+    ])
+  },
+)
+
+async function storage(owned = cleanups) {
   const parent = resolve(
     import.meta.dir,
     '../../../../node_modules/.cache/opencode2-native-source',
   )
   await mkdir(parent, { recursive: true })
   const directory = await mkdtemp(join(parent, 'fixture-'))
-  cleanups.push(() => rm(directory, { recursive: true, force: true }))
+  owned.push(() => rm(directory, { recursive: true, force: true }))
   const paths = await resolveNativePoolPaths(
     join(directory, 'anthropic-auth.json'),
     join(directory, 'anthropic-auth-state.json'),
@@ -114,8 +180,9 @@ async function storage() {
 }
 async function local(
   localOptions?: Parameters<typeof createNativeAccountRuntime>[0]['local'],
+  owned = cleanups,
 ) {
-  const { paths, store, env } = await storage()
+  const { paths, store, env } = await storage(owned)
   await store.add({
     id: 'primary-row',
     identity,
@@ -174,7 +241,7 @@ async function local(
     local: localOptions,
     vault: { env },
   })
-  cleanups.push(() => runtime.close())
+  owned.push(() => runtime.close())
   return { paths, runtime, store, env }
 }
 /**
@@ -215,13 +282,17 @@ async function registeredLogin(
     throw new Error(`Login method ${methodID} was not registered`)
   return registration
 }
-function source(runtime: NativeAccountRuntime, paths: NativePoolPaths) {
+function source(
+  runtime: NativeAccountRuntime,
+  paths: NativePoolPaths,
+  owned = cleanups,
+) {
   const native = createNativeAnthropicSource({
     runtime,
     paths,
     requestOptions: () => ({}),
   })
-  cleanups.push(() => native.close())
+  owned.push(() => native.close())
   return native
 }
 function context(

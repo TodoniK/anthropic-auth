@@ -62,8 +62,8 @@ beforeEach(async () => {
   )
 })
 afterEach(async () => {
+  await closePiNativeRuntime(storagePath)
   globalThis.fetch = originalFetch
-  closePiNativeRuntime(storagePath)
   delete process.env.PI_CODING_AGENT_DIR
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   await rm(directory, { recursive: true, force: true })

@@ -59,7 +59,7 @@ beforeEach(async () => {
   )
 })
 afterEach(async () => {
-  closePiNativeRuntime(storagePath)
+  await closePiNativeRuntime(storagePath)
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   delete process.env.PI_CODING_AGENT_DIR
   delete process.env.PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR

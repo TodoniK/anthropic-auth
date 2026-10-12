@@ -280,6 +280,9 @@ export async function setupAnthropicAuth(
         prime?.dispose(),
         ...registrations.map((registration) => registration.dispose()),
       ])
+      // Prime and transport teardown can finish attempts after source shutdown
+      // begins. Join their advisory usage writes before closing the runtime.
+      await source.close()
       runtime.close()
     })()
     return cleanup

@@ -44,6 +44,7 @@ import {
   configuredAnthropicOAuthAccountCount,
   createEmptyStorage,
   createNativeAccountRuntime,
+  createNativeUsagePublisher,
   createProviderErrorResponseScope,
   createSseFramer,
   createStickyNoRouteResponse,
@@ -1504,7 +1505,11 @@ const anthropicAuthPlugin = async (
       throw new Error('Native vault storage mismatch')
     return nativeAccounts.vault
   }
-  function closeOpenCodeScopedRuntime(_storagePath = accountStoragePath): void {
+  const usagePublications = createNativeUsagePublisher('native-auth')
+  async function closeOpenCodeScopedRuntime(
+    _storagePath = accountStoragePath,
+  ): Promise<void> {
+    await usagePublications.drain()
     nativeAccounts.close()
   }
 
@@ -3848,7 +3853,7 @@ const anthropicAuthPlugin = async (
     profileHydrationShutdown.abort()
     while (profilePublications.size) await Promise.all([...profilePublications])
     try {
-      closeOpenCodeScopedRuntime(accountStoragePath)
+      await closeOpenCodeScopedRuntime(accountStoragePath)
     } catch (error) {
       logger.warn('claustrum', 'failed to close scoped runtime', {
         error: error instanceof Error ? error.message : String(error),
@@ -6735,16 +6740,11 @@ const anthropicAuthPlugin = async (
               baseURL: account.baseURL,
             })
             if (response.ok)
-              await nativeAccounts
-                .publishApi(apiCredential.subject, {
+              usagePublications.publish(() =>
+                nativeAccounts.publishApi(apiCredential.subject, {
                   lastUsed: Date.now(),
-                })
-                .catch(async (error: unknown) => {
-                  // A lastUsed write failure still fails the request. Cancel
-                  // the reply first to clear its copied redaction key.
-                  await response.body?.cancel().catch(() => {})
-                  throw error
-                })
+                }),
+              )
             return response
           }
 
@@ -7373,7 +7373,7 @@ const anthropicAuthPlugin = async (
               await reportScoped401(relay401Attempt, 'relay_status_field')
             }
             if (response.ok) {
-              try {
+              usagePublications.publish(async () => {
                 if (served.scopedAttempt)
                   await nativeAccounts.vault.publish(served.scopedAttempt, {
                     lastUsed: Date.now(),
@@ -7382,13 +7382,7 @@ const anthropicAuthPlugin = async (
                   await nativeAccounts.publishLocal(served.localSubject, {
                     lastUsed: Date.now(),
                   })
-              } catch (error) {
-                // A lastUsed publication failure still fails the request.
-                // Cancel the reply first to clear its copied redaction material
-                // and close the provider connection.
-                await response.body?.cancel().catch(() => {})
-                throw error
-              }
+              })
             }
             return response
           }

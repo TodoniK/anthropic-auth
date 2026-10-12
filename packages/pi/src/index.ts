@@ -108,7 +108,7 @@ export default async function cortexKitPiAnthropicAuth(
   pi.on('session_shutdown', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     if (sessionId) effortHistoryBySession.delete(sessionId)
-    closePiNativeRuntime(storagePath)
+    await closePiNativeRuntime(storagePath)
   })
 
   const configuration: ProviderConfig = {

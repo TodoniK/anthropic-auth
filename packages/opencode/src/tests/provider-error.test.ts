@@ -1,7 +1,8 @@
-import { afterEach, expect } from 'bun:test'
+import { afterEach, expect, spyOn } from 'bun:test'
+import * as filesystem from 'node:fs/promises'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { APICallError } from '@ai-sdk/provider'
 import {
   __setLogTestSink,
@@ -20,6 +21,7 @@ import {
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import { ClaustrumCredentialError } from '@cortexkit/claustrum-client'
+import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
 import { createOpencodeClient, type Provider } from '@opencode-ai/sdk'
 import { $, type ServerWebSocket } from 'bun'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
@@ -1553,8 +1555,9 @@ test('OC1 Prime reports a final rejected 401 against the retried receipt and scr
   expect(state.reports).toEqual([{ recordVersion: 2, providerStatus: 401 }])
 })
 
-test('OC1 lastUsed refused by a lost vault enrollment cancels the successful body before the refusal propagates', async () => {
+test('OC1 lastUsed custody refusal keeps the reply and logs ERROR; the next authorization refuses', async () => {
   const { owner, client } = await vaultFixture()
+  const logs = captureLogs()
   const cancelled = lifetimes.gate()
   const wire: string[] = []
   const forward = loopbackModel(({ bearer }) => {
@@ -1573,11 +1576,159 @@ test('OC1 lastUsed refused by a lost vault enrollment cancels the successful bod
   const plugin = await createPlugin(owner, client)
   const seen = await visible(sendNative(owner, plugin, 'oc1-lastused-guard'))
   expect(wire).toEqual([vaultAccess(1)])
-  expect(seen.status).toBeUndefined()
-  expect(seen.text).toContain('route-unavailable')
-  expectScrubbed(seen.text, [vaultAccess(1)])
-  expect(await within(cancelled.wait)).toBe(true)
+  expect(seen.status).toBe(200)
+  expect(seen.text).toBe(healthy(echoOf(vaultAccess(1))))
+  await plugin.dispose?.()
+  expect(
+    logs.filter(
+      (record) => record.message === 'Account usage publication unavailable',
+    ),
+  ).toMatchObject([
+    {
+      level: 'error',
+      payload: { name: 'NativeCustodyError', code: 'route-unavailable' },
+    },
+  ])
+  expect(await within(cancelled.wait, 100)).toBe(false)
+  const next = await createPlugin(owner, client)
+  const refused = await visible(sendNative(owner, next, 'oc1-lastused-revoked'))
+  expect(refused.status).toBeUndefined()
+  expect(wire).toEqual([vaultAccess(1)])
 })
+
+test('OC1 serves first byte and full body while the roster lock is held, then drains lastUsed before close', async () => {
+  const { owner, client } = await vaultFixture()
+  const plugin = await createPlugin(owner, client)
+  const paths = nativeVaultPaths(
+    await resolveNativePoolPaths(
+      join(owner.directory, 'anthropic-auth.json'),
+      process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE,
+    ),
+  )
+  const locked = lifetimes.gate()
+  const release = lifetimes.gate()
+  owner.controller.signal.addEventListener('abort', () => release.open(), {
+    once: true,
+  })
+  let released = false
+  let holder: Promise<unknown> | undefined
+  const body = healthy('début 🧪 served under contention')
+  owner.network.current = async () => {
+    holder = mutateVaultRoster(paths.roster, async () => {
+      locked.open()
+      await release.wait
+      released = true
+      return { result: undefined }
+    })
+    lifetimes.trackDetached(holder)
+    await locked.wait
+    return eventStream(body)
+  }
+  const response = await sendNative(owner, plugin, 'oc1-lastused-held-lock')
+  expect(response.status).toBe(200)
+  const reader = response.body!.getReader()
+  const first = await reader.read()
+  expect(first.done).toBe(false)
+  expect(released).toBe(false)
+  const chunks = [first.value!]
+  for (;;) {
+    const next = await reader.read()
+    if (next.done) break
+    chunks.push(next.value)
+  }
+  expect(Buffer.concat(chunks).toString()).toBe(body)
+  expect(released).toBe(false)
+  let closed = false
+  client.close = () => {
+    closed = true
+  }
+  let disposed = false
+  const disposing = Promise.resolve(plugin.dispose?.()).then(() => {
+    disposed = true
+  })
+  lifetimes.trackDetached(disposing)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(disposed).toBe(false)
+  expect(closed).toBe(false)
+  release.open()
+  await holder
+  await disposing
+  expect(closed).toBe(true)
+  const runtime = JSON.parse(await readFile(paths.runtime, 'utf8'))
+  expect(
+    Object.values(runtime.accounts).some(
+      (entry) => Number(Reflect.get(entry as object, 'lastUsed')) > 0,
+    ),
+  ).toBe(true)
+})
+
+test('OC1 absorbs the real roster acquisition timeout after serving the intact reply', async () => {
+  const { owner, client } = await vaultFixture()
+  const plugin = await createPlugin(owner, client)
+  const logs = captureLogs()
+  const paths = nativeVaultPaths(
+    await resolveNativePoolPaths(
+      join(owner.directory, 'anthropic-auth.json'),
+      process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE,
+    ),
+  )
+  const locked = lifetimes.gate()
+  const release = lifetimes.gate()
+  owner.controller.signal.addEventListener('abort', () => release.open(), {
+    once: true,
+  })
+  const unhandled: unknown[] = []
+  const observeUnhandled = (error: unknown) => {
+    unhandled.push(error)
+  }
+  process.on('unhandledRejection', observeUnhandled)
+  lifetimes.deferCleanup(() => {
+    process.off('unhandledRejection', observeUnhandled)
+  })
+  let holder: Promise<unknown> | undefined
+  let released = false
+  const body = healthy('début 🧪 timeout cannot retract these bytes')
+  owner.network.current = async () => {
+    holder = mutateVaultRoster(paths.roster, async () => {
+      locked.open()
+      await release.wait
+      released = true
+      return { result: undefined }
+    })
+    lifetimes.trackDetached(holder)
+    await locked.wait
+    return eventStream(body)
+  }
+  const response = await sendNative(owner, plugin, 'oc1-lastused-lock-timeout')
+  expect(response.status).toBe(200)
+  expect(await response.text()).toBe(body)
+  expect(released).toBe(false)
+  const draining = Promise.resolve(plugin.dispose?.())
+  lifetimes.trackDetached(draining)
+  await draining
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(released).toBe(false)
+  expect(unhandled).toEqual([])
+  expect(
+    logs.filter(
+      (record) => record.message === 'Account usage publication unavailable',
+    ),
+  ).toMatchObject([
+    {
+      level: 'warn',
+      payload: { name: 'LockContentionError', code: 'unknown' },
+    },
+  ])
+  const diagnostic = JSON.stringify(
+    logs.filter(
+      (record) => record.message === 'Account usage publication unavailable',
+    ),
+  )
+  expect(diagnostic).not.toContain(owner.directory)
+  expect(diagnostic).not.toContain(vaultAccess(1))
+  release.open()
+  await holder
+}, 15_000)
 
 // A paid key with surrounding whitespace would leave without it, because
 // setting a header trims the value, and a provider echo of the trimmed key
@@ -1602,6 +1753,76 @@ function exhaustedMain(url: string, init: FetchArgs[1]) {
   if (!url.includes('/v1/messages')) throw new Error(`unexpected ${url}`)
   return jsonError(429, 'rate_limit_error', bearerValue(init))
 }
+
+test('OC1 API lastUsed storage failure is detached, drained and warns without changing reply bytes', async () => {
+  const { owner } = await localFixture(true)
+  const logs = captureLogs()
+  const entered = lifetimes.gate()
+  const release = lifetimes.gate()
+  owner.controller.signal.addEventListener('abort', () => release.open(), {
+    once: true,
+  })
+  let armed = false
+  let fired = false
+  const original = filesystem.open
+  const staging = spyOn(filesystem, 'open').mockImplementation(
+    async (path, flags, mode) => {
+      if (
+        armed &&
+        !fired &&
+        typeof path === 'string' &&
+        basename(path).includes('.native-runtime.') &&
+        path.endsWith('.partial')
+      ) {
+        fired = true
+        entered.open()
+        await release.wait
+        throw Object.assign(new Error(`/private/roster/${PAID_KEY}`), {
+          code: 'EIO',
+        })
+      }
+      return original(path, flags, mode)
+    },
+  )
+  lifetimes.deferCleanup(() => staging.mockRestore())
+  const body = healthy('début 🧪 paid reply')
+  owner.network.current = async (url, init) => {
+    if (!url.startsWith('https://paid.invalid')) return exhaustedMain(url, init)
+    armed = true
+    return eventStream(body)
+  }
+  const plugin = await createPlugin(owner)
+  const response = await sendNative(owner, plugin, 'oc1-api-lastused-io')
+  expect(response.status).toBe(200)
+  expect(await response.text()).toBe(body)
+  await entered.wait
+  let disposed = false
+  const disposing = Promise.resolve(plugin.dispose?.()).then(() => {
+    disposed = true
+  })
+  lifetimes.trackDetached(disposing)
+  await Promise.resolve()
+  expect(disposed).toBe(false)
+  release.open()
+  await disposing
+  expect(
+    logs.filter(
+      (record) => record.message === 'Account usage publication unavailable',
+    ),
+  ).toMatchObject([
+    {
+      level: 'warn',
+      payload: { name: 'NativeRuntimeError', code: 'runtime-io' },
+    },
+  ])
+  expect(
+    JSON.stringify(
+      logs.filter(
+        (record) => record.message === 'Account usage publication unavailable',
+      ),
+    ),
+  ).not.toContain(PAID_KEY)
+})
 
 /**
  * Pad the paid key in every stored file. The store refuses to import a

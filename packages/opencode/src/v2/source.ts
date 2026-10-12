@@ -1,4 +1,5 @@
 import {
+  createNativeUsagePublisher,
   getClaudeCodeIdentityForVerifiedAccount,
   getQuotaCheckIntervalMs,
   getRoutingMode,
@@ -103,7 +104,7 @@ export interface NativeSourceOptions {
 
 export interface NativeSource
   extends NativeAnthropicSource<OAuthQuotaSnapshot, NativeSourceProvenance> {
-  readonly close: () => void
+  readonly close: () => Promise<void>
   readonly resetRouting: (sessionID: string) => Promise<void>
   readonly recordPrime: (
     provenance: NativeSourceProvenance,
@@ -116,6 +117,7 @@ export function createNativeAnthropicSource(
   options: NativeSourceOptions,
 ): NativeSource {
   const { runtime } = options
+  const usagePublications = createNativeUsagePublisher('native-auth')
   // Vault mode keeps session affinity in its own file, named by the snapshot,
   // so vault sessions never read or write the local account's routing state.
   // Local mode leaves routingPath unset and uses the local routing file.
@@ -764,7 +766,9 @@ export function createNativeAnthropicSource(
           )
         }
         if (!outcome.localRefusal && outcome.status !== undefined)
-          await publish(input.provenance, state, { lastUsed: Date.now() })
+          usagePublications.publish(() =>
+            publish(input.provenance, state, { lastUsed: Date.now() }),
+          )
       } finally {
         states.delete(input.provenance)
         publications.delete(input.provenance)
@@ -804,6 +808,7 @@ export function createNativeAnthropicSource(
       sessions.clear()
       choices.clear()
       retries.clear()
+      return usagePublications.drain()
     },
   }
   const publications = new WeakMap<NativeSourceProvenance, Promise<void>>()

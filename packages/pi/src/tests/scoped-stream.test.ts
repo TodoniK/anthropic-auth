@@ -104,8 +104,8 @@ async function fixture(
     'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
   ]
   const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
-  deferCleanup(() => {
-    closePiNativeRuntime(storagePath)
+  deferCleanup(async () => {
+    await closePiNativeRuntime(storagePath)
     globalThis.fetch = originalFetch
     for (const [key, value] of previousEnv) {
       if (value === undefined) delete process.env[key]

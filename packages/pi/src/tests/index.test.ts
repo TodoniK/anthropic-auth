@@ -36,7 +36,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  closePiNativeRuntime(getPiAccountStoragePath())
+  await closePiNativeRuntime(getPiAccountStoragePath())
   globalThis.fetch = originalFetch
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   if (tempDir) await rm(tempDir, { recursive: true, force: true })

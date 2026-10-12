@@ -1,15 +1,24 @@
 import { expect, test as registerTest, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
 import * as filesystem from 'node:fs/promises'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import type {
   AccountStorage,
   NativeCustodyClient,
 } from '@cortexkit/anthropic-auth-core'
+import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  resolveNativePoolPaths,
+  setLogLevel,
+} from '@cortexkit/anthropic-auth-core'
 import type { ScopedInventoryRow } from '@cortexkit/claustrum-client'
+import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
+import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import type { TestGate } from '../../../core/src/tests/test-lifetime.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
@@ -173,7 +182,7 @@ async function ownDirectory(prefix: string) {
   ]
   const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
   deferCleanup(async () => {
-    closePiNativeRuntime(storagePath)
+    await closePiNativeRuntime(storagePath)
     globalThis.fetch = originalFetch
     for (const [key, value] of previousEnv) {
       if (value === undefined) delete process.env[key]
@@ -264,7 +273,7 @@ async function vaultFixture(relay?: { fallbackToDirect: boolean } | undefined) {
       transport: 'http',
       fallbackToDirect: relay.fallbackToDirect,
     })
-  return { state, tokenPath }
+  return { state, tokenPath, native, service, storagePath, client }
 }
 
 async function run(sessionId: string) {
@@ -959,8 +968,21 @@ test('Pi keeps a successful reply that follows comments past the first-event bud
   expect(result.content).toEqual([{ type: 'text', text }])
 })
 
-test('Pi lastUsed publication refused by a lost vault enrollment cancels the successful body and fails the request', async () => {
-  const { tokenPath } = await vaultFixture()
+function captureUsageLogs() {
+  const records: LogTestRecord[] = []
+  const previous = getLogLevel()
+  setLogLevel('debug')
+  __setLogTestSink((record) => records.push(record))
+  deferCleanup(() => {
+    __setLogTestSink(null)
+    setLogLevel(previous)
+  })
+  return records
+}
+
+test('Pi lastUsed custody refusal keeps the reply and logs ERROR; the next authorization refuses', async () => {
+  const { tokenPath, native, service } = await vaultFixture()
+  const logs = captureUsageLogs()
   const cancelled = gate()
   const sent: string[] = []
   loopbackProvider(async (wire) => {
@@ -973,10 +995,23 @@ test('Pi lastUsed publication refused by a lost vault enrollment cancels the suc
   })
   const { result } = await run('pi-lastused-guard')
   expect(sent).toEqual([vaultAccess(1)])
-  expect(result.stopReason).toBe('error')
-  expectScrubbed(result.errorMessage ?? '', [vaultAccess(1)])
-  expect(result.content).toEqual([])
-  expect(await within(cancelled.wait)).toBe(true)
+  expect(result.stopReason).toBe('stop')
+  expect(result.content).toEqual([
+    { type: 'text', text: echoOf(vaultAccess(1)) },
+  ])
+  await native.usagePublications.drain()
+  expect(
+    logs.filter(
+      (record) => record.message === 'Account usage publication unavailable',
+    ),
+  ).toMatchObject([
+    {
+      level: 'error',
+      payload: { name: 'NativeCustodyError', code: 'route-unavailable' },
+    },
+  ])
+  expect(await within(cancelled.wait, 100)).toBe(false)
+  await expect(service.vault.authorize('main')).rejects.toThrow()
 })
 
 /**
@@ -1005,8 +1040,9 @@ function onNextRuntimeStage(act: () => Promise<void>) {
   return { fired: () => fired }
 }
 
-test('Pi lastUsed write that loses its vault enrollment while staged cancels the body and fails the request', async () => {
-  const { tokenPath } = await vaultFixture()
+test('Pi staged lastUsed custody refusal keeps the reply and logs ERROR; the next authorization refuses', async () => {
+  const { tokenPath, native, service } = await vaultFixture()
+  const logs = captureUsageLogs()
   const cancelled = gate()
   // The staged write's final guard finds the enrollment gone and refuses.
   const staged = onNextRuntimeStage(() => rm(tokenPath, { force: true }))
@@ -1014,16 +1050,28 @@ test('Pi lastUsed write that loses its vault enrollment while staged cancels the
     keptOpen(healthy(echoOf(wire.bearer)), cancelled, { close: true }),
   )
   const { result } = await run('pi-lastused-staged-guard')
+  await native.usagePublications.drain()
   expect(staged.fired()).toBe(true)
-  expect(result.stopReason).toBe('error')
-  expect(result.errorMessage).toContain('publication was refused')
-  expectScrubbed(result.errorMessage ?? '', [vaultAccess(1)])
-  expect(result.content).toEqual([])
-  expect(await within(cancelled.wait)).toBe(true)
+  expect(result.stopReason).toBe('stop')
+  expect(result.content).toEqual([
+    { type: 'text', text: echoOf(vaultAccess(1)) },
+  ])
+  expect(
+    logs.filter(
+      (record) => record.message === 'Account usage publication unavailable',
+    ),
+  ).toMatchObject([
+    {
+      level: 'error',
+      payload: { name: 'NativeRuntimeError', code: 'publication-refused' },
+    },
+  ])
+  expect(await within(cancelled.wait, 100)).toBe(false)
+  await expect(service.vault.authorize('main')).rejects.toThrow()
 })
 
 test('Pi lastUsed write that fails on ordinary storage I/O still returns the successful reply', async () => {
-  await vaultFixture()
+  const { native } = await vaultFixture()
   const cancelled = gate()
   const staged = onNextRuntimeStage(async () => {
     throw Object.assign(new Error('synthetic staging write failure'), {
@@ -1033,11 +1081,153 @@ test('Pi lastUsed write that fails on ordinary storage I/O still returns the suc
   const text = `début 🧪 ${echoOf(vaultAccess(1))}`
   loopbackProvider(() => keptOpen(healthy(text), cancelled, { close: true }))
   const { result, deltas } = await run('pi-lastused-io')
+  await native.close()
   expect(staged.fired()).toBe(true)
   expect(result.stopReason).toBe('stop')
   expect(result.content).toEqual([{ type: 'text', text }])
   expect(deltas.join('')).toBe(text)
   expect(await within(cancelled.wait, 100)).toBe(false)
+})
+
+test('Pi serves first delta and full reply while the roster lock is held, then drains lastUsed before close', async () => {
+  const { native, storagePath, client } = await vaultFixture()
+  const paths = nativeVaultPaths(await resolveNativePoolPaths(storagePath))
+  const locked = gate()
+  const release = gate()
+  let released = false
+  let holder: Promise<unknown> | undefined
+  const text = 'début 🧪 served under contention'
+  useFetch(async () => {
+    holder = mutateVaultRoster(paths.roster, async () => {
+      locked.open()
+      await release.wait
+      released = true
+      return { result: undefined }
+    })
+    lifetimes.trackDetached(holder)
+    await locked.wait
+    return eventStream(healthy(text))
+  })
+  const stream = streamCortexKitAnthropic(model, context, {
+    sessionId: 'pi-lastused-held-lock',
+  })
+  let first = false
+  for await (const event of stream) {
+    if (event.type === 'text_delta') {
+      first = true
+      expect(released).toBe(false)
+    }
+  }
+  expect(first).toBe(true)
+  const result = await stream.result()
+  expect(result.stopReason).toBe('stop')
+  expect(result.content).toEqual([{ type: 'text', text }])
+  expect(released).toBe(false)
+  let closed = false
+  client.close = () => {
+    closed = true
+  }
+  let disposed = false
+  const disposing = Promise.resolve(closePiNativeRuntime(storagePath)).then(
+    () => {
+      disposed = true
+    },
+  )
+  lifetimes.trackDetached(disposing)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(disposed).toBe(false)
+  expect(closed).toBe(false)
+  await expect(native.service()).rejects.toThrow('closed')
+  release.open()
+  await holder
+  await disposing
+  expect(closed).toBe(true)
+  const runtime = JSON.parse(await readFile(paths.runtime, 'utf8'))
+  expect(
+    Object.values(runtime.accounts).some(
+      (entry) => Number(Reflect.get(entry as object, 'lastUsed')) > 0,
+    ),
+  ).toBe(true)
+})
+
+test('Pi API lastUsed storage failure is detached, drained and warns without changing reply content', async () => {
+  await routingFixture(false)
+  const native = getPiNativeRuntime()
+  const service = await native.service()
+  const logs = captureUsageLogs()
+  const entered = gate()
+  const release = gate()
+  const publication = spyOn(service, 'publishApi').mockImplementation(
+    async () => {
+      entered.open()
+      await release.wait
+      throw Object.assign(new Error(`/private/roster/${PAID_KEY}`), {
+        name: 'NativeRuntimeError',
+        code: 'runtime-io',
+      })
+    },
+  )
+  deferCleanup(() => publication.mockRestore())
+  const record = routingFetch(
+    () => jsonError(429, 'rate_limit_error', MAIN_ACCESS),
+    () => usageReading(100, 100),
+  )
+  const result = await runModel(model.id, 'pi-api-lastused-io')
+  expect(record.models).toEqual([`Bearer ${MAIN_ACCESS}`, `Bearer ${PAID_KEY}`])
+  expect(result.stopReason).toBe('stop')
+  expect(result.content).toEqual([
+    { type: 'text', text: 'another route answered' },
+  ])
+  await entered.wait
+  let disposed = false
+  const disposing = native.close().then(() => {
+    disposed = true
+  })
+  lifetimes.trackDetached(disposing)
+  await Promise.resolve()
+  expect(disposed).toBe(false)
+  release.open()
+  await disposing
+  expect(
+    logs.filter(
+      (record) => record.message === 'Account usage publication unavailable',
+    ),
+  ).toMatchObject([
+    {
+      level: 'warn',
+      payload: { name: 'NativeRuntimeError', code: 'runtime-io' },
+    },
+  ])
+})
+
+test('Pi runtime eviction drains the evicted instance before closing its native service', async () => {
+  const { native, storagePath, service } = await vaultFixture()
+  const entered = gate()
+  const release = gate()
+  let recorded = false
+  let closedAfterRecord = false
+  const originalClose = service.close.bind(service)
+  const closing = spyOn(service, 'close').mockImplementation(() => {
+    closedAfterRecord = recorded
+    originalClose()
+  })
+  deferCleanup(() => closing.mockRestore())
+  native.usagePublications.publish(async () => {
+    entered.open()
+    await release.wait
+    recorded = true
+  })
+  await entered.wait
+  for (let index = 0; index < 16; index++) {
+    const otherPath = `${storagePath}.eviction-${index}`
+    getPiNativeRuntime(otherPath)
+    deferCleanup(() => closePiNativeRuntime(otherPath))
+  }
+  expect(closing).not.toHaveBeenCalled()
+  release.open()
+  await native.close()
+  expect(closing).toHaveBeenCalledTimes(1)
+  expect(closedAfterRecord).toBe(true)
 })
 
 const jsonText = (status: number, type: string, secret: string) =>

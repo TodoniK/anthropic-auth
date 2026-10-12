@@ -6325,6 +6325,7 @@ describe('meaningful trailing assistant history', () => {
     ])
     await drainSidebarWrites()
     expect((await getSidebarState()).activeId).toBe('fallback-1')
+    await plugin.dispose?.()
     expect(
       (await readAccountStorage())?.accounts.find(
         (account) => account.id === 'fallback-1',

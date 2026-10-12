@@ -19,8 +19,8 @@ test('Pi paces physical usage GETs for two due fallback accounts before a single
     'PI_CODING_AGENT_DIR',
     'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
   ].map((name) => [name, process.env[name]] as const)
-  deferCleanup(() => {
-    closePiNativeRuntime(storagePath)
+  deferCleanup(async () => {
+    await closePiNativeRuntime(storagePath)
     globalThis.fetch = originalFetch
     for (const [name, value] of previous) {
       if (value === undefined) delete process.env[name]

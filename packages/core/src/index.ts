@@ -175,6 +175,7 @@ export {
   parseApplyRequest,
   runPiCommandMenu,
 } from './native-ui.ts'
+export * from './native-usage-publication.ts'
 export type {
   NativePiAuthSlot,
   NativePiAuthSlotErrorCode,

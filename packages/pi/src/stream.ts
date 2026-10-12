@@ -506,6 +506,9 @@ async function sendAnthropicRequest(options: {
   onResolvedTools?: (tools: Tool[]) => void
 }): Promise<Response> {
   const native = getPiNativeRuntime(options.storagePath)
+  // Capture the serving service while authorization is open. Shutdown rejects
+  // new serving work immediately but drains writes for already-served attempts.
+  const servingRuntime = await native.service()
   const snapshot = await native.view()
   const storage = snapshot.policyStorage
   setDumpEnabled(isDumpPersistentlyEnabled(storage))
@@ -611,26 +614,12 @@ async function sendAnthropicRequest(options: {
       logger.warn('native-auth', 'Pi auth-failure report unavailable')
     })
   }
-  const markUsed = async (attempt: PiNativeAttempt) => {
+  const markServed = (attempt: PiNativeAttempt) => {
     if (used.has(attempt)) return
     used.add(attempt)
-    try {
-      await native.markUsed(attempt)
-    } catch (error) {
-      if (usagePublicationRefusalIsFatal(error)) throw error
-      logger.warn('native-auth', 'Pi account usage publication unavailable')
-    }
-  }
-  // Publish lastUsed for the attempt whose response is about to be returned.
-  // A custody, lease or integrity refusal cancels the reply to clear its copied
-  // redaction material, then fails the request. Ordinary I/O only warns.
-  const markServed = async (attempt: PiNativeAttempt, response: Response) => {
-    try {
-      await markUsed(attempt)
-    } catch (error) {
-      await response.body?.cancel().catch(() => {})
-      throw error
-    }
+    native.usagePublications.publish(() =>
+      native.markUsed(attempt, servingRuntime),
+    )
   }
   const takeAttempt = async () => {
     const attempt =
@@ -720,15 +709,6 @@ async function sendAnthropicRequest(options: {
         }
       }
       if (attempt) await report(attempt, response.status, 'direct')
-      if (apiSubject && response.ok)
-        await (await native.service())
-          .publishApi(apiSubject, { lastUsed: Date.now() })
-          .catch(() => {
-            logger.warn(
-              'native-auth',
-              'Pi API account usage publication unavailable',
-            )
-          })
       await dumpDirectRequest({
         affinity: relayAffinity,
         route:
@@ -760,7 +740,13 @@ async function sendAnthropicRequest(options: {
       })
       throw error
     }
-    if (attempt && response.ok) await markServed(attempt, response)
+    if (apiSubject && response.ok) {
+      const subject = apiSubject
+      native.usagePublications.publish(() =>
+        servingRuntime.publishApi(subject, { lastUsed: Date.now() }),
+      )
+    }
+    if (attempt && response.ok) markServed(attempt)
     return response
   }
   if (options.apiAccount) return directFetch()
@@ -828,28 +814,8 @@ async function sendAnthropicRequest(options: {
     }
   }
   if (response.ok && lastTransport === 'relay' && relayAttempt)
-    await markServed(relayAttempt, response)
+    markServed(relayAttempt)
   return response
-}
-
-/**
- * Whether a lastUsed publication failure must fail the request. Custody
- * refusals (receipt, enrollment, route or pin no longer valid) and runtime
- * refusals on ownership, lease or file-integrity grounds are fatal. Ordinary
- * runtime storage I/O (`runtime-io`), a newer persisted observation
- * (`runtime-conflict`) and any other error only warn. Core exports neither
- * error class at runtime, so they are matched by name and code.
- */
-function usagePublicationRefusalIsFatal(error: unknown) {
-  if (!(error instanceof Error)) return false
-  if (error.name === 'NativeCustodyError') return true
-  if (error.name !== 'NativeRuntimeError') return false
-  const code: unknown = Reflect.get(error, 'code')
-  return (
-    code === 'publication-refused' ||
-    code === 'unsafe-runtime' ||
-    code === 'invalid-runtime'
-  )
 }
 
 function quotaSnapshotIsExhausted(

@@ -73,8 +73,8 @@ async function piFixture() {
     PI_ANTHROPIC_AUTH_FILE: process.env.PI_ANTHROPIC_AUTH_FILE,
   }
   deferCleanup(async () => {
+    await closePiNativeRuntime(storagePath)
     globalThis.fetch = originalFetch
-    closePiNativeRuntime(storagePath)
     for (const [key, value] of Object.entries(savedEnv)) {
       if (value === undefined) delete process.env[key]
       else process.env[key] = value

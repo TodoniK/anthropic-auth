@@ -1,6 +1,7 @@
 import {
   connectClaustrumScopedClient,
   createNativeAccountRuntime,
+  createNativeUsagePublisher,
   isKillswitchEnabled,
   killswitchPassesPolicy,
   logger,
@@ -98,6 +99,8 @@ export class PiNativeRuntime {
   private readonly paths: Promise<NativePoolPaths>
   private readonly initialization: Promise<NativeAccountRuntime>
   private closed = false
+  private closing: Promise<void> | undefined
+  readonly usagePublications = createNativeUsagePublisher('native-auth')
 
   constructor(
     storagePath: string,
@@ -306,21 +309,27 @@ export class PiNativeRuntime {
       )
   }
 
-  async markUsed(served: PiNativeAttempt): Promise<void> {
-    const runtime = await this.service()
+  async markUsed(
+    served: PiNativeAttempt,
+    servingRuntime?: NativeAccountRuntime,
+  ): Promise<void> {
+    const runtime = servingRuntime ?? (await this.service())
     const patch = { lastUsed: Date.now() }
     if (served.source === 'vault')
       await runtime.vault.publish(served.receipt, patch)
     else await runtime.publishLocal(served.admission.subject, patch)
   }
 
-  close(): void {
-    if (this.closed) return
+  close(): Promise<void> {
     this.closed = true
-    void this.initialization.then(
-      (runtime) => runtime.close(),
-      () => {},
-    )
+    this.closing ??= (async () => {
+      await this.usagePublications.drain()
+      await this.initialization.then(
+        (runtime) => runtime.close(),
+        () => {},
+      )
+    })()
+    return this.closing
   }
 }
 
@@ -343,7 +352,8 @@ export function getPiNativeRuntime(
 
 export function closePiNativeRuntime(
   storagePath = getPiAccountStoragePath(),
-): void {
-  runtimes.get(storagePath)?.close()
+): Promise<void> {
+  const closing = runtimes.get(storagePath)?.close() ?? Promise.resolve()
   runtimes.delete(storagePath)
+  return closing
 }
