@@ -1,17 +1,17 @@
 {
   "floors": {
-    "core": 1508,
-    "opencode": 2010,
-    "pi": 220
+    "core": 1765,
+    "opencode": 2111,
+    "pi": 264
   },
   "measurement": {
-    "head": "1a44f68301d0a83e9ad218efb850a6c7c5db060d",
+    "head": "6435e6e34f24f5121834699de8e6cc1bf201640d",
     "dirtyPaths": 0
   },
   "evidence": {
-    "_note": "Pinned Bun 1.3.14 unit totals measured on native cutover head 688a8bec by CI run 38161601147. The unit census passed, including disposable packed hosts; the later E2E step failed separately. Runner counts, not source declaration counts, are the authority at the gate.",
-    "core": "1508 passing at head 688a8bec; CI run 38161601147 MEASURED: core 1508",
-    "opencode": "2010 passing at head 688a8bec, including packed host cases; CI run 38161601147 MEASURED: opencode 2010",
-    "pi": "220 passing at head 688a8bec; CI run 38161601147 MEASURED: pi 220"
+    "_note": "CI run 38251377834 measured successful unit-suite counts at the recorded head with Bun 1.3.14. These floors are raised to those measurements; that run enforced the previous floors of 1508/2010/220. Full CI also passed packed-host checks and all 71 process E2E cases. The floor check uses runner counts, not source declaration counts.",
+    "core": "CI run 38251377834 reported MEASURED: core 1765.",
+    "opencode": "CI run 38251377834 reported MEASURED: opencode 2111, including packed-host cases.",
+    "pi": "CI run 38251377834 reported MEASURED: pi 264."
   }
 }
