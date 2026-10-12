@@ -14200,23 +14200,26 @@ describe('auth.loader', () => {
 
   test('fallback-first tries an OAuth fallback whose quota is unknown before main', async () => {
     const expires = Date.now() + 5 * 60 * 60_000
+    // The account is known; only its quota is unknown.
     await useTempAccountFile(
-      createFallbackStorage({
-        routing: { mode: 'fallback-first' },
-        quota: {
-          ...createFallbackStorage().quota,
-          failClosedOnUnknownQuota: false,
-        },
-        accounts: [
-          {
-            id: 'unknown-fallback',
-            type: 'oauth',
-            access: 'sk-ant-oat01-unknown-fallback-access',
-            refresh: 'unknown-fallback-refresh',
-            expires,
+      bindPoolAccounts(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          quota: {
+            ...createFallbackStorage().quota,
+            failClosedOnUnknownQuota: false,
           },
-        ],
-      }),
+          accounts: [
+            {
+              id: 'unknown-fallback',
+              type: 'oauth',
+              access: 'sk-ant-oat01-unknown-fallback-access',
+              refresh: 'unknown-fallback-refresh',
+              expires,
+            },
+          ],
+        }),
+      ),
     )
     const authorizations: string[] = []
     globalThis.fetch = mock(
@@ -14255,18 +14258,20 @@ describe('auth.loader', () => {
 
   test('fallback-first rejects an OAuth fallback whose quota is unknown under fail-closed', async () => {
     await expectUnknownQuotaAdmissionBlocked(
-      createFallbackStorage({
-        routing: { mode: 'fallback-first' },
-        accounts: [
-          {
-            id: 'unknown-fallback',
-            type: 'oauth',
-            access: 'sk-ant-oat01-unknown-fallback-access',
-            refresh: 'unknown-fallback-refresh',
-            expires: Date.now() + 5 * 60 * 60_000,
-          },
-        ],
-      }),
+      bindPoolAccounts(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          accounts: [
+            {
+              id: 'unknown-fallback',
+              type: 'oauth',
+              access: 'sk-ant-oat01-unknown-fallback-access',
+              refresh: 'unknown-fallback-refresh',
+              expires: Date.now() + 5 * 60 * 60_000,
+            },
+          ],
+        }),
+      ),
     )
   })
 
