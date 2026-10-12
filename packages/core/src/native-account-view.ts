@@ -499,6 +499,76 @@ function metadata(
   }
 }
 
+/**
+ * Whether a local OAuth row is held back only because another writer is part
+ * way through saving it, for example a refresh that has written the state
+ * file naming the row's first account UUID but not yet the config file.
+ *
+ * True only when the row is torn and would otherwise be an enabled,
+ * coherent candidate: it holds a credential, is not disabled (including
+ * quarantine and duplicate-identity disables), staged, invalid or unbound,
+ * and its stamp is bound to that credential. Such a row is shown enabled but
+ * without a binding: it may be chosen for a request, and local authorization
+ * then waits for the write to finish before it can serve.
+ *
+ * A different stored credential epoch can belong to a replacement. Keep
+ * the existing refusal for mismatched epochs rather than use old metadata
+ * as evidence that this write only learns the account's first UUID.
+ */
+export function nativeLocalRowAwaitsTornWrite(
+  paths: NativePoolPaths,
+  row: PoolRow,
+  stored?: NativeRuntimeEntry,
+): boolean {
+  const previous = stored?.binding
+  if (
+    (previous?.kind === 'local' &&
+      previous.credentialEpoch !== row.credentialEpoch) ||
+    row.type !== 'oauth' ||
+    row.torn !== true ||
+    row.enabled !== true ||
+    row.disabledReason !== undefined ||
+    row.credential === undefined ||
+    row.staged !== undefined ||
+    row.invalid !== undefined ||
+    row.unbound === true ||
+    row.stamp !== 'bound' ||
+    row.credentialEpoch === undefined
+  )
+    return false
+  const { torn: _torn, ...completed } = row
+  return nativeLocalPoolBindingMatches(
+    {
+      kind: 'local',
+      storageId: paths.storageId,
+      rowId: row.id,
+      credentialEpoch: row.credentialEpoch,
+      ...(row.identity !== undefined ? { identity: row.identity } : {}),
+    },
+    paths,
+    completed,
+  )
+}
+
+/** `nativeLocalRowAwaitsTornWrite` for the row a route id names, mapped as the account projection maps it. */
+export function nativeLocalRouteAwaitsTornWrite(
+  paths: NativePoolPaths,
+  rows: readonly PoolRow[],
+  settings: Record<string, unknown>,
+  routeId: string,
+  runtime?: NativeRuntimeState,
+): boolean {
+  const mainAccountId = nativeAccountSettings(settings).mainAccountId
+  const row = rows.find(
+    (candidate) =>
+      (candidate.id === mainAccountId ? 'main' : candidate.id) === routeId,
+  )
+  return (
+    row !== undefined &&
+    nativeLocalRowAwaitsTornWrite(paths, row, runtime?.accounts[row.id])
+  )
+}
+
 /** Join quota, profile and errors only for matching storage, account and credential generation; a reused route must not expose its previous account. */
 export function projectNativeAccountViews(input: {
   paths: NativePoolPaths
@@ -565,7 +635,16 @@ export function projectNativeAccountViews(input: {
       !row.credential.access.startsWith('sk-ant-oat')
         ? { state: 'unsupported-access' }
         : {}),
-      enabled: row.enabled && row.candidate,
+      // A row whose only obstacle is an unfinished write stays selectable;
+      // it has no binding, so authorization waits for that write first.
+      enabled:
+        row.enabled &&
+        (row.candidate ||
+          nativeLocalRowAwaitsTornWrite(
+            input.paths,
+            row,
+            input.runtime?.accounts[row.id],
+          )),
       label: row.label,
       addedAt: row.addedAt,
       accountIdentity: row.identity,

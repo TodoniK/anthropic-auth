@@ -27,6 +27,7 @@ import {
   isDumpPersistentlyEnabled,
   isFastModePersistentlyEnabled,
   isKillswitchEnabled,
+  isNativeTransientAccountError,
   isOAuthAccount,
   isPermanentRefreshError,
   isValidApiBaseURL,
@@ -189,7 +190,14 @@ function getPiRoutingServices(
       ) {
         try {
           await quotas.refreshFallback(account.id, '', account)
-        } catch {}
+        } catch (error) {
+          // A transient account error means another writer is still saving
+          // this fallback. Rethrow it: swallowing it would leave the fallback
+          // without a quota reading, which can exclude it below and send the
+          // request through a different account. Other probe errors are
+          // ignored.
+          if (isNativeTransientAccountError(error)) throw error
+        }
       }
       const quota =
         quotas.getFallback(account.id, account)?.quota ?? account.quota

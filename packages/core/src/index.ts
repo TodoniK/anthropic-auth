@@ -149,6 +149,10 @@ export type {
   NativeLocalFailurePolicy,
   NativeLocalFailureSkipReason,
 } from './native-runtime.ts'
+export {
+  isNativeTransientAccountError,
+  NativeTransientAccountError,
+} from './native-transient-account.ts'
 export type {
   CommandApplyRequest,
   CommandApplyResult,

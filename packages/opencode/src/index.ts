@@ -113,6 +113,7 @@ import {
   isFastModePersistentlyEnabled,
   isFastModeSupportedModel,
   isKillswitchEnabled,
+  isNativeTransientAccountError,
   isOAuthAccount,
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
@@ -2697,7 +2698,12 @@ const anthropicAuthPlugin = async (
             { accountId: account.id, requiredByPolicy },
           )
         }
-      } catch {
+      } catch (error) {
+        // A local account that another writer is still saving is the account
+        // routing chose: fail the request retryably instead of routing it
+        // past that account.
+        if (requiredByPolicy && isNativeTransientAccountError(error))
+          throw error
         // A refused account read need not persist a quota error. Keep that
         // missing reading visible to admission without poisoning token state.
         unavailable.add(account.id)
@@ -2801,7 +2807,10 @@ const anthropicAuthPlugin = async (
             access: credential.accessToken,
             expires: credential.expires,
           })
-        } catch {
+        } catch (error) {
+          // A fallback that another writer is still saving cannot be skipped:
+          // skipping it would send this request through a different account.
+          if (isNativeTransientAccountError(error)) throw error
           // Do not use credentials that failed authorization. A failed or
           // missing quota reading also cannot prove the account's general
           // limits are exhausted and therefore cannot permit paid fallback.
@@ -6074,6 +6083,9 @@ const anthropicAuthPlugin = async (
             )
           } catch (error) {
             if (error instanceof NativeUnsupportedCredentialError) throw error
+            // Main is still being saved by another writer: retry the request
+            // rather than treat main as unavailable and route elsewhere.
+            if (isNativeTransientAccountError(error)) throw error
             if (error instanceof NativeModelPolicyError) {
               denied = error.account
               // Recheck a stale limit for this model before moving the request
@@ -6103,6 +6115,8 @@ const anthropicAuthPlugin = async (
                   )
                   denied = undefined
                 } catch (retryError) {
+                  if (isNativeTransientAccountError(retryError))
+                    throw retryError
                   if (retryError instanceof NativeModelPolicyError)
                     denied = retryError.account
                   else if (
@@ -8994,7 +9008,11 @@ const anthropicAuthPlugin = async (
                     error:
                       error instanceof Error ? error.message : String(error),
                   })
-                  if (stickyRouteSelected) throw error
+                  if (
+                    stickyRouteSelected ||
+                    isNativeTransientAccountError(error)
+                  )
+                    throw error
                   const retryable =
                     error instanceof Error ? error : new Error(String(error))
                   Object.assign(retryable, {
@@ -9052,6 +9070,9 @@ const anthropicAuthPlugin = async (
                     error:
                       error instanceof Error ? error.message : String(error),
                   })
+                  // A fallback still being saved by another writer must not
+                  // be replaced by main for this request.
+                  if (isNativeTransientAccountError(error)) throw error
                 }
               }
 
@@ -9368,6 +9389,9 @@ const anthropicAuthPlugin = async (
                     error:
                       error instanceof Error ? error.message : String(error),
                   })
+                  // A fallback still being saved by another writer must not
+                  // be replaced by main for this request.
+                  if (isNativeTransientAccountError(error)) throw error
                   // Main quota checks should optimize routing, not break requests.
                 }
               }

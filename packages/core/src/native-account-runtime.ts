@@ -4,6 +4,7 @@ import {
   fingerprintOf,
   POOL_LOCK_DEFAULTS,
   type PoolCredential,
+  type PoolRow,
 } from '@cortexkit/common-auth/store'
 
 import {
@@ -17,7 +18,7 @@ import {
   quotaSnapshotPassesPolicy,
 } from './accounts.ts'
 import { resolveClaudeCodeIdentity } from './claude-code.ts'
-import type { LogLevel } from './logger.ts'
+import { type LogLevel, logger } from './logger.ts'
 import {
   applyNativeMetadataPatch,
   captureNativeMetadataPatch,
@@ -26,6 +27,7 @@ import {
   type NativeAccountSnapshot,
   type NativeAccountView,
   nativeAccountReadError,
+  nativeLocalRouteAwaitsTornWrite,
   nativeQuotaFailure,
   projectNativeAccountViews,
 } from './native-account-view.ts'
@@ -58,9 +60,14 @@ import { NATIVE_REFRESH_MAX_ATTEMPTS } from './native-refresh-coordinator.ts'
 import {
   type NativeRuntimeEntry,
   NativeRuntimeError,
+  type NativeRuntimeState,
   readNativeRuntime,
   updateNativeRuntime,
 } from './native-runtime.ts'
+import {
+  joinNativePoolWrite,
+  NativeTransientAccountError,
+} from './native-transient-account.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
 import {
   acquireNativeVaultRuntime,
@@ -506,6 +513,74 @@ export function createNativeAccountRuntime(
     )
     if (!kept) throw new NativeRuntimeError('publication-refused')
   }
+  /**
+   * One read of the selected pool: the account projection, plus the rows and
+   * settings it was projected from.
+   */
+  async function readView() {
+    const mode = await authority()
+    const selectedPaths = mode === 'claustrum' ? vaultPaths : paths
+    const selectedStore = mode === 'claustrum' ? vaultStore : store
+    const [read, settings, metadata] = await Promise.all([
+      selectedStore.read(),
+      selectedStore.readSettings(),
+      readNativeRuntime(selectedPaths.runtime, selectedPaths.storageId),
+    ])
+    if (read.status !== 'ready' || settings.status !== 'ready')
+      throw new NativeRuntimeError('publication-refused')
+    // Status reads use stored account metadata without fetching tokens or
+    // requesting vault access. Refresh, or first authorization with no stored
+    // account list, discovers authorized vault accounts. Only offline setup
+    // may enroll the host and request its grant.
+    const roster = mode === 'claustrum' ? await vault.read() : undefined
+    check()
+    const snapshot = projectNativeAccountViews({
+      paths: { ...paths, ...selectedPaths },
+      rows: read.rows,
+      settings: {
+        ...settings.settings,
+        claustrum: {
+          ...(settings.settings.claustrum as
+            | Record<string, unknown>
+            | undefined),
+          mode,
+        },
+      },
+      runtime: metadata.status === 'ready' ? metadata.state : undefined,
+      roster,
+    })
+    if (mode === 'claustrum') snapshot.routingPath = vaultPaths.routing
+    return {
+      snapshot,
+      rows: read.rows,
+      settings: settings.settings,
+      runtime: metadata.status === 'ready' ? metadata.state : undefined,
+    }
+  }
+  // The rows, settings and runtime metadata each snapshot returned by read()
+  // was projected from, so authorization can inspect a row exactly as that
+  // read saw it without reading the pool files again.
+  const projectedFrom = new WeakMap<
+    NativeAccountSnapshot,
+    {
+      rows: readonly PoolRow[]
+      settings: Record<string, unknown>
+      runtime: NativeRuntimeState | undefined
+    }
+  >()
+  function awaitsTornWrite(snapshot: NativeAccountSnapshot, routeId: string) {
+    const source = projectedFrom.get(snapshot)
+    return (
+      source !== undefined &&
+      nativeLocalRouteAwaitsTornWrite(
+        paths,
+        source.rows,
+        source.settings,
+        routeId,
+        source.runtime,
+      )
+    )
+  }
   const runtime: NativeAccountRuntime = {
     vault,
     async getRelayConfig() {
@@ -627,39 +702,9 @@ export function createNativeAccountRuntime(
       )
     },
     async read() {
-      const mode = await authority()
-      const selectedPaths = mode === 'claustrum' ? vaultPaths : paths
-      const selectedStore = mode === 'claustrum' ? vaultStore : store
-      const [read, settings, metadata] = await Promise.all([
-        selectedStore.read(),
-        selectedStore.readSettings(),
-        readNativeRuntime(selectedPaths.runtime, selectedPaths.storageId),
-      ])
-      if (read.status !== 'ready' || settings.status !== 'ready')
-        throw new NativeRuntimeError('publication-refused')
-      // Status reads use stored account metadata without fetching tokens or
-      // requesting vault access. Refresh, or first authorization with no stored
-      // account list, discovers authorized vault accounts. Only offline setup
-      // may enroll the host and request its grant.
-      const roster = mode === 'claustrum' ? await vault.read() : undefined
-      check()
-      const snapshot = projectNativeAccountViews({
-        paths: { ...paths, ...selectedPaths },
-        rows: read.rows,
-        settings: {
-          ...settings.settings,
-          claustrum: {
-            ...(settings.settings.claustrum as
-              | Record<string, unknown>
-              | undefined),
-            mode,
-          },
-        },
-        runtime: metadata.status === 'ready' ? metadata.state : undefined,
-        roster,
-      })
-      if (mode === 'claustrum') snapshot.routingPath = vaultPaths.routing
-      return snapshot
+      const view = await readView()
+      projectedFrom.set(view.snapshot, view)
+      return view.snapshot
     },
     async authorizeLocal(routeId, request = {}) {
       await authority(request.signal)
@@ -667,6 +712,42 @@ export function createNativeAccountRuntime(
       let account = snapshot.accounts.find((row) => row.id === routeId)
       if (snapshot.mode !== 'local')
         return { status: 'refused', reason: 'custody-mode', persisted: false }
+      if (!account?.binding && awaitsTornWrite(snapshot, routeId)) {
+        // The row is unavailable only because another writer is between its
+        // state-file and config-file writes. Wait for that write once, then
+        // read again. Refusing instead would let the host send the request
+        // through a different account than the one it chose.
+        logger.debug('native-auth', 'waiting for an account write to finish', {
+          phase: 'waiting',
+        })
+        const joined = await joinNativePoolWrite(
+          paths,
+          request.signal
+            ? [shutdown.signal, request.signal]
+            : [shutdown.signal],
+          () => check(request.signal),
+          now,
+        )
+        if (joined === 'deadline') {
+          logger.warn('native-auth', 'account write did not finish in time', {
+            outcome: 'deadline',
+          })
+          throw new NativeTransientAccountError()
+        }
+        snapshot = await runtime.read()
+        account = snapshot.accounts.find((row) => row.id === routeId)
+        if (snapshot.mode !== 'local')
+          return { status: 'refused', reason: 'custody-mode', persisted: false }
+        if (!account?.binding && awaitsTornWrite(snapshot, routeId)) {
+          logger.warn('native-auth', 'account write is still unfinished', {
+            outcome: 'still-torn',
+          })
+          throw new NativeTransientAccountError()
+        }
+        logger.debug('native-auth', 'account write finished', {
+          outcome: 'joined',
+        })
+      }
       if (
         !account?.binding ||
         account.source !== 'local' ||

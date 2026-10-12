@@ -2104,3 +2104,140 @@ for (const scenario of final401Cases) {
     )
   })
 }
+
+/**
+ * Pause a real pool-store refresh of the local fallback that offline
+ * migration created without an account UUID. The refresh keeps the fallback's
+ * tokens and records its first account UUID; it is paused after writing the
+ * state file and before writing the config file, the half-written moment in
+ * which a reader sees the fallback as torn. Returns once the write is paused.
+ */
+async function holdFallbackFirstIdentity(paths: {
+  config: string
+  state: string
+}) {
+  const reached = lifetimes.gate()
+  const release = lifetimes.gate()
+  let held = false
+  const producer = createNativePoolStore({
+    paths,
+    quota: nativeQuotaCodec,
+    onStep: async (step, info) => {
+      if (
+        held ||
+        step !== 'after-state-write' ||
+        info.operation !== 'refresh' ||
+        info.rowId !== 'fallback-route'
+      )
+        return
+      held = true
+      reached.open()
+      await release.wait
+    },
+  })
+  const write = producer.refresh('fallback-route', async (credential) => {
+    if (credential.access !== 'sk-ant-oat01-local-fallback')
+      throw new Error('the fallback row does not hold the migrated token')
+    return {
+      access: credential.access,
+      refresh: credential.refresh,
+      expires: Date.now() + 8 * 60 * 60_000,
+      identity: fallbackIdentity,
+    }
+  })
+  lifetimes.trackDetached(write)
+  await Promise.race([reached.wait, write.then(noop, noop)])
+  expect(held).toBe(true)
+  return { write, release: release.open }
+}
+
+function noop() {}
+
+/** Opens a gate once Core's local authorization starts waiting on an unfinished pool write. */
+function watchTornWriteJoin() {
+  const waiting = lifetimes.gate()
+  const outcomes: unknown[] = []
+  const previousLevel = getLogLevel()
+  setLogLevel('debug')
+  __setLogTestSink((record: LogTestRecord) => {
+    if (record.channel !== 'native-auth') return
+    if (record.payload?.phase === 'waiting') waiting.open()
+    if (record.payload?.outcome !== undefined)
+      outcomes.push(record.payload.outcome)
+  })
+  lifetimes.deferCleanup(() => {
+    __setLogTestSink(null)
+    setLogLevel(previousLevel)
+  })
+  return { waiting: waiting.wait, outcomes }
+}
+
+async function useFallbackFirst(
+  paths: Awaited<ReturnType<typeof resolveNativePoolPaths>>,
+) {
+  const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
+  try {
+    // The plugin applies the stored logging level; keep the debug record
+    // that shows a request waiting on the held write.
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      routing: { mode: 'fallback-first' },
+      logging: { level: 'debug' },
+    }))
+  } finally {
+    runtime.close()
+  }
+}
+
+test('fallback-first waits for a held first-identity write and serves the migrated fallback it chose', async () => {
+  const fixture = await migrateServingFixture('local', true)
+  await useFallbackFirst(fixture.paths)
+  const join = watchTornWriteJoin()
+  const held = await holdFallbackFirstIdentity(fixture.paths)
+  const plugin = await createPlugin()
+  const sending = sendNative(plugin)
+  lifetimes.trackDetached(sending.then(noop, noop))
+  const first = await Promise.race([
+    join.waiting.then(() => 'waiting' as const),
+    sending.then(
+      () => 'settled' as const,
+      () => 'settled' as const,
+    ),
+  ])
+  expect(first).toBe('waiting')
+  held.release()
+  const [written] = await Promise.allSettled([held.write])
+  const [sent] = await Promise.allSettled([sending])
+  expect(written.status).toBe('fulfilled')
+  expect(sent.status).toBe('fulfilled')
+  if (sent.status === 'fulfilled') expect(sent.value.status).toBe(200)
+  const messages = fixture.records.filter((record) =>
+    record.url.includes('/v1/messages'),
+  )
+  expect(messages.map((record) => record.authorization)).toEqual([
+    'Bearer sk-ant-oat01-local-fallback',
+  ])
+  expect(join.outcomes).toContain('joined')
+})
+
+test('fallback-first fails retryably and sends nothing when the first-identity write stays unfinished', async () => {
+  const fixture = await migrateServingFixture('local', true)
+  await useFallbackFirst(fixture.paths)
+  const join = watchTornWriteJoin()
+  const held = await holdFallbackFirstIdentity(fixture.paths)
+  const plugin = await createPlugin()
+  const [sent] = await Promise.allSettled([sendNative(plugin)])
+  expect(sent.status).toBe('rejected')
+  expect(sent.status === 'rejected' ? sent.reason : null).toMatchObject({
+    name: 'NativeTransientAccountError',
+    message: 'Anthropic account update in progress; retry the request',
+    code: 'ECONNRESET',
+  })
+  expect(
+    fixture.records.filter((record) => record.url.includes('/v1/messages')),
+  ).toEqual([])
+  expect(join.outcomes).toContain('deadline')
+  held.release()
+  const [written] = await Promise.allSettled([held.write])
+  expect(written.status).toBe('fulfilled')
+})
