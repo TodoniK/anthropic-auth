@@ -79,18 +79,23 @@ export async function cleanPiLocalAnthropicAuth(
   }
 }
 
+/**
+ * A failed install carries the child's raw exit code and stderr for the
+ * diagnostic log only; stderr can echo credentials from the environment, so it
+ * is never meant for the screen.
+ */
+export type PiInstallResult =
+  | { ok: true; message: string }
+  | { ok: false; exitCode: number; stderr: string }
+
 export async function installPiExtension(
   version: string,
   runner: CommandRunner = defaultCommandRunner,
   env: NodeJS.ProcessEnv = process.env,
-): Promise<{ ok: boolean; message: string }> {
+): Promise<PiInstallResult> {
   const entry = piPluginEntry(version)
   const result = await runner.run('pi', ['install', entry], { env })
-  if (result.exitCode !== 0) {
-    return {
-      ok: false,
-      message: `Failed to install Pi package: ${result.stderr.trim() || `exit ${result.exitCode}`}`,
-    }
-  }
+  if (result.exitCode !== 0)
+    return { ok: false, exitCode: result.exitCode, stderr: result.stderr }
   return { ok: true, message: `Installed ${entry}` }
 }

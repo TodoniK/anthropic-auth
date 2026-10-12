@@ -15,6 +15,7 @@ import {
   resolveNativePoolPaths,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
+import { type CliFailureStage, reportThrownFailure } from './cli-failure.ts'
 
 async function withNativeAccounts<T>(
   run: (runtime: NativeAccountRuntime) => Promise<T>,
@@ -211,17 +212,23 @@ type FetchLike = (
 export interface RelaySetupDeps {
   fetchImpl?: FetchLike
   prompt?: (message: string) => Promise<string>
+  /** Receives each credential this command handles, for redacting failure detail. */
+  secrets?: string[]
+  /** Prints a non-fatal warning; defaults to console.warn. */
+  warn?: (message: string) => void
 }
 
 export async function relaySetup(deps: RelaySetupDeps = {}) {
   await withNativeAccounts((runtime) => runtime.read())
   const fetchImpl = deps.fetchImpl ?? fetch
   const ask = deps.prompt ?? prompt
+  const warn = deps.warn ?? ((message: string) => console.warn(message))
   const token = requireText(
     process.env.CLOUDFLARE_API_TOKEN?.trim() ||
       (await ask('Cloudflare API token: ')),
     'Cloudflare API token',
   )
+  deps.secrets?.push(token)
   const accountId = requireText(
     process.env.CLOUDFLARE_ACCOUNT_ID || (await ask('Cloudflare account ID: ')),
     'Cloudflare account ID',
@@ -231,6 +238,7 @@ export async function relaySetup(deps: RelaySetupDeps = {}) {
     'opencode-anthropic-relay'
   const kvTitle = `${scriptName}-state`
   const relayToken = generateRelayToken()
+  deps.secrets?.push(relayToken)
 
   console.log('Creating Cloudflare KV namespace...')
   const namespace = await createKvNamespace(
@@ -248,10 +256,15 @@ export async function relaySetup(deps: RelaySetupDeps = {}) {
     relayToken,
     fetchImpl,
   })
+  // Cloudflare's error text can echo request details, so the warning names
+  // only a fixed code and the private file holding the scrubbed detail.
   await enableWorkersDev(token, accountId, scriptName, fetchImpl).catch(
-    (error) => {
-      console.warn(
-        `Could not enable workers.dev automatically: ${error instanceof Error ? error.message : String(error)}`,
+    async (error) => {
+      warn(
+        await reportThrownFailure('cli-relay-workers-dev', error, process.env, [
+          token,
+          relayToken,
+        ]),
       )
     },
   )
@@ -301,6 +314,8 @@ export interface LoginDeps {
   prompt?: (message: string) => Promise<string>
   authorize?: typeof authorize
   exchange?: typeof exchange
+  /** Receives each credential this command handles, for redacting failure detail. */
+  secrets?: string[]
 }
 
 export async function login(labelArg?: string, deps: LoginDeps = {}) {
@@ -325,6 +340,7 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     const code = await ask(
       'Paste the full callback URL or authorization code here: ',
     )
+    deps.secrets?.push(code)
     const result = await exchangeImpl(
       code,
       authorization.verifier,
@@ -332,6 +348,7 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
       authorization.state,
     )
     if (result.type === 'failed') throw new Error('Authentication failed')
+    deps.secrets?.push(result.access, result.refresh)
     if (process.env.OPENCODE_AUTH_CONTENT !== undefined)
       throw new Error(
         'Local login cannot be verified while OPENCODE_AUTH_CONTENT is set',
@@ -363,6 +380,8 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
  */
 export interface ApiAddDeps {
   prompt?: (message: string) => Promise<string>
+  /** Receives each credential this command handles, for redacting failure detail. */
+  secrets?: string[]
 }
 
 export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
@@ -386,6 +405,7 @@ export async function addApiRoute(labelArg?: string, deps: ApiAddDeps = {}) {
     process.env.OPENCODE_ANTHROPIC_AUTH_API_KEY?.trim() ||
     (await ask('API key: '))
   if (!apiKey.trim()) throw new Error('API key is required')
+  deps.secrets?.push(apiKey.trim())
   const authHeaderInput = (
     process.env.OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER?.trim() ||
     (await ask(
@@ -455,7 +475,18 @@ import { runSetupCommand } from './setup/command.ts'
 
 export { runSetupCommand }
 
-async function main() {
+/**
+ * What the top-level failure handler needs from the running command: `stage`
+ * names the command being run (it starts as the generic 'cli-command'), and
+ * `secrets` collects the credentials that command handled so a failure detail
+ * can be scrubbed of their exact values. Lives only for one CLI invocation.
+ */
+interface CliFailureContext {
+  stage: CliFailureStage
+  secrets: string[]
+}
+
+async function main(failure: CliFailureContext) {
   const [command, subcommandOrLabel, maybeLabel] = process.argv.slice(2)
   if (
     !command ||
@@ -468,28 +499,33 @@ async function main() {
   }
 
   if (command === 'setup') {
+    failure.stage = 'cli-setup'
     const code = await runSetupCommand(process.argv.slice(3))
     if (code !== 0) process.exitCode = code
     return
   }
 
   if (command === 'login') {
-    await login(subcommandOrLabel)
+    failure.stage = 'cli-login'
+    await login(subcommandOrLabel, { secrets: failure.secrets })
     return
   }
 
   if (command === 'api' && subcommandOrLabel === 'add') {
-    await addApiRoute(maybeLabel)
+    failure.stage = 'cli-api-add'
+    await addApiRoute(maybeLabel, { secrets: failure.secrets })
     return
   }
 
   if (command === 'list') {
+    failure.stage = 'cli-list'
     await listAccounts()
     return
   }
 
   if (command === 'relay' && subcommandOrLabel === 'setup') {
-    await relaySetup()
+    failure.stage = 'cli-relay-setup'
+    await relaySetup({ secrets: failure.secrets })
     return
   }
 
@@ -500,10 +536,20 @@ async function main() {
 // Only run the CLI when executed directly (e.g. `bun src/cli.ts ...`), not when
 // imported by tests that exercise individual commands (relaySetup) in-process.
 if (import.meta.main) {
+  const failure: CliFailureContext = { stage: 'cli-command', secrets: [] }
   try {
-    await main()
+    await main(failure)
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error))
+    // Known fixed remedies print as before; any other failure prints only a
+    // fixed code and the path of a private file holding the scrubbed detail.
+    console.error(
+      await reportThrownFailure(
+        failure.stage,
+        error,
+        process.env,
+        failure.secrets,
+      ),
+    )
     process.exitCode = 1
   } finally {
     closePromptInterface()
