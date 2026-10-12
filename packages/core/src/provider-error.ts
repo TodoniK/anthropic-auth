@@ -19,6 +19,7 @@
  * escapes decoded, so a credential spelled with `\uXXXX` escapes, or hidden
  * in a duplicate JSON key that a parser would drop, is still found.
  */
+import { Buffer } from 'node:buffer'
 import { types as utilTypes } from 'node:util'
 import {
   createSseFramer,
@@ -529,7 +530,19 @@ function scrubJson(
   return copy
 }
 
-/** True unless the JSON text of a non-string primitive contains a credential. */
+/**
+ * True unless the JSON text of a non-string primitive contains a credential.
+ *
+ * Known residual: a number is checked only in the spelling JSON.stringify
+ * gives it, and some non-string values are never checked at all: a thrown
+ * number or bigint, a number or bigint in a projected `cause` or array, and
+ * every thrown value once the redactor is disposed (non-strings other than
+ * objects then pass through as they are). So a credential made only of digits
+ * could get through as such a value, or as a number written in exponent form
+ * inside a JSON body. Protection covers opaque credential strings echoed by
+ * a provider, not numeric conversions. Digit-only credentials converted to
+ * numbers or bigints therefore remain outside that protection.
+ */
 function isCleanLiteral(value: unknown, secrets: readonly string[]): boolean {
   const text = JSON.stringify(value)
   return typeof text !== 'string' || scrubText(text, secrets) === text
@@ -706,6 +719,84 @@ interface Projection {
   memo: Map<object, unknown>
   /** Objects still allowed before the rest is withheld. */
   budget: number
+  /** Output bytes still allowed; see `spend`. */
+  bytes: number
+}
+
+/** Replaces one text field that does not fit in the projection's byte budget. */
+const OVERSIZED_DETAIL_MESSAGE =
+  'Provider error details exceeded the redaction size limit and were withheld'
+
+/** Charged for a kept number, boolean or other non-text value: the longest JSON number. */
+const LITERAL_BYTES = 24
+
+/**
+ * One projection retains at most PROVIDER_ERROR_MAX_BODY_BYTES, the same
+ * limit a non-2xx body gets, counted this way: every string value and string
+ * key the projection holds is charged its UTF-8 bytes, including header
+ * names and each error's `message` and `stack`; every array slot is charged
+ * one byte and every number, boolean, null, undefined or other non-text
+ * value LITERAL_BYTES (an array is copied only as far as its slots can be
+ * paid for). Text is charged its input length before it is scanned, so text
+ * that is scanned and then dropped still counts. This bounds the retained
+ * data, not any serialized form of it: JSON, for example, writes a control
+ * character as a six-byte escape. Nor does it count fixed-size metadata a
+ * runtime adds to every error it constructs (Bun records the line, column
+ * and source URL where the error was created). Returns false, and charges
+ * nothing, when the cost does not fit.
+ */
+function spend(walk: Projection, bytes: number): boolean {
+  if (bytes > walk.bytes) return false
+  walk.bytes -= bytes
+  return true
+}
+
+/** What a projected value costs beyond its text, which was charged when it was scrubbed. */
+function literalCost(value: unknown): number {
+  return typeof value === 'string' || (typeof value === 'object' && value)
+    ? 0
+    : LITERAL_BYTES
+}
+
+/**
+ * Charge the input length of text about to be scanned, then whatever its
+ * scrubbed UTF-8 form needs beyond that. False when either does not fit; the
+ * input charge stays spent, since the text was scanned.
+ */
+function spendScanned(
+  walk: Projection,
+  inputLength: number,
+  outputBytes: () => number,
+): boolean {
+  if (!spend(walk, inputLength)) return false
+  const extra = outputBytes() - inputLength
+  return extra <= 0 || spend(walk, extra)
+}
+
+/**
+ * Scrubbed text when it fits in the remaining budget, else undefined. Text
+ * longer than the remaining budget is refused before it is scanned or copied.
+ */
+function boundedText(text: string, walk: Projection): string | undefined {
+  if (text.length > walk.bytes) return undefined
+  const scrubbed = scrubText(text, walk.secrets)
+  return spendScanned(walk, text.length, () =>
+    Buffer.byteLength(scrubbed, 'utf8'),
+  )
+    ? scrubbed
+    : undefined
+}
+
+/**
+ * Like `boundedText`, but text that does not fit becomes the fixed
+ * OVERSIZED_DETAIL_MESSAGE, or undefined once even that no longer fits.
+ */
+function boundedMessage(text: string, walk: Projection): string | undefined {
+  const kept = boundedText(text, walk)
+  if (kept !== undefined) return kept
+  return spend(walk, OVERSIZED_DETAIL_MESSAGE.length)
+    ? OVERSIZED_DETAIL_MESSAGE
+    : undefined
 }
 
 /**
@@ -754,23 +845,87 @@ function defineField(target: object, key: PropertyKey, value: unknown): void {
   })
 }
 
+/**
+ * Define a projected field when its key and, for a non-text value,
+ * LITERAL_BYTES still fit in the budget. Strings were charged when scrubbed
+ * and objects are charged for their own contents.
+ */
+function keepField(
+  target: object,
+  key: string | symbol,
+  value: unknown,
+  walk: Projection,
+): void {
+  const keyBytes = typeof key === 'string' ? key.length : 0
+  if (value !== undefined && spend(walk, keyBytes + literalCost(value)))
+    defineField(target, key, value)
+}
+
 function isStatus(value: unknown): value is number {
   return Number.isInteger(value) && Number(value) >= 0 && Number(value) <= 999
 }
 
 /**
- * Header entries as a plain record. An entry whose name carries a credential
- * is dropped whole, since a header name cannot be partly redacted; values are
- * scrubbed, so retry and rate-limit headers keep theirs.
+ * Add one header to a projected record. An entry whose name carries a
+ * credential is dropped whole, since a header name cannot be partly
+ * redacted; values are scrubbed, so retry and rate-limit headers keep
+ * theirs. An entry that no longer fits in the byte budget is dropped too,
+ * checked by length before either string is scanned.
  */
-function headerRecord(
-  entries: Iterable<readonly [string, string]>,
-  secrets: readonly string[],
-): Record<string, string> {
+function addHeader(
+  record: Record<string, string>,
+  name: string,
+  value: string,
+  walk: Projection,
+): void {
+  const length = name.length + value.length
+  if (length > walk.bytes) return
+  if (scrubText(name, walk.secrets) !== name) {
+    spend(walk, length)
+    return
+  }
+  const scrubbed = scrubText(value, walk.secrets)
+  const bytes = () =>
+    Buffer.byteLength(name, 'utf8') + Buffer.byteLength(scrubbed, 'utf8')
+  if (spendScanned(walk, length, bytes)) defineField(record, name, scrubbed)
+}
+
+/**
+ * Thrown from the forEach callback to stop walking a Headers object early.
+ * Private to this module and caught right around the walk, so it never
+ * escapes.
+ */
+const STOP_HEADER_WALK: object = Object.freeze({})
+
+/**
+ * A real Headers object as a projected record, or undefined when `headers`
+ * is not one. It is read with the forEach captured at load time, never its
+ * own iterators or accessors, and nothing is collected first: each entry is
+ * checked and charged as forEach hands it over, and the walk stops after
+ * MAX_OBJECT_KEYS entries or once the byte budget is spent.
+ */
+function platformHeaderRecord(
+  headers: unknown,
+  walk: Projection,
+): Record<string, string> | undefined {
   const record: Record<string, string> = {}
-  for (const [name, value] of entries)
-    if (scrubText(name, secrets) === name)
-      defineField(record, name, scrubText(value, secrets))
+  let examined = 0
+  try {
+    Reflect.apply(HEADERS_FOR_EACH, headers, [
+      (value: unknown, name: unknown) => {
+        if (examined >= MAX_OBJECT_KEYS || walk.bytes === 0)
+          throw STOP_HEADER_WALK
+        examined += 1
+        if (typeof name === 'string' && typeof value === 'string')
+          addHeader(record, name, value, walk)
+      },
+    ])
+  } catch (error) {
+    if (error === STOP_HEADER_WALK) return record
+    // The captured forEach brand-checks its receiver with a TypeError.
+    if (error instanceof TypeError) return undefined
+    throw error
+  }
   return record
 }
 
@@ -781,17 +936,17 @@ function projectHeaders(
 ): Record<string, string> | undefined {
   if (value === null || typeof value !== 'object' || !hasProxyFreeChain(value))
     return undefined
-  const platform = branded(() => headerEntries(value))
-  if (platform) return headerRecord(platform, walk.secrets)
+  const platform = platformHeaderRecord(value, walk)
+  if (platform) return platform
   const keys = Reflect.ownKeys(value)
   if (keys.length > MAX_OBJECT_KEYS) return undefined
-  const entries: Array<readonly [string, string]> = []
+  const record: Record<string, string> = {}
   for (const key of keys) {
     const entry = typeof key === 'string' ? ownData(value, key) : undefined
     if (typeof key === 'string' && typeof entry === 'string')
-      entries.push([key, entry])
+      addHeader(record, key, entry, walk)
   }
-  return headerRecord(entries, walk.secrets)
+  return record
 }
 
 function projectField(
@@ -802,23 +957,23 @@ function projectField(
 ): unknown {
   switch (kind) {
     case 'text':
-      return typeof value === 'string'
-        ? scrubText(value, walk.secrets)
-        : undefined
+      return typeof value === 'string' ? boundedMessage(value, walk) : undefined
     case 'status':
       return isStatus(value) && isCleanLiteral(value, walk.secrets)
         ? value
         : undefined
     case 'code':
     case 'retry':
-      if (typeof value === 'string') return scrubText(value, walk.secrets)
+      if (typeof value === 'string') return boundedText(value, walk)
       return Number.isFinite(value) && isCleanLiteral(value, walk.secrets)
         ? value
         : undefined
     case 'boolean':
       return typeof value === 'boolean' ? value : undefined
     case 'syscall':
-      return typeof value === 'string' && TRANSPORT_SYSCALLS.has(value)
+      return typeof value === 'string' &&
+        TRANSPORT_SYSCALLS.has(value) &&
+        spend(walk, value.length)
         ? value
         : undefined
     case 'closeCode':
@@ -831,7 +986,8 @@ function projectField(
     case 'requestId':
       return typeof value === 'string' &&
         REQUEST_ID.test(value) &&
-        scrubText(value, walk.secrets) === value
+        scrubText(value, walk.secrets) === value &&
+        spend(walk, value.length)
         ? value
         : undefined
     case 'nested':
@@ -843,41 +999,127 @@ function projectField(
   }
 }
 
-/** Copy the whitelisted fields of `value` onto the fresh `target`. */
+/**
+ * String fields at or below this length are copied before an error's message.
+ * This preserves short classifier names, types, codes and retry hints, such as
+ * `AI_APICallError`, `rate_limit_error` or `ECONNRESET`, before large text uses the budget.
+ */
+const SHORT_FIELD_LENGTH = 128
+
+/** Fields whose cost is small and fixed: no nesting, and any string short. */
+function isShortField(kind: FieldKind, value: unknown): boolean {
+  if (kind === 'nested' || kind === 'headers' || kind === 'list') return false
+  return typeof value !== 'string' || value.length <= SHORT_FIELD_LENGTH
+}
+
+/**
+ * Copy whitelisted fields onto the fresh `target`. Project AI SDK markers
+ * and short classification fields first. Then call `between` to copy the
+ * error's message and stack, followed by long strings, nested values, headers
+ * and lists. Classification metadata gets the budget before large text uses it.
+ */
 function projectFields(
   value: object,
   target: object,
   walk: Projection,
   depth: number,
   skip: ReadonlySet<string>,
+  between?: () => void,
 ): void {
+  for (const marker of AI_SDK_ERROR_MARKERS)
+    if (ownData(value, marker) === true) keepField(target, marker, true, walk)
+  const later: Array<readonly [string, FieldKind, unknown]> = []
   for (const [key, kind] of PROJECTED_FIELDS) {
     if (skip.has(key)) continue
-    const projected = projectField(kind, ownData(value, key), walk, depth + 1)
-    if (projected !== undefined) defineField(target, key, projected)
+    const raw = ownData(value, key)
+    if (!isShortField(kind, raw)) later.push([key, kind, raw])
+    else keepField(target, key, projectField(kind, raw, walk, depth + 1), walk)
   }
-  for (const marker of AI_SDK_ERROR_MARKERS)
-    if (ownData(value, marker) === true) defineField(target, marker, true)
+  between?.()
+  for (const [key, kind, raw] of later)
+    keepField(target, key, projectField(kind, raw, walk, depth + 1), walk)
 }
 
 const ERROR_SKIP: ReadonlySet<string> = new Set(['message'])
 const AGGREGATE_SKIP: ReadonlySet<string> = new Set(['message', 'errors'])
 const NO_SKIP: ReadonlySet<string> = new Set()
 
+/** UTF-8 key lengths reserved in the byte budget for every error's message and stack. */
+const ERROR_TEXT_KEYS = 'message'.length + 'stack'.length
+
+/**
+ * Replace the stack the runtime built for a fresh projected error. A runtime
+ * stack repeats the message and adds frames, none of which the byte budget
+ * would see, so it becomes `<name>: <message>`, the first line a runtime
+ * stack shows, without frames, and is charged like other kept text. When
+ * that does not fit it is the name alone, or empty. With `message`
+ * undefined (no budget left even for the keys) the stack is removed.
+ */
+function setBoundedStack(
+  error: Error,
+  name: string,
+  message: string | undefined,
+  walk: Projection,
+): void {
+  if (message === undefined) {
+    Reflect.deleteProperty(error, 'stack')
+    return
+  }
+  const nameBytes = Buffer.byteLength(name, 'utf8')
+  const messageBytes =
+    message === '' ? 0 : 2 + Buffer.byteLength(message, 'utf8')
+  let stack = ''
+  if (spend(walk, nameBytes + messageBytes))
+    stack = message === '' ? name : `${name}: ${message}`
+  else if (spend(walk, nameBytes)) stack = name
+  Object.defineProperty(error, 'stack', {
+    value: stack,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  })
+}
+
 function projectError(value: object, walk: Projection, depth: number): Error {
-  const message = ownData(value, 'message')
-  const text =
-    typeof message === 'string' ? scrubText(message, walk.secrets) : ''
   const name = inheritedName(value)
   const aggregate = name === 'AggregateError'
   const Builtin =
     typeof name === 'string' ? BUILT_IN_ERRORS.get(name) : undefined
-  // An AggregateError gets its members afterwards, as an array this module
-  // built, so the constructor never iterates anything from the original.
-  const error = aggregate
-    ? new AggregateError([], text)
-    : new (Builtin ?? Error)(text)
+  // The keys are charged before any text, so message and stack get the
+  // budget ahead of nested fields; an aggregate also holds `errors`.
+  const keyed = spend(walk, ERROR_TEXT_KEYS + (aggregate ? 'errors'.length : 0))
+  // Built without a message, which is added once the short fields have
+  // their share of the budget. An AggregateError gets its members
+  // afterwards, as an array this module built, so the constructor never
+  // iterates anything from the original.
+  const error = aggregate ? new AggregateError([]) : new (Builtin ?? Error)()
+  if (aggregate && !keyed) Reflect.deleteProperty(error, 'errors')
   walk.memo.set(value, error)
+  const addMessage = () => {
+    const message = ownData(value, 'message')
+    const text = !keyed
+      ? undefined
+      : typeof message === 'string'
+        ? (boundedMessage(message, walk) ?? '')
+        : ''
+    if (text !== undefined)
+      Object.defineProperty(error, 'message', {
+        value: text,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      })
+    setBoundedStack(
+      error,
+      aggregate
+        ? 'AggregateError'
+        : Builtin && typeof name === 'string'
+          ? name
+          : 'Error',
+      text,
+      walk,
+    )
+  }
   // An own `name` is copied as an own string with the other fields.
   projectFields(
     value,
@@ -885,8 +1127,9 @@ function projectError(value: object, walk: Projection, depth: number): Error {
     walk,
     depth,
     aggregate ? AGGREGATE_SKIP : ERROR_SKIP,
+    addMessage,
   )
-  if (aggregate) {
+  if (aggregate && keyed) {
     const errors = ownData(value, 'errors')
     const members = Array.isArray(errors)
       ? project(errors, walk, depth + 1)
@@ -907,51 +1150,79 @@ function projectArray(
 ): unknown {
   const length = ownData(value, 'length')
   if (typeof length !== 'number' || length > MAX_OBJECT_KEYS)
-    return PROVIDER_ERROR_REDACTION
+    return redactionMarker(walk)
   const array: unknown[] = []
   walk.memo.set(value, array)
-  for (let index = 0; index < length; index += 1)
-    array.push(project(ownData(value, String(index)), walk, depth + 1))
+  // Each slot is paid for before it is kept, and the copy stops at the
+  // first slot that cannot be: the kept slots are a prefix of the original
+  // at the same indexes, with no unpaid filler after them.
+  for (let index = 0; index < length; index += 1) {
+    const raw = ownData(value, String(index))
+    if (!spend(walk, 1)) break
+    const item = project(raw, walk, depth + 1)
+    if (!spend(walk, literalCost(item))) break
+    array.push(item)
+  }
   return array
 }
 
 /**
- * Project one value. Strings are scrubbed; numbers, booleans, bigints, null
- * and undefined are kept; symbols and functions are withheld. Objects are
- * withheld when a proxy sits anywhere on their prototype chain, or past the
- * depth and object budgets; otherwise they become a fresh projection.
+ * PROVIDER_ERROR_REDACTION in place of a withheld value, charged as text,
+ * or undefined once even that does not fit.
+ */
+function redactionMarker(walk: Projection): string | undefined {
+  return spend(walk, PROVIDER_ERROR_REDACTION.length)
+    ? PROVIDER_ERROR_REDACTION
+    : undefined
+}
+
+/**
+ * Project one value. Strings are scrubbed, or replaced once they no longer
+ * fit in the byte budget; numbers, booleans, bigints, null and undefined are
+ * kept; symbols and functions are withheld. Objects are withheld when a proxy
+ * sits anywhere on their prototype chain, or past the depth and object
+ * budgets; otherwise they become a fresh projection.
  */
 function project(value: unknown, walk: Projection, depth: number): unknown {
-  if (typeof value === 'string') return scrubText(value, walk.secrets)
+  if (typeof value === 'string') return boundedMessage(value, walk) ?? ''
   if (typeof value === 'symbol' || typeof value === 'function')
-    return PROVIDER_ERROR_REDACTION
+    return redactionMarker(walk)
   if (value === null || typeof value !== 'object') return value
   if (walk.memo.has(value)) return walk.memo.get(value)
-  if (!hasProxyFreeChain(value)) return PROVIDER_ERROR_REDACTION
+  if (!hasProxyFreeChain(value)) return redactionMarker(walk)
   walk.budget -= 1
-  if (walk.budget < 0 || depth >= MAX_WALK_DEPTH)
-    return PROVIDER_ERROR_REDACTION
-  const response = readResponse(value)
-  if (response) {
+  if (walk.budget < 0 || depth >= MAX_WALK_DEPTH) return redactionMarker(walk)
+  const status = branded(() => readSlot(RESPONSE_STATUS, value))
+  if (typeof status === 'number') {
     // Status, scrubbed status text and headers only: the body and URL of a
-    // response inside an error are never read or kept.
+    // response inside an error are never read or kept, and its headers are
+    // walked with the same bounds as any other headers object.
+    const statusText = readSlot(RESPONSE_STATUS_TEXT, value)
+    if (typeof statusText !== 'string')
+      throw new TypeError('Response slots could not be read')
     const record = {}
     walk.memo.set(value, record)
-    defineField(record, 'status', response.status)
-    defineField(
+    keepField(record, 'status', status, walk)
+    keepField(record, 'statusText', boundedText(statusText, walk) ?? '', walk)
+    const headers = readSlot(RESPONSE_HEADERS, value)
+    keepField(
       record,
-      'statusText',
-      scrubText(response.statusText, walk.secrets),
+      'headers',
+      platformHeaderRecord(headers, walk) ?? {},
+      walk,
     )
-    defineField(record, 'headers', headerRecord(response.headers, walk.secrets))
     return record
   }
   const exceptionMessage = branded(() => readSlot(DOM_EXCEPTION_MESSAGE, value))
   if (typeof exceptionMessage === 'string') {
-    const error = new Error(scrubText(exceptionMessage, walk.secrets))
+    const text = spend(walk, ERROR_TEXT_KEYS)
+      ? (boundedMessage(exceptionMessage, walk) ?? '')
+      : undefined
+    const error = new Error(text)
+    setBoundedStack(error, 'Error', text, walk)
     const name = readSlot(DOM_EXCEPTION_NAME, value)
     if (typeof name === 'string')
-      defineField(error, 'name', scrubText(name, walk.secrets))
+      keepField(error, 'name', boundedMessage(name, walk), walk)
     walk.memo.set(value, error)
     return error
   }
@@ -998,7 +1269,12 @@ function redactErrorWith(error: unknown, state: RedactorState): unknown {
   try {
     const result = project(
       error,
-      { secrets, memo: new Map(), budget: MAX_WALK_OBJECTS },
+      {
+        secrets,
+        memo: new Map(),
+        budget: MAX_WALK_OBJECTS,
+        bytes: PROVIDER_ERROR_MAX_BODY_BYTES,
+      },
       0,
     )
     // A withheld thrown value still surfaces as an error, not a bare marker.
@@ -1071,10 +1347,48 @@ function forwardCancel(
   )
 }
 
+/** Constructor-owned identities that distinguish oversized sources from forged errors. */
+const OVERSIZED_SOURCE_ERRORS = new WeakSet<object>()
+
+/**
+ * For producers of a non-2xx body, such as the relay, that stop buffering it
+ * at PROVIDER_ERROR_MAX_BODY_BYTES: error the raw body stream with a new
+ * instance, and the body handed out by `redactResponse` ends with the fixed
+ * PROVIDER_ERROR_OVERSIZED_MESSAGE JSON instead of an error, also when the
+ * redactor or scope was already disposed. Bytes the source had queued are
+ * dropped. Only objects this constructor created count: membership is
+ * looked up by identity in a private set, so nothing on the value (its
+ * message, code, prototype or any getter) is read, and a look-alike, a
+ * proxy around an instance or an object with the same prototype is treated
+ * as an ordinary failure. Not exported from the Core package entry point.
+ */
+export class ProviderErrorSourceOversizedError extends Error {
+  constructor() {
+    super(PROVIDER_ERROR_OVERSIZED_MESSAGE)
+    this.name = 'ProviderErrorSourceOversizedError'
+    OVERSIZED_SOURCE_ERRORS.add(this)
+  }
+}
+
+function isOversizedSourceError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    OVERSIZED_SOURCE_ERRORS.has(error)
+  )
+}
+
+/** The fixed body that replaces a non-2xx body over the size limit. */
+function oversizedBodyJson(): Uint8Array {
+  return encoder.encode(genericErrorJson(PROVIDER_ERROR_OVERSIZED_MESSAGE))
+}
+
 /**
  * Non-2xx body that is read, bounded and scrubbed only when the caller first
  * reads it. A body over the bound is cancelled at the source and replaced
  * with a fixed message: cutting it would risk ending inside a credential.
+ * A source that errors with a ProviderErrorSourceOversizedError gets the
+ * same fixed message.
  */
 function scrubbedErrorBody(
   source: ReadableStream<Uint8Array>,
@@ -1105,13 +1419,7 @@ function scrubbedErrorBody(
             if (value.byteLength === 0) continue
             total += value.byteLength
             if (total > PROVIDER_ERROR_MAX_BODY_BYTES) {
-              deliver(
-                controller,
-                encoder.encode(
-                  genericErrorJson(PROVIDER_ERROR_OVERSIZED_MESSAGE),
-                ),
-                true,
-              )
+              deliver(controller, oversizedBodyJson(), true)
               reachTerminal(state, 'eof')
               await active.cancel().catch(() => {})
               return
@@ -1120,6 +1428,15 @@ function scrubbedErrorBody(
           }
           output = scrubErrorBody(concatBytes(chunks, total), state)
         } catch (error) {
+          if (isOversizedSourceError(error)) {
+            // The producer has already stopped at its size limit. Use the
+            // same fixed message as this reader's own limit, including after
+            // the scope retired its credentials.
+            deliver(controller, oversizedBodyJson(), true)
+            reachTerminal(state, 'eof')
+            if (active) await active.cancel().catch(() => {})
+            return
+          }
           const safe = redactErrorWith(error, state)
           reachTerminal(state, 'error')
           try {
@@ -1538,31 +1855,50 @@ const DELAY_SECONDS = /^[0-9]{1,10}$/
 const HTTP_DATE =
   /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT$/
 
+const isRetryDelay = (value: string) =>
+  DELAY_SECONDS.test(value) || HTTP_DATE.test(value)
+const isRateLimitStatus = (value: string) => RATE_LIMIT_STATUSES.has(value)
+const isDecimal = (value: string) => DECIMAL.test(value)
+
 /**
- * After disposal a header value can no longer be checked for the exact
- * credentials, so only retry and rate-limit fields whose values are numbers,
- * HTTP dates or members of a closed vocabulary are kept. Those are what retry
- * and quota routing read; everything else is withheld.
+ * The headers kept after disposal, by exact lower-case name, each with the
+ * check its value must pass. These are the retry hints and the rate-limit
+ * fields that retry handling and quota-headers.ts read. Names are matched
+ * whole, never by prefix or suffix: a name such as
+ * `anthropic-ratelimit-unified-<anything>-reset` could carry a credential in
+ * its middle, and nothing can check it for one after disposal.
+ */
+const VERIFIABLE_AFTER_DISPOSE: ReadonlyMap<
+  string,
+  (value: string) => boolean
+> = new Map([
+  ['retry-after', isRetryDelay],
+  ['x-should-retry', (value: string) => value === 'true' || value === 'false'],
+  [`${RATE_LIMIT_PREFIX}status`, isRateLimitStatus],
+  [
+    `${RATE_LIMIT_PREFIX}representative-claim`,
+    (value: string) => RATE_LIMIT_CLAIMS.has(value),
+  ],
+  [
+    `${RATE_LIMIT_PREFIX}fallback`,
+    (value: string) => RATE_LIMIT_FALLBACKS.has(value),
+  ],
+  [`${RATE_LIMIT_PREFIX}5h-status`, isRateLimitStatus],
+  [`${RATE_LIMIT_PREFIX}5h-utilization`, isDecimal],
+  [`${RATE_LIMIT_PREFIX}5h-reset`, isDecimal],
+  [`${RATE_LIMIT_PREFIX}7d-status`, isRateLimitStatus],
+  [`${RATE_LIMIT_PREFIX}7d-utilization`, isDecimal],
+  [`${RATE_LIMIT_PREFIX}7d-reset`, isDecimal],
+])
+
+/**
+ * After disposal a header can no longer be checked for the exact
+ * credentials, so only the closed list of retry and rate-limit names above is
+ * kept, and only when the value is a number, an HTTP date or a member of a
+ * closed vocabulary. Everything else, including `request-id`, is withheld.
  */
 function isVerifiableAfterDispose(name: string, value: string): boolean {
-  const lower = name.toLowerCase()
-  if (lower === 'retry-after')
-    return DELAY_SECONDS.test(value) || HTTP_DATE.test(value)
-  if (lower === 'x-should-retry') return value === 'true' || value === 'false'
-  if (!lower.startsWith(RATE_LIMIT_PREFIX)) return false
-  const field = lower.slice(RATE_LIMIT_PREFIX.length)
-  if (field === 'status' || field.endsWith('-status'))
-    return RATE_LIMIT_STATUSES.has(value)
-  if (field === 'representative-claim') return RATE_LIMIT_CLAIMS.has(value)
-  if (field === 'fallback') return RATE_LIMIT_FALLBACKS.has(value)
-  if (
-    field === 'reset' ||
-    field.endsWith('-reset') ||
-    field.endsWith('-utilization') ||
-    field.endsWith('-percentage')
-  )
-    return DECIMAL.test(value)
-  return false
+  return VERIFIABLE_AFTER_DISPOSE.get(name.toLowerCase())?.(value) === true
 }
 
 type HeaderPolicy = 'keep' | 'scrub' | 'verified-only'

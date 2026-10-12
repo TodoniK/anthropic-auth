@@ -12,6 +12,7 @@ import {
   PROVIDER_ERROR_SCOPE_CLOSED_MESSAGE,
   PROVIDER_ERROR_WITHHELD_MESSAGE,
   type ProviderErrorRedactor,
+  ProviderErrorSourceOversizedError,
   type ProviderResponseMode,
 } from '../provider-error.ts'
 import { SseFrameTooLargeError } from '../sse.ts'
@@ -2685,4 +2686,736 @@ test('a rebuilt error frame that still spells a credential across its lines is r
       message: 'Provider error could not be inspected safely',
     },
   })
+})
+
+test('after dispose only the closed list of retry and quota header names survives; a name embedding the credential does not', async () => {
+  const redactor = createProviderErrorRedactor([RELAY_CREDENTIAL])
+  redactor.dispose()
+  const kept: Array<[string, string]> = [
+    ['anthropic-ratelimit-unified-5h-reset', '1790000000'],
+    ['anthropic-ratelimit-unified-5h-status', 'allowed_warning'],
+    ['anthropic-ratelimit-unified-5h-utilization', '0.98'],
+    ['anthropic-ratelimit-unified-7d-reset', '1790500000'],
+    ['anthropic-ratelimit-unified-7d-status', 'allowed'],
+    ['anthropic-ratelimit-unified-7d-utilization', '0.4'],
+    ['anthropic-ratelimit-unified-fallback', 'available'],
+    ['anthropic-ratelimit-unified-representative-claim', 'five_hour'],
+    ['anthropic-ratelimit-unified-status', 'rejected'],
+    ['retry-after', '7'],
+    ['x-should-retry', 'true'],
+  ]
+  const original = new Response('failure', {
+    status: 429,
+    headers: [
+      ...kept,
+      // The credential can sit in the middle of a name whose prefix and
+      // suffix look like a quota field, with a value that passes the check.
+      [`anthropic-ratelimit-unified-${RELAY_CREDENTIAL}-reset`, '1'],
+      [`anthropic-ratelimit-unified-${RELAY_CREDENTIAL}-status`, 'allowed'],
+      [`anthropic-ratelimit-unified-${RELAY_CREDENTIAL}-utilization`, '0.5'],
+      [`anthropic-ratelimit-unified-${RELAY_CREDENTIAL}-percentage`, '0.5'],
+      // Names outside the verifiable retry/quota allowlist are withheld,
+      // even when they are valid HTTP header names.
+      ['anthropic-ratelimit-unified-reset', '1790000000'],
+      ['anthropic-ratelimit-unified-fallback-percentage', '0.5'],
+      ['anthropic-ratelimit-unified-overage-status', 'rejected'],
+      ['request-id', 'req_011'],
+    ],
+  })
+  const result = redactor.redactResponse(original)
+  expect(result.status).toBe(429)
+  expect(JSON.stringify([...result.headers])).not.toContain(RELAY_CREDENTIAL)
+  expect([...result.headers].sort()).toEqual(
+    [...kept, ['content-type', 'application/json'] as [string, string]].sort(),
+  )
+  expect(JSON.parse(decoder.decode(await readAll(result.body)))).toEqual({
+    type: 'error',
+    error: { message: PROVIDER_ERROR_WITHHELD_MESSAGE },
+  })
+
+  // Successful responses are still handed back untouched after dispose.
+  const success = new Response('normal model output', {
+    headers: {
+      [`anthropic-ratelimit-unified-${RELAY_CREDENTIAL}-reset`]: '1',
+      'request-id': 'req_011',
+    },
+  })
+  expect(redactor.redactResponse(success)).toBe(success)
+  expect(await success.text()).toBe('normal model output')
+})
+
+test('after dispose a real HTTP failure echoing the sent token in a quota header name keeps only status and retry hints', async () => {
+  // The server copies the bearer token it received into a header name
+  // shaped like a quota reset field, as a hostile or broken relay could.
+  let requests = 0
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request) {
+      requests += 1
+      const sent = (request.headers.get('authorization') ?? '').slice(
+        'Bearer '.length,
+      )
+      return new Response('failure', {
+        status: 400,
+        headers: {
+          [`anthropic-ratelimit-unified-${sent}-reset`]: '1',
+          'retry-after': '7',
+        },
+      })
+    },
+  })
+  deferCleanup(() => server.stop(true))
+  const redactor = createProviderErrorRedactor([OAUTH_TOKEN])
+  const original = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+    headers: { authorization: `Bearer ${OAUTH_TOKEN}` },
+  })
+  // Header names reach the client lower-cased.
+  const echoed = OAUTH_TOKEN.toLowerCase()
+  expect(JSON.stringify([...original.headers])).toContain(echoed)
+  redactor.dispose()
+  const result = redactor.redactResponse(original)
+  expect(requests).toBe(1)
+  expect(result.status).toBe(400)
+  expect(result.headers.get('retry-after')).toBe('7')
+  expect(JSON.stringify([...result.headers]).toLowerCase()).not.toContain(
+    echoed,
+  )
+  expect(decoder.decode(await readAll(result.body))).not.toContain(OAUTH_TOKEN)
+})
+
+/** The fixed text that replaces a projected text field over the byte budget. */
+const OVERSIZED_DETAIL =
+  'Provider error details exceeded the redaction size limit and were withheld'
+
+/**
+ * Own keys Bun adds to every Error object it constructs, recording the
+ * line, column and source file of the `new Error()` call. Their size does
+ * not depend on the projected data, so `projectedTextBytes` excludes them.
+ */
+const RUNTIME_ERROR_KEYS: ReadonlySet<PropertyKey> = new Set([
+  'line',
+  'column',
+  'sourceURL',
+  'originalLine',
+  'originalColumn',
+])
+
+/**
+ * UTF-8 bytes of every string key and string value reachable through own
+ * data properties of a projection, `message` and `stack` included. Array
+ * index keys and `length` are not text the projection chose, so only array
+ * values are counted.
+ */
+function projectedTextBytes(value: unknown, seen = new Set<object>()): number {
+  if (typeof value === 'string') return encoder.encode(value).length
+  if (value === null || typeof value !== 'object' || seen.has(value)) return 0
+  seen.add(value)
+  let total = 0
+  const array = Array.isArray(value)
+  for (const key of Reflect.ownKeys(value)) {
+    if (RUNTIME_ERROR_KEYS.has(key)) continue
+    if (typeof key === 'string' && !array) total += encoder.encode(key).length
+    total += projectedTextBytes(own(value, key), seen)
+  }
+  return total
+}
+
+/** Read the projected error's own stack value without invoking an accessor. */
+function ownStack(value: unknown): unknown {
+  return own(value, 'stack')
+}
+
+test('a 2 MiB thrown message becomes a fixed generic message while type and classification fields stay', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const marker = Symbol.for('vercel.ai.error.AI_APICallError')
+  const base = Symbol.for('vercel.ai.error')
+  const huge = Object.assign(
+    new TypeError(`${'x'.repeat(2 * 1024 * 1024)} ${RELAY_CREDENTIAL}`),
+    {
+      statusCode: 429,
+      isRetryable: true,
+      code: 'ECONNRESET',
+      responseHeaders: { 'retry-after': '2' },
+      cause: Object.assign(new Error('fetch failed'), { code: 'ECONNRESET' }),
+      [marker]: true,
+      [base]: true,
+    },
+  )
+  const result = instance(redactor.redactError(huge), TypeError)
+  expect(Object.getOwnPropertyDescriptor(result, 'message')?.value).toBe(
+    OVERSIZED_DETAIL,
+  )
+  expect(own(result, 'statusCode')).toBe(429)
+  expect(own(result, 'isRetryable')).toBe(true)
+  expect(own(result, 'code')).toBe('ECONNRESET')
+  expect(own(result, 'responseHeaders')).toEqual({ 'retry-after': '2' })
+  expect(own(instance(result.cause, Error), 'code')).toBe('ECONNRESET')
+  expect(own(result, marker)).toBe(true)
+  expect(own(result, base)).toBe(true)
+  expect(ownStack(result)).toBe(`TypeError: ${OVERSIZED_DETAIL}`)
+  expect(projectedTextBytes(result)).toBeLessThanOrEqual(
+    PROVIDER_ERROR_MAX_BODY_BYTES,
+  )
+
+  // A thrown string and a string cause are bounded the same way.
+  expect(redactor.redactError('y'.repeat(2 * 1024 * 1024))).toBe(
+    OVERSIZED_DETAIL,
+  )
+  // Multi-byte text is measured in UTF-8 bytes, not UTF-16 units.
+  const wide = instance(
+    redactor.redactError(new Error('é'.repeat(600 * 1024))),
+    Error,
+  )
+  expect(wide.message).toBe(OVERSIZED_DETAIL)
+})
+
+test('a message that fits the byte budget is kept, scrubbed and exact up to the limit', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const half = `${'z'.repeat(512 * 1024)} ${RELAY_CREDENTIAL}`
+  const halfResult = instance(redactor.redactError(new Error(half)), Error)
+  expect(halfResult.message).toBe(
+    `${'z'.repeat(512 * 1024)} ${PROVIDER_ERROR_REDACTION}`,
+  )
+  // Repeating the message in the stack exceeds the budget, so only
+  // the error name remains.
+  expect(ownStack(halfResult)).toBe('Error')
+  // The `message` and `stack` keys are charged first (12 bytes); a message
+  // of exactly the rest is kept, with no room left for any stack text.
+  const exact = 'a'.repeat(PROVIDER_ERROR_MAX_BODY_BYTES - 12)
+  const exactResult = instance(redactor.redactError(new Error(exact)), Error)
+  expect(exactResult.message).toBe(exact)
+  expect(ownStack(exactResult)).toBe('')
+  expect(projectedTextBytes(exactResult)).toBe(PROVIDER_ERROR_MAX_BODY_BYTES)
+  const over = instance(redactor.redactError(new Error(`${exact}a`)), Error)
+  expect(over.message).toBe(OVERSIZED_DETAIL)
+  expect(ownStack(over)).toBe(`Error: ${OVERSIZED_DETAIL}`)
+})
+
+test('large and aggregate header values in a projection share the byte budget', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const value = 'h'.repeat(300 * 1024)
+  // One oversized header is dropped; the retry hint beside it stays.
+  const single = redactor.redactError(
+    Object.assign(new Error('limited'), {
+      status: 429,
+      headers: { 'x-huge': 'v'.repeat(2 * 1024 * 1024), 'retry-after': '3' },
+    }),
+  )
+  expect(own(single, 'headers')).toEqual({ 'retry-after': '3' })
+  expect(own(single, 'status')).toBe(429)
+
+  // Many large headers, in a record and in platform Headers, together never
+  // exceed the budget; the entries that do not fit are dropped whole.
+  const aggregate = redactor.redactError(
+    Object.assign(new Error('limited'), {
+      responseHeaders: Object.fromEntries(
+        Array.from({ length: 6 }, (_, index) => [`x-big-${index}`, value]),
+      ),
+      headers: new Headers(
+        Array.from({ length: 6 }, (_, index) => [`x-platform-${index}`, value]),
+      ),
+    }),
+  )
+  const headers = own(aggregate, 'headers')
+  expect(Object.keys(headers as object)).toEqual([
+    'x-platform-0',
+    'x-platform-1',
+    'x-platform-2',
+  ])
+  expect(own(headers, 'x-platform-0')).toBe(value)
+  expect(own(aggregate, 'responseHeaders')).toEqual({})
+  expect(projectedTextBytes(aggregate)).toBeLessThanOrEqual(
+    PROVIDER_ERROR_MAX_BODY_BYTES,
+  )
+
+  // Nested causes and aggregate members draw on the same budget, and each
+  // member's stack line is charged too: the first member keeps its message
+  // and full stack, the second its message with the name as stack, and the
+  // rest get the fixed generic message.
+  const members = Array.from(
+    { length: 5 },
+    (_, index) => new Error(`${index}${'m'.repeat(300 * 1024)}`),
+  )
+  const many = instance(
+    redactor.redactError(new AggregateError(members, 'all failed')),
+    AggregateError,
+  )
+  const kept = many.errors.map((error) => instance(error, Error))
+  const messages = kept.map((error) => error.message)
+  expect(messages[0]?.length).toBe(300 * 1024 + 1)
+  expect(messages[1]?.length).toBe(300 * 1024 + 1)
+  expect(messages.slice(2)).toEqual([
+    OVERSIZED_DETAIL,
+    OVERSIZED_DETAIL,
+    OVERSIZED_DETAIL,
+  ])
+  expect(ownStack(kept[0])).toBe(`Error: ${messages[0]}`)
+  expect(ownStack(kept[1])).toBe('Error')
+  expect(ownStack(many)).toBe('AggregateError: all failed')
+  expect(projectedTextBytes(many)).toBeLessThanOrEqual(
+    PROVIDER_ERROR_MAX_BODY_BYTES,
+  )
+})
+
+test('a real Headers object with many fields is walked only up to the key limit and keeps its retry metadata', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const headers = new Headers({
+    'retry-after': '17',
+    'anthropic-ratelimit-unified-status': 'rejected',
+  })
+  for (let index = 0; index < 5000; index += 1)
+    headers.append(`x-fill-${String(index).padStart(4, '0')}`, 'f')
+  const response = new Response(null, { status: 429, headers })
+  const result = redactor.redactError(
+    Object.assign(new Error('limited'), {
+      status: 429,
+      headers,
+      response,
+    }),
+  )
+  expect(own(result, 'status')).toBe(429)
+  // The Fetch API's Headers iterator sorts names. Retry and quota names
+  // precede the filler names, so they survive the 1000-entry limit.
+  for (const record of [
+    own(result, 'headers'),
+    own(own(result, 'response'), 'headers'),
+  ]) {
+    expect(Object.keys(record as object).length).toBe(1000)
+    expect(own(record, 'retry-after')).toBe('17')
+    expect(own(record, 'anthropic-ratelimit-unified-status')).toBe('rejected')
+    expect(own(record, 'x-fill-0997')).toBe('f')
+    expect(Object.hasOwn(record as object, 'x-fill-0998')).toBe(false)
+  }
+  expect(own(own(result, 'response'), 'status')).toBe(429)
+  expect(projectedTextBytes(result)).toBeLessThanOrEqual(
+    PROVIDER_ERROR_MAX_BODY_BYTES,
+  )
+})
+
+test('header names that are scanned and dropped for carrying the credential still use up the budget', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const filler = 'n'.repeat(330 * 1024)
+  const result = redactor.redactError(
+    Object.assign(new Error('limited'), {
+      headers: new Headers(
+        Array.from({ length: 3 }, (_, index) => [
+          `x-${RELAY_CREDENTIAL}-${filler}-${index}`,
+          'v',
+        ]),
+      ),
+      responseHeaders: {
+        'retry-after': '3',
+        'x-later': 'l'.repeat(100 * 1024),
+      },
+    }),
+  )
+  expect(own(result, 'headers')).toEqual({})
+  // Scanning the three credential-bearing header names consumes about
+  // 990 KiB of the byte budget. The later 100 KiB value cannot fit, but
+  // the short retry hint can.
+  expect(own(result, 'responseHeaders')).toEqual({ 'retry-after': '3' })
+  expect(JSON.stringify(result)).not.toContain(RELAY_CREDENTIAL)
+})
+
+test('a projected error stack is one fresh line inside the budget, never the runtime stack', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const fetchFailure = instance(
+    redactor.redactError(new TypeError(`fetch failed ${RELAY_CREDENTIAL}`)),
+    TypeError,
+  )
+  expect(ownStack(fetchFailure)).toBe(
+    `TypeError: fetch failed ${PROVIDER_ERROR_REDACTION}`,
+  )
+  const bare = instance(redactor.redactError(new RangeError()), RangeError)
+  expect(ownStack(bare)).toBe('RangeError')
+  const dom = instance(
+    redactor.redactError(new DOMException('aborted', 'AbortError')),
+    Error,
+  )
+  expect(dom.name).toBe('AbortError')
+  expect(ownStack(dom)).toBe('Error: aborted')
+
+  // Repeating the 700 KiB message in the stack exceeds the 1 MiB projection
+  // limit. Keep the message once and only the error name in the stack.
+  const large = 's'.repeat(700 * 1024)
+  const kept = instance(redactor.redactError(new Error(large)), Error)
+  expect(kept.message).toBe(large)
+  expect(ownStack(kept)).toBe('Error')
+  expect(projectedTextBytes(kept)).toBeLessThanOrEqual(
+    PROVIDER_ERROR_MAX_BODY_BYTES,
+  )
+})
+
+/** An AI SDK APICallError-shaped error: own classification fields and markers. */
+function apiCallError(message: string): Error {
+  return Object.assign(new Error(message), {
+    name: 'AI_APICallError',
+    statusCode: 429,
+    isRetryable: true,
+    code: 'ECONNRESET',
+    [Symbol.for('vercel.ai.error')]: true,
+    [Symbol.for('vercel.ai.error.AI_APICallError')]: true,
+  })
+}
+
+/** Check the APICallError name, status, retry flag, transport code and SDK markers. */
+function expectApiCallClassification(value: unknown): void {
+  expect(own(value, 'name')).toBe('AI_APICallError')
+  expect(own(value, 'statusCode')).toBe(429)
+  expect(own(value, 'isRetryable')).toBe(true)
+  expect(own(value, 'code')).toBe('ECONNRESET')
+  expect(own(value, Symbol.for('vercel.ai.error'))).toBe(true)
+  expect(own(value, Symbol.for('vercel.ai.error.AI_APICallError'))).toBe(true)
+}
+
+test('an APICallError with a message at or near the byte limit keeps its status, retry flag, code and markers', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  // Near the limit: the short fields are charged first and the message
+  // still fits after them, so it is kept whole.
+  const near = 'x'.repeat(PROVIDER_ERROR_MAX_BODY_BYTES - 400)
+  const nearResult = instance(redactor.redactError(apiCallError(near)), Error)
+  expectApiCallClassification(nearResult)
+  expect(nearResult.message).toBe(near)
+  expect(projectedTextBytes(nearResult)).toBeLessThanOrEqual(
+    PROVIDER_ERROR_MAX_BODY_BYTES,
+  )
+  // A message within 100 bytes of the limit leaves no room for classification
+  // fields if copied first. Keep those fields and replace the message with
+  // the fixed oversized-detail text.
+  for (const length of [
+    PROVIDER_ERROR_MAX_BODY_BYTES - 100,
+    PROVIDER_ERROR_MAX_BODY_BYTES - 12,
+    PROVIDER_ERROR_MAX_BODY_BYTES,
+  ]) {
+    const result = instance(
+      redactor.redactError(apiCallError('x'.repeat(length))),
+      Error,
+    )
+    expectApiCallClassification(result)
+    expect(result.message).toBe(OVERSIZED_DETAIL)
+    expect(ownStack(result)).toBe(`Error: ${OVERSIZED_DETAIL}`)
+  }
+})
+
+test('aggregate members each keep their classification while their large messages share the budget', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const members = Array.from({ length: 4 }, (_, index) =>
+    apiCallError(`${index}${'m'.repeat(400 * 1024)}`),
+  )
+  const result = instance(
+    redactor.redactError(
+      Object.assign(new AggregateError(members, 'all attempts failed'), {
+        status: 429,
+      }),
+    ),
+    AggregateError,
+  )
+  expect(own(result, 'status')).toBe(429)
+  const kept = result.errors.map((error) => instance(error, Error))
+  for (const member of kept) expectApiCallClassification(member)
+  expect(kept[0]?.message.length).toBe(400 * 1024 + 1)
+  expect(kept.slice(1).map((member) => member.message)).toEqual([
+    OVERSIZED_DETAIL,
+    OVERSIZED_DETAIL,
+    OVERSIZED_DETAIL,
+  ])
+  expect(projectedTextBytes(result)).toBeLessThanOrEqual(
+    PROVIDER_ERROR_MAX_BODY_BYTES,
+  )
+})
+
+/**
+ * Queue a credential-bearing chunk, then error the stream after reading
+ * starts. `failure` can be the relay's oversized-source sentinel or a forged
+ * look-alike; the reader must recognize only the constructor-owned sentinel.
+ */
+function erroredSource(failure: unknown) {
+  let control: ReadableStreamDefaultController<Uint8Array> | undefined
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      control = controller
+      controller.enqueue(encoder.encode(`{"leak":"${RELAY_CREDENTIAL}"}`))
+    },
+  })
+  return {
+    stream,
+    fail: () => control?.error(failure),
+  }
+}
+
+const OVERSIZED_JSON = {
+  type: 'error',
+  error: { message: PROVIDER_ERROR_OVERSIZED_MESSAGE },
+}
+
+function failingResponse(stream: ReadableStream<Uint8Array>): Response {
+  return new Response(stream, {
+    status: 401,
+    headers: {
+      'content-type': 'text/plain',
+      'retry-after': '5',
+      'x-echo': RELAY_CREDENTIAL,
+    },
+  })
+}
+
+/** Start reading `body`, error its source, then return what the read gave. */
+async function readAfterFailure(
+  body: ReadableStream<Uint8Array> | null,
+  fail: () => void,
+): Promise<unknown> {
+  const reading = readAll(body).then(
+    (bytes) => JSON.parse(decoder.decode(bytes)) as unknown,
+    (error: unknown) => error,
+  )
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  fail()
+  return reading
+}
+
+test('a body source errored with ProviderErrorSourceOversizedError ends with the fixed oversized JSON, live or disposed', async () => {
+  expect(Object.hasOwn(publicApi, 'ProviderErrorSourceOversizedError')).toBe(
+    false,
+  )
+  const cases: Array<
+    [string, (response: Response) => { body: Response; dispose(): void }]
+  > = [
+    [
+      'live redactor',
+      (response) => {
+        const redactor = ownRedactor([RELAY_CREDENTIAL])
+        return { body: redactor.redactResponse(response), dispose() {} }
+      },
+    ],
+    [
+      'redactor disposed before the response is redacted',
+      (response) => {
+        const redactor = createProviderErrorRedactor([RELAY_CREDENTIAL])
+        redactor.dispose()
+        return { body: redactor.redactResponse(response), dispose() {} }
+      },
+    ],
+    [
+      'redactor disposed after the response is redacted',
+      (response) => {
+        const redactor = createProviderErrorRedactor([RELAY_CREDENTIAL])
+        return {
+          body: redactor.redactResponse(response),
+          dispose: () => redactor.dispose(),
+        }
+      },
+    ],
+    [
+      'response scope disposed after the response is redacted',
+      (response) => {
+        const scope = createProviderErrorResponseScope(
+          [RELAY_CREDENTIAL],
+          'http',
+        )
+        return {
+          body: scope.redactResponse(response),
+          dispose: () => scope.dispose(),
+        }
+      },
+    ],
+  ]
+  for (const [label, redact] of cases) {
+    const source = erroredSource(new ProviderErrorSourceOversizedError())
+    const { body, dispose } = redact(failingResponse(source.stream))
+    dispose()
+    const outcome = await readAfterFailure(body.body, source.fail)
+    expect({ label, outcome }).toEqual({ label, outcome: OVERSIZED_JSON })
+    expect(body.status).toBe(401)
+    expect(body.headers.get('retry-after')).toBe('5')
+    expect(JSON.stringify([...body.headers])).not.toContain(RELAY_CREDENTIAL)
+  }
+
+  // Properties on a real instance are never read: only its identity counts.
+  let reads = 0
+  const decorated = new ProviderErrorSourceOversizedError()
+  Object.defineProperty(decorated, 'message', {
+    get() {
+      reads += 1
+      return RELAY_CREDENTIAL
+    },
+  })
+  const redactor = createProviderErrorRedactor([RELAY_CREDENTIAL])
+  redactor.dispose()
+  const source = erroredSource(decorated)
+  const body = redactor.redactResponse(failingResponse(source.stream))
+  expect(await readAfterFailure(body.body, source.fail)).toEqual(OVERSIZED_JSON)
+  expect(reads).toBe(0)
+})
+
+test('look-alikes of ProviderErrorSourceOversizedError are ordinary failures, withheld after dispose, with no getter or trap run', async () => {
+  let runs = 0
+  const count = () => {
+    runs += 1
+  }
+  const real = new ProviderErrorSourceOversizedError()
+  const lookAlikes: Array<[string, unknown]> = [
+    [
+      'same name, message and a code',
+      Object.assign(new Error(PROVIDER_ERROR_OVERSIZED_MESSAGE), {
+        name: 'ProviderErrorSourceOversizedError',
+        code: 'ERR_BODY_TOO_LARGE',
+      }),
+    ],
+    [
+      'same prototype, not constructed',
+      Object.create(ProviderErrorSourceOversizedError.prototype),
+    ],
+    [
+      'proxy around a real instance',
+      new Proxy(real, {
+        get(target, key) {
+          count()
+          return Reflect.get(target, key)
+        },
+        getPrototypeOf(target) {
+          count()
+          return Reflect.getPrototypeOf(target)
+        },
+        getOwnPropertyDescriptor(target, key) {
+          count()
+          return Reflect.getOwnPropertyDescriptor(target, key)
+        },
+        has(target, key) {
+          count()
+          return Reflect.has(target, key)
+        },
+        ownKeys(target) {
+          count()
+          return Reflect.ownKeys(target)
+        },
+      }),
+    ],
+    [
+      'getters only',
+      Object.defineProperties(
+        {},
+        {
+          name: {
+            get() {
+              count()
+              return 'ProviderErrorSourceOversizedError'
+            },
+          },
+          message: {
+            get() {
+              count()
+              return PROVIDER_ERROR_OVERSIZED_MESSAGE
+            },
+          },
+        },
+      ),
+    ],
+  ]
+  for (const [label, failure] of lookAlikes) {
+    const redactor = createProviderErrorRedactor([RELAY_CREDENTIAL])
+    redactor.dispose()
+    const source = erroredSource(failure)
+    const body = redactor.redactResponse(failingResponse(source.stream))
+    const outcome = await readAfterFailure(body.body, source.fail)
+    expect({ label, message: instance(outcome, Error).message }).toEqual({
+      label,
+      message: PROVIDER_ERROR_WITHHELD_MESSAGE,
+    })
+  }
+  expect(runs).toBe(0)
+})
+
+/**
+ * The documented byte model, counted independently of the implementation:
+ * UTF-8 bytes of every string key outside arrays and every string value,
+ * one byte per array slot, and 24 bytes for every other non-object value
+ * (null and undefined included, symbol-keyed values too). Each object is
+ * counted once however often it is referenced; Bun's own error metadata
+ * keys are skipped.
+ */
+function projectedCost(value: unknown, seen = new Set<object>()): number {
+  if (typeof value === 'string') return encoder.encode(value).length
+  if (value === null || typeof value !== 'object') return 24
+  if (seen.has(value)) return 0
+  seen.add(value)
+  const array = Array.isArray(value)
+  let total = 0
+  for (const key of Reflect.ownKeys(value)) {
+    if (RUNTIME_ERROR_KEYS.has(key)) continue
+    if (array) {
+      if (key === 'length') continue
+      total += 1
+    } else if (typeof key === 'string') total += encoder.encode(key).length
+    total += projectedCost(own(value, key), seen)
+  }
+  return total
+}
+
+test('arrays are copied only as far as their slots and values can be paid for', () => {
+  const redactor = ownRedactor([
+    'sk-ant-oat01-bound-projection-realistic-string',
+  ])
+  // 80 arrays of 1000 zeros cost far more than the budget under the model.
+  const zeros = instance(
+    redactor.redactError(
+      new AggregateError(
+        Array.from({ length: 80 }, () => Array(1000).fill(0)),
+        'attempt detail arrays',
+      ),
+    ),
+    AggregateError,
+  )
+  expect(projectedCost(zeros)).toBeLessThanOrEqual(
+    PROVIDER_ERROR_MAX_BODY_BYTES,
+  )
+  const arrays = zeros.errors as unknown[][]
+  expect(arrays[0]).toEqual(Array(1000).fill(0))
+  expect(arrays.length).toBeLessThan(80)
+  // Every kept array is a prefix of its original: zeros at the original
+  // indexes, never a filler value after the budget ran out.
+  for (const array of arrays) {
+    expect(array.length).toBeLessThanOrEqual(1000)
+    expect(array.every((item) => item === 0)).toBe(true)
+  }
+
+  // Withheld values are paid for as the marker text they become.
+  const symbols = instance(
+    redactor.redactError(
+      new AggregateError(
+        Array.from({ length: 150 }, () => Array(1000).fill(Symbol('s'))),
+        'symbols',
+      ),
+    ),
+    AggregateError,
+  )
+  expect(projectedCost(symbols)).toBeLessThanOrEqual(
+    PROVIDER_ERROR_MAX_BODY_BYTES,
+  )
+  for (const array of symbols.errors as unknown[][])
+    expect(array.every((item) => item === PROVIDER_ERROR_REDACTION)).toBe(true)
+})
+
+test('small arrays in errors keep every value at its index', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const result = instance(
+    redactor.redactError(
+      Object.assign(
+        new AggregateError(
+          [[1, 'a', undefined, null], [`b ${RELAY_CREDENTIAL}`], []],
+          'two attempts',
+        ),
+        { cause: [429, true] },
+      ),
+    ),
+    AggregateError,
+  )
+  expect(result.errors).toEqual([
+    [1, 'a', undefined, null],
+    [`b ${PROVIDER_ERROR_REDACTION}`],
+    [],
+  ])
+  expect((result.errors[0] as unknown[]).length).toBe(4)
+  expect(result.cause).toEqual([429, true])
+  expect(projectedCost(result)).toBeLessThan(1024)
 })
