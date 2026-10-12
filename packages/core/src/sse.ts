@@ -11,6 +11,7 @@
  * character split across network chunks simply stays in the carried partial
  * frame until the frame is complete.
  */
+import { types as utilTypes } from 'node:util'
 
 /** Largest single frame a framer accepts before it refuses the stream. */
 export const DEFAULT_SSE_MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -61,7 +62,12 @@ export interface SseFramer {
 
 function readMaxFrameBytes(options: SseFramerOptions | undefined): number {
   if (options === undefined) return DEFAULT_SSE_MAX_FRAME_BYTES
-  if (options === null || typeof options !== 'object')
+  // Reject proxies before inspecting maxFrameBytes: descriptor lookup can run their traps.
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    utilTypes.isProxy(options)
+  )
     throw new TypeError('SSE framer options must be an object')
   // Read through the descriptor so an accessor is rejected rather than run.
   const field = Object.getOwnPropertyDescriptor(options, 'maxFrameBytes')
@@ -114,7 +120,7 @@ export function createSseFramer(options?: SseFramerOptions): SseFramer {
 
   const push = (chunk: Uint8Array): Uint8Array[] => {
     if (failed) throw new SseFrameTooLargeError(maxFrameBytes)
-    if (!(chunk instanceof Uint8Array))
+    if (!utilTypes.isUint8Array(chunk))
       throw new TypeError('SSE framer input must be a Uint8Array')
     const end = chunk.length
     if (end === 0) return []
@@ -223,11 +229,46 @@ export interface SseEvent {
   retry?: number
 }
 
-const frameDecoder = new TextDecoder()
+// ignoreBOM keeps U+FEFF in the output: a frame is usually not the start of
+// its stream, and only the stream start may drop a byte-order mark.
+const frameDecoder = new TextDecoder('utf-8', { ignoreBOM: true })
+const BYTE_ORDER_MARK = 0xfeff
 
-/** Decode a frame as UTF-8, replacing invalid sequences like EventSource. */
-export function decodeSseFrame(frame: Uint8Array): string {
-  return frameDecoder.decode(frame)
+export interface SseDecodeOptions {
+  /**
+   * The frame is the first one of its stream, so one leading byte-order mark
+   * is dropped as the event-stream rules require. Elsewhere U+FEFF is an
+   * ordinary character (for example part of a field name) and is kept.
+   */
+  streamStart?: boolean
+}
+
+function readStreamStart(options: unknown): boolean {
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    utilTypes.isProxy(options)
+  )
+    return false
+  const field = Object.getOwnPropertyDescriptor(options, 'streamStart')
+  return field !== undefined && 'value' in field && field.value === true
+}
+
+/**
+ * Decode a frame as UTF-8, replacing invalid sequences like EventSource. A
+ * leading byte-order mark is dropped only for the first frame of a stream.
+ * The one-argument form stays usable as an `Array.prototype.map` callback.
+ */
+export function decodeSseFrame(frame: Uint8Array): string
+export function decodeSseFrame(
+  frame: Uint8Array,
+  options: SseDecodeOptions,
+): string
+export function decodeSseFrame(frame: Uint8Array, options?: unknown): string {
+  const text = frameDecoder.decode(frame)
+  return text.charCodeAt(0) === BYTE_ORDER_MARK && readStreamStart(options)
+    ? text.slice(1)
+    : text
 }
 
 /**

@@ -203,3 +203,35 @@ test('isTerminatedSseFrame distinguishes complete frames from EOF tails', () => 
   for (const frame of ['', 'a', 'a\n', 'a\r\n', 'a\r'])
     expect(isTerminatedSseFrame(bytes(frame))).toBe(false)
 })
+
+test('framer options that are a Proxy are rejected without running a trap', () => {
+  let ran = 0
+  const options = new Proxy(
+    { maxFrameBytes: 16 },
+    {
+      getOwnPropertyDescriptor(target, key) {
+        ran++
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      },
+      get(target, key, receiver) {
+        ran++
+        return Reflect.get(target, key, receiver)
+      },
+    },
+  )
+  expect(() => createSseFramer(options)).toThrow(TypeError)
+  expect(ran).toBe(0)
+})
+
+test('decodeSseFrame keeps a byte-order mark unless the frame starts the stream', () => {
+  const frame = bytes('\uFEFFevent: error\ndata: x\n\n')
+  expect(decodeSseFrame(frame)).toBe('\uFEFFevent: error\ndata: x\n\n')
+  expect(parseSseFrame(frame)).toEqual({ data: 'x' })
+  expect(decodeSseFrame(frame, { streamStart: true })).toBe(
+    'event: error\ndata: x\n\n',
+  )
+  // Only one leading mark is ignored, even at the stream start.
+  expect(
+    decodeSseFrame(bytes('\uFEFF\uFEFFdata: x\n\n'), { streamStart: true }),
+  ).toBe('\uFEFFdata: x\n\n')
+})

@@ -529,27 +529,12 @@ async function recordFailure(
   if (secrets === undefined) lines = [CLI_FAILURE_SECRETS_UNREADABLE]
   else {
     try {
-      // createProviderErrorRedactor replaces exact values before token patterns. A short
-      // exact value inside a JWT or Bearer token would split that token so
-      // the patterns no longer match its pieces, so the patterns run first on
-      // their own. Each exact value is also listed in the form the pattern
-      // pass leaves it in, so a value with a token-shaped part is still
-      // replaced whole.
-      const patterns = createProviderErrorRedactor([])
-      const exact = createProviderErrorRedactor([
-        ...secrets,
-        ...secrets.map((secret) => patterns.redactText(secret)),
-      ])
+      const redactor = createProviderErrorRedactor(secrets)
       try {
         const { text, keep } = detail()
-        lines = boundRedactedDetail(
-          text,
-          { redactText: (raw) => exact.redactText(patterns.redactText(raw)) },
-          keep,
-        )
+        lines = boundRedactedDetail(text, redactor, keep)
       } finally {
-        exact.dispose()
-        patterns.dispose()
+        redactor.dispose()
       }
     } catch {
       lines = ['[failure detail could not be recorded]']

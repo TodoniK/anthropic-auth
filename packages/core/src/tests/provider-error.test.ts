@@ -211,52 +211,61 @@ test('each attempt scrubs only its own exact credentials', () => {
 class UsageLimitError extends Error {
   status: number
   code: string
-  retryAfterMs: number
+  retryAfter: number
   isRetryable: boolean
   constructor(message: string) {
     super(message)
     this.name = 'UsageLimitError'
     this.status = 429
     this.code = 'usage_limit_reached'
-    this.retryAfterMs = 30_000
+    this.retryAfter = 30
     this.isRetryable = false
   }
   get rerouteKind() {
-    // Classifiers may read prototype getters that use safe own fields; the
-    // copy keeps the prototype so this still works.
     return this.code === 'usage_limit_reached' ? 'usage-limit' : 'other'
   }
 }
 
-test('a credential beside a usage-limit code keeps class, status, code and retry metadata', () => {
+// Thrown values are projected, not copied: classification fields survive as
+// own data on a fresh Error or plain record, while the original's prototype
+// (and so its getters and private state) never comes back.
+
+test('a credential beside a usage-limit code keeps name, status, code and retry metadata in a fresh projection', () => {
   const redactor = ownRedactor([OAUTH_TOKEN])
   const original = new UsageLimitError(
     `usage limit reached for token ${OAUTH_TOKEN}`,
   )
-  const result = redactor.redactError(original)
-  if (!(result instanceof UsageLimitError)) throw new Error('class lost')
+  const result = instance(redactor.redactError(original), Error)
   expect(result).not.toBe(original)
+  expect(result).not.toBeInstanceOf(UsageLimitError)
+  expect(Object.getPrototypeOf(result)).toBe(Error.prototype)
   expect(result.message).toBe(
     `usage limit reached for token ${PROVIDER_ERROR_REDACTION}`,
   )
   expect(result.name).toBe('UsageLimitError')
-  expect(result.status).toBe(429)
-  expect(result.code).toBe('usage_limit_reached')
-  expect(result.retryAfterMs).toBe(30_000)
-  expect(result.isRetryable).toBe(false)
-  expect(result.rerouteKind).toBe('usage-limit')
+  expect(own(result, 'status')).toBe(429)
+  expect(own(result, 'code')).toBe('usage_limit_reached')
+  expect(own(result, 'retryAfter')).toBe(30)
+  expect(own(result, 'isRetryable')).toBe(false)
+  // A prototype getter is not part of the projection.
+  expect('rerouteKind' in result).toBe(false)
   expect(result.stack).not.toContain(OAUTH_TOKEN)
   expect(Bun.inspect(result)).not.toContain(OAUTH_TOKEN)
   expect(original.message).toContain(OAUTH_TOKEN)
 })
 
-test('an error without credentials is returned as the same object', () => {
+test('an error without credentials is still a fresh projection with the same classification', () => {
   const redactor = ownRedactor([OAUTH_TOKEN])
   const original = new UsageLimitError('usage limit reached')
   Object.defineProperty(original, 'cause', {
     value: { status: 529, nested: ['overloaded_error'] },
   })
-  expect(redactor.redactError(original)).toBe(original)
+  const result = instance(redactor.redactError(original), Error)
+  expect(result).not.toBe(original)
+  expect(result.message).toBe('usage limit reached')
+  expect(own(result, 'status')).toBe(429)
+  expect(own(result, 'code')).toBe('usage_limit_reached')
+  expect(own(result, 'cause')).toEqual({ status: 529 })
   expect(redactor.redactError(42)).toBe(42)
   expect(redactor.redactError(undefined)).toBe(undefined)
   expect(redactor.redactError(`plain ${OAUTH_TOKEN}`)).toBe(
@@ -264,27 +273,29 @@ test('an error without credentials is returned as the same object', () => {
   )
 })
 
-test('accessor properties are dropped from the copy without being run', () => {
+test('accessor properties are dropped from the projection without being run', () => {
   const redactor = ownRedactor([RELAY_CREDENTIAL])
   let getterRuns = 0
   const original = new Error('transport failed')
-  Object.defineProperty(original, 'secretView', {
-    get() {
-      getterRuns++
-      return RELAY_CREDENTIAL
-    },
-    enumerable: true,
-  })
+  for (const key of ['code', 'secretView'])
+    Object.defineProperty(original, key, {
+      get() {
+        getterRuns++
+        return RELAY_CREDENTIAL
+      },
+      enumerable: true,
+    })
   Object.defineProperty(original, 'status', { value: 502, enumerable: true })
   const result = instance(redactor.redactError(original), Error)
   expect(getterRuns).toBe(0)
   expect(result).not.toBe(original)
+  expect(Object.getOwnPropertyDescriptor(result, 'code')).toBeUndefined()
   expect(Object.getOwnPropertyDescriptor(result, 'secretView')).toBeUndefined()
   expect(own(result, 'status')).toBe(502)
   expect(result.message).toBe('transport failed')
 })
 
-test('a frozen error yields a frozen scrubbed copy and stays untouched', () => {
+test('a frozen built-in error is projected to a fresh error of the same built-in type and stays untouched', () => {
   const redactor = ownRedactor([RELAY_CREDENTIAL])
   const original = Object.freeze(
     Object.assign(new TypeError(`fetch ${RELAY_CREDENTIAL}`), {
@@ -292,16 +303,19 @@ test('a frozen error yields a frozen scrubbed copy and stays untouched', () => {
     }),
   )
   const result = instance(redactor.redactError(original), TypeError)
-  expect(Object.isFrozen(result)).toBe(true)
+  expect(result).not.toBe(original)
   expect(result.message).toBe(`fetch ${PROVIDER_ERROR_REDACTION}`)
   expect(own(result, 'code')).toBe('ECONNRESET')
   expect(original.message).toBe(`fetch ${RELAY_CREDENTIAL}`)
-  // A frozen original without credentials needs no copy.
-  const clean = Object.freeze(new Error('fine'))
-  expect(redactor.redactError(clean)).toBe(clean)
+  // The built-in type comes from a closed list of names, and only for
+  // values that really are native errors; a plain record claiming the name
+  // stays a plain record.
+  const pretender = redactor.redactError({ name: 'TypeError', message: 'x' })
+  expect(pretender).not.toBeInstanceOf(Error)
+  expect(pretender).toEqual({ name: 'TypeError', message: 'x' })
 })
 
-test('nested causes, aggregate members, symbols and cycles are scrubbed', () => {
+test('nested causes and aggregate members are projected; symbols and unknown fields are dropped', () => {
   const redactor = ownRedactor([RELAY_CREDENTIAL])
   const marker = Symbol('detail')
   const inner = new Error(`inner ${RELAY_CREDENTIAL}`)
@@ -312,27 +326,29 @@ test('nested causes, aggregate members, symbols and cycles are scrubbed', () => 
   const outer = new AggregateError([inner, 'safe'], 'outer', { cause: inner })
   Object.defineProperty(inner, 'parent', { value: outer, enumerable: true })
   const result = instance(redactor.redactError(outer), AggregateError)
+  expect(result.message).toBe('outer')
   const copiedInner = instance(result.errors[0], Error)
   expect(copiedInner).not.toBe(inner)
   expect(copiedInner.message).toBe(`inner ${PROVIDER_ERROR_REDACTION}`)
-  expect(own(copiedInner, marker)).toBe(`symbol ${PROVIDER_ERROR_REDACTION}`)
+  expect(Reflect.ownKeys(copiedInner)).not.toContain(marker)
+  expect(Object.hasOwn(copiedInner, 'parent')).toBe(false)
   expect(result.cause).toBe(copiedInner)
-  expect(own(copiedInner, 'parent')).toBe(result)
   expect(result.errors[1]).toBe('safe')
   expect(Bun.inspect(result)).not.toContain(RELAY_CREDENTIAL)
 })
 
-test('a cycle through an unchanged object still points at the scrubbed copy', () => {
+test('a cycle through cause points at the projection', () => {
   const redactor = ownRedactor([RELAY_CREDENTIAL])
-  const holder: { owner?: unknown; note: string } = { note: 'safe' }
+  const holder: { cause?: unknown; message: string } = { message: 'safe' }
   const original = Object.assign(new Error(`x ${RELAY_CREDENTIAL}`), {
-    holder,
+    cause: holder,
   })
-  holder.owner = original
+  holder.cause = original
   const result = redactor.redactError(original)
-  const copiedHolder = own(result, 'holder')
+  const copiedHolder = own(result, 'cause')
   expect(copiedHolder).not.toBe(holder)
-  expect(own(copiedHolder, 'owner')).toBe(result)
+  expect(own(copiedHolder, 'message')).toBe('safe')
+  expect(own(copiedHolder, 'cause')).toBe(result)
 })
 
 test('proxies and hostile objects are replaced without running traps', () => {
@@ -352,89 +368,96 @@ test('proxies and hostile objects are replaced without running traps', () => {
   const top = instance(redactor.redactError(proxied), Error)
   expect(top.message).not.toContain(RELAY_CREDENTIAL)
   const nested = redactor.redactError(
-    Object.assign(new Error('outer'), { detail: proxied }),
+    Object.assign(new Error('outer'), { cause: proxied }),
   )
-  expect(own(nested, 'detail')).toBe(PROVIDER_ERROR_REDACTION)
+  expect(own(nested, 'cause')).toBe(PROVIDER_ERROR_REDACTION)
   expect(traps).toBe(0)
 })
 
-test('responses, headers, requests and byte payloads inside errors are scrubbed', async () => {
+test('responses and headers inside errors become status and header records; bodies, requests and bytes are dropped', () => {
   const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const nested = new Response(`denied ${RELAY_CREDENTIAL}`, {
+    status: 401,
+    statusText: `No ${RELAY_CREDENTIAL}`,
+    headers: {
+      'content-type': 'text/plain',
+      'retry-after': '7',
+      'x-echo': RELAY_CREDENTIAL,
+    },
+  })
   const original = Object.assign(new Error('upstream'), {
-    response: new Response(`denied ${RELAY_CREDENTIAL}`, { status: 401 }),
+    response: nested,
     headers: new Headers({ 'x-echo': RELAY_CREDENTIAL, 'retry-after': '3' }),
+    responseHeaders: {
+      'retry-after': '5',
+      [`x-${RELAY_CREDENTIAL}`]: 'named after the credential',
+    },
     body: encoder.encode(`raw ${RELAY_CREDENTIAL}`),
-    view: new DataView(encoder.encode(`view ${RELAY_CREDENTIAL}`).buffer),
     request: new Request('https://api.example.test/v1/messages', {
       method: 'POST',
       headers: { authorization: `Bearer ${RELAY_CREDENTIAL}` },
     }),
   })
   const result = redactor.redactError(original)
-  const response = instance(own(result, 'response'), Response)
-  expect(response.status).toBe(401)
-  expect(await response.text()).toBe(`denied ${PROVIDER_ERROR_REDACTION}`)
-  const headers = instance(own(result, 'headers'), Headers)
-  expect(headers.get('x-echo')).toBe(PROVIDER_ERROR_REDACTION)
-  expect(headers.get('retry-after')).toBe('3')
-  expect(decoder.decode(instance(own(result, 'body'), Uint8Array))).toBe(
-    `raw ${PROVIDER_ERROR_REDACTION}`,
-  )
-  expect(decoder.decode(instance(own(result, 'view'), Uint8Array))).toBe(
-    `view ${PROVIDER_ERROR_REDACTION}`,
-  )
-  const request = instance(own(result, 'request'), Request)
-  expect(request.method).toBe('POST')
-  expect(request.headers.get('authorization')).toBe(
-    `Bearer ${PROVIDER_ERROR_REDACTION}`,
-  )
+  expect(own(result, 'response')).toEqual({
+    status: 401,
+    statusText: `No ${PROVIDER_ERROR_REDACTION}`,
+    headers: {
+      'content-type': 'text/plain',
+      'retry-after': '7',
+      'x-echo': PROVIDER_ERROR_REDACTION,
+    },
+  })
+  expect(nested.bodyUsed).toBe(false)
+  expect(own(result, 'headers')).toEqual({
+    'retry-after': '3',
+    'x-echo': PROVIDER_ERROR_REDACTION,
+  })
+  expect(own(result, 'responseHeaders')).toEqual({ 'retry-after': '5' })
+  expect(Object.hasOwn(Object(result), 'body')).toBe(false)
+  expect(Object.hasOwn(Object(result), 'request')).toBe(false)
 })
 
-test('clean platform values inside a changed error keep their identity; bytes are copied', () => {
+test('platform values inside an error never keep their identity, even without credentials', () => {
   const redactor = ownRedactor([RELAY_CREDENTIAL])
   const headers = new Headers({ 'retry-after': '3' })
-  const body = encoder.encode('no credential here')
   const exception = new DOMException('aborted', 'AbortError')
   const response = Response.json({ ok: true })
   const result = redactor.redactError(
     Object.assign(new Error(RELAY_CREDENTIAL), {
       headers,
-      body,
-      exception,
+      cause: exception,
       response,
     }),
   )
-  expect(own(result, 'headers')).toBe(headers)
-  expect(own(result, 'exception')).toBe(exception)
-  expect(own(result, 'response')).toBe(response)
-  // Bytes are always a fresh plain copy so no override can travel with them.
-  const copiedBody = instance(own(result, 'body'), Uint8Array)
-  expect(copiedBody).not.toBe(body)
-  expect([...copiedBody]).toEqual([...body])
+  expect(own(result, 'headers')).toEqual({ 'retry-after': '3' })
+  const cause = instance(own(result, 'cause'), Error)
+  expect(cause).not.toBeInstanceOf(DOMException)
+  expect(cause.name).toBe('AbortError')
+  expect(own(result, 'response')).not.toBe(response)
+  expect(own(own(result, 'response'), 'status')).toBe(200)
+  expect(response.bodyUsed).toBe(false)
 })
 
-test('Map, Set and other slot-backed containers in error details are withheld', () => {
+test('Map, Set and other slot-backed containers in error fields contribute nothing', async () => {
   const redactor = ownRedactor([RELAY_CREDENTIAL])
   const original = Object.assign(new Error('rate limited'), {
     status: 429,
     code: 'rate_limit_error',
-    details: {
-      byKey: new Map([['token', RELAY_CREDENTIAL]]),
-      seen: new Set([RELAY_CREDENTIAL]),
-      weak: new WeakMap([[{}, RELAY_CREDENTIAL]]),
-      boxed: Object(RELAY_CREDENTIAL),
-      pending: Promise.resolve(RELAY_CREDENTIAL),
-      retryAfterSeconds: 9,
-    },
+    headers: new Map([['token', RELAY_CREDENTIAL]]),
+    cause: new Set([RELAY_CREDENTIAL]),
+    error: Promise.resolve(RELAY_CREDENTIAL),
+    responseHeaders: new WeakMap([[{}, RELAY_CREDENTIAL]]),
+    retryAfter: Object(RELAY_CREDENTIAL),
   })
   const result = instance(redactor.redactError(original), Error)
   expect(own(result, 'status')).toBe(429)
   expect(own(result, 'code')).toBe('rate_limit_error')
-  const details = own(result, 'details')
-  for (const key of ['byKey', 'seen', 'weak', 'boxed', 'pending'])
-    expect(own(details, key)).toBe(PROVIDER_ERROR_REDACTION)
-  expect(own(details, 'retryAfterSeconds')).toBe(9)
-  expect(Bun.inspect(result)).not.toContain(RELAY_CREDENTIAL)
+  expect(own(result, 'headers')).toEqual({})
+  expect(own(result, 'cause')).toEqual({})
+  expect(own(result, 'error')).toEqual({})
+  expect(Object.hasOwn(result, 'retryAfter')).toBe(false)
+  expect(await exposes(result, RELAY_CREDENTIAL)).toBe(false)
 })
 
 /** Install overriding accessors or methods that count every call. */
@@ -482,38 +505,29 @@ test('subclass and instance overrides of platform accessors never run while erro
       status: 401,
       headers: { 'x-echo': RELAY_CREDENTIAL },
     }),
-    shadowed,
+    error: { response: shadowed },
     headers: new TrickHeaders({ 'x-echo': RELAY_CREDENTIAL }),
     request: new TrickRequest(
       `https://api.example.test/v1/messages?key=${RELAY_CREDENTIAL}`,
     ),
-    exception: new TrickException(`aborted ${RELAY_CREDENTIAL}`, 'AbortError'),
+    cause: new TrickException(`aborted ${RELAY_CREDENTIAL}`, 'AbortError'),
     bytes: new TrickBytes(encoder.encode(`raw ${RELAY_CREDENTIAL}`)),
   })
   const result = redactor.redactError(original)
   expect(overrides).toBe(0)
   const response = own(result, 'response')
-  expect(response).not.toBeInstanceOf(TrickResponse)
-  const copied = instance(response, Response)
-  expect(copied.status).toBe(401)
-  expect(copied.headers.get('x-echo')).toBe(PROVIDER_ERROR_REDACTION)
-  expect(await copied.text()).toBe(`denied ${PROVIDER_ERROR_REDACTION}`)
-  const copiedShadowed = instance(own(result, 'shadowed'), Response)
-  expect(copiedShadowed).not.toBe(shadowed)
-  expect(copiedShadowed.status).toBe(404)
-  expect(await copiedShadowed.text()).toBe(`gone ${PROVIDER_ERROR_REDACTION}`)
-  const headers = instance(own(result, 'headers'), Headers)
-  expect(headers).not.toBeInstanceOf(TrickHeaders)
-  expect(headers.get('x-echo')).toBe(PROVIDER_ERROR_REDACTION)
-  const request = instance(own(result, 'request'), Request)
-  expect(request).not.toBeInstanceOf(TrickRequest)
-  expect(request.url).not.toContain(RELAY_CREDENTIAL)
-  const exception = instance(own(result, 'exception'), DOMException)
-  expect(exception).not.toBeInstanceOf(TrickException)
+  expect(response).not.toBeInstanceOf(Response)
+  expect(own(response, 'status')).toBe(401)
+  expect(own(own(response, 'headers'), 'x-echo')).toBe(PROVIDER_ERROR_REDACTION)
+  expect(own(own(own(result, 'error'), 'response'), 'status')).toBe(404)
+  expect(own(result, 'headers')).toEqual({ 'x-echo': PROVIDER_ERROR_REDACTION })
+  expect(Object.hasOwn(Object(result), 'request')).toBe(false)
+  expect(Object.hasOwn(Object(result), 'bytes')).toBe(false)
+  const exception = instance(own(result, 'cause'), Error)
+  expect(exception).not.toBeInstanceOf(DOMException)
+  expect(exception.name).toBe('AbortError')
   expect(exception.message).toBe(`aborted ${PROVIDER_ERROR_REDACTION}`)
-  const bytes = instance(own(result, 'bytes'), Uint8Array)
-  expect(bytes).not.toBeInstanceOf(TrickBytes)
-  expect(decoder.decode(bytes)).toBe(`raw ${PROVIDER_ERROR_REDACTION}`)
+  expect(await exposes(result, RELAY_CREDENTIAL)).toBe(false)
   expect(overrides).toBe(0)
 })
 
@@ -534,14 +548,15 @@ test('redactResponse reads a Response subclass through platform accessors', asyn
   expect(await result.text()).toBe(`denied ${PROVIDER_ERROR_REDACTION}`)
 })
 
-test('DOMException messages are scrubbed through the platform type', () => {
+test('DOMException name and message are read through the platform type into a fresh error', () => {
   const redactor = ownRedactor([RELAY_CREDENTIAL])
   const result = instance(
     redactor.redactError(
       new DOMException(`aborted ${RELAY_CREDENTIAL}`, 'AbortError'),
     ),
-    DOMException,
+    Error,
   )
+  expect(result).not.toBeInstanceOf(DOMException)
   expect(result.name).toBe('AbortError')
   expect(result.message).toBe(`aborted ${PROVIDER_ERROR_REDACTION}`)
 })
@@ -717,12 +732,14 @@ test('successful responses survive a clone peek and release before the original 
     decoder.decode(await peekCloneThenRead(redactor.redactResponse(json))),
   ).toBe('{"type":"message"}')
 
-  // Inside an error, a clean successful response is also left untouched.
+  // Inside an error, a successful response is projected without its body
+  // ever being read, so its owner can still peek and read it.
   const nested = new Response(text)
   const result = redactor.redactError(
     Object.assign(new Error(`failed ${OAUTH_TOKEN}`), { response: nested }),
   )
-  expect(own(result, 'response')).toBe(nested)
+  expect(own(own(result, 'response'), 'status')).toBe(200)
+  expect(nested.bodyUsed).toBe(false)
   expect([...(await peekCloneThenRead(nested))]).toEqual([...bytes])
 
   // Event streams are wrapped; the wrapper survives the same peek.
@@ -1807,4 +1824,865 @@ test('http mode leaves ordinary successful responses untouched and unread, even 
       SUCCESS_FRAME,
     )
   }
+})
+
+// Cover credential echoes in encoded data, error metadata and stream failures.
+// Most cases pass the credentials associated with the response's physical request.
+
+/** Decode JSON \uXXXX escapes the way any JSON decoder downstream would. */
+function decodeEscapes(text: string): string {
+  return text.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  )
+}
+
+/**
+ * True when `secret` can be read back out of `value` by an ordinary consumer:
+ * own and inherited properties (getters included), symbol descriptions,
+ * header names and values, URL text, and stream or response body bytes.
+ */
+async function exposes(value: unknown, secret: string): Promise<boolean> {
+  const seen = new Set<unknown>()
+  const visit = async (current: unknown, depth: number): Promise<boolean> => {
+    if (typeof current === 'string')
+      return current.includes(secret) || decodeEscapes(current).includes(secret)
+    if (typeof current === 'symbol')
+      return (current.description ?? '').includes(secret)
+    if (current === null || depth > 8) return false
+    if (typeof current !== 'object' && typeof current !== 'function')
+      return false
+    if (seen.has(current)) return false
+    seen.add(current)
+    if (current instanceof Headers)
+      for (const [name, entry] of current)
+        if (name.includes(secret) || entry.includes(secret)) return true
+    if (current instanceof URL && current.href.includes(secret)) return true
+    if (current instanceof Response) {
+      if (current.url.includes(secret)) return true
+      if (!current.bodyUsed && (await current.clone().text()).includes(secret))
+        return true
+    }
+    if (current instanceof ReadableStream && !current.locked)
+      return (await new Response(current).text()).includes(secret)
+    const keys = new Set<PropertyKey>(Reflect.ownKeys(current))
+    for (const key in current) keys.add(key)
+    for (const key of keys) {
+      if (typeof key === 'symbol' && (await visit(key, depth))) return true
+      if (typeof key === 'string' && key.includes(secret)) return true
+      let entry: unknown
+      try {
+        entry = Reflect.get(current, key)
+      } catch {
+        continue
+      }
+      if (await visit(entry, depth + 1)) return true
+    }
+    return false
+  }
+  return visit(value, 0)
+}
+
+test('a non-2xx JSON body cannot hide a credential in an earlier duplicate key, literal or escaped', async () => {
+  for (const body of [
+    `{"type":"error","error":{"type":"rate_limit_error","message":"${RELAY_CREDENTIAL}"},"error":{"type":"rate_limit_error","message":"ok"}}`,
+    `{"m":"${unicodeEscape(RELAY_CREDENTIAL)}","m":"ok"}`,
+  ])
+    for (const mode of ['http', 'event-stream'] as const) {
+      const scope = ownResponseScope([RELAY_CREDENTIAL], mode)
+      const result = scope.redactResponse(new Response(body, { status: 429 }))
+      const text = decoder.decode(await readAll(result.body))
+      expect(text).not.toContain(RELAY_CREDENTIAL)
+      expect(decodeEscapes(text)).not.toContain(RELAY_CREDENTIAL)
+      expect(await settlementNow(scope)).toBe('eof')
+    }
+})
+
+test('a non-JSON non-2xx body that spells the credential only as escapes is scrubbed', async () => {
+  const scope = ownResponseScope([RELAY_CREDENTIAL], 'http')
+  const body = `event: error\ndata: {"error":"${unicodeEscape(RELAY_CREDENTIAL)}"}\n\n`
+  const text = decoder.decode(
+    await readAll(
+      scope.redactResponse(new Response(body, { status: 401 })).body,
+    ),
+  )
+  expect(decodeEscapes(text)).not.toContain(RELAY_CREDENTIAL)
+  expect(text).toContain('event: error')
+})
+
+test('an SSE error frame cannot hide an escaped credential in an earlier duplicate key', async () => {
+  const frame = `event: error\ndata: {"type":"error","error":{"type":"api_error","message":"${unicodeEscape(RELAY_CREDENTIAL)}"},"error":{"type":"api_error","message":"ok"}}\n\n`
+  const scope = ownResponseScope([RELAY_CREDENTIAL], 'event-stream')
+  const text = decoder.decode(
+    await readAll(
+      scope.redactResponse(eventStream([encoder.encode(frame)]).response).body,
+    ),
+  )
+  expect(decodeEscapes(text)).not.toContain(RELAY_CREDENTIAL)
+  // The error event retains its api_error type.
+  expect(text.startsWith('event: error\n')).toBe(true)
+  expect(text).toContain('"type":"api_error"')
+  const relay = decoder.decode(
+    feedScope([RELAY_CREDENTIAL], [encoder.encode(frame)]),
+  )
+  expect(decodeEscapes(relay)).not.toContain(RELAY_CREDENTIAL)
+})
+
+test('non-2xx header entries whose name carries the credential are dropped while retry headers keep their values', () => {
+  const headers = {
+    [`x-${RELAY_CREDENTIAL}`]: '1',
+    [RELAY_CREDENTIAL]: 'x',
+    'retry-after': '4',
+    'anthropic-ratelimit-unified-status': 'rejected',
+  }
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const scope = ownResponseScope([RELAY_CREDENTIAL], 'http')
+  for (const result of [
+    redactor.redactResponse(new Response(null, { status: 401, headers })),
+    scope.redactResponse(new Response('denied', { status: 429, headers })),
+  ]) {
+    const names = [...result.headers.keys()]
+    expect(names.some((name) => name.includes(RELAY_CREDENTIAL))).toBe(false)
+    expect(result.headers.get('retry-after')).toBe('4')
+    expect(result.headers.get('anthropic-ratelimit-unified-status')).toBe(
+      'rejected',
+    )
+  }
+})
+
+test('thrown values never carry the credential through expandos, callables, inherited data, URL, symbol or stream slots', async () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const body = () =>
+    new Response(`denied ${RELAY_CREDENTIAL}`, { status: 401 }).body
+  const inputs: Array<[string, unknown]> = [
+    [
+      'headers expando',
+      Object.assign(new Headers(), { token: RELAY_CREDENTIAL }),
+    ],
+    ['callable', Object.assign(() => 0, { token: RELAY_CREDENTIAL })],
+    ['inherited data', Object.create({ token: RELAY_CREDENTIAL })],
+    ['url', new URL(`https://example.invalid/?key=${RELAY_CREDENTIAL}`)],
+    ['symbol', Symbol(RELAY_CREDENTIAL)],
+    ['stream slot', { body: body() }],
+    ['error with stream', Object.assign(new Error('x'), { body: body() })],
+    [
+      'error with url and symbol',
+      Object.assign(new Error('x'), {
+        url: new URL(`https://example.invalid/?key=${RELAY_CREDENTIAL}`),
+        marker: Symbol(RELAY_CREDENTIAL),
+        cause: Object.create({ token: RELAY_CREDENTIAL }),
+      }),
+    ],
+    [
+      'request',
+      {
+        request: new Request(
+          `https://example.invalid/?key=${RELAY_CREDENTIAL}`,
+          { method: 'POST', body: RELAY_CREDENTIAL },
+        ),
+      },
+    ],
+    [
+      'domexception expando',
+      Object.assign(new DOMException('aborted', 'AbortError'), {
+        token: RELAY_CREDENTIAL,
+      }),
+    ],
+  ]
+  for (const [label, input] of inputs) {
+    const result = redactor.redactError(input)
+    if (await exposes(result, RELAY_CREDENTIAL))
+      throw new Error(`${label} exposed the credential`)
+  }
+})
+
+test('an ok Response nested in a thrown error keeps no URL, headers or body that could carry the credential', async () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const nested = new Response(`echo ${RELAY_CREDENTIAL}`, {
+    headers: { 'x-echo': RELAY_CREDENTIAL },
+  })
+  const result = redactor.redactError(
+    Object.assign(new Error('failed'), { response: nested }),
+  )
+  expect(await exposes(result, RELAY_CREDENTIAL)).toBe(false)
+  // The original body was never read, so its owner can still consume it.
+  expect(nested.bodyUsed).toBe(false)
+})
+
+test('thrown values are projected without running proxy traps on their prototype chain', async () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  let ran = 0
+  const hostile = new Proxy(Error.prototype, {
+    getPrototypeOf() {
+      ran++
+      return null
+    },
+    getOwnPropertyDescriptor(target, key) {
+      ran++
+      return Reflect.getOwnPropertyDescriptor(target, key)
+    },
+    get(target, key, receiver) {
+      ran++
+      return Reflect.get(target, key, receiver)
+    },
+  })
+  const viaCreate = Object.create(hostile)
+  const viaError = new Error(`failed ${RELAY_CREDENTIAL}`)
+  Object.setPrototypeOf(viaError, hostile)
+  for (const input of [
+    viaCreate,
+    viaError,
+    Object.assign(new Error('outer'), { cause: viaError }),
+  ]) {
+    const result = redactor.redactError(input)
+    expect(await exposes(result, RELAY_CREDENTIAL)).toBe(false)
+  }
+  expect(ran).toBe(0)
+})
+
+test('redactError never wraps a nested Response body, so it cannot change the scope settlement', async () => {
+  const http = ownResponseScope([RELAY_CREDENTIAL], 'http')
+  http.redactError({ r: new Response('x', { status: 500 }) })
+  http.redactResponse(new Response('ok'))
+  expect(await settlementNow(http)).toBe('untouched')
+
+  // Reading the nested failure body to the end must not change the live stream's settlement.
+  const stream = ownResponseScope([RELAY_CREDENTIAL], 'event-stream')
+  const result = stream.redactResponse(
+    eventStream([encoder.encode(errorFrame(RELAY_CREDENTIAL))]).response,
+  )
+  const nested = own(
+    stream.redactError({
+      response: new Response(`x ${RELAY_CREDENTIAL}`, { status: 500 }),
+    }),
+    'response',
+  )
+  expect(nested instanceof Response).toBe(false)
+  expect(await settlementNow(stream)).toBe('pending')
+  expect(decoder.decode(await readAll(result.body))).toBe(
+    errorFrame(PROVIDER_ERROR_REDACTION),
+  )
+  expect(await settlementNow(stream)).toBe('eof')
+})
+
+/** A source whose cancel rejects with the credential in its message. */
+function rejectingCancelSource() {
+  return new ReadableStream<Uint8Array>({
+    cancel() {
+      throw new Error(`cancel failed for ${RELAY_CREDENTIAL}`)
+    },
+  })
+}
+
+test('a source cancel rejection after retirement reaches the consumer only as a generic error', async () => {
+  for (const [mode, status] of [
+    ['event-stream', 200],
+    ['http', 401],
+  ] as const) {
+    const scope = ownResponseScope([RELAY_CREDENTIAL], mode)
+    const result = scope.redactResponse(
+      new Response(rejectingCancelSource(), { status }),
+    )
+    const rejection = await result.body?.cancel('stop').then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(await exposes(rejection, RELAY_CREDENTIAL)).toBe(false)
+    expect(await settlementNow(scope)).toBe('cancel')
+  }
+  // The public redactor must also replace a source cancellation rejection
+  // with a fixed error that cannot repeat the source's credential.
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const rejection = await redactor
+    .redactResponse(
+      new Response(rejectingCancelSource(), {
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    )
+    .body?.cancel()
+    .then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+  expect(await exposes(rejection, RELAY_CREDENTIAL)).toBe(false)
+})
+
+test('a byte-order mark is stripped only at the start of the stream', async () => {
+  // Mid-stream, U+FEFF is part of the field name, so this frame is an
+  // ordinary message event and must pass byte for byte.
+  const later = encoder.encode(
+    `:\n\n\uFEFFevent: error\ndata: ${RELAY_CREDENTIAL}\n\n`,
+  )
+  // At the very start one BOM is ignored, so this frame is a real error
+  // event, even when the BOM bytes arrive split across chunks.
+  const first = encoder.encode(`\uFEFF${errorFrame(RELAY_CREDENTIAL)}`)
+  const firstExpected = encoder.encode(
+    `\uFEFF${errorFrame(PROVIDER_ERROR_REDACTION)}`,
+  )
+  for (const chunks of [[later], splitEvery(later, 1)]) {
+    const scope = ownResponseScope([RELAY_CREDENTIAL], 'event-stream')
+    const bytes = await readAll(
+      scope.redactResponse(eventStream(chunks).response).body,
+    )
+    expect([...bytes]).toEqual([...later])
+    expect([...feedScope([RELAY_CREDENTIAL], chunks)]).toEqual([...later])
+  }
+  for (const chunks of [[first], splitEvery(first, 1), splitEvery(first, 2)]) {
+    const scope = ownResponseScope([RELAY_CREDENTIAL], 'event-stream')
+    const bytes = await readAll(
+      scope.redactResponse(eventStream(chunks).response).body,
+    )
+    expect([...bytes]).toEqual([...firstExpected])
+    expect([...feedScope([RELAY_CREDENTIAL], chunks)]).toEqual([
+      ...firstExpected,
+    ])
+  }
+})
+
+test('the JWT shape scan removes real JWTs, plain or escaped', () => {
+  const redactor = ownRedactor([])
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.c2lnbmF0dXJl'
+  expect(redactor.redactText(`token=${jwt};`)).toBe(
+    `token=${PROVIDER_ERROR_REDACTION};`,
+  )
+  expect(redactor.redactText(`x-${jwt}`)).toBe(`x-${PROVIDER_ERROR_REDACTION}`)
+  expect(redactor.redactText(unicodeEscape(jwt))).toBe(PROVIDER_ERROR_REDACTION)
+})
+
+test('the JWT shape scan stays linear on a long run of JWT-like starts', () => {
+  const redactor = ownRedactor([])
+  // Each 'eyJ' is a possible token start, but the input has no dot delimiter.
+  // An unbounded regular expression can scan the entire remaining suffix at
+  // each start before rejecting it, causing quadratic work. The scanner must
+  // advance once through this long input instead of revisiting each suffix.
+  const pathological = 'eyJ-'.repeat(64 * 1024)
+  const start = performance.now()
+  expect(redactor.redactText(pathological)).toBe(pathological)
+  expect(performance.now() - start).toBeLessThan(1000)
+})
+
+test('zero-length chunks in a non-2xx body do not stop the body from completing', async () => {
+  let pulls = 0
+  const source = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        pulls++
+        if (pulls <= 100_000) controller.enqueue(new Uint8Array(0))
+        else if (pulls === 100_001)
+          controller.enqueue(encoder.encode(`late ${RELAY_CREDENTIAL}`))
+        else controller.close()
+      },
+    },
+    { highWaterMark: 0 },
+  )
+  const scope = ownResponseScope([RELAY_CREDENTIAL], 'http')
+  const text = decoder.decode(
+    await readAll(
+      scope.redactResponse(new Response(source, { status: 500 })).body,
+    ),
+  )
+  expect(text).toBe(`late ${PROVIDER_ERROR_REDACTION}`)
+})
+
+test('one merged span covers a credential found inside a longer credential shape', () => {
+  // The exact key is a piece of the JWT; replacing it first would leave the
+  // rest of the token behind.
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.c2lnbmF0dXJl'
+  const redactor = ownRedactor(['OiJzeW50'])
+  expect(redactor.redactText(`a ${jwt} b`)).toBe(
+    `a ${PROVIDER_ERROR_REDACTION} b`,
+  )
+  expect(redactor.redactText(`Bearer ${jwt}`)).toBe(
+    `Bearer ${PROVIDER_ERROR_REDACTION}`,
+  )
+})
+
+test('escape-decoded matches replace exactly the escapes that spell the credential', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const half = RELAY_CREDENTIAL.length / 2
+  const mixed = `${RELAY_CREDENTIAL.slice(0, half)}${unicodeEscape(RELAY_CREDENTIAL.slice(half))}`
+  expect(
+    redactor.redactText(`{"a":"x\\n${mixed}\\u00e9","b":"\\\\u0041"}`),
+  ).toBe(`{"a":"x\\n${PROVIDER_ERROR_REDACTION}\\u00e9","b":"\\\\u0041"}`)
+  // An escaped backslash is not an escape introducer for what follows.
+  expect(redactor.redactText(`\\\\${unicodeEscape(RELAY_CREDENTIAL)}`)).toBe(
+    `\\\\${PROVIDER_ERROR_REDACTION}`,
+  )
+})
+
+test('projections keep what fetch and AI SDK classifiers read: built-in TypeError, cause codes, APICallError markers', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  // The AI SDK's handleFetchError treats a failure as a retryable network
+  // error only when it is `instanceof TypeError` with the exact message
+  // 'fetch failed', or when its cause chain holds an Error with a network
+  // code, so the projection must keep all three.
+  const fetchFailure = new TypeError('fetch failed', {
+    cause: Object.assign(new Error(`connect ${RELAY_CREDENTIAL}`), {
+      code: 'ECONNRESET',
+    }),
+  })
+  const fetchResult = instance(redactor.redactError(fetchFailure), TypeError)
+  expect(fetchResult.message).toBe('fetch failed')
+  const cause = instance(fetchResult.cause, Error)
+  expect(own(cause, 'code')).toBe('ECONNRESET')
+  expect(cause.message).toBe(`connect ${PROVIDER_ERROR_REDACTION}`)
+
+  // APICallError.isInstance recognizes an error by an own property keyed by
+  // Symbol.for('vercel.ai.error.AI_APICallError') holding true; the
+  // projection must keep that marker (and the base AI SDK one) for retries
+  // to classify it, while dropping URL, request and response bodies.
+  const marker = Symbol.for('vercel.ai.error.AI_APICallError')
+  const base = Symbol.for('vercel.ai.error')
+  const apiCall = Object.assign(new Error(`limited ${RELAY_CREDENTIAL}`), {
+    name: 'AI_APICallError',
+    statusCode: 429,
+    isRetryable: true,
+    responseHeaders: { 'retry-after': '2', 'x-echo': RELAY_CREDENTIAL },
+    url: `https://api.example.test/?key=${RELAY_CREDENTIAL}`,
+    requestBodyValues: { token: RELAY_CREDENTIAL },
+    responseBody: `{"error":"${RELAY_CREDENTIAL}"}`,
+    data: { token: RELAY_CREDENTIAL },
+    [marker]: true,
+    [base]: true,
+    [Symbol.for('vercel.ai.error.Other')]: true,
+  })
+  const result = instance(redactor.redactError(apiCall), Error)
+  expect(own(result, marker)).toBe(true)
+  expect(own(result, base)).toBe(true)
+  expect(result.name).toBe('AI_APICallError')
+  expect(own(result, 'statusCode')).toBe(429)
+  expect(own(result, 'isRetryable')).toBe(true)
+  expect(own(result, 'responseHeaders')).toEqual({
+    'retry-after': '2',
+    'x-echo': PROVIDER_ERROR_REDACTION,
+  })
+  for (const key of ['url', 'requestBodyValues', 'responseBody', 'data'])
+    expect(Object.hasOwn(result, key)).toBe(false)
+  expect(
+    Object.getOwnPropertySymbols(result).map((symbol) => symbol.description),
+  ).toEqual(['vercel.ai.error', 'vercel.ai.error.AI_APICallError'].sort())
+
+  // The marker is copied only from an own data property holding exactly
+  // true: a getter is never run, and a string 'true' does not count.
+  let ran = 0
+  const lying = new Error('x')
+  Object.defineProperty(lying, marker, {
+    get() {
+      ran++
+      return true
+    },
+  })
+  Object.defineProperty(lying, base, { value: 'true' })
+  const lyingResult = instance(redactor.redactError(lying), Error)
+  expect(ran).toBe(0)
+  expect(Object.getOwnPropertySymbols(lyingResult)).toEqual([])
+})
+
+test('projections keep 429, overload and context-overflow envelopes and retry hints', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  const overflow = {
+    status: 400,
+    error: {
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: `prompt is too long: 250000 tokens > 200000 maximum (${RELAY_CREDENTIAL})`,
+      },
+    },
+  }
+  expect(redactor.redactError(overflow)).toEqual({
+    status: 400,
+    error: {
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: `prompt is too long: 250000 tokens > 200000 maximum (${PROVIDER_ERROR_REDACTION})`,
+      },
+    },
+  })
+  const limited = Object.assign(new Error('rate limited'), {
+    status: 429,
+    retryAfter: 17,
+    headers: new Headers({
+      'retry-after': '17',
+      'anthropic-ratelimit-unified-status': 'rejected',
+    }),
+    error: { type: 'error', error: { type: 'rate_limit_error' } },
+  })
+  const result = instance(redactor.redactError(limited), Error)
+  expect(own(result, 'status')).toBe(429)
+  expect(own(result, 'retryAfter')).toBe(17)
+  expect(own(result, 'headers')).toEqual({
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'retry-after': '17',
+  })
+  expect(own(result, 'error')).toEqual({
+    type: 'error',
+    error: { type: 'rate_limit_error' },
+  })
+  // Keep only numeric integer statuses in the supported 0–999 range.
+  for (const status of [Number.NaN, 4e3, '429', 429.5])
+    expect(
+      Object.hasOwn(Object(redactor.redactError({ status })), 'status'),
+    ).toBe(false)
+})
+
+/**
+ * The error has own fields for the failed WebSocket operation and close
+ * code, beside a close reason that may echo the credential.
+ */
+class WebSocketResetError extends Error {
+  readonly code = 'ECONNRESET'
+  readonly syscall = 'websocket'
+  readonly closeCode?: number
+  readonly closeReason?: string
+  readonly wasClean?: boolean
+  constructor(message: string, event?: CloseEvent) {
+    super(message)
+    this.name = 'RelayWebSocketConnectionResetError'
+    this.closeCode = event?.code
+    this.closeReason = event?.reason
+    this.wasClean = event?.wasClean
+  }
+}
+
+test('a websocket reset failing a wrapped stream keeps its closed transport metadata, not the close reason', async () => {
+  const scope = ownResponseScope([RELAY_CREDENTIAL], 'event-stream')
+  let sent = false
+  const source = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (!sent) {
+          sent = true
+          controller.enqueue(encoder.encode(SUCCESS_FRAME))
+          return
+        }
+        throw new WebSocketResetError(
+          'relay websocket closed during response stream',
+          new CloseEvent('close', {
+            code: 1006,
+            reason: `peer said ${RELAY_CREDENTIAL}`,
+            wasClean: false,
+          }),
+        )
+      },
+    },
+    { highWaterMark: 0 },
+  )
+  const reader = scope
+    .redactResponse(new Response(source, { status: 200 }))
+    .body?.getReader()
+  if (!reader) throw new Error('missing body')
+  deferCleanup(() => reader.cancel().catch(() => {}))
+  expect(decoder.decode((await reader.read()).value)).toBe(SUCCESS_FRAME)
+  const failure = instance(
+    await reader.read().catch((error: unknown) => error),
+    Error,
+  )
+  // Each field checked on its own descriptor: printing the error does not
+  // show own properties, so a missing field would otherwise go unnoticed.
+  expect(own(failure, 'code')).toBe('ECONNRESET')
+  expect(own(failure, 'syscall')).toBe('websocket')
+  expect(own(failure, 'closeCode')).toBe(1006)
+  expect(own(failure, 'wasClean')).toBe(false)
+  expect(failure.message).toBe('relay websocket closed during response stream')
+  expect(failure.name).toBe('RelayWebSocketConnectionResetError')
+  expect(failure).toMatchObject({
+    code: 'ECONNRESET',
+    syscall: 'websocket',
+    closeCode: 1006,
+  })
+  // No consumer reads the close reason, and it is provider text.
+  expect(Object.hasOwn(failure, 'closeReason')).toBe(false)
+  expect(await exposes(failure, RELAY_CREDENTIAL)).toBe(false)
+  expect(await settlementNow(scope)).toBe('error')
+})
+
+test('transport metadata outside its closed form is dropped without running getters', async () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  let ran = 0
+  const hostile = new Error('closed')
+  Object.defineProperty(hostile, 'closeCode', {
+    get() {
+      ran++
+      return 1006
+    },
+  })
+  Object.defineProperty(hostile, 'wasClean', {
+    get() {
+      ran++
+      return true
+    },
+  })
+  Object.assign(hostile, { syscall: 'websocket', code: 'ECONNRESET' })
+  const fromGetters = instance(redactor.redactError(hostile), Error)
+  expect(ran).toBe(0)
+  expect(own(fromGetters, 'syscall')).toBe('websocket')
+  expect(Object.hasOwn(fromGetters, 'closeCode')).toBe(false)
+  expect(Object.hasOwn(fromGetters, 'wasClean')).toBe(false)
+
+  for (const [field, value] of [
+    ['syscall', RELAY_CREDENTIAL],
+    ['syscall', `websocket ${RELAY_CREDENTIAL}`],
+    ['syscall', 'websocket-extra'],
+    ['syscall', 42],
+    ['closeCode', 999],
+    ['closeCode', 5000],
+    ['closeCode', 1006.5],
+    ['closeCode', '1006'],
+    ['wasClean', 'false'],
+    ['wasClean', 0],
+  ] as const) {
+    const result = instance(
+      redactor.redactError(
+        Object.assign(new Error('closed'), { [field]: value }),
+      ),
+      Error,
+    )
+    if (Object.hasOwn(result, field))
+      throw new Error(`${field}=${String(value)} survived the projection`)
+    expect(await exposes(result, RELAY_CREDENTIAL)).toBe(false)
+  }
+  // Withhold WebSocket transport fields when the error is backed by a proxy.
+  let traps = 0
+  const proxied = Object.assign(new Error('closed'), {
+    syscall: 'websocket',
+    closeCode: 1006,
+  })
+  Object.setPrototypeOf(
+    proxied,
+    new Proxy(Error.prototype, {
+      getPrototypeOf() {
+        traps++
+        return null
+      },
+    }),
+  )
+  const withheld = instance(redactor.redactError(proxied), Error)
+  expect(traps).toBe(0)
+  expect(Object.hasOwn(withheld, 'syscall')).toBe(false)
+  expect(Object.hasOwn(withheld, 'closeCode')).toBe(false)
+})
+
+/** A Bearer-shaped credential not included in the current scope's credentials. */
+const OLDER_TOKEN = 'Qx7Lm2Vb9Kr4Wd1Zp8Hs6Ta3'
+
+test('an error frame cannot split an unknown Bearer token from its scheme across data lines', async () => {
+  const frame = `event: error\ndata: Bearer\ndata: ${OLDER_TOKEN}\n\n`
+  const scope = ownResponseScope([RELAY_CREDENTIAL], 'event-stream')
+  const text = decoder.decode(
+    await readAll(
+      scope.redactResponse(eventStream([encoder.encode(frame)]).response).body,
+    ),
+  )
+  expect(text).toBe(
+    `event: error\ndata: Bearer\ndata: ${PROVIDER_ERROR_REDACTION}\n\n`,
+  )
+  expect(await settlementNow(scope)).toBe('eof')
+  const relay = decoder.decode(
+    feedScope([RELAY_CREDENTIAL], [encoder.encode(frame)]),
+  )
+  expect(relay).not.toContain(OLDER_TOKEN)
+  // The same lines in a successful frame are model output and stay exact.
+  const success = encoder.encode(
+    `event: content_block_delta\ndata: {"type":"content_block_delta",\ndata: "delta":{"type":"text_delta","text":"Bearer ${OLDER_TOKEN}"}}\n\ndata: Bearer\ndata: ${OLDER_TOKEN}\n\n`,
+  )
+  expect([...feedScope([RELAY_CREDENTIAL], [success])]).toEqual([...success])
+})
+
+test('an exact numeric credential in an error JSON body or frame is not re-emitted as a JSON number', async () => {
+  const secret = '4242424242424242'
+  const data = `{"type":"error","error":{"type":"api_error","message":"x"},"acct":${secret}}`
+  const http = ownResponseScope([secret], 'http')
+  const body = decoder.decode(
+    await readAll(
+      http.redactResponse(new Response(data, { status: 400 })).body,
+    ),
+  )
+  expect(body).not.toContain(secret)
+  expect(JSON.parse(body)).toEqual({
+    type: 'error',
+    error: { type: 'api_error', message: 'x' },
+    acct: PROVIDER_ERROR_REDACTION,
+  })
+  const stream = ownResponseScope([secret], 'event-stream')
+  const frame = decoder.decode(
+    await readAll(
+      stream.redactResponse(
+        eventStream([encoder.encode(`event: error\ndata: ${data}\n\n`)])
+          .response,
+      ).body,
+    ),
+  )
+  expect(frame).not.toContain(secret)
+  expect(frame).toContain('"type":"api_error"')
+  // In a thrown value, a number equal to the credential is left out of the
+  // projection; other numbers are kept.
+  const redactor = ownRedactor([secret])
+  const projected = redactor.redactError({
+    status: 429,
+    code: Number(secret),
+    retryAfter: Number(secret),
+  })
+  expect(projected).toEqual({ status: 429 })
+})
+
+test('own request id strings survive the projection; accessors, proxies, credentials and free text do not', () => {
+  const redactor = ownRedactor([RELAY_CREDENTIAL])
+  expect(
+    redactor.redactError({
+      status: 429,
+      request_id: 'req_011',
+      requestID: 'req_012',
+      error: { type: 'rate_limit_error', message: 'busy' },
+    }),
+  ).toEqual({
+    status: 429,
+    request_id: 'req_011',
+    requestID: 'req_012',
+    error: { type: 'rate_limit_error', message: 'busy' },
+  })
+  const sdkStyle = instance(
+    redactor.redactError(
+      Object.assign(new Error('limited'), { requestID: 'req_013' }),
+    ),
+    Error,
+  )
+  expect(own(sdkStyle, 'requestID')).toBe('req_013')
+
+  let ran = 0
+  const accessor = new Error('x')
+  Object.defineProperty(accessor, 'request_id', {
+    get() {
+      ran++
+      return 'req_014'
+    },
+  })
+  expect(
+    Object.hasOwn(Object(redactor.redactError(accessor)), 'request_id'),
+  ).toBe(false)
+  expect(ran).toBe(0)
+  for (const value of [
+    RELAY_CREDENTIAL,
+    `req_${RELAY_CREDENTIAL}`,
+    'req 011',
+    'r'.repeat(129),
+    42,
+  ])
+    for (const key of ['request_id', 'requestID'])
+      expect(
+        Object.hasOwn(Object(redactor.redactError({ [key]: value })), key),
+      ).toBe(false)
+  const proxied = { request_id: 'req_015' }
+  Object.setPrototypeOf(
+    proxied,
+    new Proxy(Object.prototype, {
+      getPrototypeOf() {
+        ran++
+        return null
+      },
+    }),
+  )
+  const withheld = redactor.redactError(proxied)
+  expect(ran).toBe(0)
+  expect(Object.hasOwn(Object(withheld), 'request_id')).toBe(false)
+})
+
+test('a credential that only appears across JSON structure falls back to the known error type', async () => {
+  // Each JSON value is clean on its own, so scrubbing the values cannot
+  // remove this credential; the redactor checks the re-serialized body text
+  // for it again before returning that text.
+  const secret = '1,"retry'
+  const body =
+    '{"type":"error","error":{"type":"overloaded_error"},"a":1,"retry":2}'
+  const scope = ownResponseScope([secret], 'http')
+  const result = scope.redactResponse(new Response(body, { status: 529 }))
+  const text = decoder.decode(await readAll(result.body))
+  expect(text).not.toContain(secret)
+  expect(result.status).toBe(529)
+  expect(JSON.parse(text)).toEqual({
+    type: 'error',
+    error: {
+      type: 'overloaded_error',
+      message: 'Provider error could not be inspected safely',
+    },
+  })
+})
+
+/** Rewrite one SSE frame through a fresh event-stream scope and the relay scope. */
+async function rewriteBoth(
+  secrets: readonly string[],
+  frame: string,
+): Promise<string> {
+  const scope = ownResponseScope(secrets, 'event-stream')
+  const wrapped = decoder.decode(
+    await readAll(
+      scope.redactResponse(eventStream([encoder.encode(frame)]).response).body,
+    ),
+  )
+  const relay = decoder.decode(feedScope(secrets, [encoder.encode(frame)]))
+  expect(relay).toBe(wrapped)
+  return wrapped
+}
+
+test('a rebuilt error frame never copies a retry value that spells the credential', async () => {
+  const secret = '4242424242424242'
+  const data = '{"type":"error","error":{"type":"api_error","message":"busy"}}'
+  for (const retry of [secret, `0${secret}`, `${secret}0`]) {
+    const out = await rewriteBoth(
+      [secret],
+      `event: error\nretry: ${retry}\ndata: ${data}\n\n`,
+    )
+    expect(out).not.toContain(secret)
+    // Only the retry line goes; the event and its classification stay.
+    expect(out).toBe(`event: error\ndata: ${data}\n\n`)
+  }
+  // A valid retry next to a scrubbed credential is kept as it was.
+  expect(
+    await rewriteBoth(
+      [RELAY_CREDENTIAL],
+      `event: error\nretry: 1500\ndata: {"type":"error","error":{"type":"api_error","message":"${RELAY_CREDENTIAL}"}}\n\n`,
+    ),
+  ).toBe(
+    `event: error\nretry: 1500\ndata: {"type":"error","error":{"type":"api_error","message":"${PROVIDER_ERROR_REDACTION}"}}\n\n`,
+  )
+  // A clean error frame with a retry is not rebuilt at all.
+  const clean = `event: error\r\nretry: 1500\r\n: note\r\ndata: ${data}\r\n\r\n`
+  expect(await rewriteBoth([secret], clean)).toBe(clean)
+})
+
+test('event and id values of a rebuilt error frame are scrubbed, escaped spellings included', async () => {
+  const data = '{"type":"error","error":{"type":"api_error","message":"busy"}}'
+  for (const [field, value] of [
+    ['id', RELAY_CREDENTIAL],
+    ['id', unicodeEscape(RELAY_CREDENTIAL)],
+    ['event', `error ${RELAY_CREDENTIAL}`],
+    ['event', `error ${unicodeEscape(RELAY_CREDENTIAL)}`],
+  ] as const) {
+    const out = await rewriteBoth(
+      [RELAY_CREDENTIAL],
+      `${field}: ${value}\ndata: ${data}\n\n`,
+    )
+    expect(decodeEscapes(out)).not.toContain(RELAY_CREDENTIAL)
+    expect(out).toContain(`data: ${data}`)
+  }
+})
+
+test('a rebuilt error frame that still spells a credential across its lines is replaced by a generic error', async () => {
+  // A contrived credential that spans the event and id lines: each field is
+  // clean on its own, so only a check of the rebuilt bytes can catch it.
+  const secret = 'error\nid: 7'
+  const out = await rewriteBoth(
+    [secret],
+    'event: error\nid: 7\ndata: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}\n\n',
+  )
+  expect(out).not.toContain(secret)
+  expect(out.startsWith('event: error\n')).toBe(true)
+  const payload = JSON.parse(out.split('\n')[1]?.slice('data: '.length) ?? '')
+  expect(payload).toEqual({
+    type: 'error',
+    error: {
+      type: 'overloaded_error',
+      message: 'Provider error could not be inspected safely',
+    },
+  })
 })
