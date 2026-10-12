@@ -108,6 +108,29 @@ import {
   TOKEN_URL,
 } from './test-fetch'
 
+async function assertPrimeWithPublicDiagnostics(
+  manager: PrimeManager,
+  requestStages: readonly string[],
+  assertion: () => void,
+): Promise<void> {
+  try {
+    assertion()
+  } catch (error) {
+    // Record only request stages and public status. A diagnostic read failure
+    // must not replace the original assertion or expose exception text.
+    let status: ReturnType<PrimeManager['stats']> | 'unavailable'
+    try {
+      status = manager.stats(await readAccountStorage())
+    } catch {
+      status = 'unavailable'
+    }
+    console.error(
+      JSON.stringify({ primeAssertionFailure: { requestStages, status } }),
+    )
+    throw error
+  }
+}
+
 async function freshPrimeQuotaResponse(
   body: unknown,
   init: ResponseInit = { status: 200 },
@@ -250,9 +273,9 @@ afterEach(async () => {
   const lifetime = testLifetime
   testLifetime = undefined
   try {
-    await cleanupTempConfigDirs()
-  } finally {
     await lifetime?.finish()
+  } finally {
+    await cleanupTempConfigDirs()
   }
 })
 
@@ -18134,6 +18157,10 @@ describe('auth.loader', () => {
       try {
         const response = await result.fetch(MESSAGES_URL, {
           ...EMPTY_POST,
+          body: JSON.stringify({
+            ...JSON.parse(EMPTY_POST.body),
+            stream: true,
+          }),
           headers: { 'x-session-affinity': 'quota-relay-websocket' },
         })
         expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe(
@@ -18241,6 +18268,10 @@ describe('auth.loader', () => {
       try {
         const response = await result.fetch(MESSAGES_URL, {
           ...EMPTY_POST,
+          body: JSON.stringify({
+            ...JSON.parse(EMPTY_POST.body),
+            stream: true,
+          }),
           headers: { 'x-session-affinity': 'quota-relay-synthetic-only' },
         })
         expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe(
@@ -20814,26 +20845,28 @@ describe('claude-prime direct request', () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(past).toISOString(),
-              checkedAt: 1,
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: 1,
+              },
             },
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: 'fp-main',
           },
-          mainQuotaCheckedAt: 1,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+      ),
     )
 
     const primeCalls: Array<{
@@ -20934,57 +20967,72 @@ describe('claude-prime direct request', () => {
   })
 
   test('main prime uses main OAuth token + Anthropic identity headers', async () => {
+    const requestStages: string[] = []
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(past).toISOString(),
-              checkedAt: 1,
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: 1,
+              },
             },
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: 'fp-main',
           },
-          mainQuotaCheckedAt: 1,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+      ),
     )
 
     let observedAuth: string | undefined
     globalThis.fetch = mock(
-      withNativeAdmission((input: any, init?: RequestInit) => {
-        const url = extractUrl(input)
-        if (url.includes('/v1/messages')) {
-          const headers = new Headers(init?.headers ?? {})
-          observedAuth = headers.get('authorization') ?? undefined
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                usage: { input_tokens: 20, output_tokens: 1 },
-              }),
-              { status: 200, headers: { 'content-type': 'application/json' } },
-            ),
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          requestStages.push(
+            url.includes('/api/oauth/usage')
+              ? 'quota'
+              : url.includes('/v1/messages')
+                ? 'model'
+                : 'other',
           )
-        }
-        if (url.includes('/api/oauth/usage')) {
-          return freshPrimeQuotaResponse({
-            five_hour: {
-              utilization: 0,
-              resets_at: new Date(now - 1_000).toISOString(),
-            },
-          })
-        }
-        return Promise.resolve(new Response('not-mocked', { status: 599 }))
-      }),
+          if (url.includes('/v1/messages')) {
+            const headers = new Headers(init?.headers ?? {})
+            observedAuth = headers.get('authorization') ?? undefined
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  usage: { input_tokens: 20, output_tokens: 1 },
+                }),
+                {
+                  status: 200,
+                  headers: { 'content-type': 'application/json' },
+                },
+              ),
+            )
+          }
+          if (url.includes('/api/oauth/usage')) {
+            return freshPrimeQuotaResponse({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(now - 1_000).toISOString(),
+              },
+            })
+          }
+          return Promise.resolve(new Response('not-mocked', { status: 599 }))
+        },
+      ),
     ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
@@ -21003,36 +21051,43 @@ describe('claude-prime direct request', () => {
         __primeManager?: { tick: () => Promise<void> }
       }
     ).__primeManager
-    await mgr!.tick()
+    if (!(mgr instanceof Core.PrimeManager))
+      throw new Error('Expected the native Prime manager')
+    await mgr.tick()
 
-    expect(observedAuth).toBeDefined()
-    expect(observedAuth).toContain('sk-ant-oat01-main-access')
+    await assertPrimeWithPublicDiagnostics(mgr, requestStages, () => {
+      expect(observedAuth).toBeDefined()
+      expect(observedAuth).toContain('sk-ant-oat01-main-access')
+    })
   })
 
   test('main host credential replacement keeps the stable lineage in the same reset window', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(past).toISOString(),
-              checkedAt: 1,
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: 1,
+              },
             },
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: 'fp-main',
           },
-          mainQuotaCheckedAt: 1,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+        'sk-ant-oat01-main-access-a',
+      ),
       {
         access: 'sk-ant-oat01-main-access-a',
         refresh: 'main-refresh-a',
@@ -21376,42 +21431,44 @@ describe('claude-prime direct request', () => {
       force: true,
     }).catch(() => {})
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [
-          {
-            id: 'work-alt',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fb-access',
-            refresh: 'fb-refresh',
-            // expires must exceed the refresh-before-expiry window (4h default)
-            // so the token is NOT marked as needing refresh and the prime
-            // request flows through without the OAuth refresh fetch.
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-            quota: {
-              five_hour: {
-                usedPercent: 0,
-                remainingPercent: 100,
-                resetsAt: new Date(past).toISOString(),
-                // Recent (1min) so the background refresh's
-                // `isFallbackStale` guard does NOT fire a competing
-                // refresh in the same millisecond — without this the
-                // prime fresh-check's baseline equals the fetched
-                // checkedAt and `fresh` is false. The check-interval
-                // gate is 5min (storage.quota.checkIntervalMinutes),
-                // so a 1min-old checkedAt is comfortably fresh.
-                checkedAt: Date.now() - 60 * 1000,
+      bindPoolAccounts(
+        createFallbackStorage({
+          accounts: [
+            {
+              id: 'work-alt',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fb-access',
+              refresh: 'fb-refresh',
+              // expires must exceed the refresh-before-expiry window (4h default)
+              // so the token is NOT marked as needing refresh and the prime
+              // request flows through without the OAuth refresh fetch.
+              expires: Date.now() + 5 * 60 * 60 * 1000,
+              quota: {
+                five_hour: {
+                  usedPercent: 0,
+                  remainingPercent: 100,
+                  resetsAt: new Date(past).toISOString(),
+                  // Recent (1min) so the background refresh's
+                  // `isFallbackStale` guard does NOT fire a competing
+                  // refresh in the same millisecond — without this the
+                  // prime fresh-check's baseline equals the fetched
+                  // checkedAt and `fresh` is false. The check-interval
+                  // gate is 5min (storage.quota.checkIntervalMinutes),
+                  // so a 1min-old checkedAt is comfortably fresh.
+                  checkedAt: Date.now() - 60 * 1000,
+                },
               },
             },
+          ],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
           },
-        ],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+      ),
     )
 
     const calls: Array<{ url: string; auth?: string }> = []
@@ -21473,33 +21530,35 @@ describe('claude-prime direct request', () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [
-          {
-            id: 'work-rotating',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fb-access-a',
-            refresh: 'fb-refresh-a',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-            authLineageId: 'lineage-work',
-            quota: {
-              five_hour: {
-                usedPercent: 0,
-                remainingPercent: 100,
-                resetsAt: new Date(past).toISOString(),
-                checkedAt: Date.now() - 60 * 1000,
+      bindPoolAccounts(
+        createFallbackStorage({
+          accounts: [
+            {
+              id: 'work-rotating',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fb-access-a',
+              refresh: 'fb-refresh-a',
+              expires: Date.now() + 5 * 60 * 60 * 1000,
+              authLineageId: 'lineage-work',
+              quota: {
+                five_hour: {
+                  usedPercent: 0,
+                  remainingPercent: 100,
+                  resetsAt: new Date(past).toISOString(),
+                  checkedAt: Date.now() - 60 * 1000,
+                },
               },
             },
+          ],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
           },
-        ],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+      ),
     )
 
     let sends = 0
@@ -21564,26 +21623,28 @@ describe('claude-prime direct request', () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(past).toISOString(),
-              checkedAt: 1,
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: 1,
+              },
             },
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: 'fp-main',
           },
-          mainQuotaCheckedAt: 1,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+      ),
     )
 
     let messageCalls = 0
@@ -21634,35 +21695,39 @@ describe('claude-prime direct request', () => {
   })
 
   test('successful send increments main prime counters', async () => {
+    const requestStages: string[] = []
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(past).toISOString(),
-              checkedAt: 1,
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: 1,
+              },
             },
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: 'fp-main',
           },
-          mainQuotaCheckedAt: 1,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+      ),
     )
 
     globalThis.fetch = mock(
-      withNativeAdmission((input: any) => {
+      withNativeAdmission((input: string | URL | Request) => {
         const url = extractUrl(input)
         if (url.includes('/v1/messages')) {
+          requestStages.push('model')
           return Promise.resolve(
             new Response(
               JSON.stringify({
@@ -21673,6 +21738,7 @@ describe('claude-prime direct request', () => {
           )
         }
         if (url.includes('/api/oauth/usage')) {
+          requestStages.push('quota')
           return freshPrimeQuotaResponse({
             five_hour: {
               utilization: 0,
@@ -21700,14 +21766,18 @@ describe('claude-prime direct request', () => {
         __primeManager?: { tick: () => Promise<void> }
       }
     ).__primeManager
-    await mgr!.tick()
+    if (!(mgr instanceof Core.PrimeManager))
+      throw new Error('Expected the native Prime manager')
+    await mgr.tick()
 
     const raw = await readNativeRuntimeState()
-    expect(raw.main?.prime).toEqual({
-      count: 1,
-      inputTokens: 20,
-      outputTokens: 1,
-      since: expect.any(Number),
+    await assertPrimeWithPublicDiagnostics(mgr, requestStages, () => {
+      expect(raw.main?.prime).toEqual({
+        count: 1,
+        inputTokens: 20,
+        outputTokens: 1,
+        since: expect.any(Number),
+      })
     })
   })
 
@@ -21715,26 +21785,29 @@ describe('claude-prime direct request', () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(past).toISOString(),
-              checkedAt: 1,
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: 1,
+              },
             },
+            mainQuotaCheckedAt: 1,
+            mainQuotaToken: 'fp-main',
           },
-          mainQuotaCheckedAt: 1,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+        'sk-ant-oat01-expired-main-access',
+      ),
       // The pool's main access token has expired, so it has no usable
       // access token until it refreshes.
       {
@@ -21980,26 +22053,28 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(past).toISOString(),
-              checkedAt: 10,
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: 10,
+              },
             },
+            mainQuotaCheckedAt: 10,
+            mainQuotaToken: 'fp-main',
           },
-          mainQuotaCheckedAt: 10,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+      ),
     )
 
     const primeCalls: any[] = []
@@ -22012,19 +22087,21 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
       },
     }
 
-    globalThis.fetch = mock((input: any) => {
-      const url = typeof input === 'string' ? input : input.url
-      if (url.includes('/v1/messages')) {
-        primeCalls.push({ url })
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({ usage: { input_tokens: 0, output_tokens: 0 } }),
-            { status: 200, headers: { 'content-type': 'application/json' } },
-          ),
-        )
-      }
-      return Promise.resolve(new Response('not-mocked', { status: 599 }))
-    }) as unknown as typeof fetch
+    globalThis.fetch = mock(
+      withNativeAdmission((input: string | URL | Request) => {
+        const url = extractUrl(input)
+        if (url.includes('/v1/messages')) {
+          primeCalls.push({ url })
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({ usage: { input_tokens: 0, output_tokens: 0 } }),
+              { status: 200, headers: { 'content-type': 'application/json' } },
+            ),
+          )
+        }
+        return Promise.resolve(new Response('not-mocked', { status: 599 }))
+      }),
+    ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
     await plugin.auth.loader(
@@ -22037,13 +22114,17 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
         }),
       { models: {} },
     )
-    const mgr = (plugin as any).__primeManager
-    mgr.options.refreshQuota = async () => ({
-      quota: cachedQuota,
-      fresh: false,
-    })
+    const mgr = Reflect.get(plugin, '__primeManager')
+    if (!(mgr instanceof Core.PrimeManager))
+      throw new Error('Expected the native Prime manager')
+    let freshChecks = 0
+    mgr.options.refreshQuota = async () => {
+      freshChecks += 1
+      return { quota: cachedQuota, fresh: false }
+    }
     await mgr.tick()
 
+    expect(freshChecks).toBe(1)
     expect(primeCalls).toHaveLength(0)
   })
 
@@ -22051,29 +22132,31 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(past).toISOString(),
-              checkedAt: 10,
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: 10,
+              },
             },
+            mainQuotaCheckedAt: 10,
+            mainQuotaToken: 'fp-main',
           },
-          mainQuotaCheckedAt: 10,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+      ),
     )
 
-    const primeCalls: any[] = []
+    const primeCalls: Array<{ url: string }> = []
     const freshQuota = {
       five_hour: {
         usedPercent: 0,
@@ -22242,35 +22325,37 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
       },
     }
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [
-          {
-            id: 'work-alt',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fb-access',
-            refresh: 'fb-refresh',
-            expires: now + 10 * 60 * 60_000,
-            quota: cachedQuota,
-          },
-        ],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(now + 5 * 60 * 60_000).toISOString(),
-              checkedAt: now,
+      bindPoolAccounts(
+        createFallbackStorage({
+          accounts: [
+            {
+              id: 'work-alt',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fb-access',
+              refresh: 'fb-refresh',
+              expires: now + 10 * 60 * 60_000,
+              quota: cachedQuota,
             },
+          ],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(now + 5 * 60 * 60_000).toISOString(),
+                checkedAt: now,
+              },
+            },
+            mainQuotaCheckedAt: now,
+            mainQuotaToken: 'sk-ant-oat01-main-access',
           },
-          mainQuotaCheckedAt: now,
-          mainQuotaToken: 'sk-ant-oat01-main-access',
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+      ),
     )
 
     let primeCalls = 0
@@ -22304,25 +22389,43 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
         }),
       { models: {} },
     )
-    const quotaManager = (plugin as any).__quotaManager
+    const quotaManager = Reflect.get(plugin, '__quotaManager')
+    const mgr = Reflect.get(plugin, '__primeManager')
+    if (
+      !(quotaManager instanceof Core.QuotaManager) ||
+      !(mgr instanceof Core.PrimeManager)
+    )
+      throw new Error('Expected the native quota and Prime managers')
+    const storage = await mgr.options.loadStorage()
+    const account = storage?.accounts.find(
+      (candidate) => candidate.id === 'work-alt',
+    )
+    if (
+      account?.type !== 'oauth' ||
+      !account.authLineageId ||
+      !account.anthropicAccountUuid
+    )
+      throw new Error('Expected the current native fallback account binding')
     quotaManager.setFallback(
       'work-alt',
       {
-        quota: cachedQuota,
+        quota: {
+          ...cachedQuota,
+          accountIdentity: account.anthropicAccountUuid,
+        },
         refreshAfter: now,
         checkedAt: now + 60_000,
       },
-      undefined,
+      account,
     )
     await expect(
       quotaManager.refreshFallback(
         'work-alt',
         'sk-ant-oat01-fb-access',
-        undefined,
+        account,
       ),
     ).rejects.toThrow('429')
 
-    const mgr = (plugin as any).__primeManager
     await mgr.tick()
 
     expect(primeCalls).toBe(0)
