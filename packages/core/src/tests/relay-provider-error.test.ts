@@ -2644,7 +2644,7 @@ async function nodeRelayClient(options: {
   }
 }
 
-/** The child's outcome with its Node version cut to the major release. */
+/** Keep the child's actual Node major without assuming the runner's installed version. */
 function majorVersionOnly(child: Awaited<ReturnType<typeof nodeRelayClient>>) {
   const node = child.result?.node
   const result: Record<string, unknown> | undefined = child.result && {
@@ -2656,7 +2656,7 @@ function majorVersionOnly(child: Awaited<ReturnType<typeof nodeRelayClient>>) {
 
 for (const status of [204, 205, 304] as const) {
   for (const streaming of [false, true]) {
-    test(`a real Node 24 relay client settles a real provider ${status} as an empty response (streaming=${streaming})`, async () => {
+    test(`a real Node relay client settles a real provider ${status} as an empty response (streaming=${streaming})`, async () => {
       const provider = startProvider(() => ({
         status,
         reason: 'Provider',
@@ -2670,7 +2670,7 @@ for (const status of [204, 205, 304] as const) {
         exit: 0,
         stderr: '',
         result: {
-          node: 'v24',
+          node: expect.stringMatching(/^v\d+$/),
           authorizations: 1,
           state: 'fulfilled',
           status,
@@ -2697,7 +2697,7 @@ for (const [kind, start] of [
     }),
   ],
 ] as const) {
-  test(`a real Node 24 relay client fails a response_start with ${kind} closed, without another attempt`, async () => {
+  test(`a real Node relay client fails a response_start with ${kind} closed, without another attempt`, async () => {
     const provider = startProvider(() => ({
       status: 200,
       reason: 'OK',
@@ -2716,7 +2716,7 @@ for (const [kind, start] of [
       exit: 0,
       stderr: '',
       result: {
-        node: 'v24',
+        node: expect.stringMatching(/^v\d+$/),
         authorizations: 1,
         state: 'rejected',
         message: MALFORMED_START,
