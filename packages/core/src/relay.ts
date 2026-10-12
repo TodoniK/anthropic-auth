@@ -2,7 +2,16 @@ import { Buffer } from 'node:buffer'
 import { createHash, randomBytes } from 'node:crypto'
 import type { AccountStorage } from './accounts.ts'
 import { dumpRelayRequest } from './dump.ts'
+import { parseJsonRedacted } from './json.ts'
 import { relayLog } from './logger.ts'
+import {
+  createProviderErrorResponseScope,
+  createProviderErrorStreamScope,
+  type ProviderErrorResponseScope,
+  type ProviderErrorStreamScope,
+  type ProviderResponseMode,
+} from './provider-error.ts'
+import { SseFrameTooLargeError } from './sse.ts'
 
 export type RelayConfig = {
   enabled: boolean
@@ -102,6 +111,13 @@ export type RelayAttemptAuthorization = {
   headers: Headers
   /** Called only for a genuine upstream response, never optimistic/transport status. */
   onUpstreamStatus?: (status: number) => void
+  /**
+   * Additional exact credentials this physical attempt sends upstream, used
+   * only to scrub provider error material echoed back for this attempt. The
+   * credentials in the outgoing `authorization` and `x-api-key` headers are
+   * always scrubbed as well; this list can only add to them.
+   */
+  errorSecrets?: readonly string[]
 }
 export type AuthorizeRelayAttempt = () => Promise<RelayAttemptAuthorization>
 
@@ -111,21 +127,83 @@ class RelayAuthorizationError extends Error {
   }
 }
 
-async function authorizeRelayPayload(
+/**
+ * Credentials carried by the standard Anthropic credential headers: the whole
+ * `authorization` value, its credential without the scheme, and `x-api-key`.
+ */
+function protocolHeaderSecrets(headers: Record<string, string>): string[] {
+  const secrets: string[] = []
+  const authorization = headers.authorization?.trim()
+  if (authorization) {
+    secrets.push(authorization)
+    const credential = /^\S+\s+(\S.*)$/.exec(authorization)?.[1]
+    if (credential) secrets.push(credential)
+  }
+  const apiKey = headers['x-api-key']?.trim()
+  if (apiKey) secrets.push(apiKey)
+  return secrets
+}
+
+/**
+ * One physical relay attempt: the authorization it sent (if any) and the
+ * redaction scope holding exactly that attempt's credentials plus the relay
+ * token. Scopes are never shared between attempts, and no credential from an
+ * earlier attempt is remembered.
+ */
+type PhysicalAttempt<Scope> = {
+  authorization?: RelayAttemptAuthorization
+  scope: Scope
+}
+
+async function authorizePhysicalAttempt<Scope>(
+  config: RelayConfig,
   payload: RelayPayload,
-  authorize?: AuthorizeRelayAttempt,
-): Promise<RelayAttemptAuthorization | undefined> {
-  if (!authorize) return undefined
+  authorize: AuthorizeRelayAttempt | undefined,
+  createScope: (secrets: readonly string[]) => Scope,
+): Promise<PhysicalAttempt<Scope>> {
   try {
-    const attempt = await authorize()
-    payload.upstream = {
-      ...payload.upstream,
-      headers: jsonHeaders(attempt.headers),
+    const authorization = authorize ? await authorize() : undefined
+    if (authorization)
+      payload.upstream = {
+        ...payload.upstream,
+        headers: jsonHeaders(authorization.headers),
+      }
+    // The serialized headers are what the attempt actually sends, so their
+    // credentials are always included; errorSecrets only adds to them.
+    return {
+      authorization,
+      scope: createScope([
+        config.token,
+        ...protocolHeaderSecrets(payload.upstream.headers),
+        ...(authorization?.errorSecrets ?? []),
+      ]),
     }
-    return attempt
   } catch (error) {
     throw new RelayAuthorizationError(error)
   }
+}
+
+/** Peer-supplied numbers are logged only when they really are finite numbers. */
+function logNumber(value: unknown): number | 'unknown' {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 'unknown'
+}
+
+/**
+ * An event stream only when the request body is a JSON object whose `stream`
+ * is the boolean true. Anything else, including a body that is not valid
+ * JSON, is a plain HTTP response. A parse failure is neither thrown nor
+ * logged, and the request is still sent exactly as before.
+ */
+function requestResponseMode(bodyText: string): ProviderResponseMode {
+  let parsed: unknown
+  try {
+    parsed = parseJsonRedacted(bodyText)
+  } catch {
+    return 'http'
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+    return 'http'
+  return 'stream' in parsed && parsed.stream === true ? 'event-stream' : 'http'
 }
 
 class RelayStateMismatchError extends Error {}
@@ -423,32 +501,96 @@ function updateLocalRelayState(
   cleanupRelaySessionCaches(now)
 }
 
+/**
+ * POST one physical attempt. Its response is scrubbed by that attempt's own
+ * response scope before any status check, fallback decision or host reader
+ * sees it, and a rejected POST is scrubbed with the same live scope before
+ * the scope is retired. `mode` is the request's protocol, so the scope does
+ * not have to trust the response's content type.
+ */
+async function postRelayAttempt(
+  config: RelayConfig,
+  payload: RelayPayload,
+  signal: AbortSignal | null | undefined,
+  authorizeAttempt: AuthorizeRelayAttempt | undefined,
+  mode: ProviderResponseMode,
+) {
+  const { authorization, scope } = await authorizePhysicalAttempt(
+    config,
+    payload,
+    authorizeAttempt,
+    (secrets) => createProviderErrorResponseScope(secrets, mode),
+  )
+  let raw: Response
+  try {
+    raw = await postRelay(config, payload, signal)
+  } catch (error) {
+    const safe = scope.redactError(error)
+    scope.dispose()
+    throw safe
+  }
+  try {
+    return { authorization, scope, response: scope.redactResponse(raw) }
+  } catch (error) {
+    // Never hand the unscrubbed response on; the scope accepted nothing.
+    scope.dispose()
+    await raw.body?.cancel().catch(() => {})
+    throw error
+  }
+}
+
+/** Retire an attempt that will not be returned, then release its body. */
+async function discardRelayAttempt(attempt: {
+  scope: ProviderErrorResponseScope
+  response: Response
+}) {
+  attempt.scope.dispose()
+  await attempt.response.body?.cancel().catch(() => {})
+}
+
 async function sendRelayHttp(options: {
   config: RelayConfig
   payload: RelayPayload
   bodyText: string
+  requestMode: () => ProviderResponseMode
   fallback: () => Promise<Response>
   signal?: AbortSignal | null
   authorizeAttempt?: AuthorizeRelayAttempt
 }): Promise<RelaySendResult> {
-  const { config, payload, bodyText, fallback, signal, authorizeAttempt } =
-    options
+  const {
+    config,
+    payload,
+    bodyText,
+    requestMode,
+    fallback,
+    signal,
+    authorizeAttempt,
+  } = options
+  // Fixed before the first POST and kept for the 409 full-sync retry.
+  const mode = requestMode()
   let actualPayload = payload
-  let authorization = authorizeAttempt
-    ? await authorizeRelayPayload(actualPayload, authorizeAttempt)
-    : undefined
-  let response = await postRelay(config, actualPayload, signal)
-  if (response.status === 409 && actualPayload.mode === 'patch') {
+  let attempt = await postRelayAttempt(
+    config,
+    actualPayload,
+    signal,
+    authorizeAttempt,
+    mode,
+  )
+  if (attempt.response.status === 409 && actualPayload.mode === 'patch') {
     relayLog(
       `state mismatch from relay session=${shortAffinity(actualPayload.affinity)}; retrying full_sync`,
     )
-    await response.body?.cancel().catch(() => {})
+    await discardRelayAttempt(attempt)
     actualPayload = createFullSyncPayload(actualPayload, bodyText)
-    authorization = authorizeAttempt
-      ? await authorizeRelayPayload(actualPayload, authorizeAttempt)
-      : undefined
-    response = await postRelay(config, actualPayload, signal)
+    attempt = await postRelayAttempt(
+      config,
+      actualPayload,
+      signal,
+      authorizeAttempt,
+      mode,
+    )
   }
+  const { response, authorization } = attempt
   // Old workers already forward Anthropic request IDs. Without upstream
   // provenance a relay's own 401 must never invalidate an OAuth credential.
   const upstreamProvenance = /^req_[A-Za-z0-9_-]+$/.test(
@@ -457,7 +599,7 @@ async function sendRelayHttp(options: {
   if (response.status === 401 && !upstreamProvenance) {
     // The relay rejected its own credentials, not the Claude account. Never
     // let an account router interpret this as a permanent upstream OAuth 401.
-    await response.body?.cancel().catch(() => {})
+    await discardRelayAttempt(attempt)
     if (config.fallbackToDirect) {
       relayLog(
         `relay authentication rejected; falling back direct session=${shortAffinity(actualPayload.affinity)}`,
@@ -497,7 +639,7 @@ async function sendRelayHttp(options: {
     relayLog(
       `relay returned ${response.status}; falling back direct session=${shortAffinity(actualPayload.affinity)}`,
     )
-    await response.body?.cancel().catch(() => {})
+    await discardRelayAttempt(attempt)
     return {
       response: await fallback(),
       payload: actualPayload,
@@ -564,6 +706,38 @@ type RelayTimerImplementations = {
   clearTimeout: typeof globalThis.clearTimeout
 }
 
+/**
+ * Redaction for one physical WebSocket attempt, built from that attempt's
+ * exact credentials. The stream scope scrubs event-stream bytes and errors.
+ * A non-optimistic attempt also gets a response scope, created for the
+ * request's protocol. It is used for every response except a successful one
+ * to a streaming request, which the stream scope handles; so a successful
+ * non-streaming body stays untouched whatever its content type, and error
+ * bodies (which are not SSE frames) are scrubbed. When unused it is retired.
+ * An optimistic response is always an event stream, so it gets none.
+ */
+type WebSocketAttemptScopes = {
+  stream: ProviderErrorStreamScope
+  response?: ProviderErrorResponseScope
+}
+
+function createWebSocketAttemptScopes(
+  secrets: readonly string[],
+  responseMode: ProviderResponseMode | undefined,
+): WebSocketAttemptScopes {
+  const stream = createProviderErrorStreamScope(secrets)
+  if (responseMode === undefined) return { stream }
+  return {
+    stream,
+    response: createProviderErrorResponseScope(secrets, responseMode),
+  }
+}
+
+function disposeWebSocketAttemptScopes(scopes: WebSocketAttemptScopes) {
+  scopes.stream.dispose()
+  scopes.response?.dispose()
+}
+
 type PendingWebSocketRequest = {
   payload: RelayPayload
   bodyText: string
@@ -581,6 +755,11 @@ type PendingWebSocketRequest = {
   acceptedAt?: number
   responseStartedAt?: number
   streamChunkCount: number
+  /**
+   * Raw upstream bytes received, counted before redaction. A partial frame
+   * held by the scope still counts, so the retry guard never replays an
+   * attempt that has already produced upstream bytes.
+   */
   streamByteCount: number
   retryAttempts: number
   retryingBeforeResponse: boolean
@@ -588,6 +767,16 @@ type PendingWebSocketRequest = {
   stagedResponseHeaders?: Headers
   authorizeAttempt?: AuthorizeRelayAttempt
   authorization?: RelayAttemptAuthorization
+  /** Current physical attempt's stream scope; cleared when it is retired. */
+  scope?: ProviderErrorStreamScope
+  /** Current attempt's response scope until the response shape is known. */
+  responseScope?: ProviderErrorResponseScope
+  /** Request protocol for response scopes; undefined for optimistic sends. */
+  responseMode?: ProviderResponseMode
+  /** True when the body is a raw upstream body read through a response scope. */
+  rawBody: boolean
+  /** Set once the host cancelled or the request ended; no attempt may follow. */
+  retired: boolean
   responseHeadersDelivered: boolean
 }
 
@@ -618,6 +807,7 @@ class PersistentRelaySession {
   }
 
   dispose() {
+    if (this.pending) this.retireAttempt(this.pending)
     this.socket?.close()
     this.socket = undefined
     this.serverState = undefined
@@ -630,6 +820,7 @@ class PersistentRelaySession {
     optimisticResponse = false,
     onResponseHeaders?: (headers: Headers) => void,
     authorizeAttempt?: AuthorizeRelayAttempt,
+    responseMode?: ProviderResponseMode,
   ): Promise<RelaySendResult> {
     this.touch()
     const enqueuedAt = perfNowMs()
@@ -643,6 +834,7 @@ class PersistentRelaySession {
           optimisticResponse,
           onResponseHeaders,
           authorizeAttempt,
+          responseMode,
         ),
       )
     const result = start.then(async ({ response, getPayload }) => ({
@@ -666,7 +858,10 @@ class PersistentRelaySession {
     optimisticResponse: boolean,
     onResponseHeaders?: (headers: Headers) => void,
     authorizeAttempt?: AuthorizeRelayAttempt,
+    responseMode?: ProviderResponseMode,
   ) {
+    const createScopes = (secrets: readonly string[]) =>
+      createWebSocketAttemptScopes(secrets, responseMode)
     const connectStart = perfNowMs()
     await this.ensureConnected()
     const connectedAt = perfNowMs()
@@ -696,9 +891,12 @@ class PersistentRelaySession {
       `perf websocket send_start session=${shortAffinity(this.affinity)} request=${requestPayload.id} mode=${requestPayload.mode} queueMs=${formatMs(connectedAt - enqueuedAt)} connectMs=${formatMs(connectedAt - connectStart)} bodyBytes=${bodyText.length} relayBytes=${JSON.stringify(requestPayload).length}`,
     )
 
-    const authorization = authorizeAttempt
-      ? await authorizeRelayPayload(requestPayload, authorizeAttempt)
-      : undefined
+    const firstAttempt = await authorizePhysicalAttempt(
+      this.config,
+      requestPayload,
+      authorizeAttempt,
+      createScopes,
+    )
     let activePayload = requestPayload
     const first = this.sendPayload(
       requestPayload,
@@ -706,7 +904,8 @@ class PersistentRelaySession {
       optimisticResponse,
       onResponseHeaders,
       authorizeAttempt,
-      authorization,
+      firstAttempt,
+      responseMode,
     )
     void first.done.catch(() => {})
     let activeDone = first.done
@@ -721,9 +920,12 @@ class PersistentRelaySession {
       fullSync.protocol = 2
       fullSync.id = createRequestId()
       fullSync.revision = (this.serverState?.revision ?? 0) + 1
-      const retryAuthorization = authorizeAttempt
-        ? await authorizeRelayPayload(fullSync, authorizeAttempt)
-        : undefined
+      const retryAttempt = await authorizePhysicalAttempt(
+        this.config,
+        fullSync,
+        authorizeAttempt,
+        createScopes,
+      )
       activePayload = fullSync
       const retry = this.sendPayload(
         fullSync,
@@ -731,7 +933,8 @@ class PersistentRelaySession {
         optimisticResponse,
         onResponseHeaders,
         authorizeAttempt,
-        retryAuthorization,
+        retryAttempt,
+        responseMode,
       )
       void retry.done.catch(() => {})
       activeDone = retry.done
@@ -835,12 +1038,14 @@ class PersistentRelaySession {
     payload: RelayPayload,
     bodyText: string,
     optimisticResponse: boolean,
-    onResponseHeaders?: (headers: Headers) => void,
-    authorizeAttempt?: AuthorizeRelayAttempt,
-    authorization?: RelayAttemptAuthorization,
+    onResponseHeaders: ((headers: Headers) => void) | undefined,
+    authorizeAttempt: AuthorizeRelayAttempt | undefined,
+    attempt: PhysicalAttempt<WebSocketAttemptScopes>,
+    responseMode: ProviderResponseMode | undefined,
   ) {
     const socket = this.socket
     if (!socket || socket.readyState !== WebSocket.OPEN) {
+      disposeWebSocketAttemptScopes(attempt.scope)
       throw new Error('relay websocket is not connected')
     }
     const sentAt = perfNowMs()
@@ -870,7 +1075,12 @@ class PersistentRelaySession {
         retryingBeforeResponse: false,
         onResponseHeaders,
         authorizeAttempt,
-        authorization,
+        authorization: attempt.authorization,
+        scope: attempt.scope.stream,
+        responseScope: attempt.scope.response,
+        responseMode,
+        rawBody: false,
+        retired: false,
         stagedResponseHeaders: undefined,
         responseHeadersDelivered: false,
       }
@@ -905,6 +1115,14 @@ class PersistentRelaySession {
     if (pending.responseStartedAt != null && pending.streamByteCount > 0)
       return false
     if (pending.streamDone) return false
+    // A non-optimistic response has already handed the host its real status,
+    // headers and a body bound to this attempt's credentials. A replay could
+    // not change that status, and its body would be scrubbed with the wrong
+    // attempt's credentials, so it ends here. An optimistic response carries
+    // only the synthetic status, so it may still retry before any byte.
+    if (!pending.optimisticResponse && pending.responseStarted) return false
+    // A cancelled request gets no further physical attempt.
+    if (pending.retired) return false
     if (pending.retryAttempts >= 1) return false
 
     pending.retryAttempts += 1
@@ -925,6 +1143,7 @@ class PersistentRelaySession {
       try {
         await this.ensureConnected()
         if (this.pending !== pending) return
+        if (pending.retired) return this.endCancelledRetry(pending)
         const retryPayload = createFullSyncPayload(
           pending.payload,
           pending.bodyText,
@@ -933,11 +1152,22 @@ class PersistentRelaySession {
         retryPayload.id = createRequestId()
         retryPayload.revision = (this.serverState?.revision ?? 0) + 1
 
-        const authorization = pending.authorizeAttempt
-          ? await authorizeRelayPayload(retryPayload, pending.authorizeAttempt)
-          : undefined
-        if (this.pending !== pending || pending.streamDone) return
-        pending.authorization = authorization
+        const retryAttempt = await authorizePhysicalAttempt(
+          this.config,
+          retryPayload,
+          pending.authorizeAttempt,
+          (secrets) =>
+            createWebSocketAttemptScopes(secrets, pending.responseMode),
+        )
+        if (this.pending !== pending || pending.streamDone || pending.retired) {
+          disposeWebSocketAttemptScopes(retryAttempt.scope)
+          if (this.pending === pending && pending.retired)
+            this.endCancelledRetry(pending)
+          return
+        }
+        // The new physical attempt replaces the old one's credentials before
+        // anything is sent on its behalf.
+        this.installAttempt(pending, retryAttempt)
         pending.payload = retryPayload
         pending.accepted = false
         pending.acceptedAt = undefined
@@ -958,14 +1188,62 @@ class PersistentRelaySession {
         socket.send(JSON.stringify(retryPayload))
       } catch (error) {
         pending.retryingBeforeResponse = false
-        if (this.pending === pending)
-          this.failPending(
-            error instanceof RelayAuthorizationError ? error.failure : error,
-          )
+        if (this.pending !== pending) return
+        // An authorization failure is the host's own error, passed on as is.
+        if (error instanceof RelayAuthorizationError)
+          this.failPending(error.failure, false)
+        else this.failPending(error)
       }
     })()
 
     return true
+  }
+
+  /**
+   * The host cancelled while a retry was reconnecting or being authorized:
+   * end the request instead of sending an attempt nobody will read.
+   */
+  private endCancelledRetry(pending: PendingWebSocketRequest) {
+    pending.retryingBeforeResponse = false
+    this.failPending(new Error('relay websocket response was cancelled'), false)
+  }
+
+  /** Replace the current attempt's credentials with a new attempt's. */
+  private installAttempt(
+    pending: PendingWebSocketRequest,
+    attempt: PhysicalAttempt<WebSocketAttemptScopes>,
+  ) {
+    pending.scope?.dispose()
+    pending.responseScope?.dispose()
+    pending.authorization = attempt.authorization
+    pending.scope = attempt.scope.stream
+    // An optimistic response already exists, so only the stream scope can
+    // apply to the new attempt.
+    if (pending.responseStarted) {
+      attempt.scope.response?.dispose()
+      pending.responseScope = undefined
+    } else pending.responseScope = attempt.scope.response
+  }
+
+  /**
+   * Drop the attempt's credentials: its scopes and the authorization holding
+   * the headers it sent. Byte counters and the retry guard are kept.
+   */
+  private retireAttempt(pending: PendingWebSocketRequest) {
+    pending.retired = true
+    pending.scope?.dispose()
+    pending.scope = undefined
+    pending.responseScope?.dispose()
+    pending.responseScope = undefined
+    pending.authorization = undefined
+  }
+
+  /** Remove credential echoes using the current attempt's redaction scope. */
+  private redactAttemptError(pending: PendingWebSocketRequest, error: unknown) {
+    // Without a live scope the error cannot be checked, so none of it is kept.
+    return pending.scope
+      ? pending.scope.redactError(error)
+      : new Error('relay websocket request ended')
   }
 
   private enqueueStreamChunk(
@@ -975,7 +1253,39 @@ class PersistentRelaySession {
     this.deliverResponseHeaders(pending)
     pending.streamChunkCount += 1
     pending.streamByteCount += chunk.byteLength
-    pending.streamController?.enqueue(chunk)
+    this.forwardStreamBytes(pending, chunk)
+  }
+
+  /**
+   * Every byte for the host, upstream or synthesized, passes through the
+   * current attempt's scope before it is enqueued. A raw body is enqueued
+   * as is because its response scope scrubs it when the host reads it.
+   */
+  private forwardStreamBytes(
+    pending: PendingWebSocketRequest,
+    bytes: Uint8Array,
+  ) {
+    const controller = pending.streamController
+    const scope = pending.scope
+    // No stream yet (bytes before response_start) or the attempt is retired.
+    if (!controller || !scope) return
+    if (pending.rawBody) {
+      controller.enqueue(bytes)
+      return
+    }
+    let output: Uint8Array[]
+    try {
+      output = scope.push(bytes)
+    } catch (error) {
+      // The scope has already cleared its credentials. The frame-limit error
+      // contains only a fixed message and byte counts, so it is safe to keep.
+      // Other failures become generic errors: their text can no longer be
+      // checked against the credentials that this attempt sent.
+      this.failPending(error, !(error instanceof SseFrameTooLargeError))
+      this.socket?.close()
+      return
+    }
+    for (const chunk of output) controller.enqueue(chunk)
   }
 
   private deliverResponseHeaders(pending: PendingWebSocketRequest) {
@@ -1009,16 +1319,43 @@ class PersistentRelaySession {
         pending.streamController = controller
       },
       cancel: () => {
+        this.retireAttempt(pending)
         this.socket?.close()
       },
     })
-    pending.resolve(
-      new Response(stream, {
-        status,
-        statusText,
-        headers,
-      }),
-    )
+    const response = new Response(stream, {
+      status,
+      statusText,
+      headers,
+    })
+    const responseScope = pending.responseScope
+    pending.responseScope = undefined
+    // The request's protocol decides the pipeline, never the response's
+    // content type. An optimistic response is the caller's event stream, and
+    // a successful response to a streaming request goes through the stream
+    // scope; everything else goes through the response scope, which leaves a
+    // successful non-streaming body untouched and scrubs error responses.
+    const streamed =
+      pending.optimisticResponse ||
+      (response.ok && pending.responseMode === 'event-stream')
+    if (streamed || !responseScope) {
+      responseScope?.dispose()
+      pending.resolve(response)
+      return
+    }
+    // Remove echoed credentials from error bodies using the request's mode.
+    pending.rawBody = true
+    let scrubbed: Response
+    try {
+      scrubbed = responseScope.redactResponse(response)
+    } catch (error) {
+      // Never hand the unscrubbed response on.
+      pending.responseStarted = false
+      this.failPending(error)
+      this.socket?.close()
+      return
+    }
+    pending.resolve(scrubbed)
   }
 
   private handleMessage(message: RelayControlMessage) {
@@ -1056,7 +1393,7 @@ class PersistentRelaySession {
         pending.authorization?.onUpstreamStatus?.(message.status)
       } catch {}
       relayLog(
-        `perf websocket response_start session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(responseStartedAt - pending.sentAt)} upstreamMs=${pending.acceptedAt == null ? 'unknown' : formatMs(responseStartedAt - pending.acceptedAt)} status=${message.status}`,
+        `perf websocket response_start session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(responseStartedAt - pending.sentAt)} upstreamMs=${pending.acceptedAt == null ? 'unknown' : formatMs(responseStartedAt - pending.acceptedAt)} status=${logNumber(message.status)}`,
       )
       this.timers.clearTimeout(pending.timeout)
       if (message.headers)
@@ -1069,7 +1406,8 @@ class PersistentRelaySession {
       )
       if (pending.optimisticResponse && message.status >= 400) {
         this.deliverResponseHeaders(pending)
-        pending.streamController?.enqueue(
+        this.forwardStreamBytes(
+          pending,
           new TextEncoder().encode(
             `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'relay_upstream_error', message: `Relay upstream returned HTTP ${message.status}` } })}\n\n`,
           ),
@@ -1096,7 +1434,8 @@ class PersistentRelaySession {
           `websocket relay error during optimistic response session=${shortAffinity(this.affinity)} request=${pending.payload.id} status=${Number.isFinite(message.status) ? message.status : 'unknown'} code=relay_stream_error chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}`,
         )
         this.deliverResponseHeaders(pending)
-        pending.streamController?.enqueue(
+        this.forwardStreamBytes(
+          pending,
           new TextEncoder().encode(
             `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'relay_error', message: message.message || 'relay error' } })}\n\n`,
           ),
@@ -1105,18 +1444,17 @@ class PersistentRelaySession {
         this.socket?.close()
         return
       }
+      // The peer's message is never logged or kept: a fixed stage names the
+      // retry, and the state-mismatch error carries no peer text.
       if (
         message.status === 409 &&
-        this.retryPendingBeforeResponse(
-          pending,
-          message.message || 'state mismatch',
-        )
+        this.retryPendingBeforeResponse(pending, 'state mismatch')
       ) {
         return
       }
       const error =
         message.status === 409
-          ? new RelayStateMismatchError(message.message || 'state mismatch')
+          ? new RelayStateMismatchError('state mismatch')
           : new Error(relayControlErrorMessage(message))
       this.failPending(error)
     }
@@ -1128,32 +1466,52 @@ class PersistentRelaySession {
     const finishedAt = perfNowMs()
     const workerStats =
       done && 'frames' in done
-        ? ` upstreamChunks=${done.upstreamChunks ?? 'unknown'} upstreamBytes=${done.upstreamBytes ?? 'unknown'} frames=${done.frames} frameBytes=${done.frameBytes ?? 'unknown'}`
+        ? ` upstreamChunks=${logNumber(done.upstreamChunks)} upstreamBytes=${logNumber(done.upstreamBytes)} frames=${logNumber(done.frames)} frameBytes=${logNumber(done.frameBytes)}`
         : ''
     relayLog(
       `perf websocket done session=${shortAffinity(this.affinity)} request=${pending.payload.id} sentMs=${formatMs(finishedAt - pending.sentAt)} streamMs=${pending.responseStartedAt == null ? 'unknown' : formatMs(finishedAt - pending.responseStartedAt)} chunks=${pending.streamChunkCount} bytes=${pending.streamByteCount}${workerStats}`,
     )
     this.timers.clearTimeout(pending.timeout)
-    if (!pending.streamDone) {
-      this.deliverResponseHeaders(pending)
-      pending.streamDone = true
-      pending.streamController?.close()
+    try {
+      if (!pending.streamDone) {
+        this.deliverResponseHeaders(pending)
+        pending.streamDone = true
+        // An unterminated last frame is still scrubbed before delivery.
+        const tail = pending.rawBody ? [] : (pending.scope?.finish() ?? [])
+        for (const chunk of tail) pending.streamController?.enqueue(chunk)
+        pending.streamController?.close()
+      }
+    } finally {
+      this.retireAttempt(pending)
+      pending.authorizeAttempt = undefined
+      pending.onResponseHeaders = undefined
     }
     pending.resolveDone()
     this.pending = undefined
   }
 
-  private failPending(error: unknown) {
+  /**
+   * End the request with an error scrubbed by the current attempt's live
+   * credentials, then retire them. Callers pass `redact = false` only for
+   * errors that hold no provider text: the error the host's own
+   * `authorizeAttempt` threw (returned to the host unchanged), and errors
+   * this class builds from fixed messages.
+   */
+  private failPending(error: unknown, redact = true) {
     const pending = this.pending
     if (!pending) return
+    const safe = redact ? this.redactAttemptError(pending, error) : error
     this.timers.clearTimeout(pending.timeout)
     this.pending = undefined
+    this.retireAttempt(pending)
+    pending.authorizeAttempt = undefined
+    pending.onResponseHeaders = undefined
     if (pending.responseStarted) {
-      pending.streamController?.error(error)
+      pending.streamController?.error(safe)
     } else {
-      pending.reject(error)
+      pending.reject(safe)
     }
-    pending.rejectDone(error)
+    pending.rejectDone(safe)
   }
 }
 
@@ -1213,6 +1571,12 @@ export async function sendViaRelay(options: {
   body: RequestInit['body'] | null | undefined
   fallback: () => Promise<Response>
   affinity?: string | null
+  /**
+   * Resolve a WebSocket send with a synthetic 200 event stream before the
+   * upstream answers. Honoured only for streaming requests (body `stream` is
+   * true); any other request waits for the real response on the same
+   * WebSocket transport.
+   */
   optimisticResponse?: boolean
   /** Fresh authorization for every physical relay attempt, including internal retries. */
   authorizeAttempt?: AuthorizeRelayAttempt
@@ -1281,6 +1645,13 @@ export async function sendViaRelay(options: {
     bodyBytes: bodyText.length,
     previousBytes: previous?.body.length,
   })
+  // The request's protocol, decoded at most once per send, and only once a
+  // relay transport is chosen.
+  let responseMode: ProviderResponseMode | undefined
+  const requestMode = () => {
+    responseMode ??= requestResponseMode(bodyText)
+    return responseMode
+  }
   try {
     let result: RelaySendResult
     const sendStart = perfNowMs()
@@ -1290,12 +1661,17 @@ export async function sendViaRelay(options: {
           setTimeout: setTimeoutImpl,
           clearTimeout: clearTimeoutImpl,
         })
+        // Only a streaming request can be answered with a synthetic event
+        // stream; a non-streaming one waits for the real status and body.
+        const optimistic =
+          optimisticResponse === true && requestMode() === 'event-stream'
         result = await session.send(
           payload,
           bodyText,
-          optimisticResponse === true,
+          optimistic,
           onResponseHeaders,
           authorizeAttempt,
+          optimistic ? undefined : requestMode(),
         )
       } catch (error) {
         if (error instanceof RelayAuthorizationError) throw error
@@ -1306,6 +1682,7 @@ export async function sendViaRelay(options: {
           config,
           payload,
           bodyText,
+          requestMode,
           fallback,
           signal: init?.signal,
           authorizeAttempt,
@@ -1316,6 +1693,7 @@ export async function sendViaRelay(options: {
         config,
         payload,
         bodyText,
+        requestMode,
         fallback,
         signal: init?.signal,
         authorizeAttempt,

@@ -30,6 +30,14 @@ function headers(affinity: string) {
   })
 }
 
+/**
+ * A model request asking for a streamed response. Only streaming requests
+ * get an optimistic relay response, so optimistic fixtures must send one.
+ */
+function streamingRequest(text: string) {
+  return JSON.stringify({ stream: true, messages: [text] })
+}
+
 function workerInternals() {
   const source = WORKER_SCRIPT.replace(
     /export default[\s\S]*$/,
@@ -523,7 +531,7 @@ describe('relay client', () => {
         input: 'https://api.anthropic.com/v1/messages?beta=true',
         init: { method: 'POST' },
         headers: headers('session-relay-ws-optimistic'),
-        body: 'body',
+        body: streamingRequest('body'),
         fallback: async () => new Response('direct'),
         optimisticResponse: true,
         onResponseHeaders: (value) => receivedHeaders.push(value),
@@ -543,7 +551,7 @@ describe('relay client', () => {
             protocol: 2,
             type: 'accepted',
             id: payloadId,
-            hash: hashBody('body'),
+            hash: hashBody(streamingRequest('body')),
             revision: 1,
           }),
         }),
@@ -747,7 +755,7 @@ describe('relay client', () => {
         input: 'https://api.anthropic.com/v1/messages?beta=true',
         init: { method: 'POST' },
         headers: headers('session-relay-ws-reconnect-before-response'),
-        body: 'body',
+        body: streamingRequest('body'),
         fallback: async () => new Response('direct'),
         optimisticResponse: true,
         onResponseHeaders: (value) => receivedHeaders.push(value),
@@ -859,7 +867,7 @@ describe('relay client', () => {
         input: 'https://api.anthropic.com/v1/messages?beta=true',
         init: { method: 'POST' },
         headers: headers('session-relay-ws-close-before-stream-bytes'),
-        body: 'body',
+        body: streamingRequest('body'),
         fallback: async () => new Response('direct'),
         optimisticResponse: true,
         onResponseHeaders: (value) => receivedHeaders.push(value),
@@ -953,7 +961,7 @@ describe('relay client', () => {
         input: 'https://api.anthropic.com/v1/messages?beta=true',
         init: { method: 'POST' },
         headers: headers('session-relay-ws-close-after-bytes'),
-        body: 'body',
+        body: streamingRequest('body'),
         fallback: async () => new Response('direct'),
         optimisticResponse: true,
       })
@@ -1055,7 +1063,7 @@ describe('relay client', () => {
         input: 'https://api.anthropic.com/v1/messages?beta=true',
         init: { method: 'POST' },
         headers: headers('session-relay-ws-local-e2e'),
-        body: JSON.stringify({ messages: ['hello'] }),
+        body: streamingRequest('hello'),
         fallback: async () => {
           directFallbackUsed = true
           return new Response('direct')
@@ -1508,7 +1516,7 @@ describe('relay client', () => {
         input: 'https://api.anthropic.com/v1/messages?beta=true',
         init: { method: 'POST' },
         headers: headers('session-relay-optimistic-mismatch'),
-        body: 'first',
+        body: streamingRequest('first'),
         fallback: async () => new Response('direct'),
         optimisticResponse: true,
       })
@@ -1517,7 +1525,7 @@ describe('relay client', () => {
         input: 'https://api.anthropic.com/v1/messages?beta=true',
         init: { method: 'POST' },
         headers: headers('session-relay-optimistic-mismatch'),
-        body: 'second',
+        body: streamingRequest('second'),
         fallback: async () => new Response('direct'),
         optimisticResponse: true,
       })

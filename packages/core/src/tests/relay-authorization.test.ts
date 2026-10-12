@@ -7,6 +7,13 @@ const body = (suffix: string) =>
     model: 'test-model',
     messages: [{ role: 'user', content: 'x'.repeat(8000) + suffix }],
   })
+/** A model request asking for a streamed response, needed for an optimistic relay response. */
+const streamingBody = (suffix: string) =>
+  JSON.stringify({
+    model: 'test-model',
+    stream: true,
+    messages: [{ role: 'user', content: 'x'.repeat(8000) + suffix }],
+  })
 const config = (
   url: string,
   transport: 'http' | 'websocket' = 'http',
@@ -213,7 +220,7 @@ test('optimistic WebSocket reconnect uses a fresh receipt without reporting its 
       input: 'https://api.anthropic.com/v1/messages',
       init: { method: 'POST' },
       headers: new Headers(),
-      body: body('first'),
+      body: streamingBody('first'),
       affinity: randomUUID(),
       optimisticResponse: true,
       fallback: async () => {
@@ -231,6 +238,7 @@ test('optimistic WebSocket reconnect uses a fresh receipt without reporting its 
       },
     })
     expect(response.status).toBe(200)
+    expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
     expect(await response.text()).toContain('Relay upstream returned HTTP 401')
     expect(sent.map((entry) => entry.upstream.headers.authorization)).toEqual([
       'Bearer test-1',
