@@ -140,7 +140,7 @@ export class NativeAuthorityError extends Error {
     super(
       {
         'migration-required':
-          'Anthropic account migration is required; run setup',
+          'Anthropic account migration is required. Stop OpenCode, LiteCode and Pi, then run bunx @cortexkit/opencode-anthropic-auth@2.0.0 setup',
         'migration-incomplete':
           'Anthropic account migration is incomplete; resume setup',
         'invalid-journal': 'Anthropic account migration journal is invalid',

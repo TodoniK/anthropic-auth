@@ -157,7 +157,7 @@ const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
   'Native setup storage paths overlap between selected hosts',
   // Migration requires distinct credential and runtime storage paths.
   'Anthropic account storage paths overlap; migration requires separate files',
-  'Anthropic account migration is required; run setup',
+  'Anthropic account migration is required. Stop OpenCode, LiteCode and Pi, then run bunx @cortexkit/opencode-anthropic-auth@2.0.0 setup',
   'Anthropic account migration is incomplete; resume setup',
   'Anthropic account migration journal is invalid',
   'Anthropic account migration journal changed',

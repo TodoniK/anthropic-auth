@@ -194,6 +194,10 @@ describe('zero-bind scoped custody', () => {
         await writeFile(join(env.configDir, 'anthropic-auth.json'), JSON.stringify({ version: 1, accounts: [], claustrum: { mode: 'claustrum' } }), { mode: 0o600 })
       },
     }))
+    const legacyConfigPath = join(harness.opencode.env.configDir, 'anthropic-auth.json')
+    const legacyConfigBefore = await readFile(legacyConfigPath, 'utf8')
+    const hostAuthPath = join(harness.opencode.env.dataDir, 'opencode', 'auth.json')
+    const hostAuthBefore = await readFile(hostAuthPath, 'utf8')
     const session = await harness.createSession()
     await harness.startPrompt(session, 'must fail before transport')
     try {
@@ -209,7 +213,11 @@ describe('zero-bind scoped custody', () => {
       expect(
         assistants.map((message) => message.info.error?.data?.message),
         JSON.stringify({ errors: assistants.map((message) => message.info.error), statuses, finalStatus }),
-      ).toEqual(assistants.map(() => 'Anthropic account migration is required; run setup'))
+      ).toEqual(
+        assistants.map(
+          () => 'Anthropic account migration is required. Stop OpenCode, LiteCode and Pi, then run bunx @cortexkit/opencode-anthropic-auth@2.0.0 setup',
+        ),
+      )
       expect(statuses).not.toContain('retry')
       expect(finalStatus).not.toBe('retry')
       expect(assistants.flatMap((message) => message.parts ?? []).filter((part) => part.type === 'text' && part.text)).toEqual([])
@@ -225,6 +233,12 @@ describe('zero-bind scoped custody', () => {
         join(harness.opencode.env.configDir, 'anthropic-auth-state.json'),
       )
       expect(await readNativeMigrationJournal(pool)).toBeUndefined()
+      expect(await readFile(legacyConfigPath, 'utf8')).toBe(legacyConfigBefore)
+      expect(await readFile(hostAuthPath, 'utf8')).toBe(hostAuthBefore)
+      expect(harness.anthropic.tokenRequests()).toBe(0)
+      for (const path of [pool.config, pool.state, pool.runtime, pool.roster]) {
+        await expect(readFile(path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+      }
     } finally {
       await harness.abortSession(session)
     }
