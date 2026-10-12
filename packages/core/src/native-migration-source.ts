@@ -130,7 +130,9 @@ const settingFields: Record<string, readonly string[]> = {
   killswitch: ['enabled', 'main', 'accounts'],
 }
 
-function validateSettings(settings: Record<string, unknown>): void {
+export function validateNativeMigrationSettings(
+  settings: Record<string, unknown>,
+): void {
   const threshold = (value: unknown) =>
     record(value) &&
     Object.entries(value).every(
@@ -623,7 +625,7 @@ export function projectNativeMigrationSource(
         if (account.runtime[key] === undefined) delete account.runtime[key]
       if (account.quota === undefined) delete account.quota
     }
-    validateSettings(settings)
+    validateNativeMigrationSettings(settings)
     const relay = object(config.relay)
     return {
       accounts,

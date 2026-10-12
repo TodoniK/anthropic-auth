@@ -7,6 +7,10 @@ import {
   type NativeLockEvent,
   nativeLockObserver,
 } from './native-lock-observer.ts'
+import {
+  nativeVaultFileAbsent,
+  readNativeVaultLegacySettings,
+} from './native-vault-seed.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 
 export type { NativeLockEvent } from './native-lock-observer.ts'
@@ -16,7 +20,9 @@ interface NativeQuotaCodec {
   merge(stored: unknown | undefined, observation: unknown): unknown
 }
 
-export type NativePoolStorePaths = Pick<NativePoolPaths, 'config' | 'state'>
+export type NativePoolStorePaths = Pick<NativePoolPaths, 'config' | 'state'> & {
+  legacySeedConfig?: string
+}
 
 export interface NativePoolStoreOptions
   extends Pick<
@@ -44,7 +50,7 @@ export function nativePoolStoreLocks(paths: NativePoolStorePaths) {
  * authority or vault enrollment authority before using these files.
  */
 export function createNativePoolStore(options: NativePoolStoreOptions) {
-  return openPoolStore({
+  const store = openPoolStore({
     provider: 'anthropic',
     configPath: options.paths.config,
     statePath: options.paths.state,
@@ -58,4 +64,21 @@ export function createNativePoolStore(options: NativePoolStoreOptions) {
     onLockEvent: nativeLockObserver(options.onLockEvent),
     onLockStep: options.onLockStep,
   })
+  const legacyConfig = options.paths.legacySeedConfig
+  if (!legacyConfig) return store
+  return {
+    ...store,
+    updateSettings: ((mutator, callOptions) =>
+      store.updateSettings(async (draft) => {
+        // The config/state file locks are held while creating vault settings.
+        // Write legacy preferences together with the discovered default account's
+        // route and UUID; any existing settings file prevents later imports.
+        if (await nativeVaultFileAbsent(options.paths.config))
+          Object.assign(
+            draft,
+            await readNativeVaultLegacySettings(legacyConfig),
+          )
+        return mutator(draft)
+      }, callOptions)) satisfies typeof store.updateSettings,
+  }
 }

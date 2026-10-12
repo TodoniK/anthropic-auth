@@ -213,12 +213,14 @@ function getPiRoutingServices(
 }
 
 async function getPiStickyRouter(storagePath: string) {
-  const path = await getPiNativeRuntime(storagePath).routingPath()
+  const { path, vaultSeed } =
+    await getPiNativeRuntime(storagePath).routingStorage()
   let router = stickyRouters.get(path)
   if (!router) {
-    router = new StickySessionRouter({ path })
+    router = new StickySessionRouter({ path, vaultSeed })
     setBoundedService(stickyRouters, path, router)
   }
+  router.setVaultSeed(vaultSeed)
   return router
 }
 

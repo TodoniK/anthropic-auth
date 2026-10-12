@@ -11,6 +11,7 @@ export interface NativeVaultPaths {
   roster: string
   routing: string
   storageId: string
+  legacySeedConfig: string
 }
 
 function sibling(path: string, expected: string, name: string, suffix: string) {
@@ -67,6 +68,7 @@ export function nativeVaultPaths(local: NativePoolPaths): NativeVaultPaths {
   )
     throw new Error('Vault storage overlaps local account storage')
   return {
+    legacySeedConfig: local.legacyConfig,
     config,
     state,
     runtime,

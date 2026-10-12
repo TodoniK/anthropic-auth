@@ -6,6 +6,7 @@ import {
   mkdtemp,
   readFile,
   rm,
+  stat,
   symlink,
   writeFile,
 } from 'node:fs/promises'
@@ -29,6 +30,7 @@ import {
   setLogLevel,
   stickyRouteFamilyForModel,
 } from '@cortexkit/anthropic-auth-core'
+import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
 import { createOpencodeClient, type Provider } from '@opencode-ai/sdk'
 import { $ } from 'bun'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
@@ -2240,4 +2242,119 @@ test('fallback-first fails retryably and sends nothing when the first-identity w
   held.release()
   const [written] = await Promise.allSettled([held.write])
   expect(written.status).toBe('fulfilled')
+})
+
+test('first OpenCode request after a 1.x vault upgrade uses legacy fallback-first before any main send', async () => {
+  const f = await migrateServingFixture('claustrum', true)
+  const vault = nativeVaultPaths(f.paths)
+  const legacy = JSON.stringify({
+    version: 1,
+    mainAccountId: mainIdentity,
+    claustrum: {
+      mode: 'claustrum',
+      primaryAccount: {
+        credentialId: 'oauth:anthropic',
+        accountId: mainIdentity,
+        state: 'active',
+      },
+    },
+    routing: { mode: 'fallback-first' },
+    quota: { enabled: false },
+    prime: { enabled: false },
+    cacheKeep: { enabled: false },
+    accounts: [
+      {
+        id: 'legacy-secondary',
+        label: 'Work',
+        type: 'oauth',
+        enabled: true,
+        addedAt: Date.now(),
+        claustrumScopedCredentialId: 'oauth:secondary',
+        anthropicAccountUuid: fallbackIdentity,
+      },
+    ],
+  })
+  await writeFile(configPath, legacy, { mode: 0o600 })
+  await rm(vault.config, { force: true })
+  await rm(vault.routing, { force: true })
+  expect(f.authorizedGets).toHaveLength(0)
+  expect(
+    f.records.filter((record) => record.url.includes('/v1/messages')),
+  ).toHaveLength(0)
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => f.scopedClient,
+  })
+  expect((await sendNative(plugin)).status).toBe(200)
+  const sent = f.records.filter((record) => record.url.includes('/v1/messages'))
+  expect(sent).toHaveLength(1)
+  expect(sent[0]?.authorization).toBe('Bearer sk-ant-oat01-vault-fallback-v1')
+  expect(f.authorizedGets).not.toContain('oauth:anthropic')
+  expect(JSON.parse(await readFile(vault.config, 'utf8')).routing).toEqual({
+    mode: 'fallback-first',
+  })
+  expect(await readFile(configPath, 'utf8')).toBe(legacy)
+})
+
+test('OpenCode routes normally during roster deferral without publishing an empty routing file or completed marker', async () => {
+  const f = await migrateServingFixture('claustrum', true)
+  const vault = nativeVaultPaths(f.paths)
+  await mutateVaultRoster(vault.roster, (roster) => {
+    if (!roster) throw new Error('Fixture has no roster')
+    return { next: { ...roster, complete: false }, result: undefined }
+  })
+  const list = f.scopedClient.listScoped
+  f.scopedClient.listScoped = async () => {
+    throw new Error('synthetic discovery unavailable')
+  }
+  const legacy = JSON.stringify({
+    version: 1,
+    mainAccountId: mainIdentity,
+    claustrum: {
+      mode: 'claustrum',
+      primaryAccount: {
+        credentialId: 'oauth:anthropic',
+        accountId: mainIdentity,
+        state: 'active',
+      },
+    },
+    routing: { mode: 'fallback-first' },
+    quota: { enabled: false },
+    prime: { enabled: false },
+    cacheKeep: { enabled: false },
+    accounts: [
+      {
+        id: 'legacy-secondary',
+        type: 'oauth',
+        enabled: true,
+        anthropicAccountUuid: fallbackIdentity,
+      },
+    ],
+  })
+  await writeFile(configPath, legacy, { mode: 0o600 })
+  await rm(vault.config, { force: true })
+  await rm(vault.routing, { force: true })
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => f.scopedClient,
+  })
+  expect((await sendNative(plugin)).status).toBe(200)
+  const sent = f.records.filter((record) => record.url.includes('/v1/messages'))
+  expect(sent).toHaveLength(1)
+  expect(sent[0]?.authorization).toBe('Bearer sk-ant-oat01-vault-fallback-v1')
+  await expect(stat(vault.routing)).rejects.toMatchObject({ code: 'ENOENT' })
+  f.scopedClient.listScoped = list
+  const runtime = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    vault: { connect: async () => f.scopedClient },
+  })
+  try {
+    await runtime.vault.refresh()
+    await runtime.read()
+    expect(
+      JSON.parse(await readFile(vault.routing, 'utf8')).vaultLegacySeed,
+    ).toBe('complete')
+  } finally {
+    runtime.close()
+  }
+  expect(await readFile(configPath, 'utf8')).toBe(legacy)
 })

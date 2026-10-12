@@ -139,12 +139,19 @@ export class PiNativeRuntime {
   }
 
   async routingPath(): Promise<string> {
+    return (await this.routingStorage()).path
+  }
+
+  async routingStorage(): Promise<{
+    path: string
+    vaultSeed?: NativeAccountSnapshot['routingSeed']
+  }> {
     const runtime = await this.service()
     const snapshot = await runtime.read()
     if (snapshot.mode === 'claustrum') {
       if (!snapshot.routingPath)
         throw new Error('Vault routing storage is unavailable')
-      return snapshot.routingPath
+      return { path: snapshot.routingPath, vaultSeed: snapshot.routingSeed }
     }
     // Keep local session-to-account assignments at the exact file destination
     // recorded by migration; guessing a new path would lose those assignments.
@@ -155,14 +162,15 @@ export class PiNativeRuntime {
       !journal.routingPaths.destination
     )
       throw new Error('Pi native routing requires committed offline migration')
-    return journal.routingPaths.destination
+    return { path: journal.routingPaths.destination }
   }
 
   /**
-   * Core's own refusal when offline setup has never migrated this install,
-   * otherwise undefined. This asks Core's account runtime directly, skipping
-   * the Pi login check that service() runs first, so a 1.x install whose Pi
-   * login is still stored is recognized too. It only reads.
+   * Return the account runtime's migration-refusal error when local credentials
+   * have not been migrated by offline setup, or undefined when no such refusal
+   * occurs. Bypass the Pi login check in service() so older installations with
+   * a stored Pi login are recognized too. An enrolled vault may initialize its
+   * public settings on this read; local storage is never changed.
    */
   async migrationRefusal(): Promise<Error | undefined> {
     if (this.closed) return undefined

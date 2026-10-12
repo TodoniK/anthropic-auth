@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
+import { readVaultRoster } from '@cortexkit/common-auth/claustrum'
 import {
   type AccountOperationError,
   type AccountStorage,
@@ -16,6 +17,12 @@ import {
   quotaSnapshotPassesModelScope,
 } from './accounts.ts'
 import { isClaudeFableOrMythos5Model } from './models.ts'
+import type { NativeVaultRosterDocument } from './native-roster-seed.ts'
+import {
+  type NativeVaultRoutingSeed,
+  nativeVaultLegacyRoutes,
+  readNativeVaultLegacyJson,
+} from './native-vault-seed.ts'
 
 export const STICKY_ROUTING_MAIN_ACCOUNT_ID = 'main'
 export const STICKY_ROUTING_SHORT_RESET_GRACE_MS = 15 * 60_000
@@ -60,6 +67,7 @@ type StickyRouteState = {
   version: 1
   updatedAt: number
   assignments: Record<string, StickyRouteAssignment>
+  vaultLegacySeed?: 'pending' | 'complete'
 }
 
 export type StickyRouteResolution = {
@@ -234,6 +242,10 @@ function normalizeState(value: unknown): StickyRouteState | undefined {
     version: 1,
     updatedAt: finiteNumber(value.updatedAt) ?? 0,
     assignments,
+    ...(value.vaultLegacySeed === 'pending' ||
+    value.vaultLegacySeed === 'complete'
+      ? { vaultLegacySeed: value.vaultLegacySeed }
+      : {}),
   }
 }
 
@@ -529,12 +541,14 @@ export class StickySessionRouter {
   private state: StickyRouteState
   private stateMtimeNs: bigint | undefined
   private touchChain: Promise<void> = Promise.resolve()
+  private seedFinalized = false
 
   constructor(
     private readonly options: {
       path: string
       now?: () => number
       assignmentTtlMs?: number
+      vaultSeed?: NativeVaultRoutingSeed
     },
   ) {
     this.state = emptyState(this.now())
@@ -554,7 +568,12 @@ export class StickySessionRouter {
       return normalized
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return emptyState(this.now())
+        return {
+          ...emptyState(this.now()),
+          ...(this.options.vaultSeed
+            ? { vaultLegacySeed: 'pending' as const }
+            : {}),
+        }
       }
       throw error
     }
@@ -631,12 +650,17 @@ export class StickySessionRouter {
       })
   }
 
-  private async writeState(state: StickyRouteState) {
-    this.prune(state)
+  private async writeState(
+    state: StickyRouteState,
+    prune = true,
+    beforeRename?: () => Promise<void>,
+  ) {
+    if (prune) this.prune(state)
     state.updatedAt = this.now()
     const tempPath = `${this.options.path}.${randomUUID()}.tmp`
     try {
       await writeFile(tempPath, `${JSON.stringify(state)}\n`, { mode: 0o600 })
+      await beforeRename?.()
       await rename(tempPath, this.options.path)
     } finally {
       await rm(tempPath, { force: true }).catch(() => {})
@@ -644,6 +668,82 @@ export class StickySessionRouter {
     this.state = state
     this.stateMtimeNs = await this.readStateMtimeNs()
     this.loaded = true
+  }
+
+  /** Import legacy session pins only after vault account discovery produces a complete verified roster. No empty routing file is published while that roster is incomplete. */
+  async prepareLegacySeed(knownRoster?: NativeVaultRosterDocument | null) {
+    const seed = this.options.vaultSeed
+    if (!seed || this.seedFinalized) return
+    try {
+      await this.refreshStateIfChanged()
+    } catch {
+      // An unreadable existing file cannot prove it opted into a deferred import.
+      // Leave it alone; ordinary sticky routing still reports its read error.
+      this.seedFinalized = true
+      return
+    }
+    // An unmarked existing file predates this importer and belongs to the user.
+    if (this.state.vaultLegacySeed !== 'pending') {
+      this.seedFinalized = true
+      return
+    }
+    const roster =
+      knownRoster === undefined
+        ? await readVaultRoster(seed.roster)
+        : knownRoster
+    if (!roster?.complete) return
+    const lock = await this.acquireLock()
+    try {
+      const state = await this.readState()
+      if (state.vaultLegacySeed !== 'pending') {
+        this.seedFinalized = true
+        return
+      }
+      const source = await readNativeVaultLegacyJson(seed.legacyConfig)
+      const routes = nativeVaultLegacyRoutes(source, roster)
+      const legacy = await readNativeVaultLegacyJson(
+        getStickyRoutingStatePath(seed.legacyConfig),
+      )
+      if (
+        isRecord(legacy) &&
+        legacy.version === 1 &&
+        isRecord(legacy.assignments)
+      ) {
+        for (const [key, raw] of Object.entries(legacy.assignments)) {
+          // Both namespaces hash the raw session ID with SHA-256, without a salt.
+          if (
+            !/^[0-9a-f]{64}$/.test(key) ||
+            Object.hasOwn(state.assignments, key)
+          )
+            continue
+          const assignment = normalizeAssignment(raw)
+          const target = assignment && routes.get(assignment.accountId)
+          if (assignment && target)
+            state.assignments[key] = {
+              ...assignment,
+              accountId: target.routeId,
+              accountIdentity: target.accountIdentity,
+            }
+        }
+      }
+      state.vaultLegacySeed = 'complete'
+      // Seed and marker share one rename. Pruning here would remove live pins
+      // written during deferral, so leave their lifetime to ordinary routing.
+      await this.writeState(state, false, () => lock.assertOwned())
+      this.seedFinalized = true
+    } finally {
+      await lock.release()
+    }
+  }
+
+  private logicalAccountId(assignment: StickyRouteAssignment) {
+    return assignment.accountId === this.options.vaultSeed?.mainRouteId
+      ? STICKY_ROUTING_MAIN_ACCOUNT_ID
+      : assignment.accountId
+  }
+
+  setVaultSeed(seed: NativeVaultRoutingSeed | undefined) {
+    this.options.vaultSeed = seed
   }
 
   private scheduleTouch(key: string) {
@@ -703,15 +803,16 @@ export class StickySessionRouter {
     const pendingBytes = new Map<string, number>()
     for (const assignment of Object.values(input.state.assignments)) {
       const candidate = weighted.find(
-        (entry) => entry.candidate.accountId === assignment.accountId,
+        (entry) =>
+          entry.candidate.accountId === this.logicalAccountId(assignment),
       )?.candidate
       if (!candidate) continue
       const quota = knownQuota(candidate.quota)
       if (quota && assignment.quotaCheckedAt !== snapshotCheckedAt(quota))
         continue
       pendingBytes.set(
-        assignment.accountId,
-        (pendingBytes.get(assignment.accountId) ?? 0) +
+        this.logicalAccountId(assignment),
+        (pendingBytes.get(this.logicalAccountId(assignment)) ?? 0) +
           assignment.initialInputBytes,
       )
     }
@@ -746,6 +847,7 @@ export class StickySessionRouter {
     excludeAccountIds?: ReadonlySet<string>
   }): Promise<StickyRouteResolution | null> {
     if (!input.sessionId) return null
+    await this.prepareLegacySeed()
     await this.refreshStateIfChanged()
     const key = sessionKey(input.sessionId)
     const affinityModelId = input.affinityModelId ?? input.modelId
@@ -763,7 +865,7 @@ export class StickySessionRouter {
     }
     const matchesAccountIdentity = (assignment: StickyRouteAssignment) => {
       if (!input.accountIdentities) return true
-      const identity = identityForAccount(assignment.accountId)
+      const identity = identityForAccount(this.logicalAccountId(assignment))
       return identity !== undefined && assignment.accountIdentity === identity
     }
     const cached = this.state.assignments[key]
@@ -772,15 +874,15 @@ export class StickySessionRouter {
       this.assignmentIsActive(cached) &&
       matchesAffinity(cached) &&
       matchesAccountIdentity(cached) &&
-      input.retainAccountIds.has(cached.accountId) &&
-      !input.excludeAccountIds?.has(cached.accountId)
+      input.retainAccountIds.has(this.logicalAccountId(cached)) &&
+      !input.excludeAccountIds?.has(this.logicalAccountId(cached))
     ) {
       if (this.now() - cached.lastSeenAt >= STICKY_ROUTING_TOUCH_INTERVAL_MS) {
         cached.lastSeenAt = this.now()
         this.scheduleTouch(key)
       }
       return {
-        accountId: cached.accountId,
+        accountId: this.logicalAccountId(cached),
         assignment: { ...cached },
         created: false,
         migrated: false,
@@ -796,13 +898,13 @@ export class StickySessionRouter {
         current &&
         matchesAffinity(current) &&
         matchesAccountIdentity(current) &&
-        input.retainAccountIds.has(current.accountId) &&
-        !input.excludeAccountIds?.has(current.accountId)
+        input.retainAccountIds.has(this.logicalAccountId(current)) &&
+        !input.excludeAccountIds?.has(this.logicalAccountId(current))
       ) {
         current.lastSeenAt = this.now()
         await this.writeState(state)
         return {
-          accountId: current.accountId,
+          accountId: this.logicalAccountId(current),
           assignment: { ...current },
           created: false,
           migrated: false,

@@ -22,6 +22,7 @@ import type {
   NativeRuntimeState,
 } from './native-runtime.ts'
 import { NativeRuntimeError } from './native-runtime.ts'
+import type { NativeVaultRoutingSeed } from './native-vault-seed.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import {
   type NativeLocalPoolBinding,
@@ -78,6 +79,7 @@ export interface NativeAccountSnapshot {
   accounts: NativeAccountView[]
   /** Vault session-to-account assignments use this separate file. Local mode keeps the assignment file at the destination recorded by migration. */
   routingPath?: string
+  routingSeed?: NativeVaultRoutingSeed
   /** AccountStorage-shaped input for pure policy predicates, never a credential or persistence authority. */
   policyStorage: AccountStorage
 }

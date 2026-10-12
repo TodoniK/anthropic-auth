@@ -128,9 +128,13 @@ export function createNativeAnthropicSource(
       getStickyRoutingStatePath(options.paths.legacyConfig)
     let router = routers.get(path)
     if (!router) {
-      router = new StickySessionRouter({ path })
+      router = new StickySessionRouter({
+        path,
+        vaultSeed: snapshot.routingSeed,
+      })
       routers.set(path, router)
     }
+    router.setVaultSeed(snapshot.routingSeed)
     return router
   }
   const states = new WeakMap<NativeSourceProvenance, State>()

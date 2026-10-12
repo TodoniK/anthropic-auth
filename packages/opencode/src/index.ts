@@ -1774,9 +1774,13 @@ const anthropicAuthPlugin = async (
     }
     let router = stickySessionRouters.get(path)
     if (!router) {
-      router = new StickySessionRouter({ path })
+      router = new StickySessionRouter({
+        path,
+        vaultSeed: snapshot.routingSeed,
+      })
       stickySessionRouters.set(path, router)
     }
+    router.setVaultSeed(snapshot.routingSeed)
     return { router, ...(accountIdentities && { accountIdentities }) }
   }
   // The runtime stores quota readings for the account and tokens used to fetch

@@ -57,6 +57,7 @@ import {
 } from './native-runtime.ts'
 import type { NativeVaultPaths } from './native-vault-paths.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
+import { nativeVaultFileAbsent } from './native-vault-seed.ts'
 import { fetchOAuthAccountProfile } from './oauth-profile.ts'
 import { NativeAuthorityError } from './pool-authority.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
@@ -148,6 +149,7 @@ export function nativeDisplayProfile(
 }
 
 export interface NativeVaultRuntime {
+  initializeSettings(): Promise<void>
   read(): Promise<NativeVaultRosterDocument | undefined>
   refresh(signal?: AbortSignal): Promise<NativeVaultRosterDocument | undefined>
   authorize(
@@ -340,9 +342,11 @@ export function createNativeVaultRuntime(
     if (!(await active())) throw new NativeCustodyError('route-unavailable')
     check(signal)
   }
-  async function publishPrimaryPin(signal?: AbortSignal) {
+  async function publishPrimaryPin(signal?: AbortSignal, absentOnly = false) {
     await requireActive(signal)
     await mutateVaultRoster(paths.roster, async (roster, lease) => {
+      if (absentOnly && !(await nativeVaultFileAbsent(paths.config)))
+        return { result: undefined }
       const primary = roster?.rows.find(
         (row) =>
           (row.credentialId === NATIVE_PRIMARY_CREDENTIAL_ID ||
@@ -358,11 +362,12 @@ export function createNativeVaultRuntime(
       if (read.status !== 'ready') throw new NativeCustodyError('invalid-state')
       const previous = nativeVaultPrimaryPin(read.settings)
       if (
-        (!primary && !previous) ||
-        (primary &&
-          previous?.routeId === primary.routeId &&
-          previous.credentialId === NATIVE_PRIMARY_CREDENTIAL_ID &&
-          previous.accountIdentity === primary.accountIdentity)
+        !absentOnly &&
+        ((!primary && !previous) ||
+          (primary &&
+            previous?.routeId === primary.routeId &&
+            previous.credentialId === NATIVE_PRIMARY_CREDENTIAL_ID &&
+            previous.accountIdentity === primary.accountIdentity))
       )
         return { result: undefined }
       const writer = createNativePoolStore({
@@ -378,7 +383,11 @@ export function createNativeVaultRuntime(
           }
         },
       })
-      await writer.updateSettings((settings) => {
+      await writer.updateSettings(async (settings) => {
+        // Another writer may have created settings before this writer acquired
+        // the settings-file lock. Initialization must leave that file untouched.
+        if (absentOnly && !(await nativeVaultFileAbsent(paths.config)))
+          return settings
         if (primary) {
           settings.mainAccountId = primary.routeId
           settings.claustrum = {
@@ -416,6 +425,7 @@ export function createNativeVaultRuntime(
     return route
   }
   const runtime: NativeVaultRuntime = {
+    initializeSettings: () => publishPrimaryPin(undefined, true),
     async read() {
       await requireActive()
       const roster = await readVaultRoster(paths.roster)
@@ -1047,6 +1057,7 @@ export function acquireNativeVaultRuntime(
     return owned.runtime
   }
   return {
+    initializeSettings: () => use().initializeSettings(),
     read: () => use().read(),
     refresh: (signal) => use().refresh(signal),
     authorize: (id, signal) => use().authorize(id, signal),

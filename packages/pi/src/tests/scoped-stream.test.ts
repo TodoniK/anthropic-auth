@@ -29,6 +29,7 @@ import {
   ModelRuntime,
   type ProviderConfig,
 } from '@earendil-works/pi-coding-agent'
+import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
@@ -1276,4 +1277,72 @@ test('Pi vault default UUID replacement re-places the old session without inheri
   expect(await Promise.all(f.localFiles.map((file) => readFile(file)))).toEqual(
     f.beforeLocal,
   )
+})
+
+test('first Pi request after a 1.x vault upgrade uses legacy fallback-first before any main send', async () => {
+  const f = await fixture()
+  const workUuid = fixtureAccountIdentity('work')
+  f.rows.push(row('oauth:work', workUuid))
+  await (await f.native.service()).vault.refresh()
+  const paths = await resolveNativePoolPaths(
+    f.path,
+    join(dirname(f.path), 'anthropic-auth-state.json'),
+  )
+  const vault = nativeVaultPaths(paths)
+  const legacy = JSON.stringify({
+    version: 1,
+    mainAccountId: fixtureAccountIdentity('main'),
+    claustrum: {
+      mode: 'claustrum',
+      primaryAccount: {
+        credentialId: 'oauth:anthropic',
+        accountId: fixtureAccountIdentity('main'),
+        state: 'active',
+      },
+    },
+    routing: { mode: 'fallback-first' },
+    quota: { enabled: false },
+    prime: { enabled: false },
+    cacheKeep: { enabled: false },
+    accounts: [
+      {
+        id: 'old-work',
+        label: 'Work',
+        type: 'oauth',
+        enabled: true,
+        addedAt: Date.now(),
+        claustrumScopedCredentialId: 'oauth:work',
+        anthropicAccountUuid: workUuid,
+      },
+    ],
+  })
+  await writeFile(f.path, legacy, { mode: 0o600 })
+  closePiNativeRuntime(f.path)
+  await rm(vault.config, { force: true })
+  await rm(vault.routing, { force: true })
+  getPiNativeRuntime(f.path, { connect: async () => f.client })
+  expect(f.gets).toHaveLength(0)
+  const sent: string[] = []
+  globalThis.fetch = Object.assign(
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      if (String(input).includes('/v1/messages'))
+        sent.push(new Headers(init?.headers).get('authorization') ?? '')
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const first = await streamCortexKitAnthropic(model, context, {
+    sessionId: 'legacy-vault-first-request',
+  }).result()
+  expect(first.errorMessage).toBeUndefined()
+  expect(first.stopReason).toBe('stop')
+  expect(sent).toEqual(['Bearer vault-test-access-1'])
+  expect(f.gets.map((get) => get.credentialId)).toEqual(['oauth:work'])
+  expect(JSON.parse(await readFile(vault.config, 'utf8')).routing).toEqual({
+    mode: 'fallback-first',
+  })
+  expect(await readFile(f.path, 'utf8')).toBe(legacy)
 })

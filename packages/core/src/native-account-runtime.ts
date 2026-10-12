@@ -76,6 +76,7 @@ import {
   type NativeVaultRuntimeOptions,
   nativeDisplayProfile,
 } from './native-vault-runtime.ts'
+import type { NativeVaultRoutingSeed } from './native-vault-seed.ts'
 import { fetchOAuthAccountProfile } from './oauth-profile.ts'
 import { requireNativePoolAuthority } from './pool-authority.ts'
 import {
@@ -87,6 +88,7 @@ import type { NativePoolPaths } from './pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
 import type { QuotaRequestDispatch } from './quota-manager.ts'
 import type { RelayConfig } from './relay.ts'
+import { StickySessionRouter } from './sticky-routing.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
 export type {
@@ -272,6 +274,16 @@ export function createNativeAccountRuntime(
   const now = options.local?.now ?? options.vault?.now ?? Date.now
   const env = { ...(options.vault?.env ?? process.env) }
   const vaultPaths = nativeVaultPaths(paths)
+  const routingSeed: NativeVaultRoutingSeed = {
+    legacyConfig: paths.legacyConfig,
+    roster: vaultPaths.roster,
+  }
+  const vaultRouter = new StickySessionRouter({
+    path: vaultPaths.routing,
+    vaultSeed: routingSeed,
+    now,
+  })
+  let settingsBootstrap: Promise<unknown> | undefined
   const vaultStore = createNativePoolStore({
     paths: vaultPaths,
     quota: nativeQuotaCodec,
@@ -519,6 +531,16 @@ export function createNativeAccountRuntime(
    */
   async function readView() {
     const mode = await authority()
+    if (mode === 'claustrum') {
+      // Load legacy routing preferences before deciding which account receives
+      // the first request. A status read may create vault settings; it never
+      // fetches credentials.
+      settingsBootstrap ??= vault.initializeSettings().catch((error) => {
+        settingsBootstrap = undefined
+        throw error
+      })
+      await settingsBootstrap
+    }
     const selectedPaths = mode === 'claustrum' ? vaultPaths : paths
     const selectedStore = mode === 'claustrum' ? vaultStore : store
     const [read, settings, metadata] = await Promise.all([
@@ -549,7 +571,15 @@ export function createNativeAccountRuntime(
       runtime: metadata.status === 'ready' ? metadata.state : undefined,
       roster,
     })
-    if (mode === 'claustrum') snapshot.routingPath = vaultPaths.routing
+    if (mode === 'claustrum') {
+      routingSeed.mainRouteId =
+        typeof settings.settings.mainAccountId === 'string'
+          ? settings.settings.mainAccountId
+          : undefined
+      await vaultRouter.prepareLegacySeed(roster ?? null)
+      snapshot.routingPath = vaultPaths.routing
+      snapshot.routingSeed = { ...routingSeed }
+    }
     return {
       snapshot,
       rows: read.rows,
