@@ -300,8 +300,12 @@ export function createNativeAccountRuntime(
   }
   async function authority(signal?: AbortSignal) {
     check(signal)
-    const mode = await readNativeEnrollmentMode(options.host, env)
-    if (mode === 'local') await requireNativePoolAuthority(paths)
+    let mode = await readNativeEnrollmentMode(options.host, env)
+    if (mode === 'local') {
+      await requireNativePoolAuthority(paths)
+      // Enrollment can land while the local journal is being read.
+      mode = await readNativeEnrollmentMode(options.host, env)
+    }
     check(signal)
     return mode
   }
@@ -407,12 +411,14 @@ export function createNativeAccountRuntime(
                 },
                 {
                   beforeRename: async () => {
-                    await localAuthority()
                     if (!(await matches()))
                       throw new NativeRuntimeError('publication-refused')
                     await configLease.assertOwned()
                     await stateLease.assertOwned()
+                    // Binding and lease checks yield; custody must be checked last.
+                    await localAuthority()
                   },
+                  beforePublish: () => localAuthority(),
                 },
               )
               return true
@@ -727,6 +733,25 @@ export function createNativeAccountRuntime(
         paths,
         ...options.local,
         now,
+        publicationGuard: async (event) => {
+          // An exchange has already consumed the predecessor. Keep its committed
+          // successor recoverable even if host enrollment lands before completion.
+          if (
+            event.status === 'persisted' ||
+            (event.status === 'failed' &&
+              event.persisted &&
+              event.committed !== undefined)
+          )
+            return true
+          try {
+            return (
+              (await readNativeEnrollmentMode(options.host, env)) === 'local'
+            )
+          } catch {
+            // Unknown custody cannot authorize a local metadata write.
+            return false
+          }
+        },
         externalPolicy: () => baseGate(account, snapshot),
         failurePolicy:
           options.local?.failurePolicy ??

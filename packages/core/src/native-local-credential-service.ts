@@ -17,6 +17,8 @@ import {
   classifyNativeLocalFailure,
   type NativeLocalFailureAttribution,
   type NativeLocalFailurePolicy,
+  NativeRuntimeError,
+  type NativeRuntimeWriteHooks,
   publishNativeLocalCredentialValidation,
   publishNativeLocalFirstIdentity,
   publishNativeLocalRefreshFailure,
@@ -47,6 +49,10 @@ export interface NativeLocalFailurePolicyInput {
 export interface NativeLocalCredentialServiceOptions {
   /** Storage resolved by resolveNativePoolPaths. The service keeps its own copy. */
   readonly paths: NativePoolPaths
+  /** Recheck host custody for this observation. Already consumed successors may finish their durable reconciliation; unconsumed work must still have local authority. */
+  readonly publicationGuard: (
+    observation: NativeRefreshObservation,
+  ) => Promise<boolean>
   /**
    * Decide without I/O whether local OAuth mode, the account and its quota
    * allow the operation. Credential-validation evidence is checked separately.
@@ -89,6 +95,7 @@ export interface NativeLocalCredentialService {
 
 const optionKeys = [
   'paths',
+  'publicationGuard',
   'externalPolicy',
   'failurePolicy',
   'now',
@@ -226,6 +233,9 @@ export function createNativeLocalCredentialService(
   if (!descriptors)
     throw new TypeError('Native local credential service options are invalid')
   const paths = capturePaths(descriptors.paths?.value)
+  const publicationGuard = requiredFunction<
+    NativeLocalCredentialServiceOptions['publicationGuard']
+  >(descriptors, 'publicationGuard')
   const externalPolicy = requiredFunction<
     NativeLocalCredentialServiceOptions['externalPolicy']
   >(descriptors, 'externalPolicy')
@@ -240,6 +250,33 @@ export function createNativeLocalCredentialService(
     NativeLocalCredentialServiceOptions['resolveIdentity']
   >(descriptors, 'resolveIdentity')
 
+  async function publish(
+    event: NativeRefreshObservation,
+    operation: (
+      hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish'>,
+    ) => Promise<unknown>,
+  ) {
+    if ((await publicationGuard(event)) !== true) return
+    const hooks = {
+      beforePublish: async () => {
+        if ((await publicationGuard(event)) !== true)
+          throw new NativeRuntimeError('publication-refused')
+      },
+    }
+    try {
+      await operation(hooks)
+    } catch (error) {
+      // Losing host authority drops the observation, not an account failure.
+      if (
+        error instanceof NativeRuntimeError &&
+        error.code === 'publication-refused' &&
+        (await publicationGuard(event)) !== true
+      )
+        return
+      throw error
+    }
+  }
+
   async function reconcile(observation: NativeRefreshObservation) {
     // This result identifies the account and credential version to update.
     // A later storage read may already refer to a replacement credential.
@@ -252,9 +289,11 @@ export function createNativeLocalCredentialService(
       event.bootstrap === 'resolved'
     ) {
       const predecessor = event.context?.runtimeBinding
-      if (predecessor && predecessor.identity === undefined)
-        await publishNativeLocalFirstIdentity(paths, event)
-      else await publishNativeLocalCredentialValidation(paths, event)
+      await publish(event, (hooks) =>
+        predecessor && predecessor.identity === undefined
+          ? publishNativeLocalFirstIdentity(paths, event, hooks)
+          : publishNativeLocalCredentialValidation(paths, event, hooks),
+      )
       return
     }
     if (event.status !== 'failed' && event.status !== 'persisted') return
@@ -271,7 +310,9 @@ export function createNativeLocalCredentialService(
     // Recording a failure, skipping an inapplicable update or rejecting a stale
     // update cannot validate credentials. Leave the authorization result to the
     // coordinator's separate admission check.
-    await publishNativeLocalRefreshFailure(paths, event, policy)
+    await publish(event, (hooks) =>
+      publishNativeLocalRefreshFailure(paths, event, policy, hooks),
+    )
   }
 
   const coordinator = createNativeRefreshCoordinator({

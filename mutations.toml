@@ -550,3 +550,51 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "local-authority-rechecks-enrollment-after-journal"
+guards = "Enrollment during the final journal read prevents local OAuth/API release and settings publication."
+file = "packages/core/src/native-account-runtime.ts"
+old = "      mode = await readNativeEnrollmentMode(options.host, env)\n"
+new = ""
+test_file = "packages/core/src/tests/native-enrollment-await.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-enrollment-await.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["local OAuth final journal read rechecks custody / enroll=true", "local API final journal read rechecks custody / enroll=true", "local settings final journal read rechecks custody / enroll=true"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "unconsumed-validation-respects-enrollment"
+guards = "An identity lookup completed after enrollment cannot change local runtime bytes; a consumed successor remains durable."
+file = "packages/core/src/native-account-runtime.ts"
+old = "              (await readNativeEnrollmentMode(options.host, env)) === 'local'\n"
+new = "              true\n"
+test_file = "packages/core/src/tests/native-enrollment-await.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-enrollment-await.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["local identity lookup cannot publish validation after enrollment / enroll=true"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "runtime-final-publication-check-follows-lease"
+guards = "Enrollment during the runtime writer's own lease assertion prevents local metadata replacement."
+file = "packages/core/src/native-runtime.ts"
+old = "            await hooks.beforePublish?.()\n"
+new = ""
+test_file = "packages/core/src/tests/native-enrollment-await.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-enrollment-await.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["local metadata runtime-lease await rechecks custody / enroll=true"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

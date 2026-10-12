@@ -561,6 +561,8 @@ export async function readNativeRuntime(
 export interface NativeRuntimeWriteHooks {
   /** Verify that the observed account still matches the current pool record or vault roster and that the caller still owns the locks protecting those records. */
   beforeRename?: () => Promise<void>
+  /** Check caller authority after every lease assertion, immediately before replacement. This hook can only refuse publication. */
+  beforePublish?: () => Promise<void>
   /** Runs after the new file replaces the old one. Failure does not undo that replacement. */
   afterRename?: () => Promise<void>
 }
@@ -759,6 +761,11 @@ async function writeNativeRuntime(
           } catch {
             throw new NativeRuntimeError('publication-refused')
           }
+          try {
+            await hooks.beforePublish?.()
+          } catch {
+            throw new NativeRuntimeError('publication-refused')
+          }
           await rename(stage, path)
           ownsStage = false
           try {
@@ -947,6 +954,7 @@ function firstIdentityEntry(
 export async function publishNativeLocalFirstIdentity(
   paths: NativePoolPaths,
   observation: NativeRefreshObservation,
+  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish'> = {},
 ): Promise<NativeRuntimeState> {
   try {
     paths = { ...paths }
@@ -962,6 +970,8 @@ export async function publishNativeLocalFirstIdentity(
         ),
       (old) => firstIdentityEntry(old, publication),
       publication,
+      undefined,
+      hooks,
     )
   } catch (error) {
     if (error instanceof NativeRuntimeError) throw error
@@ -1003,6 +1013,7 @@ function knownValidationEntry(
 export async function publishNativeLocalCredentialValidation(
   paths: NativePoolPaths,
   observation: NativeRefreshObservation,
+  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish'> = {},
 ): Promise<NativeRuntimeState> {
   try {
     paths = { ...paths }
@@ -1021,6 +1032,9 @@ export async function publishNativeLocalCredentialValidation(
       (material) =>
         nativeLocalCredentialValidationMatches(proof, proof.binding, material),
       (old) => knownValidationEntry(old, publication),
+      undefined,
+      undefined,
+      hooks,
     )
   } catch (error) {
     if (error instanceof NativeRuntimeError) throw error
@@ -1341,6 +1355,7 @@ export async function publishNativeLocalRefreshFailure(
   paths: NativePoolPaths,
   observation: NativeRefreshObservation,
   policy: NativeLocalFailurePolicy,
+  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish'> = {},
 ): Promise<NativeLocalFailurePublication> {
   let reason: NativeLocalFailureSupersededReason | undefined
   const superseded = (value: NativeLocalFailureSupersededReason): never => {
@@ -1474,6 +1489,7 @@ export async function publishNativeLocalRefreshFailure(
       },
       undefined,
       superseded,
+      hooks,
     )
     return { status: 'published', attribution, state }
   } catch (error) {
@@ -1503,6 +1519,7 @@ async function publishLocalEntry(
   replacement: (old: NativeRuntimeEntry | undefined) => NativeRuntimeEntry,
   firstIdentity?: FirstIdentityPublication,
   superseded?: (reason: 'row-binding' | 'row-credential') => never,
+  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish'> = {},
 ): Promise<NativeRuntimeState> {
   try {
     const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
@@ -1549,6 +1566,7 @@ async function publishLocalEntry(
                   await configLease.assertOwned()
                   await stateLease.assertOwned()
                 },
+                beforePublish: hooks.beforePublish,
               },
               firstIdentity,
             )

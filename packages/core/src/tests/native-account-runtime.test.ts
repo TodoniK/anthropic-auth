@@ -700,6 +700,7 @@ test('cross-process remove and readd same native route and UUID creates new Prim
   const service = createNativeLocalCredentialService({
     paths: f.paths,
     now: () => now,
+    publicationGuard: async () => true,
     externalPolicy: () => ({ status: 'allowed' }),
     failurePolicy: () => ({ checkedAt: now }),
     resolveIdentity: async () => {

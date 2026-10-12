@@ -246,6 +246,7 @@ function service(
   return module.createNativeLocalCredentialService({
     paths: f.paths,
     now: () => f.time,
+    publicationGuard: async () => true,
     externalPolicy: () => ({ status: 'allowed' }),
     failurePolicy: (input) => {
       f.failures.push(input)
@@ -1201,6 +1202,7 @@ test('service exposes only authorize and accepts only own data option properties
   const base: Record<string, unknown> = {
     paths: f.paths,
     now: () => f.time,
+    publicationGuard: async () => true,
     externalPolicy: () => ({ status: 'allowed' }),
     failurePolicy: () => ({ checkedAt: 0 }),
     refreshToken: async () => {
@@ -1218,8 +1220,10 @@ test('service exposes only authorize and accepts only own data option properties
     ])
   expect(() => create(base)).not.toThrow()
   for (const [label, options] of [
+    ['missing publication guard', { ...base, publicationGuard: undefined }],
     ['missing external policy', { ...base, externalPolicy: undefined }],
     ['missing failure policy', { ...base, failurePolicy: undefined }],
+    ['non-function publication guard', { ...base, publicationGuard: true }],
     ['non-function now', { ...base, now: 5 }],
     ['replaceable reconciliation', { ...base, reconcile: async () => {} }],
     ['replaceable admission', { ...base, readAdmission: async () => {} }],
@@ -1227,6 +1231,13 @@ test('service exposes only authorize and accepts only own data option properties
     [
       'incomplete paths',
       { ...base, paths: { ...f.paths, runtime: undefined } },
+    ],
+    [
+      'getter publication guard',
+      Object.defineProperty({ ...base }, 'publicationGuard', {
+        enumerable: true,
+        get: () => async () => true,
+      }),
     ],
     [
       'getter failure policy',
@@ -1276,21 +1287,21 @@ const guardBreaks: Array<{
   {
     guard: 'first-identity predecessor selection',
     scenario: firstIdentityScenario,
-    from: 'if (predecessor && predecessor.identity === undefined)',
-    to: 'if (false)',
+    from: 'predecessor && predecessor.identity === undefined',
+    to: 'false',
     assertion: 'first-identity repair serves validated access',
   },
   {
     guard: 'known predecessor selection',
     scenario: knownRotationScenario,
-    from: 'if (predecessor && predecessor.identity === undefined)',
-    to: 'if (predecessor)',
+    from: 'predecessor && predecessor.identity === undefined',
+    to: 'predecessor',
     assertion: 'known rotation preserves metadata and records proof',
   },
   {
     guard: 'failure publisher dispatch',
     scenario: invalidGrantScenario,
-    from: '    await publishNativeLocalRefreshFailure(paths, event, policy)\n',
+    from: '    await publish(event, (hooks) =>\n      publishNativeLocalRefreshFailure(paths, event, policy, hooks),\n    )\n',
     to: '',
     assertion: 'invalid grant is reported and recorded as permanent',
   },
