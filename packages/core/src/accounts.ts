@@ -4546,12 +4546,11 @@ export class FallbackAccountManager {
         if (
           canUseCachedQuotaAfterRefreshError(next, storage, error, this.now())
         ) {
+          // The refresh error can carry provider response text; the
+          // account id identifies the fallback without echoing it.
           log(
             '[refresh] fallback quota using cached quota after refresh error',
-            {
-              accountId: next.id,
-              error: formatErrorMessage(error),
-            },
+            { accountId: next.id },
           )
           if (
             this.accountPassesQuotaPolicy(
@@ -4669,9 +4668,10 @@ export class FallbackAccountManager {
         await this.refreshAccount(account, storage)
         changed = true
       } catch (error) {
+        // The refresh error can carry provider response text and is kept
+        // only in the account's recorded refresh error, not in the log.
         logger.warn('refresh', 'fallback oauth background failed', {
           accountId: account.id,
-          error: error instanceof Error ? error.message : String(error),
         })
         recordRefreshError(account, error, this.now())
         updateStoredAccount(storage, account)

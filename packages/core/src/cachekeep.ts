@@ -16,6 +16,11 @@ export const CACHE_KEEP_PREWARM_TIMEOUT_MS = 30_000
 export const CACHE_KEEP_RETRY_BASE_MS = 60_000
 export const CACHE_KEEP_RETRY_MAX_MS = 15 * 60_000
 export const CACHE_KEEP_RETRY_JITTER_MAX_MS = 30_000
+// Fixed text returned when no credential headers can be prepared for a
+// prewarm. Among retryable prewarm failures it is the only reason that is not
+// provider or exception text, so it is the only one logged verbatim.
+const CACHE_KEEP_CREDENTIAL_UNAVAILABLE_REASON =
+  'OAuth cache prewarm credential is unavailable'
 
 const STATUS_TITLE = '## Claude Cache Keep Status'
 const ENABLED_TITLE = '## Claude Cache Keep Enabled'
@@ -427,10 +432,10 @@ export class CacheKeepManager {
     logger.debug('cachekeep', 'started')
     this.timer = (this.options.setIntervalImpl ?? globalThis.setInterval)(
       () => {
-        void this.tick().catch((error) => {
-          logger.warn('cachekeep', 'tick failed', {
-            error: error instanceof Error ? error.message : String(error),
-          })
+        // The caught value can carry provider or peer text, so only the fixed
+        // stage name is logged.
+        void this.tick().catch(() => {
+          logger.warn('cachekeep', 'tick failed')
         })
       },
       CACHE_KEEP_TICK_MS,
@@ -487,15 +492,12 @@ export class CacheKeepManager {
     const callback = this.options.onTrackedSessionsChanged
     if (!callback) return
     try {
-      void Promise.resolve(callback(this.trackedSessions())).catch((error) => {
-        logger.warn('cachekeep', 'failed to publish tracked sessions', {
-          error: error instanceof Error ? error.message : String(error),
-        })
+      // Host callback failures may echo arbitrary text; log the stage only.
+      void Promise.resolve(callback(this.trackedSessions())).catch(() => {
+        logger.warn('cachekeep', 'failed to publish tracked sessions')
       })
-    } catch (error) {
-      logger.warn('cachekeep', 'failed to publish tracked sessions', {
-        error: error instanceof Error ? error.message : String(error),
-      })
+    } catch {
+      logger.warn('cachekeep', 'failed to publish tracked sessions')
     }
   }
 
@@ -656,11 +658,8 @@ export class CacheKeepManager {
       if (target.nextPrewarmAt > now) continue
       try {
         await this.prewarm(target, now)
-      } catch (error) {
-        logger.warn('cachekeep', 'prewarm failed', {
-          session: target.id,
-          reason: error instanceof Error ? error.message : String(error),
-        })
+      } catch {
+        logger.warn('cachekeep', 'prewarm failed', { session: target.id })
         target.consecutiveFailures += 1
         target.nextPrewarmAt =
           now + cacheKeepRetryDelayMs(target.id, target.consecutiveFailures)
@@ -683,10 +682,9 @@ export class CacheKeepManager {
       if (this.options.prepareBody) {
         try {
           bodyText = await this.options.prepareBody(bodyText, target)
-        } catch (error) {
+        } catch {
           logger.warn('cachekeep', 'prepare body failed', {
             session: target.id,
-            error: error instanceof Error ? error.message : String(error),
           })
         }
       }
@@ -706,7 +704,7 @@ export class CacheKeepManager {
       if (!headers) {
         return {
           ok: false,
-          reason: 'OAuth cache prewarm credential is unavailable',
+          reason: CACHE_KEEP_CREDENTIAL_UNAVAILABLE_REASON,
           transient: true,
         }
       }
@@ -785,11 +783,8 @@ export class CacheKeepManager {
           status: response.status,
           message: data,
         })
-      } catch (error) {
-        logger.debug('cachekeep', 'dump failed', {
-          session: target.id,
-          error: error instanceof Error ? error.message : String(error),
-        })
+      } catch {
+        logger.debug('cachekeep', 'dump failed', { session: target.id })
       }
       if (!response.ok) {
         return {
@@ -827,10 +822,17 @@ export class CacheKeepManager {
         })
         this.targets.delete(target.id)
       } else {
+        // A failed result's reason may be the raw provider response body or a
+        // transport exception message, so only the fixed credential reason
+        // is copied into the log; everything else is described by status and
+        // the transient flag.
         logger.warn('cachekeep', 'prewarm failed', {
           session: target.id,
           status: result.status,
-          reason: result.reason,
+          ...(result.transient && { transient: true }),
+          ...(result.reason === CACHE_KEEP_CREDENTIAL_UNAVAILABLE_REASON && {
+            reason: result.reason,
+          }),
         })
         target.consecutiveFailures += 1
         target.nextPrewarmAt =

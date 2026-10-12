@@ -599,10 +599,9 @@ export class PrimeManager {
     this.stopped = false
     logger.trace('prime', 'manager started')
     this.timer = this.setIntervalImpl(() => {
-      void this.tick().catch((error) => {
-        logger.warn('prime', 'tick failed', {
-          error: error instanceof Error ? error.message : String(error),
-        })
+      // Caught values can carry provider or host text; log the stage only.
+      void this.tick().catch(() => {
+        logger.warn('prime', 'tick failed')
       })
     }, PRIME_TICK_MS)
     if (typeof this.timer === 'object' && 'unref' in this.timer) {
@@ -787,12 +786,9 @@ export class PrimeManager {
       let refreshed: PrimeRefreshResult
       try {
         refreshed = await this.options.refreshQuota(evaluation.id)
-      } catch (error) {
+      } catch {
         // Quota fresh-check failure: skip this tick without consuming a claim.
-        logger.warn('prime', 'refresh failed', {
-          account: evaluation.label,
-          error: error instanceof Error ? error.message : String(error),
-        })
+        logger.warn('prime', 'refresh failed', { account: evaluation.label })
         return
       }
       // Re-check stop + persist opt-in after every await boundary so
@@ -875,10 +871,9 @@ export class PrimeManager {
       }
 
       await this.fire(evaluation, now, postClaimStorage)
-    } catch (error) {
+    } catch {
       logger.warn('prime', 'account evaluation failed', {
         account: evaluation.label,
-        error: error instanceof Error ? error.message : String(error),
       })
     }
   }
@@ -943,12 +938,8 @@ export class PrimeManager {
     let result: PrimeSendResult
     try {
       result = await this.options.sendPrime(evaluation.id)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      logger.warn('prime', 'prime fire threw', {
-        account: evaluation.label,
-        error: message,
-      })
+    } catch {
+      logger.warn('prime', 'prime fire threw', { account: evaluation.label })
       this.transient.set(evaluation.id, {
         lastPrimedAt: now,
         lastResult: 'error',
@@ -963,10 +954,12 @@ export class PrimeManager {
       //   before the request fires (reason: 'token-refresh').
       // - `prime fire failed` — HTTP error / fetch throw /
       //   identity failure during the request (reason: 'send').
+      // `result.error` is free text from the sender and may hold a provider
+      // response body, so the logs carry only the fixed reason and status.
       if (result.reason === 'token-refresh') {
         logger.warn('prime', 'prime token refresh failed', {
           account: evaluation.label,
-          error: result.error,
+          reason: 'token-refresh',
         })
       } else if (result.reason === 'vault-cold') {
         logger.debug('prime', 'prime vault credential cold', {
@@ -977,7 +970,7 @@ export class PrimeManager {
         logger.warn('prime', 'prime fire failed', {
           account: evaluation.label,
           status: result.status,
-          error: result.error,
+          reason: 'send',
         })
       }
       this.transient.set(evaluation.id, {
@@ -1015,12 +1008,12 @@ export class PrimeManager {
         },
       })
       this.schedulePostFireRefresh(evaluation)
-    } catch (error) {
-      // Persisting counters failed; surface the error but keep the marker so
-      // the cycle counts as attempted. Operator can retry next reset epoch.
+    } catch {
+      // Persisting usage counters failed. Log the failed step, but keep the
+      // claim marker file so this quota window still counts as attempted;
+      // the next prime happens after the next five-hour reset.
       logger.warn('prime', 'recordSuccess failed', {
         account: evaluation.label,
-        error: error instanceof Error ? error.message : String(error),
       })
       this.transient.set(evaluation.id, {
         lastPrimedAt: now,
@@ -1040,10 +1033,9 @@ export class PrimeManager {
         const storage = await this.options.loadStorage()
         if (this.stopped || storage?.prime?.enabled !== true) return
         await this.options.refreshQuota(evaluation.id)
-      })().catch((error) => {
+      })().catch(() => {
         logger.debug('prime', 'post-fire refresh failed', {
           account: evaluation.label,
-          error: error instanceof Error ? error.message : String(error),
         })
       })
     }, PRIME_POST_FIRE_REFRESH_MS)

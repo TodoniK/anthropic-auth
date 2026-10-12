@@ -542,10 +542,8 @@ function parseBody(bodyText: string): Record<string, unknown> | null {
       !Array.isArray(parsed)
       ? parsed
       : null
-  } catch (error) {
-    relayLog(
-      `dump body parse failed: ${error instanceof Error ? error.message : String(error)}`,
-    )
+  } catch {
+    relayLog('dump body parse failed')
     return null
   }
 }
@@ -698,10 +696,10 @@ async function dumpRequest(input: {
     relayLog(
       `dumped request id=${id} session=${shortAffinity(affinity)} body=${files.body} meta=${files.metadata}`,
     )
-  } catch (error) {
-    relayLog(
-      `dump failed: ${error instanceof Error ? error.message : String(error)}`,
-    )
+  } catch {
+    // Filesystem errors echo caller-controlled paths; log the stage and the
+    // shortened session id only.
+    relayLog(`dump failed session=${shortAffinity(affinity)}`)
     return null
   }
   return {
@@ -798,9 +796,7 @@ export async function dumpResponseArtifact(
       handle.responsePath,
       `${JSON.stringify(artifact, null, 2)}\n`,
     )
-  } catch (error) {
-    relayLog(
-      `dump response failed: ${error instanceof Error ? error.message : String(error)}`,
-    )
+  } catch {
+    relayLog(`dump response failed status=${input.status}`)
   }
 }

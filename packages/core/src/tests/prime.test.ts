@@ -2250,13 +2250,13 @@ describe('PrimeManager — logging', () => {
     )
     expect(tokenRefreshWarns).toHaveLength(1)
     const payload = tokenRefreshWarns[0]?.payload as
-      | { account?: string; error?: string }
+      | { account?: string; error?: string; reason?: string }
       | undefined
     expect(payload?.account).toBe('work-alt')
-    expect(payload?.error).toBe('main refresh failed')
+    expect(payload?.error).toBeUndefined()
+    expect(payload?.reason).toBe('token-refresh')
 
-    // The generic `prime fire failed` must NOT fire for a token-refresh
-    // failure — the two events are distinct in the spec Logging table.
+    // Refresh failures and request failures produce distinct log events.
     const fireFailedWarns = capturedPrimeSink.filter(
       (r) =>
         r.channel === 'prime' &&
@@ -2378,15 +2378,16 @@ describe('PrimeManager — logging', () => {
     expect(mainFire?.usage?.inputTokens).toBe(20)
     expect(mainFire?.usage?.outputTokens).toBe(1)
 
-    // -- work-alt: fire failed → warn, label, status, error --
+    // -- work-alt: failure keeps label, status and the fixed send reason --
     const failed = prime('prime fire failed')
     expect(failed).toHaveLength(1)
     const fbFail = pick(failed, 'work-alt') as
-      | { account: string; status?: number; error: string }
+      | { account: string; status?: number; error?: string; reason?: string }
       | undefined
     expect(fbFail).toBeDefined()
     expect(fbFail?.status).toBe(500)
-    expect(fbFail?.error).toBe('fire_failure')
+    expect(fbFail?.error).toBeUndefined()
+    expect(fbFail?.reason).toBe('send')
 
     // -- apikey-acc: eligibility skip → debug, label, reason --
     const ineligible = prime('ineligible')
