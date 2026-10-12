@@ -67,6 +67,15 @@ export function createNativePrime(options: {
         }
         let status: number | undefined
         let delivered = false
+        let discarded = false
+        // Prime never reads an error body it does not classify. Cancelling the
+        // adapter's response body retires this send's credentials before the
+        // cancel reaches the connection, so Prime does not wait for the
+        // connection to close.
+        const discard = (response: Response) => {
+          discarded = true
+          void response.body?.cancel().catch(() => {})
+        }
         try {
           const request = await native.adapter.rewriteRequest?.({
             ...scope,
@@ -86,7 +95,19 @@ export function createNativePrime(options: {
             else headers.set(name, value)
           }
           const final = new Request(request, { headers })
-          const response = await (options.fetch ?? fetch)(final)
+          const physical = await (options.fetch ?? fetch)(final)
+          // Rewrite each physical response before Prime reads it. The native
+          // adapter scrubs error metadata and bodies with the sent credentials
+          // and applies Core's 1 MiB error-body limit. Quota classification and
+          // usage handling consume only this rewritten response.
+          const response =
+            (await native.adapter.rewriteResponse?.({
+              ...scope,
+              accountId,
+              request: final,
+              response: physical,
+              attempt,
+            })) ?? physical
           status = response.status
           native.adapter.quotaFromHeaders?.(
             response.headers,
@@ -106,7 +127,7 @@ export function createNativePrime(options: {
             /^(vault-newer|local-newer|relay-direct):/.test(limit.reason) &&
             index < 2
           ) {
-            await response.body?.cancel()
+            discard(response)
             const next = await source.chooseAccount({
               ...scope,
               rerouteFrom: { accountId, limit },
@@ -115,13 +136,15 @@ export function createNativePrime(options: {
               throw new Error('Native Prime retry changed account')
             continue
           }
-          if (!response.ok)
+          if (!response.ok) {
+            discard(response)
             return {
               ok: false,
               status,
               ms: performance.now() - started,
               error: 'Native Prime upstream refused the request',
             }
+          }
           const data = record(await response.json())
           const usage = record(data.usage)
           const delta = {
@@ -160,7 +183,18 @@ export function createNativePrime(options: {
           await native.adapter.onAttemptEnd?.(attempt, {
             status,
             outputStarted: false,
-            ...(delivered ? {} : { error: { reason: 'failed' as const } }),
+            // Prime will not read a discarded body. Mark its send cancelled
+            // so the native adapter releases its credentials, even if the
+            // connection's cancellation is still pending.
+            ...(delivered
+              ? {}
+              : {
+                  error: {
+                    reason: discarded
+                      ? ('cancelled' as const)
+                      : ('failed' as const),
+                  },
+                }),
           })
         }
       }
