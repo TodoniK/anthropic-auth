@@ -2,6 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- Core is now an internal package of the OpenCode and Pi hosts, apart from the public, stable identity, header, billing and signing APIs documented in its README. Remove legacy sidecar loader/writer and pre-native scoped-runtime exports and their dedicated tests; preserve offline migration and vault-seed readers. This cleanup ships with the next user-facing release; package versions are unchanged.
+- Share native settings section updates and the operation that removes CacheKeep's previous hour limits when selecting an always-on keep-warm schedule, without changing host command behavior.
+
 ## 2.0.0
 
 ### Breaking Changes

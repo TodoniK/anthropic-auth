@@ -5,8 +5,6 @@ import { join } from 'node:path'
 import {
   getClaustrumMode,
   getHostClaustrumEnrollmentPaths,
-  loadAccounts,
-  saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 import { createPiCustodyCommands } from '../custody.ts'
 
@@ -99,3 +97,8 @@ test('terminal enrollment reset is local, locked and independent of daemon avail
   expect((await f.commands.reset()).text).toContain('cleared')
   expect(await f.commands.status()).toEqual({ state: 'idle' })
 })
+
+import {
+  loadAccounts,
+  saveAccounts,
+} from '../../../core/src/tests/legacy-account-fixture.ts'

@@ -3,13 +3,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import {
-  type AccountStorage,
-  FallbackAccountManager,
-  loadAccounts,
-  type OAuthAccount,
-  saveAccounts,
-} from '../accounts.ts'
+import type { AccountStorage } from '../accounts.ts'
 import { CacheKeepManager } from '../cachekeep.ts'
 import {
   __setLogTestSink,
@@ -495,43 +489,6 @@ test('Prime caught exceptions log fixed stages with the account label only', asy
 
 // -- Fallback accounts -------------------------------------------------------
 
-test('fallback OAuth background refresh failure logs the account id, not the provider body', async () => {
-  const logs = captureLogs()
-  const root = await tempRoot('accounts-log-')
-  const configPath = join(root, 'anthropic-auth.json')
-  const account: OAuthAccount = {
-    id: 'fallback-a',
-    type: 'oauth',
-    enabled: true,
-    access: 'synthetic-expired-access',
-    refresh: 'synthetic-refresh',
-    expires: 1,
-  }
-  await saveAccounts({ version: 1, accounts: [account] }, configPath)
-  const outbound: string[] = []
-  const manager = new FallbackAccountManager({
-    configPath,
-    fetchImpl: fakeFetch(async (input) => {
-      outbound.push(String(input))
-      return new Response(echoBody, { status: 400 })
-    }),
-  })
-
-  await manager.refreshDueAccounts()
-
-  expect(outbound).toHaveLength(1)
-  expect(
-    logs
-      .find('refresh', 'fallback oauth background failed')
-      .map((r) => r.payload),
-  ).toEqual([{ accountId: 'fallback-a' }])
-  expectNoEcho(JSON.stringify(logs.records))
-  // The account still stores the refresh error (status 400) for later status
-  // reporting; only the log omits the provider body.
-  const stored = (await loadAccounts(configPath))?.accounts[0]
-  expect(stored).toMatchObject({ lastRefreshError: { status: 400 } })
-})
-
 // -- Owned child processes ---------------------------------------------------
 
 type ChildOwner = Pick<TestLifetime, 'gate' | 'trackDetached' | 'deferCleanup'>
@@ -683,7 +640,7 @@ test('dump and cached-quota diagnostics written by a production logger omit raw 
   const json = (value: unknown) => JSON.stringify(value)
   const script = `
     const dump = await import(${moduleHref('../dump.ts')})
-    const accounts = await import(${moduleHref('../accounts.ts')})
+    const { log } = await import(${moduleHref('../logger.ts')})
     dump.setDumpEnabled(true)
     process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = ${json(join(blockedParent, 'dumps'))}
     const blocked = await dump.dumpDirectRequest({
@@ -714,13 +671,10 @@ test('dump and cached-quota diagnostics written by a production logger omit raw 
         quota: { five_hour: window, seven_day: window },
       }],
     }
-    const configPath = ${json(join(root, 'anthropic-auth.json'))}
-    await accounts.saveAccounts(storage, configPath)
-    const manager = new accounts.FallbackAccountManager({
-      configPath,
-      fetchImpl: async () => new Response(${json(echoBody)}, { status: 429 }),
-    })
-    const usable = await manager.getUsableFallbackAccounts(storage)
+    // The cached-quota producer was retired. Preserve its archived diagnostic as
+    // input to the real production logger, not as a claim about account routing.
+    log('[refresh] fallback quota using cached quota after refresh error', { accountId: storage.accounts[0].id })
+    const usable = storage.accounts
     console.log(JSON.stringify({
       blocked: blocked === null,
       written: written !== null,

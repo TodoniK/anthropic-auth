@@ -36,12 +36,6 @@ import {
 } from './stream.ts'
 import { fetchPiOAuth } from './transport.ts'
 
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {}
-}
-
 export function createPiNativeCommands(
   storagePath = getPiAccountStoragePath(),
 ): PiNativeCommands {
@@ -52,10 +46,9 @@ export function createPiNativeCommands(
     { authorization: Awaited<ReturnType<typeof authorize>>; expires: number }
   >()
   const setSection = async (key: string, patch: Record<string, unknown>) => {
-    await (await native.service()).updateSettings((settings) => ({
-      ...settings,
-      [key]: { ...record(settings[key]), ...patch },
-    }))
+    await (await native.service()).updateSettings((settings) =>
+      mergeNativeSettingsSection(settings, key, patch),
+    )
   }
   const setLimits = async (entries: readonly NativeMenuKillswitchEntry[]) => {
     const snapshot = await native.view()
@@ -268,17 +261,7 @@ export function createPiNativeCommands(
         await setSection('claudeCache', { mode: request.values.mode })
         return { ok: true, text: 'Native prompt cache mode updated.' }
       case 'cachekeep-always':
-        await runtime.updateSettings((settings) => {
-          const {
-            startHour: _start,
-            endHour: _end,
-            ...keep
-          } = record(settings.cacheKeep)
-          return {
-            ...settings,
-            cacheKeep: { ...keep, enabled: true, always: true },
-          }
-        })
+        await runtime.updateSettings(nativeCacheKeepAlways)
         return { ok: true, text: 'Native CacheKeep is always enabled.' }
       case 'cachekeep-off':
         await setSection('cacheKeep', { enabled: false })
@@ -397,3 +380,9 @@ export function createPiNativeCommands(
     },
   }
 }
+
+import {
+  mergeNativeSettingsSection,
+  nativeCacheKeepAlways,
+  nativeSettingsRecord as record,
+} from '@cortexkit/anthropic-auth-core'

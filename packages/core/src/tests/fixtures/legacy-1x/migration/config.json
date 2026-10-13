@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "mainAccountId": "00000000-0000-4000-8000-000000000001",
+  "main": {
+    "type": "opencode",
+    "provider": "anthropic"
+  },
+  "quota": {
+    "enabled": true
+  },
+  "cacheKeep": {
+    "enabled": true,
+    "startHour": 9,
+    "endHour": 23,
+    "subagents": true
+  },
+  "prime": {
+    "enabled": true
+  },
+  "accounts": [
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "label": "work",
+      "type": "oauth",
+      "enabled": true,
+      "addedAt": 1700000000000
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "label": "proxy",
+      "type": "api",
+      "enabled": true,
+      "addedAt": 1700000000000,
+      "baseURL": "https://api.anthropic.com",
+      "authHeader": "x-api-key"
+    }
+  ]
+}

@@ -1377,26 +1377,10 @@ const anthropicAuthPlugin = async (
       | 'killswitch',
     patch: Record<string, unknown>,
   ) {
-    await nativeAccounts.updateSettings((settings) => {
-      const previous = settings[section]
-      return {
-        ...settings,
-        [section]: {
-          ...(previous &&
-          typeof previous === 'object' &&
-          !Array.isArray(previous)
-            ? previous
-            : {}),
-          ...patch,
-        },
-      }
-    })
+    await nativeAccounts.updateSettings((settings) =>
+      mergeNativeSettingsSection(settings, section, patch),
+    )
     return loadAccounts()
-  }
-  function plainSettingsSection(value: unknown): Record<string, unknown> {
-    return value && typeof value === 'object' && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : {}
   }
   // Turning the cache on or off also records the effective strategy, as the
   // standalone cache command always did: a pool without a stored mode is
@@ -1425,17 +1409,7 @@ const anthropicAuthPlugin = async (
   // startHour/endHour behind would revive that window as soon as anything
   // reads the hours without first checking `always`.
   const setCacheKeepPersistentAlways = async () => {
-    await nativeAccounts.updateSettings((settings) => {
-      const {
-        startHour: _startHour,
-        endHour: _endHour,
-        ...rest
-      } = plainSettingsSection(settings.cacheKeep)
-      return {
-        ...settings,
-        cacheKeep: { ...rest, enabled: true, always: true },
-      }
-    })
+    await nativeAccounts.updateSettings(nativeCacheKeepAlways)
     return loadAccounts()
   }
   const setCacheKeepPersistentWindow = (startHour: number, endHour: number) =>
@@ -9771,3 +9745,9 @@ const anthropicAuthPlugin = async (
 }
 
 export const AnthropicAuthPlugin: Plugin = anthropicAuthPlugin
+
+import {
+  mergeNativeSettingsSection,
+  nativeCacheKeepAlways,
+  nativeSettingsRecord as plainSettingsSection,
+} from '@cortexkit/anthropic-auth-core'

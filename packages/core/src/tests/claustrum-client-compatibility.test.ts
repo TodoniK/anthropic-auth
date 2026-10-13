@@ -15,10 +15,11 @@ import type {
   ClaustrumScopedClient as CommonAuthScopedClient,
 } from '@cortexkit/common-auth/claustrum'
 import type { ClaustrumEnrollmentClient } from '../claustrum-enrollment.ts'
-import type {
-  ClaustrumScopedAttempt,
-  ClaustrumScopedClient,
-} from '../claustrum-scoped.ts'
+
+type ClaustrumScopedClient = Pick<
+  ClaustrumClient,
+  'listScoped' | 'getScoped' | 'reportAuthFailureScoped' | 'close'
+>
 
 type Assert<T extends true> = T
 type Equal<Actual, Expected> = [Actual] extends [Expected]
@@ -79,20 +80,6 @@ const producerContract: [
     Equal<
       ScopedInventoryRow['authMethod'],
       'apikey' | 'chatgpt' | 'antigravity' | 'oauth' | undefined
-    >
-  >,
-  Assert<
-    Equal<
-      Pick<
-        ClaustrumScopedAttempt,
-        'credentialId' | 'accountId' | 'recordVersion' | 'expiresAtMs'
-      >,
-      {
-        readonly credentialId: string
-        readonly accountId: string
-        readonly recordVersion: number
-        readonly expiresAtMs: number
-      }
     >
   >,
   Assert<
@@ -167,7 +154,6 @@ const producerContract: [
   >,
   Assert<Equal<ClaustrumEnrollmentClient, CommonAuthEnrollmentClient>>,
 ] = [
-  true,
   true,
   true,
   true,

@@ -19,15 +19,11 @@ import {
 // relative `./logger.ts` path) reach the test capture array. The dist logger
 // instance is the package-alias target used by other tests; both must be
 // wired to keep sink assertions consistent across runs.
-import {
-  type AccountStorage,
-  getOrCreateMainAccountId,
-  getOrCreatePrimeAuthLineageId,
-  loadAccounts,
-  type OAuthAccount,
-  type OAuthQuotaSnapshot,
-  type PrimeUsageCounters,
-  saveAccountState,
+import type {
+  AccountStorage,
+  OAuthAccount,
+  OAuthQuotaSnapshot,
+  PrimeUsageCounters,
 } from '../accounts.ts'
 import {
   __setLogTestSink as __setLogTestSinkSource,
@@ -457,55 +453,6 @@ afterEach(async () => {
   if (markerRoot) {
     await rm(markerRoot, { recursive: true, force: true }).catch(() => {})
   }
-})
-
-describe('Prime main identity lineage', () => {
-  test('main identity stays stable across refresh token rotation', async () => {
-    const storagePath = join(markerRoot, 'accounts.json')
-    const mainAccountId = await getOrCreateMainAccountId(
-      storagePath,
-      () => 'main-stable-identity',
-    )
-
-    await saveAccountState(
-      {
-        version: 1,
-        main: { type: 'opencode', provider: 'anthropic' },
-        accounts: [],
-        mainAccountId,
-        prime: {
-          mainAuthLineageRefreshTokenFingerprint: 'refresh-before-rotation',
-        },
-      },
-      storagePath,
-      { mainPrime: true },
-    )
-
-    const beforeRotation = await getOrCreatePrimeAuthLineageId(
-      'main',
-      storagePath,
-    )
-
-    const persisted = await loadAccounts(storagePath)
-    expect(persisted?.prime?.mainAuthLineageId).toBe(beforeRotation)
-    await saveAccountState(
-      {
-        ...persisted!,
-        prime: {
-          ...persisted?.prime,
-          mainAuthLineageRefreshTokenFingerprint: 'refresh-after-rotation',
-        },
-      },
-      storagePath,
-      { mainPrime: true },
-    )
-
-    expect(mainAccountId).toBe('main-stable-identity')
-    expect(beforeRotation).toBe('main-stable-identity')
-    expect(await getOrCreatePrimeAuthLineageId('main', storagePath)).toBe(
-      beforeRotation,
-    )
-  })
 })
 
 describe('PrimeManager — due boundary', () => {

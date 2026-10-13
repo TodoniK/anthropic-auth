@@ -7,9 +7,6 @@ export * from './cch.ts'
 export * from './claude-code.ts'
 export * from './claustrum.ts'
 export * from './claustrum-enrollment.ts'
-export * from './claustrum-scoped.ts'
-export * from './claustrum-scoped-roster.ts'
-export * from './claustrum-scoped-runtime.ts'
 export * from './commands/account.ts'
 export * from './constants.ts'
 export * from './custom-headers.ts'
@@ -150,6 +147,7 @@ export type {
   NativeLocalFailureSkipReason,
 } from './native-runtime.ts'
 export { nativeRuntimeOptionIdentity } from './native-runtime-registry.ts'
+export * from './native-settings.ts'
 export {
   isNativeTransientAccountError,
   NativeTransientAccountError,

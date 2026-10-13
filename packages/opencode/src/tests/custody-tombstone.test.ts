@@ -5,22 +5,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   assertNotCustodyTombstone,
-  buildRefreshOperationError,
   CustodyTombstoneRefreshError,
   createNativeAccountRuntime,
   custodyTombstoneKey,
   custodyTombstoneOAuth,
-  FallbackAccountManager,
   fetchOAuthAccountProfile,
   fetchOAuthQuotaSnapshot,
-  getFallbackReauthLabels,
   isCustodyTombstoneOAuth,
-  isPermanentRefreshError,
-  loadAccounts,
   type NativeCustodyClient,
   refreshClaudeOAuthToken,
   resetClaudeCodeIdentityCachesForTest,
-  saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Auth,
@@ -360,24 +354,6 @@ function proMaxMethod(plugin: PluginHooks) {
   if (method?.type !== 'oauth')
     throw new Error('Plugin offers no Claude Pro/Max sign-in')
   return method
-}
-
-async function createTempStorage<T>(
-  storage: Record<string, unknown>,
-  callback: (path: string) => Promise<T>,
-): Promise<T> {
-  const directory = await mkdtemp(join(tmpdir(), 'anthropic-custody-test-'))
-  const path = join(directory, 'anthropic-auth.json')
-  const previous = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = path
-  try {
-    await saveAccounts(storage as never, path)
-    return await callback(path)
-  } finally {
-    if (previous === undefined) delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-    else process.env.OPENCODE_ANTHROPIC_AUTH_FILE = previous
-    await rm(directory, { recursive: true, force: true })
-  }
 }
 
 const livePlugins = new Set<Set<PluginHooks>>()
@@ -842,72 +818,6 @@ describe('Claustrum custody tombstones', () => {
       )
       expect(authorizeImpl).toHaveBeenCalledTimes(1)
       expect(outbound).toEqual([])
-    },
-  )
-
-  lifetimes.test(
-    'fallback refresh rejects the tombstone without network or refresh classification',
-    async () => {
-      const fetchCalls: string[] = []
-      const fetchImpl = mock((input: unknown) => {
-        fetchCalls.push(extractUrl(input as string | URL | Request))
-        return Promise.resolve(
-          new Response(JSON.stringify({ error: 'invalid_grant' }), {
-            status: 400,
-          }),
-        )
-      }) as unknown as typeof fetch
-      const account = {
-        id: 'fallback-tombstone',
-        type: 'oauth' as const,
-        access: 'expired-access',
-        refresh: oauthFixture.entry.refresh as string,
-        expires: 0,
-      }
-      const storage = {
-        version: 1,
-        main: { type: 'opencode', provider: oauthFixture.provider },
-        refresh: {
-          enabled: true,
-          intervalMinutes: 10,
-          refreshBeforeExpiryMinutes: 30,
-        },
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 0, seven_day: 0 },
-          failClosedOnUnknownQuota: false,
-        },
-        accounts: [account],
-      }
-
-      await createTempStorage(storage, async (path) => {
-        const manager = new FallbackAccountManager({
-          configPath: path,
-          fetchImpl,
-        })
-        const refreshError = await manager
-          .refreshAccount(account, storage as never)
-          .catch((error: unknown) => error)
-        expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
-        expect(refreshError).toBeInstanceOf(CustodyTombstoneRefreshError)
-        await manager.refreshDueAccounts()
-        await manager.refreshQuotaForDueAccounts()
-        const loaded = await loadAccounts(path)
-        expect(loaded?.accounts[0]?.type).toBe('oauth')
-        if (loaded?.accounts[0]?.type === 'oauth') {
-          expect(loaded.accounts[0].lastRefreshError).toBeUndefined()
-          expect(loaded.accounts[0].lastQuotaRefreshError).toBeUndefined()
-        }
-        expect(getFallbackReauthLabels(loaded)).toEqual([])
-        const classification = buildRefreshOperationError({
-          error: new CustodyTombstoneRefreshError(oauthFixture.provider),
-          now: 1,
-          accountIdentity: account.id,
-        })
-        expect(isPermanentRefreshError(classification)).toBe(false)
-        expect(classification.permanent).toBe(false)
-      })
     },
   )
 })

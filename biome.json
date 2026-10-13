@@ -20,6 +20,8 @@
     "includes": [
       "packages/*/src/**",
       "!packages/opencode/src/tests/fixtures/claustrum-golden",
+      "!packages/core/src/tests/fixtures/legacy-1x/*/config.json",
+      "!packages/core/src/tests/fixtures/legacy-1x/*/state.json",
       "!packages/opencode/src/tui-compiled",
       "packages/*/*.json",
       "packages/*/scripts/**",

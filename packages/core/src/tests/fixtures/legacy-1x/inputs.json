@@ -1,0 +1,71 @@
+[
+  { "name": "empty-pi", "storage": { "version": 1, "accounts": [] } },
+  {
+    "name": "migration",
+    "storage": {
+      "version": 1,
+      "mainAccountId": "00000000-0000-4000-8000-000000000001",
+      "main": {
+        "type": "opencode",
+        "provider": "anthropic",
+        "profile": {
+          "organizationType": "claude_max",
+          "rateLimitTier": "default_claude_max_5x",
+          "checkedAt": 1700000000000,
+          "tokenFingerprint": "fixture-main"
+        }
+      },
+      "quota": {
+        "enabled": true,
+        "mainQuota": {
+          "five_hour": {
+            "usedPercent": 10,
+            "remainingPercent": 90,
+            "checkedAt": 1700000000000
+          }
+        },
+        "mainQuotaToken": "fixture-main"
+      },
+      "prime": {
+        "enabled": true,
+        "mainAuthLineageId": "fixture-lineage",
+        "main": { "inputTokens": 20, "outputTokens": 1, "count": 1 }
+      },
+      "cacheKeep": {
+        "enabled": true,
+        "startHour": 9,
+        "endHour": 23,
+        "subagents": true
+      },
+      "accounts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "type": "oauth",
+          "label": "work",
+          "enabled": true,
+          "access": "synthetic-access",
+          "refresh": "synthetic-refresh",
+          "expires": 1700003600000,
+          "anthropicAccountUuid": "fixture-work",
+          "addedAt": 1700000000000
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "type": "api",
+          "label": "proxy",
+          "enabled": true,
+          "apiKey": "synthetic-key",
+          "baseURL": "https://api.anthropic.com",
+          "authHeader": "x-api-key",
+          "addedAt": 1700000000000
+        }
+      ]
+    },
+    "scope": {
+      "mainProfile": true,
+      "mainQuota": true,
+      "mainPrime": true,
+      "accounts": true
+    }
+  }
+]

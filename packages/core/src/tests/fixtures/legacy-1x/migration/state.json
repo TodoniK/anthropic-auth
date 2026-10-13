@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "main": {
+    "quota": {
+      "five_hour": {
+        "usedPercent": 10,
+        "remainingPercent": 90,
+        "checkedAt": 1700000000000
+      }
+    },
+    "quotaCheckedAt": 1700000000000,
+    "quotaToken": "fixture-main",
+    "profile": {
+      "organizationType": "claude_max",
+      "rateLimitTier": "default_claude_max_5x",
+      "checkedAt": 1700000000000,
+      "tokenFingerprint": "fixture-main"
+    },
+    "prime": {
+      "inputTokens": 20,
+      "outputTokens": 1,
+      "count": 1
+    },
+    "primeAuthLineageId": "fixture-lineage"
+  },
+  "accounts": {
+    "00000000-0000-4000-8000-000000000002": {
+      "anthropicAccountUuid": "fixture-work",
+      "access": "synthetic-access",
+      "refresh": "synthetic-refresh",
+      "expires": 1700003600000
+    },
+    "00000000-0000-4000-8000-000000000003": {
+      "apiKey": "synthetic-key"
+    }
+  }
+}

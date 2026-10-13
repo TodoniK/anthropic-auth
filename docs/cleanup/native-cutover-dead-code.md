@@ -241,3 +241,70 @@ above come from direct source comparison, not from a clone-score assumption.
   dependents, then full Core/OpenCode-offline/Pi suites, every typecheck, Pi
   dist-import guard and packed-type closure. Require comment review, fenced
   commits and a clean worktree. These Phase 2 gates are deferred until approval.
+
+## Phase 2 owner decisions and narrowly approved additions
+
+Core is internal to the hosts except the eight stable Synapse values listed in
+`packages/core/README.md` and pinned by `src/tests/export-manifest.test.ts`.
+There is no version bump. Conditional fixture removals are unblocked by a
+**test-only** archived serializer and checked-in npm-published 1.23.0 golden bytes;
+production never imports that serializer. Existing runtime assertions remain.
+The named `setKillswitchPersistent` test block accompanying that DELETE symbol
+is removed; neighboring killswitch policy/command tests remain.
+
+| Additional file/block | Evidence and retained coverage | Verdict |
+| --- | --- | --- |
+| OpenCode `accounts.test.ts` — `fallback quota polling` (baseline lines 579–644) | Constructs two retired managers and tests a custody-verification lock versus quota polling; a serializer cannot perform those operations. Owner explicitly approved removing only this additional legacy-only block. Native `quota-sweep.test.ts` tests serialized due sweeps (`a background sweep started during the held startup usage GET...`, baseline `:635`) and coalesced request reads (`:688`); Core `quota-dispatch.test.ts` tests physical dispatch pacing and lock losers (`:72`, `:121`). Those tests cover overlapping/duplicate polls, **not an asserted equivalent of the specific two-instance retired-manager verification/poll race**. | **delete** |
+| Core `claustrum-client-compatibility.test.ts` — retired Core receipt type-only tuple entry (baseline lines 84–97), matching `true` | Owner approved removing only the assertion about deleted Core-local `ClaustrumScopedAttempt.accountId`; all runtime and producer/common-auth client compatibility assertions stay. The live common-auth receipt has `assertedAccountIdentity`, already checked by `native-custody.test.ts`'s `actual served identity assertion` (`:217-228`), including receipt provenance checks elsewhere in that suite. No old receipt shim or new contract is introduced. | **delete** |
+
+The combined dump/cached-quota logging case remains. Its removed manager producer
+is represented by the archived diagnostic supplied to the **real** production
+logger; dump/error redaction and exact log assertions remain unchanged. It no
+longer claims to exercise retired manager account selection.
+
+`ARCHITECTURE.md` and `STRUCTURE.md` were present at the inventory commit and are
+updated in place; no compatibility documentation path was invented.
+
+| Additional file/block | Evidence and retained coverage | Verdict |
+| --- | --- | --- |
+| OpenCode `custody-tombstone.test.ts` — `fallback refresh rejects the tombstone without network or refresh classification` | Owner approved removal of only this parameterized legacy-manager case (pre-removal `:846-910`); neighboring native/plugin tombstone cases remain unchanged. Native coordinator regressions in `packages/core/src/tests/native-refresh-coordinator.test.ts:3898-3947` cover Anthropic, OpenAI and unrecognized-provider tombstone keys, before any provider request, with no failed observation or persisted error/backoff state. They exercise a bound native local row named `sentinel`; they are **not an end-to-end OpenCode fallback-route selection test**, so no route-equivalence claim is made. | **delete** |
+
+## Measured cleanup verification
+
+Pinned Bun 1.3.14, TypeScript 7.0.2; Core rebuilt before host gates. The offline
+OpenCode suite explicitly excludes the registry-installing
+`opencode2-e2e.test.ts`; no remote command requested network. The same offline
+selection was used for both measurements, with a 30-second test timeout.
+
+| Package | Before cleanup | After cleanup | Change |
+| --- | ---: | ---: | ---: |
+| Core | 1799 | 1737 | -62 (including eight new public-export and two golden-byte tests) |
+| OpenCode offline | 2130 | 2000 | -130 |
+| Pi | 280 | 280 | 0 |
+
+All remaining assertions passed. Fixture code alone now owns both config and
+state paths during retained accounts tests, preventing an ambient state override
+from another suite from contaminating migration/profile fixtures. The 1.23.0
+writer was installed in a local temporary directory and invoked once to generate
+the checked-in golden config/state bytes; the test-only serializer matches them.
+The Core/host/E2E/scripts type checks, Pi emitted-import guard and declaration
+closure passed. All 36 mutation catalogue fragments still exist unchanged, so
+no catalogue row was removed.
+
+The fresh **packed** consumer closure test cannot install its temporary dependency
+graph on the remote no-network runner. With owner approval, that test file ran
+unchanged locally using pinned Bun 1.3.14: seven tests passed, consumer TypeScript
+checked 379 files inside its fresh prefix, and Node 26.10.0 passed 18 packed
+runtime assertions without common-auth installed. Other gates stayed remote.
+
+Non-vacuity checks: neutralizing `CLAUDE_CODE_IDENTITY` at the actual barrel made
+only `stable public Core export: CLAUDE_CODE_IDENTITY` fail (other seven passed).
+A forbidden process-launch import in `native-custody.ts` made only the named
+custody source-dependency fence fail. Both temporary changes were staged-baseline
+mutations, then restored with empty unstaged diffs; neither ships.
+
+The fleet layout adjustment excludes edits to the moved feature/quota documents;
+those files were restored and are not part of this cleanup. The inventory stays
+at its explicitly approved `docs/cleanup/` delivery path for the owner to relocate
+at merge. The runtime/module documentation changes do not change the `docs/`
+directory-layout line.

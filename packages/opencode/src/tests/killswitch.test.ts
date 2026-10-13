@@ -12,11 +12,8 @@ import {
   isKillswitchEnabled,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
-  loadAccounts,
   type OAuthQuotaSnapshot,
   parseKillswitchCommandAction,
-  saveAccounts,
-  setKillswitchPersistent,
 } from '@cortexkit/anthropic-auth-core'
 
 import {
@@ -368,36 +365,6 @@ describe('killswitch config helpers', () => {
 // ---------------------------------------------------------------------------
 // setKillswitchPersistent
 // ---------------------------------------------------------------------------
-describe('setKillswitchPersistent', () => {
-  test('persists killswitch config to disk', async () => {
-    await saveAccounts(baseStorage(), accountPath)
-    await setKillswitchPersistent(
-      {
-        enabled: true,
-        main: { five_hour: 3, seven_day: 8 },
-        accounts: { 'work-alt': { five_hour: 5, seven_day: 10 } },
-      },
-      accountPath,
-    )
-
-    const loaded = await loadAccounts(accountPath)
-    expect(loaded?.killswitch?.enabled).toBe(true)
-    expect(loaded?.killswitch?.main?.five_hour).toBe(3)
-    expect(loaded?.killswitch?.accounts?.['work-alt']?.five_hour).toBe(5)
-  })
-
-  test('preserves existing storage fields', async () => {
-    const storage = baseStorage()
-    storage.claudeCache = { enabled: true, mode: 'hybrid' }
-    await saveAccounts(storage, accountPath)
-
-    await setKillswitchPersistent({ enabled: true }, accountPath)
-
-    const loaded = await loadAccounts(accountPath)
-    expect(loaded?.claudeCache?.enabled).toBe(true)
-    expect(loaded?.killswitch?.enabled).toBe(true)
-  })
-})
 
 // ---------------------------------------------------------------------------
 // executeKillswitchCommand

@@ -5,8 +5,8 @@ import { join } from 'node:path'
 const productionFiles = [
   '../custody-mode.ts',
   '../custody-dimensions.ts',
-  '../../../core/src/claustrum-scoped-runtime.ts',
-  '../../../core/src/claustrum-scoped-roster.ts',
+  '../../../core/src/native-custody.ts',
+  '../../../core/src/native-vault-runtime.ts',
   '../../../core/src/claustrum.ts',
   '../../../core/src/claustrum-enrollment.ts',
   '../../../core/src/commands/account.ts',

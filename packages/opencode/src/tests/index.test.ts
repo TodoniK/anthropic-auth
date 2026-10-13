@@ -47,7 +47,6 @@ import {
   isNativeLocalCredentialValidation,
   isOAuthAccount,
   type LogTestRecord,
-  loadAccounts,
   type NativeCustodyClient,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
@@ -58,8 +57,6 @@ import {
   resetClaudeCodeIdentityCachesForTest,
   resetDumpState,
   resetFastModeState,
-  saveAccountState,
-  saveAccounts,
   setLogLevel,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
   tokenFingerprint,
@@ -22690,3 +22687,9 @@ describe('claude-prime — warn dedup (R3)', () => {
     ).toHaveLength(0)
   })
 })
+
+import {
+  loadAccounts,
+  saveAccountState,
+  saveAccounts,
+} from '../../../core/src/tests/legacy-account-fixture.ts'
