@@ -200,7 +200,12 @@ async function fixture(
     close: () => {},
   }
   const connect = async () => client
-  const native = getPiNativeRuntime(path, { connect })
+  // Tests publish roster changes explicitly; a background poll would make
+  // discovery timing nondeterministic. One test below enables it on purpose.
+  const native = getPiNativeRuntime(path, {
+    connect,
+    vaultPoll: { intervalMs: 0 },
+  })
   const service = await native.service()
   const roster = await service.vault.refresh()
   await service.updateSettings((settings) => ({
@@ -232,6 +237,40 @@ async function fixture(
     native,
   }
 }
+
+test('Pi background vault poll adopts a main re-login while a fallback serves, with no request-time discovery', async () => {
+  const f = await fixture('main-first')
+  f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
+  f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+  const service = await f.native.service()
+  await service.vault.refresh()
+  // Two Pi runtimes for the same storage share one vault connection. The
+  // fixture's runtime was created with polling off; this second one turns the
+  // shared background poll on at a short interval for this test.
+  const polled = new PiNativeRuntime(f.path, {
+    connect: f.connect,
+    vaultPoll: { intervalMs: 20 },
+  })
+  deferCleanup(() => polled.close())
+  const requestRefresh = spyOn(service.vault, 'refresh')
+  deferCleanup(() => requestRefresh.mockRestore())
+  const mainState = async () =>
+    (await polled.requestView()).accounts.find(
+      (account) => account.credentialId === 'oauth:anthropic',
+    )?.state
+  // The 'work' account is active, so a request can be served without asking
+  // the vault for changes. The main account stays needs_reauth here until the
+  // background poll notices the re-login below.
+  expect(await mainState()).toBe('needs_reauth')
+  f.rows[0] = { ...f.rows[0]!, state: 'active' }
+  let state = await mainState()
+  while (state !== 'active') {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    state = await mainState()
+  }
+  expect(state).toBe('active')
+  expect(requestRefresh).toHaveBeenCalledTimes(0)
+})
 
 test('Pi same-key replacement drains its predecessor without closing the shared consumer', async () => {
   const f = await fixture()

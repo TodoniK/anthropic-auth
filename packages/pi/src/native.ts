@@ -15,6 +15,7 @@ import {
   type NativeLocalExternalPolicy,
   type NativePoolPaths,
   type NativeRefreshResult,
+  type NativeVaultWatch,
   nativeMigrationAuthorityPhase,
   nativeRuntimeOptionIdentity,
   quotaSnapshotHasStandardWindows,
@@ -124,18 +125,33 @@ export function isNativeMigrationRequired(error: unknown): error is Error {
 }
 
 /** Checks Pi host authentication and enrollment before delegating credential authorization and metadata writes to the shared account runtime. */
+/** How often Pi asks the vault for account changes, matching OpenCode's default. Model requests no longer rediscover a healthy roster, so this poll is how Pi notices a re-login or a newly added account. */
+export const PI_VAULT_POLL_INTERVAL_MS = 2000
+
+export interface PiVaultPollOptions {
+  /** 0 disables the poll. */
+  intervalMs: number
+  setInterval?: typeof globalThis.setInterval
+  clearInterval?: typeof globalThis.clearInterval
+}
+
 export class PiNativeRuntime {
   private readonly paths: Promise<NativePoolPaths>
   private readonly initialization: Promise<NativeAccountRuntime>
+  private vaultWatch: NativeVaultWatch | undefined
   private closed = false
   private closing: Promise<void> | undefined
   readonly usagePublications = createNativeUsagePublisher('native-auth')
 
   constructor(
     storagePath: string,
-    options: { connect?: () => Promise<NativeCustodyClient> } = {},
+    options: {
+      connect?: () => Promise<NativeCustodyClient>
+      vaultPoll?: PiVaultPollOptions
+    } = {},
   ) {
     const env = { ...process.env }
+    const poll = options.vaultPoll ?? { intervalMs: PI_VAULT_POLL_INTERVAL_MS }
     const identity = getPiClaustrumConnectionOptions(storagePath).identity
     this.paths = resolveNativePoolPaths(storagePath)
     this.initialization = this.paths.then((paths) => {
@@ -151,6 +167,18 @@ export class PiNativeRuntime {
         },
       })
       if (this.closed) runtime.close()
+      // Refresh returns at once while this host uses local accounts, so the
+      // poll costs one enrollment read per tick outside vault custody.
+      else if (poll.intervalMs > 0) {
+        this.vaultWatch = runtime.vault.watch({
+          intervalMs: poll.intervalMs,
+          setInterval: poll.setInterval,
+          clearInterval: poll.clearInterval,
+        })
+        // A failed first discovery must not surface as an unhandled rejection;
+        // the next poll or a request's bounded refresh retries it.
+        void this.vaultWatch.ready.catch(() => {})
+      }
       return runtime
     })
     // Initialization is lazy from the host's perspective; a path failure is
@@ -363,6 +391,7 @@ export class PiNativeRuntime {
 
   close(): Promise<void> {
     this.closed = true
+    this.vaultWatch?.close()
     this.closing ??= (async () => {
       await this.usagePublications.drain()
       await this.initialization.then(
@@ -376,7 +405,10 @@ export class PiNativeRuntime {
 
 export function getPiNativeRuntime(
   storagePath = getPiAccountStoragePath(),
-  options: { connect?: () => Promise<NativeCustodyClient> } = {},
+  options: {
+    connect?: () => Promise<NativeCustodyClient>
+    vaultPoll?: PiVaultPollOptions
+  } = {},
 ): PiNativeRuntime {
   const contextKey = runtimeCacheKey(storagePath)
   const key = JSON.stringify([

@@ -199,6 +199,8 @@ export {
 export type {
   NativeVaultRuntime,
   NativeVaultRuntimeOptions,
+  NativeVaultWatch,
+  NativeVaultWatchOptions,
 } from './native-vault-runtime.ts'
 export {
   acquireNativeVaultRuntime,
