@@ -8,8 +8,15 @@ packages/opencode/src/tui-compiled/
 # Local agent/dev state
 .opencode/
 .claude/
-.cortexkit/
 .pi/
+
+# Fleet layout: internal docs and tool state under .cortexkit/ stay out of git.
+# Only release notes, skills, rules and WORKER.md may be tracked there.
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
+!/.cortexkit/WORKER.md
 
 # Editor and OS metadata
 .DS_Store

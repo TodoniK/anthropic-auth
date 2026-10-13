@@ -52,5 +52,6 @@ jobs:
       - run: bun run test:e2e
         env:
           ANTHROPIC_AUTH_E2E_OPENCODE_CONFIG_DEPS: ${{ github.workspace }}/packages/e2e-tests/fixtures/opencode1-config-deps
+      - run: scripts/check-cortexkit-layout.sh
       - run: bun run format:check
       - run: bun run lint

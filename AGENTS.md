@@ -7,4 +7,4 @@ The `captures/` directory is for local system-prompt captures from Claude Code a
 - **Capture traffic**: `./scripts/capture-with-mitmproxy.sh -o <name>.flow -- <command>`
 - **Extract prompt**: `bun run extract <name>.flow -o captures/<tool>-v<version>.txt`
 
-See [captures/AGENTS.md](captures/AGENTS.md) for prerequisites, full workflow, and PII redaction rules.
+Prerequisites, the full workflow and PII redaction rules are in the local, untracked `.cortexkit/internal-docs/research/claude-code-prompt-captures.md`.
