@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  type AccountStorage,
   getClaustrumMode,
   getHostClaustrumEnrollmentPaths,
 } from '@cortexkit/anthropic-auth-core'
@@ -21,7 +22,11 @@ async function fixture() {
   const tokenPath = join(dir, 'token.json')
   process.env.PI_CODING_AGENT_DIR = dir
   process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
-  await saveAccounts({ version: 1, accounts: [] }, storagePath)
+  await writeLegacyAccountFiles(storagePath, {
+    version: 1,
+    main: { type: 'opencode', provider: 'anthropic' },
+    accounts: [],
+  })
   await writeFile(
     tokenPath,
     JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
@@ -42,9 +47,13 @@ test('custody mode commands give offline guidance without granting or changing a
   expect((await f.commands.transition('claustrum')).text).toContain(
     'offline setup',
   )
-  expect(getClaustrumMode(await loadAccounts(f.storagePath))).toBe('local')
+  expect(
+    getClaustrumMode(await readLegacyJson<AccountStorage>(f.storagePath)),
+  ).toBe('local')
   expect((await f.commands.transition('local')).text).toContain('offline setup')
-  expect(getClaustrumMode(await loadAccounts(f.storagePath))).toBe('local')
+  expect(
+    getClaustrumMode(await readLegacyJson<AccountStorage>(f.storagePath)),
+  ).toBe('local')
   expect(await readFile(f.storagePath, 'utf8')).toBe(before)
   expect(await readFile(f.tokenPath, 'utf8')).toBe(tokenBefore)
 })
@@ -73,7 +82,9 @@ test('offline custody guidance does not need a live vault preflight or reconfigu
   expect((await f.commands.transition('claustrum')).text).toContain(
     'offline setup',
   )
-  expect(getClaustrumMode(await loadAccounts(f.storagePath))).toBe('local')
+  expect(
+    getClaustrumMode(await readLegacyJson<AccountStorage>(f.storagePath)),
+  ).toBe('local')
   expect(await readFile(f.storagePath, 'utf8')).toBe(before)
   await expect(readFile(f.tokenPath, 'utf8')).rejects.toMatchObject({
     code: 'ENOENT',
@@ -99,6 +110,6 @@ test('terminal enrollment reset is local, locked and independent of daemon avail
 })
 
 import {
-  loadAccounts,
-  saveAccounts,
+  readLegacyJson,
+  writeLegacyAccountFiles,
 } from '../../../core/src/tests/legacy-account-fixture.ts'

@@ -1,5 +1,24 @@
 [
-  { "name": "empty-pi", "storage": { "version": 1, "accounts": [] } },
+  {
+    "name": "empty-pi",
+    "storage": {
+      "version": 1,
+      "accounts": []
+    },
+    "config": {
+      "version": 1,
+      "main": {
+        "type": "opencode",
+        "provider": "anthropic"
+      },
+      "accounts": []
+    },
+    "state": {
+      "version": 1,
+      "main": {},
+      "accounts": {}
+    }
+  },
   {
     "name": "migration",
     "storage": {
@@ -29,7 +48,11 @@
       "prime": {
         "enabled": true,
         "mainAuthLineageId": "fixture-lineage",
-        "main": { "inputTokens": 20, "outputTokens": 1, "count": 1 }
+        "main": {
+          "inputTokens": 20,
+          "outputTokens": 1,
+          "count": 1
+        }
       },
       "cacheKeep": {
         "enabled": true,
@@ -66,6 +89,81 @@
       "mainQuota": true,
       "mainPrime": true,
       "accounts": true
+    },
+    "config": {
+      "version": 1,
+      "mainAccountId": "00000000-0000-4000-8000-000000000001",
+      "main": {
+        "type": "opencode",
+        "provider": "anthropic"
+      },
+      "quota": {
+        "enabled": true
+      },
+      "cacheKeep": {
+        "enabled": true,
+        "startHour": 9,
+        "endHour": 23,
+        "subagents": true
+      },
+      "prime": {
+        "enabled": true
+      },
+      "accounts": [
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "label": "work",
+          "type": "oauth",
+          "enabled": true,
+          "addedAt": 1700000000000
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "label": "proxy",
+          "type": "api",
+          "enabled": true,
+          "addedAt": 1700000000000,
+          "baseURL": "https://api.anthropic.com",
+          "authHeader": "x-api-key"
+        }
+      ]
+    },
+    "state": {
+      "version": 1,
+      "main": {
+        "quota": {
+          "five_hour": {
+            "usedPercent": 10,
+            "remainingPercent": 90,
+            "checkedAt": 1700000000000
+          }
+        },
+        "quotaCheckedAt": 1700000000000,
+        "quotaToken": "fixture-main",
+        "profile": {
+          "organizationType": "claude_max",
+          "rateLimitTier": "default_claude_max_5x",
+          "checkedAt": 1700000000000,
+          "tokenFingerprint": "fixture-main"
+        },
+        "prime": {
+          "inputTokens": 20,
+          "outputTokens": 1,
+          "count": 1
+        },
+        "primeAuthLineageId": "fixture-lineage"
+      },
+      "accounts": {
+        "00000000-0000-4000-8000-000000000002": {
+          "anthropicAccountUuid": "fixture-work",
+          "access": "synthetic-access",
+          "refresh": "synthetic-refresh",
+          "expires": 1700003600000
+        },
+        "00000000-0000-4000-8000-000000000003": {
+          "apiKey": "synthetic-key"
+        }
+      }
     }
   }
 ]

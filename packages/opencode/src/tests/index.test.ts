@@ -838,36 +838,24 @@ function syntheticMainHostAuth() {
 }
 
 /**
- * Serialize old-installation data with saveAccounts and saveAccountState.
- * Return the config and credential-state text for offline migration.
+ * Serialize raw old-installation input without interpreting or merging it.
+ * Migration, not this fixture writer, owns its meaning.
  */
 async function legacyAccountFiles(storage: AccountStorage) {
   const scratch = await mkdtemp(join(tmpdir(), 'anthropic-plugin-legacy-'))
   const configPath = join(scratch, 'anthropic-auth.json')
   const statePath = join(scratch, 'anthropic-auth-state.json')
-  const savedStatePath = process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE
-  process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = statePath
   try {
-    await saveAccounts(storage, configPath)
-    if (
-      storage.main?.profile ||
-      storage.prime?.mainAuthLineageId ||
-      storage.prime?.main
-    )
-      await saveAccountState(storage, configPath, {
-        mainProfile: Boolean(storage.main?.profile),
-        mainPrime: Boolean(
-          storage.prime?.mainAuthLineageId || storage.prime?.main,
-        ),
-      })
+    await writeLegacyAccountFiles(configPath, storage, statePath, {
+      version: 1,
+      main: {},
+      accounts: {},
+    })
     return {
       config: await readFile(configPath, 'utf8'),
       state: await readFile(statePath, 'utf8').catch(() => undefined),
     }
   } finally {
-    if (savedStatePath === undefined)
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE
-    else process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = savedStatePath
     await rm(scratch, { recursive: true, force: true })
   }
 }
@@ -1542,7 +1530,10 @@ async function useUnmigratedAccountFile(storage: AccountStorage) {
     'quota-header-feed',
   )
   process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(root, 'rpc')
-  await saveAccounts(storage)
+  await writeLegacyAccountFiles(
+    process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
+    storage,
+  )
 }
 
 // The fetch installed by the test preload (setup.ts), which only allows
@@ -1822,7 +1813,10 @@ async function waitForSidebarState(
  */
 async function readAccountStorage(): Promise<AccountStorage | null> {
   const pool = migratedPool
-  if (!pool) return loadAccounts()
+  if (!pool)
+    return readLegacyJson<AccountStorage>(
+      process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+    )
   const runtime = createNativeAccountRuntime({
     paths: pool.paths,
     host: 'opencode',
@@ -1835,7 +1829,7 @@ async function readAccountStorage(): Promise<AccountStorage | null> {
 }
 
 async function waitForAccountStorage(
-  predicate: (storage: Awaited<ReturnType<typeof loadAccounts>>) => boolean,
+  predicate: (storage: AccountStorage | null) => boolean,
 ) {
   for (let attempt = 0; attempt < 100; attempt++) {
     const storage = await readAccountStorage()
@@ -3495,6 +3489,7 @@ describe('quota header feed integration', () => {
             ...createFallbackStorage().quota,
             mainQuota: {
               source: 'headers',
+              checkedAt: requestCheckedAt,
               five_hour: {
                 usedPercent: 4,
                 remainingPercent: 96,
@@ -5307,9 +5302,6 @@ describe('quota header feed extended integration', () => {
       },
     })
     await useTempAccountFile(storage)
-    await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
-      mainQuota: true,
-    })
     const messageRequests: string[] = []
     globalThis.fetch = mock(
       withNativeAdmission((input: any) => {
@@ -13730,10 +13722,10 @@ describe('auth.loader', () => {
     const routed = await result.fetch(MESSAGES_URL, request)
     expect(routed.status).toBe(200)
 
-    await saveAccounts({
-      ...storage,
+    await updatePoolSettings((settings) => ({
+      ...settings,
       quota: { ...storage.quota, failClosedOnUnknownQuota: true },
-    })
+    }))
     const blocked = await result.fetch(MESSAGES_URL, {
       ...request,
       headers: { 'x-session-affinity': 'unknown-quota-blocked' },
@@ -14857,7 +14849,7 @@ describe('auth.loader', () => {
   })
 
   test('fetch wrapper retries with fallback when main streaming body reports rate limit', async () => {
-    await useTempAccountFile(createFallbackStorage())
+    await useTempAccountFile(bindPoolAccounts(createFallbackStorage()))
     const authorizations: string[] = []
 
     globalThis.fetch = mock(
@@ -22689,7 +22681,6 @@ describe('claude-prime — warn dedup (R3)', () => {
 })
 
 import {
-  loadAccounts,
-  saveAccountState,
-  saveAccounts,
+  readLegacyJson,
+  writeLegacyAccountFiles,
 } from '../../../core/src/tests/legacy-account-fixture.ts'

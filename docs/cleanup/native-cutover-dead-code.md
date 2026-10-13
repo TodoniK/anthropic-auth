@@ -308,3 +308,104 @@ those files were restored and are not part of this cleanup. The inventory stays
 at its explicitly approved `docs/cleanup/` delivery path for the owner to relocate
 at merge. The runtime/module documentation changes do not change the `docs/`
 directory-layout line.
+
+## Required fixture reduction after merge review
+
+The initial 2,673-line archived module was a compatibility shim, not an acceptable
+fixture writer. It is replaced by **27 lines**: raw two-space JSON serialization
+with a trailing newline, optional state-file output, and a tiny single-file JSON
+reader. There are no imports/re-exports of `@cortexkit/anthropic-auth-core`, copies
+of account/quota type definitions, normalization,
+merges, policy calculations, refresh operations or locks. Golden config/state
+bytes are unchanged; fixed, already-shaped payloads are inputs to the byte test.
+
+Live OpenCode migration/refusal tests now write explicit old-format inputs and
+read the actual native account runtime. Post-migration settings changes use the
+live `updatePoolSettings` service instead of writing a retired sidecar. The quota
+ordering fixture explicitly gives its observed snapshot its check time, and the
+streaming fallback fixture declares its account identity using the existing test
+identity helper. Pi's live custody tests seed raw JSON and read only that JSON;
+all mode decisions still call Core directly.
+
+The following **70 legacy-only tests** in
+`packages/opencode/src/tests/accounts.test.ts` are deleted, not kept alive by a
+fixture implementation. Their subjects were the copied loader/writer/merger or
+mutators (including round-trip assertions with a secondary live predicate).
+Live profile fetching/freshness, locks, refresh/quota errors, quota/killswitch
+policy and in-memory Core predicates remain. The NaN/finite threshold tests now
+pass their fixture objects directly to live Core policy, with no legacy loader.
+
+- `an equal-generation stale observation cannot resurrect a clear`
+- `a stale main refresh error cannot resurrect a refresh clear`
+- `does not echo secrets from corrupt account stores`
+- `dedicated main and scoped fallback profiles survive sidecar load`
+- `profile runtime fields are omitted from anthropic-auth.json`
+- `re-login does not retain a previous account profile`
+- `runtime merge clears a fallback profile when OAuth credentials rotate`
+- `runtime merge keeps a fallback profile when OAuth credentials match`
+- `delayed main profile clear preserves a newer profile for the same token`
+- `delayed fallback profile clear preserves a newer profile for the same token`
+- `rotated access token reuses the same account profile`
+- `older profile cannot overwrite newer profile for the same identity`
+- `different identity does not reuse another account profile`
+- `legacy profile without identity is adopted under the current identity`
+- `missing identity never deletes stored profile state`
+- `persists explicit behavior and defaults unknown values safely`
+- `persists across save/load round-trip`
+- `preserves mixed quota field provenance across a save/load round-trip`
+- `keeps a reloaded poll window poll-owned during a partial header harvest`
+- `filters unknown quota provenance fields and invalid sources on load`
+- `drops provenance for quota fields rejected during normalization`
+- `saves and loads sidecar accounts`
+- `stores API fallback route secret in runtime state and endpoint in config`
+- `prefers newer legacy config OAuth credentials over stale runtime state`
+- `keeps newer runtime OAuth credentials over older legacy config credentials`
+- `drops API fallback routes with invalid base URLs on load`
+- `preserves runtime state when config membership entry is shape-invalid`
+- `prunes runtime state for a fully valid config membership set`
+- `uses incoming account credentials to establish config membership`
+- `does not establish membership from config-owned fields on an incoming api account`
+- `keeps runtime state when incoming storage cannot validate config membership`
+- `does not establish membership from an id-less shape-valid config entry`
+- `prunes runtime state for an explicitly empty config account list`
+- `runtime state saves do not rewrite user-editable config`
+- `runtime state saves preserve accounts when config is missing`
+- `runtime state saves preserve whitespace-padded configured account ids`
+- `loads a trimmed legacy state key for a padded configured account`
+- `persists rotated credentials under the key the padded loader accepts`
+- `runtime state saves preserve all state when config has a whitespace-only account id`
+- `runtime state saves preserve accounts when config omits accounts`
+- `treats a partially parseable populated config as unknown membership`
+- `scoped saves preserve accounts when populated config membership is unknown`
+- `a wholly unparseable populated config prunes nothing when storage is loaded from it`
+- `generic saves preserve a newer persisted main profile`
+- `runtime state saves do not overwrite newer quota snapshots`
+- `equal-time stale saves do not overwrite a harvested header snapshot`
+- `equal-time poll replaces headers and keeps scoped quota`
+- `equal-time header snapshot can replace another header snapshot`
+- `main quota ordering ignores the legacy standalone timestamp`
+- `main equal-time poll beats headers and source-less saves`
+- `fallback header persistence preserves newer poll-owned fields from disk`
+- `main header persistence preserves newer poll-owned fields from disk`
+- `fallback token rotation never rebinds the previous token quota`
+- `runtime token updates drop source-less quota passthrough`
+- `malformed config file throws a clear error`
+- `preserves relay config when saving storage loaded by older code`
+- `persists claudeCache enabled state and mode`
+- `persists cacheKeep window`
+- `persists cacheKeep always mode, preserves subagents, and clears the old window`
+- `persists and reads cacheKeep subagents toggle`
+- `persists claudeFast enabled state`
+- `returns null when neither config nor state file exists`
+- `reads runtime state when config file is absent (no fallback accounts)`
+- `lease written via saveAccountState is visible to loadAccounts without a config file`
+- `does not persist a harvested UUID after the stored lineage was replaced`
+- `drops legacy custody gates rather than using them as authority`
+- `defaults invalid persisted global modes to local`
+- `persists global mode in config and retains it through a state save`
+- `serializes a mode write with another config write without losing either field`
+- `survives save/load round-trip`
+
+This section supersedes the earlier archived-writer justification. The earlier
+verification counts describe the first delivery; revised measured counts and
+floor provenance accompany this reduction.
