@@ -27,7 +27,7 @@ anthropic-auth/
 │       └── tests/              # Test files
 ├── scripts/                    # Dev, release, and analysis scripts
 ├── captures/                   # System-prompt capture artifacts (git-ignored)
-├── docs/                       # Feature docs, research, plans, specs, and perf notes
+├── docs/                       # Public user and contributor docs (internal notes live in the ignored .cortexkit/internal-docs/)
 ├── images/                     # Images for README
 └── .github/                    # CI workflows + issue templates
 ```
