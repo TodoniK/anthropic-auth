@@ -1,17 +1,17 @@
 {
   "floors": {
     "core": 1737,
-    "opencode": 2000,
+    "opencode": 1930,
     "pi": 280
   },
   "measurement": {
-    "head": "cc322215305afc672079283bd4d352ec7fcab7fa",
+    "head": "33144235be00c946ed1ed449f48e0caedb6010cd",
     "dirtyPaths": 0
   },
   "evidence": {
-    "_note": "Clean rebased cleanup commit measured on remote pinned Bun 1.3.14 without network. Core was rebuilt before dependents. All remaining assertions pass; only approved legacy tests were deleted. OpenCode uses the full offline selection, excluding the registry-installing opencode2-e2e.test.ts; CI still runs that unchanged packed-host gate separately. Counts are Bun runner measurements, not source declaration counts.",
+    "_note": "Clean minimal-writer revision measured on remote pinned Bun 1.3.14 without network. The 2673-line copied legacy module is replaced by 27 lines of raw JSON write/read and 70 tests of copied behavior are removed. Core was rebuilt before dependents; remaining live Core behavior uses direct Core APIs and explicit fixture input data. OpenCode uses the full offline selection, excluding the unchanged registry-installing opencode2-e2e.test.ts. Counts are runner measurements.",
     "core": "Core: 1737 pass, 0 fail across 77 files. Before cleanup: 1799 pass across 80 files. Eight export-manifest and two published-1.23.0 golden-byte tests are included.",
-    "opencode": "OpenCode offline: 2000 pass, 0 fail across 86 files. Before cleanup, identical offline selection: 2130 pass across 86 files.",
+    "opencode": "OpenCode offline: 1930 pass, 0 fail across 86 files on the clean recorded source commit. Initial pre-cleanup count was 2130; the first delivery had 2000 and this revision removes 70 remaining legacy-shim tests.",
     "pi": "Pi: 280 pass, 0 fail across 18 files before and after cleanup; raise the prior 264 floor to the measured 280."
   }
 }

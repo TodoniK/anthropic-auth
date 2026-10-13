@@ -409,3 +409,18 @@ pass their fixture objects directly to live Core policy, with no legacy loader.
 This section supersedes the earlier archived-writer justification. The earlier
 verification counts describe the first delivery; revised measured counts and
 floor provenance accompany this reduction.
+
+### Revised clean measurement
+
+The final minimal-writer source commit `33144235be00c946ed1ed449f48e0caedb6010cd`
+was measured clean on remote Bun 1.3.14: **Core 1737/77 files, OpenCode offline
+1930/86 files, Pi 280/18 files, all zero failures**. This revision removes 70
+more legacy-only tests from the first delivery's OpenCode count of 2000; the
+initial pre-cleanup count was 2130. Core/Pi counts are unchanged. Floors and the
+explicit main-relative lowering marker now use **1737/1930/280**. All six
+TypeScript 7.0.2 configurations, Pi emitted-import guard, public-export/golden
+checks, layout check and declaration closure pass. The unchanged seven-test
+packed fresh-consumer file again passed locally on pinned Bun 1.3.14 as the
+owner-authorized network exception (379 declaration/type files and 18 Node
+runtime assertions). Production files and published golden bytes were not
+changed by the fixture reduction.
