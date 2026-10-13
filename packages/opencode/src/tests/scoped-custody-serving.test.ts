@@ -1,4 +1,4 @@
-import { afterEach, describe, expect } from 'bun:test'
+import { afterEach, describe, expect, spyOn } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -261,6 +261,170 @@ function scopedLegacyConfig(extra: Record<string, unknown> = {}) {
 }
 
 describe('OpenCode scoped custody serving', () => {
+  test('project leases share one real vault poller and survive a disposing predecessor', async () => {
+    const { root, plugins } = await startBody('opencode-shared-consumer-')
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'aa'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: scopedLegacyConfig(),
+    })
+    const counts = { connects: 0, lists: 0, gets: 0, closes: 0 }
+    const nextList = () => {
+      const arrived = lifetimes.gate()
+      arrivals.push(arrived.open)
+      return arrived.wait
+    }
+    const arrivals: Array<() => void> = []
+    const client: NativeCustodyClient = {
+      async listScoped() {
+        counts.lists++
+        arrivals.shift()?.()
+        return { view: 'shared-consumer', rows: [mainRow] }
+      },
+      async getScoped(input) {
+        counts.gets++
+        return {
+          credentialId: input.credentialId,
+          accountId: mainRow.accountId,
+          material: `fresh-scoped-${counts.gets}`,
+          recordVersion: mainRow.recordVersion,
+          expiresAtMs: Date.now() + 3_600_000,
+        }
+      },
+      async reportAuthFailureScoped() {},
+      close() {
+        counts.closes++
+      },
+    }
+    const authorizations: string[] = []
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (String(input).includes('/v1/messages')) {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+        return Response.json({
+          id: 'shared-message',
+          type: 'message',
+          content: [],
+        })
+      }
+      return Response.json({})
+    }) as typeof fetch
+    const intervals = new Set<ReturnType<typeof setInterval>>()
+    const polls = new Set<ReturnType<typeof setInterval>>()
+    const pollMs = 1000
+    const overrides = {
+      claustrumScopedConnect: async () => {
+        counts.connects++
+        return client
+      },
+      scopedRosterPollIntervalMs: pollMs,
+      cacheKeepAggregateRefreshIntervalMs: 0,
+      setInterval: ((fn: () => void, ms: number) => {
+        const timer = setInterval(fn, ms)
+        intervals.add(timer)
+        if (ms === pollMs) polls.add(timer)
+        return timer
+      }) as typeof setInterval,
+      clearInterval: ((timer: ReturnType<typeof setInterval>) => {
+        intervals.delete(timer)
+        polls.delete(timer)
+        clearInterval(timer)
+      }) as typeof clearInterval,
+    }
+    // The injection wraps real timers; teardown also owns them if an assertion fails.
+    lifetimes.deferCleanup(() => {
+      for (const timer of intervals) clearInterval(timer)
+      intervals.clear()
+      polls.clear()
+    })
+    const instances: PluginHooks[] = []
+    for (let index = 0; index < 3; index++) {
+      const plugin = await createPlugin(
+        plugins,
+        { root: join(root, `project-${index}`) },
+        overrides,
+      )
+      await (plugin as any).__fallbackRefreshReady
+      instances.push(plugin)
+    }
+    expect(counts.connects).toBe(1)
+    expect(counts.lists).toBe(1)
+    expect(polls.size).toBe(1)
+    for (let tick = 0; tick < 2; tick++) {
+      const before = counts.lists
+      await nextList()
+      expect(counts.lists).toBe(before + 1)
+    }
+    for (const plugin of instances.slice(0, 2)) {
+      await plugin.dispose?.()
+      plugins.delete(plugin)
+    }
+    expect(counts.closes).toBe(0)
+    expect(polls.size).toBe(1)
+    await nextList()
+    const predecessor = instances[2]!
+    const transport = await (predecessor as any).auth.loader(
+      migratedActivation(fixture),
+      { models: {} },
+    )
+    const sent = await transport.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(sent.status).toBe(200)
+    await sent.text()
+    const entered = lifetimes.gate()
+    const release = lifetimes.gate()
+    const vault = (predecessor as any).__scopedRuntime
+    const originalPublish = vault.publish.bind(vault)
+    const publication = spyOn(vault, 'publish').mockImplementation(
+      async (...args: Parameters<typeof vault.publish>) => {
+        entered.open()
+        await release.wait
+        return originalPublish(...args)
+      },
+    )
+    lifetimes.deferCleanup(() => publication.mockRestore())
+    // A second served request owns a detached usage write that blocks only its disposer.
+    const second = await transport.fetch(MESSAGES_URL, EMPTY_POST)
+    await second.text()
+    await entered.wait
+    let disposed = false
+    const disposing = Promise.resolve(predecessor.dispose?.()).then(() => {
+      disposed = true
+    })
+    lifetimes.trackDetached(disposing)
+    const successor = await createPlugin(
+      plugins,
+      { root: join(root, 'project-2') },
+      overrides,
+    )
+    await (successor as any).__fallbackRefreshReady
+    expect(disposed).toBe(false)
+    release.open()
+    await disposing
+    plugins.delete(predecessor)
+    expect(counts.closes).toBe(0)
+    expect(polls.size).toBe(1)
+    publication.mockRestore()
+    const newTransport = await (successor as any).auth.loader(
+      migratedActivation(fixture),
+      { models: {} },
+    )
+    const third = await newTransport.fetch(MESSAGES_URL, EMPTY_POST)
+    await third.text()
+    expect(third.status).toBe(200)
+    expect(new Set(authorizations).size).toBe(3)
+    expect(
+      authorizations.every((value) => /^Bearer fresh-scoped-\d+$/.test(value)),
+    ).toBe(true)
+    await nextList()
+    await successor.dispose?.()
+    plugins.delete(successor)
+    expect(counts.closes).toBe(1)
+    expect(polls.size).toBe(0)
+    expect(intervals.size).toBe(0)
+  }, 15_000)
+
   test('serves requests using scoped receipts and dynamically adopts newly logged-in accounts without restart', async () => {
     const { root, plugins } = await startBody('opencode-scoped-serving-')
     const rows = [mainRow, workRow]

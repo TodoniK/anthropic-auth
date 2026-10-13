@@ -65,16 +65,22 @@ import {
   updateNativeRuntime,
 } from './native-runtime.ts'
 import {
+  NativeRuntimeRegistry,
+  nativeRuntimeOptionIdentity,
+} from './native-runtime-registry.ts'
+import {
   joinNativePoolWrite,
   NativeTransientAccountError,
 } from './native-transient-account.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
 import {
   acquireNativeVaultRuntime,
+  leaseNativeVaultRuntime,
   type NativeDisplayProfile,
   type NativeVaultRuntime,
   type NativeVaultRuntimeOptions,
   nativeDisplayProfile,
+  nativeVaultRuntimeKey,
 } from './native-vault-runtime.ts'
 import type { NativeVaultRoutingSeed } from './native-vault-seed.ts'
 import { fetchOAuthAccountProfile } from './oauth-profile.ts'
@@ -243,6 +249,64 @@ export interface NativeAccountRuntime {
     signal?: AbortSignal,
   ): Promise<NativeDisplayProfile>
   close(): void
+}
+
+const sharedAccounts = new NativeRuntimeRegistry<NativeAccountRuntime>()
+
+/** Host instances own leases, while stores and the vault connection live until the last release. */
+export function acquireNativeAccountRuntime(
+  options: NativeAccountRuntimeOptions,
+): NativeAccountRuntime {
+  const key = JSON.stringify([
+    nativeVaultRuntimeKey({
+      ...options.vault,
+      paths: options.paths,
+      host: options.host,
+    }),
+    ...[
+      options.beforePoolWrite,
+      options.local?.refreshToken,
+      options.local?.resolveIdentity,
+      options.local?.failurePolicy,
+      options.local?.now,
+    ].map(nativeRuntimeOptionIdentity),
+  ])
+  const { use, close } = sharedAccounts.acquire(key, () =>
+    createNativeAccountRuntime(options),
+  )
+  const vault = leaseNativeVaultRuntime(() => use().vault, close)
+  return {
+    vault,
+    getRelayConfig: () => use().getRelayConfig(),
+    updateRelay: (patch) => use().updateRelay(patch),
+    read: () => use().read(),
+    authorizeLocal: (id, request) => use().authorizeLocal(id, request),
+    authorizeApi: (id, signal) => use().authorizeApi(id, signal),
+    authorizeVault: (id, signal) => use().authorizeVault(id, signal),
+    loginOAuth: (input) => use().loginOAuth(input),
+    putAccount: (input) => use().putAccount(input),
+    addApi: (input) => use().addApi(input),
+    updateSettings: (mutator) => use().updateSettings(mutator),
+    setLoggingLevel: (level) => use().setLoggingLevel(level),
+    setEnabled: (id, enabled) => use().setEnabled(id, enabled),
+    remove: (id) => use().remove(id),
+    reorder: (ids, moved) => use().reorder(ids, moved),
+    captureLocalSubject: (id) => use().captureLocalSubject(id),
+    publishLocal: (subject, patch) => use().publishLocal(subject, patch),
+    publishApi: (subject, patch) => use().publishApi(subject, patch),
+    resetBackoff: (id, fence, kind) => use().resetBackoff(id, fence, kind),
+    getOrCreateAuthLineage: (id, fence) =>
+      use().getOrCreateAuthLineage(id, fence),
+    incrementPrimeUsage: (id, fence, delta) =>
+      use().incrementPrimeUsage(id, fence, delta),
+    fetchQuota: (id, transport, signal, dispatch) =>
+      use().fetchQuota(id, transport, signal, dispatch),
+    fetchProfile: (id, transport, signal) =>
+      use().fetchProfile(id, transport, signal),
+    fetchProfileForDisplay: (id, transport, signal) =>
+      use().fetchProfileForDisplay(id, transport, signal),
+    close: () => vault.close(),
+  }
 }
 
 /** Evaluate quota and killswitch policy for this caller's model, outside shared credential refresh work. */

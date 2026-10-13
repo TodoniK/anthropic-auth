@@ -1,6 +1,6 @@
 import {
+  acquireNativeAccountRuntime,
   authorize,
-  createNativeAccountRuntime,
   createNativeUi,
   disconnectNativeVaultForHost,
   exchange,
@@ -206,7 +206,7 @@ export async function setupAnthropicAuth(
   options: AnthropicAuthV2Options = {},
 ): Promise<Plugin.Cleanup> {
   const paths = options.paths ?? (await resolveNativePoolPaths())
-  const runtime = createNativeAccountRuntime({
+  const runtime = acquireNativeAccountRuntime({
     paths,
     host: 'opencode',
     local: options.local,

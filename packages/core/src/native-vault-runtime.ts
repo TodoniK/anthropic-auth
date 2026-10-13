@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { ClaustrumClient } from '@cortexkit/claustrum-client'
+import {
+  ClaustrumClient,
+  type ClaustrumClientOptions,
+} from '@cortexkit/claustrum-client'
 import {
   acceptAccount,
   ClaustrumConsumerError,
@@ -15,7 +18,6 @@ import {
   type OAuthQuotaSnapshot,
   type PrimeUsageDelta,
 } from './accounts.ts'
-import { resolveClaustrumConnectionPath } from './claustrum.ts'
 import { logger } from './logger.ts'
 import {
   applyNativeMetadataPatch,
@@ -55,6 +57,12 @@ import {
   updateNativeRuntime,
   updateNativeRuntimeOptional,
 } from './native-runtime.ts'
+import {
+  NativeRuntimeRegistry,
+  nativeRuntimeConnectionFile,
+  nativeRuntimeOptionIdentity,
+  nativeRuntimeStorageKey,
+} from './native-runtime-registry.ts'
 import type { NativeVaultPaths } from './native-vault-paths.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
 import { nativeVaultFileAbsent } from './native-vault-seed.ts'
@@ -67,12 +75,25 @@ import type { QuotaRequestDispatch } from './quota-manager.ts'
 export interface NativeVaultRuntimeOptions {
   paths: NativePoolPaths
   host: 'opencode' | 'pi'
+  identity?: ClaustrumClientOptions['identity']
   connect?: () => Promise<NativeCustodyClient>
   /** Reuse the inventory verifier supplied by offline setup without changing per-send scoped authorization. */
   discover?: () => Promise<NativeCustodyInventory>
   readToken?: () => Promise<{ token: string; token_generation: number }>
   env?: NodeJS.ProcessEnv
   now?: () => number
+}
+
+export interface NativeVaultWatchOptions {
+  intervalMs: number
+  onRefresh?: () => void | Promise<void>
+  shouldRefresh?: () => boolean | Promise<boolean>
+  setInterval?: typeof globalThis.setInterval
+  clearInterval?: typeof globalThis.clearInterval
+}
+export interface NativeVaultWatch {
+  readonly ready: Promise<void>
+  close(): void
 }
 
 /** Send classes that may replay once after a vault credential's 401, named in diagnostics. */
@@ -149,6 +170,8 @@ export function nativeDisplayProfile(
 }
 
 export interface NativeVaultRuntime {
+  /** Subscribe to one discovery loop; notifications contain no credential material. */
+  watch(options: NativeVaultWatchOptions): NativeVaultWatch
   initializeSettings(): Promise<void>
   read(): Promise<NativeVaultRosterDocument | undefined>
   refresh(signal?: AbortSignal): Promise<NativeVaultRosterDocument | undefined>
@@ -275,6 +298,7 @@ export async function discoverNativeVaultInventory(
   signal?: AbortSignal,
 ): Promise<NativeCustodyInventory> {
   const env = { ...(options.env ?? process.env) }
+  const connectionFile = nativeRuntimeConnectionFile(options.host, env)
   const custody = createNativeCustody({
     host: options.host,
     readToken: options.readToken,
@@ -284,7 +308,8 @@ export async function discoverNativeVaultInventory(
       options.connect ??
       (() =>
         ClaustrumClient.connect({
-          connectionFile: resolveClaustrumConnectionPath(undefined, env),
+          connectionFile,
+          identity: options.identity,
         })),
   })
   try {
@@ -300,6 +325,8 @@ export function createNativeVaultRuntime(
 ): NativeVaultRuntime {
   const paths = Object.freeze(nativeVaultPaths(options.paths))
   const env = { ...(options.env ?? process.env) }
+  const connectionFile = nativeRuntimeConnectionFile(options.host, env)
+  const identity = options.identity ? { ...options.identity } : undefined
   const shutdown = new AbortController()
   const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
   const custody = createNativeCustody({
@@ -310,7 +337,8 @@ export function createNativeVaultRuntime(
       options.connect ??
       (() =>
         ClaustrumClient.connect({
-          connectionFile: resolveClaustrumConnectionPath(undefined, env),
+          connectionFile,
+          identity,
         })),
     env,
   })
@@ -322,6 +350,61 @@ export function createNativeVaultRuntime(
   const versions = new Map<string, number>()
   const reservedRouteIds = new Set<string>(['main'])
   let refreshing: Promise<NativeVaultRosterDocument | undefined> | undefined
+  const watchers = new Set<NativeVaultWatchOptions>()
+  let pollReady: Promise<void> | undefined
+  let polling: Promise<void> | undefined
+  let pollTimer:
+    | {
+        handle: ReturnType<typeof setInterval>
+        clear: typeof clearInterval
+        ms: number
+      }
+    | undefined
+
+  function schedulePoll() {
+    const owner = [...watchers]
+      .filter((watch) => watch.intervalMs > 0)
+      .sort((a, b) => a.intervalMs - b.intervalMs)[0]
+    if (pollTimer?.ms === owner?.intervalMs) return
+    if (pollTimer) pollTimer.clear(pollTimer.handle)
+    pollTimer = undefined
+    if (!owner) return
+    const handle = (owner.setInterval ?? setInterval)(() => {
+      void poll().catch(() => {})
+    }, owner.intervalMs)
+    handle.unref?.()
+    pollTimer = {
+      handle,
+      clear: owner.clearInterval ?? clearInterval,
+      ms: owner.intervalMs,
+    }
+  }
+  function poll(): Promise<void> {
+    if (polling) return polling
+    polling = (async () => {
+      const allowed = await Promise.all(
+        [...watchers].map(
+          async (watch) =>
+            !watch.shouldRefresh || (await watch.shouldRefresh()),
+        ),
+      )
+      if (shutdown.signal.aborted || !allowed.some(Boolean)) return
+      await runtime.refresh(shutdown.signal)
+      if (shutdown.signal.aborted) return
+      // Notifications belong to their observers. A slow or disposing host must
+      // not hold discovery for the other leases; hosts drain their own writes.
+      for (const watch of watchers) {
+        void Promise.resolve()
+          .then(() => {
+            if (watchers.has(watch)) return watch.onRefresh?.()
+          })
+          .catch(() => {})
+      }
+    })().finally(() => {
+      polling = undefined
+    })
+    return polling
+  }
 
   function check(signal?: AbortSignal) {
     if (shutdown.signal.aborted) throw new NativeCustodyError('closed')
@@ -428,6 +511,26 @@ export function createNativeVaultRuntime(
     return route
   }
   const runtime: NativeVaultRuntime = {
+    watch(options) {
+      check()
+      if (!Number.isFinite(options.intervalMs) || options.intervalMs < 0)
+        throw new RangeError('Invalid native vault poll interval')
+      const watch = { ...options }
+      watchers.add(watch)
+      schedulePoll()
+      pollReady ??= poll()
+      let closed = false
+      return {
+        ready: pollReady,
+        close() {
+          if (closed) return
+          closed = true
+          watchers.delete(watch)
+          schedulePoll()
+          if (!watchers.size) pollReady = undefined
+        },
+      }
+    },
     initializeSettings: () => publishPrimaryPin(undefined, true),
     async read() {
       await requireActive()
@@ -447,12 +550,17 @@ export function createNativeVaultRuntime(
         signal: shutdown.signal,
         isActive: active,
         projection: () => ({ reservedRouteIds }),
-      }).finally(() => {
-        refreshing = undefined
       })
-      const roster = await waitFor(refreshing, signalFor(signal))
-      await publishPrimaryPin(signal)
-      return roster
+        .then(async (roster) => {
+          // Publish the primary account pin once for the shared discovery refresh,
+          // rather than once for each caller waiting for that refresh.
+          await publishPrimaryPin(shutdown.signal)
+          return roster
+        })
+        .finally(() => {
+          refreshing = undefined
+        })
+      return waitFor(refreshing, signalFor(signal))
     },
     async authorize(logicalId, signal) {
       const combined = signalFor(signal)
@@ -723,6 +831,8 @@ export function createNativeVaultRuntime(
       })
     },
     close() {
+      watchers.clear()
+      schedulePoll()
       if (shutdown.signal.aborted) return
       shutdown.abort(new NativeCustodyError('closed'))
       custody.close()
@@ -1040,26 +1150,50 @@ function waitFor<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
   })
 }
 
-const shared = new Map<string, { runtime: NativeVaultRuntime; users: number }>()
+const shared = new NativeRuntimeRegistry<NativeVaultRuntime>()
+
+export function nativeVaultRuntimeKey(
+  options: NativeVaultRuntimeOptions,
+): string {
+  return JSON.stringify([
+    nativeRuntimeStorageKey(options),
+    options.identity
+      ? Object.entries(options.identity).sort(([a], [b]) => a.localeCompare(b))
+      : undefined,
+    ...[options.connect, options.discover, options.readToken, options.now].map(
+      nativeRuntimeOptionIdentity,
+    ),
+  ])
+}
 
 /** Each handle owns one reference; disposing it cannot close another host session. */
 export function acquireNativeVaultRuntime(
   options: NativeVaultRuntimeOptions,
 ): NativeVaultRuntime {
-  const key = JSON.stringify([options.paths.storageId, options.host])
-  let entry = shared.get(key)
-  if (!entry) {
-    entry = { runtime: createNativeVaultRuntime(options), users: 0 }
-    shared.set(key, entry)
-  }
-  entry.users++
-  const owned = entry
-  let closed = false
-  function use(): NativeVaultRuntime {
-    if (closed) throw new NativeCustodyError('closed')
-    return owned.runtime
-  }
+  const { use, close } = shared.acquire(nativeVaultRuntimeKey(options), () =>
+    createNativeVaultRuntime(options),
+  )
+  return leaseNativeVaultRuntime(use, close)
+}
+
+/** Each account lease wraps the shared vault runtime and tracks its own subscriptions, so releasing the lease removes those subscriptions. */
+export function leaseNativeVaultRuntime(
+  use: () => NativeVaultRuntime,
+  close: () => void,
+): NativeVaultRuntime {
+  const watches = new Set<NativeVaultWatch>()
   return {
+    watch: (options) => {
+      const watch = use().watch(options)
+      watches.add(watch)
+      return {
+        ready: watch.ready,
+        close() {
+          watches.delete(watch)
+          watch.close()
+        },
+      }
+    },
     initializeSettings: () => use().initializeSettings(),
     read: () => use().read(),
     refresh: (signal) => use().refresh(signal),
@@ -1069,8 +1203,8 @@ export function acquireNativeVaultRuntime(
     prepareRetry: (receipt, signal, site) =>
       use().prepareRetry(receipt, signal, site),
     publish: (receipt, patch) => use().publish(receipt, patch),
-    fetchQuota: (id, transport, signal) =>
-      use().fetchQuota(id, transport, signal),
+    fetchQuota: (id, transport, signal, dispatch) =>
+      use().fetchQuota(id, transport, signal, dispatch),
     fetchProfile: (id, transport, signal) =>
       use().fetchProfile(id, transport, signal),
     fetchProfileForDisplay: (id, transport, signal) =>
@@ -1081,12 +1215,9 @@ export function acquireNativeVaultRuntime(
     incrementPrimeUsage: (receipt, delta) =>
       use().incrementPrimeUsage(receipt, delta),
     close() {
-      if (closed) return
-      closed = true
-      if (--owned.users === 0) {
-        if (shared.get(key) === owned) shared.delete(key)
-        owned.runtime.close()
-      }
+      for (const watch of watches) watch.close()
+      watches.clear()
+      close()
     },
   }
 }

@@ -1,7 +1,9 @@
+import { resolve } from 'node:path'
 import {
-  connectClaustrumScopedClient,
-  createNativeAccountRuntime,
+  acquireNativeAccountRuntime,
   createNativeUsagePublisher,
+  getAccountStatePath,
+  getHostClaustrumEnrollmentPaths,
   isKillswitchEnabled,
   killswitchPassesPolicy,
   logger,
@@ -14,16 +16,18 @@ import {
   type NativePoolPaths,
   type NativeRefreshResult,
   nativeMigrationAuthorityPhase,
+  nativeRuntimeOptionIdentity,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   readNativeMigrationJournal,
+  resolveClaustrumConnectionPath,
   resolveNativePoolPaths,
 } from '@cortexkit/anthropic-auth-core'
-import { requirePiEnrollment } from './custody.ts'
 import {
   getPiAccountStoragePath,
   getPiClaustrumConnectionOptions,
+  getPiConfigDir,
   requirePiNativeHostAuth,
 } from './paths.ts'
 
@@ -78,8 +82,32 @@ function requestPolicy(routeId: string, modelId?: string) {
   }
 }
 
-const runtimes = new Map<string, PiNativeRuntime>()
+const runtimes = new Map<
+  string,
+  { contextKey: string; storagePath: string; runtime: PiNativeRuntime }
+>()
 const RUNTIME_LIMIT = 16
+
+function runtimeCacheKey(storagePath: string) {
+  const enrollment = getHostClaustrumEnrollmentPaths('pi')
+  return JSON.stringify([
+    resolve(storagePath),
+    resolve(getAccountStatePath(storagePath)),
+    resolve(getPiConfigDir()),
+    enrollment.tokenPath,
+    enrollment.statePath,
+    getPiClaustrumConnectionOptions(storagePath).identity,
+    resolve(
+      resolveClaustrumConnectionPath(
+        process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE,
+        {
+          ...process.env,
+          OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: undefined,
+        },
+      ),
+    ),
+  ])
+}
 
 /**
  * Core's refusal for an install that offline setup has never migrated, such
@@ -106,20 +134,19 @@ export class PiNativeRuntime {
     storagePath: string,
     options: { connect?: () => Promise<NativeCustodyClient> } = {},
   ) {
+    const env = { ...process.env }
+    const identity = getPiClaustrumConnectionOptions(storagePath).identity
     this.paths = resolveNativePoolPaths(storagePath)
     this.initialization = this.paths.then((paths) => {
-      const runtime = createNativeAccountRuntime({
+      const runtime = acquireNativeAccountRuntime({
         paths,
         host: 'pi',
         vault: {
-          connect: async () => {
-            await requirePiEnrollment()
-            return options.connect
-              ? options.connect()
-              : connectClaustrumScopedClient(
-                  getPiClaustrumConnectionOptions(storagePath),
-                )
-          },
+          // Core checks Pi enrollment and reads a fresh scoped receipt on every send.
+          // Keep the injected connector's identity rather than wrapping it per instance.
+          connect: options.connect,
+          env,
+          identity,
         },
       })
       if (this.closed) runtime.close()
@@ -345,23 +372,40 @@ export function getPiNativeRuntime(
   storagePath = getPiAccountStoragePath(),
   options: { connect?: () => Promise<NativeCustodyClient> } = {},
 ): PiNativeRuntime {
-  const existing = runtimes.get(storagePath)
-  if (existing) return existing
+  const contextKey = runtimeCacheKey(storagePath)
+  const key = JSON.stringify([
+    contextKey,
+    nativeRuntimeOptionIdentity(options.connect),
+  ])
+  const existing = runtimes.get(key)
+  if (existing) return existing.runtime
+  if (!options.connect) {
+    // A supplied connector installs the context's test transport. Ordinary host
+    // lookups reuse it, but an explicitly different connector owns another key.
+    const configured = [...runtimes.values()].find(
+      (entry) => entry.contextKey === contextKey,
+    )
+    if (configured) return configured.runtime
+  }
   const runtime = new PiNativeRuntime(storagePath, options)
   while (runtimes.size >= RUNTIME_LIMIT) {
     const oldest = runtimes.keys().next().value
     if (oldest === undefined) break
-    runtimes.get(oldest)?.close()
+    void runtimes.get(oldest)?.runtime.close()
     runtimes.delete(oldest)
   }
-  runtimes.set(storagePath, runtime)
+  runtimes.set(key, { contextKey, storagePath: resolve(storagePath), runtime })
   return runtime
 }
 
 export function closePiNativeRuntime(
   storagePath = getPiAccountStoragePath(),
 ): Promise<void> {
-  const closing = runtimes.get(storagePath)?.close() ?? Promise.resolve()
-  runtimes.delete(storagePath)
-  return closing
+  const closing: Promise<void>[] = []
+  for (const [key, entry] of runtimes) {
+    if (entry.storagePath !== resolve(storagePath)) continue
+    runtimes.delete(key)
+    closing.push(entry.runtime.close())
+  }
+  return Promise.all(closing).then(() => {})
 }

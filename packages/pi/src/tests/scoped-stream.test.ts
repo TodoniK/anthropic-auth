@@ -1,4 +1,4 @@
-import { expect, test as registerTest } from 'bun:test'
+import { expect, test as registerTest, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -32,7 +32,11 @@ import {
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
-import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
+import {
+  closePiNativeRuntime,
+  getPiNativeRuntime,
+  PiNativeRuntime,
+} from '../native.ts'
 import {
   __prewarmPiCacheKeepForTest,
   streamCortexKitAnthropic,
@@ -102,6 +106,7 @@ async function fixture(
     'PI_AGENT_DIR',
     'PI_ANTHROPIC_AUTH_FILE',
     'PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+    'PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
     'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
   ]
   const previousEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
@@ -194,7 +199,8 @@ async function fixture(
     },
     close: () => {},
   }
-  const native = getPiNativeRuntime(path, { connect: async () => client })
+  const connect = async () => client
+  const native = getPiNativeRuntime(path, { connect })
   const service = await native.service()
   const roster = await service.vault.refresh()
   await service.updateSettings((settings) => ({
@@ -214,8 +220,91 @@ async function fixture(
   )
   if (!primary?.accountIdentity)
     throw new Error('Fixture vault primary identity is missing')
-  return { rows, gets, reports, client, path, localFiles, beforeLocal, native }
+  return {
+    rows,
+    gets,
+    reports,
+    client,
+    connect,
+    path,
+    localFiles,
+    beforeLocal,
+    native,
+  }
 }
+
+test('Pi same-key replacement drains its predecessor without closing the shared consumer', async () => {
+  const f = await fixture()
+  const closes = spyOn(f.client, 'close')
+  deferCleanup(() => closes.mockRestore())
+  const get = f.client.getScoped.bind(f.client)
+  const stableVersion = spyOn(f.client, 'getScoped').mockImplementation(
+    async (input) => ({
+      ...(await get(input)),
+      recordVersion: 1,
+    }),
+  )
+  deferCleanup(() => stableVersion.mockRestore())
+  const runtime = await f.native.service()
+  const first = await f.native.authorize('main')
+  const entered = lifetimes.gate()
+  const release = lifetimes.gate()
+  let wrote = false
+  f.native.usagePublications.publish(async () => {
+    entered.open()
+    await release.wait
+    if (first.source !== 'vault') throw new Error('Expected a vault receipt')
+    wrote = await runtime.vault.publish(first.receipt, { lastUsed: Date.now() })
+  })
+  await entered.wait
+  let disposed = false
+  const disposing = closePiNativeRuntime(f.path).then(() => {
+    disposed = true
+  })
+  lifetimes.trackDetached(disposing)
+  const successor = new PiNativeRuntime(f.path, { connect: f.connect })
+  deferCleanup(() => successor.close())
+  expect(disposed).toBe(false)
+  const second = await successor.authorize('main')
+  expect(second.source).toBe('vault')
+  if (first.source !== 'vault' || second.source !== 'vault')
+    throw new Error('Expected vault attempts')
+  expect(second.receipt).not.toBe(first.receipt)
+  expect(second.receipt.accessToken).not.toBe(first.receipt.accessToken)
+  release.open()
+  await disposing
+  expect(wrote).toBe(true)
+  expect(closes).toHaveBeenCalledTimes(0)
+  await successor.authorize('main')
+  await successor.close()
+  expect(closes).toHaveBeenCalledTimes(1)
+})
+
+test('Pi runtime cache isolates connection and enrollment paths for the same storage file', async () => {
+  const f = await fixture()
+  process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
+    dirname(f.path),
+    'connection-a.json',
+  )
+  const a = getPiNativeRuntime(f.path, { connect: f.connect })
+  expect(getPiNativeRuntime(f.path)).toBe(a)
+  const differentConnector = getPiNativeRuntime(f.path, {
+    connect: async () => f.client,
+  })
+  expect(differentConnector).not.toBe(a)
+  process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
+    dirname(f.path),
+    'connection-b.json',
+  )
+  const b = getPiNativeRuntime(f.path, { connect: f.connect })
+  expect(b).not.toBe(a)
+  process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+    dirname(f.path),
+    'other-enrollment.json',
+  )
+  const c = getPiNativeRuntime(f.path, { connect: f.connect })
+  expect(c).not.toBe(b)
+})
 
 test('Pi sends using scoped credentials without host auth, and never bootstraps with a cached token', async () => {
   const f = await fixture()

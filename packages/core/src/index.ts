@@ -31,6 +31,7 @@ export type {
   NativeRelayUpdate,
 } from './native-account-runtime.ts'
 export {
+  acquireNativeAccountRuntime,
   createNativeAccountRuntime,
   nativeAccountPolicy,
 } from './native-account-runtime.ts'
@@ -149,6 +150,7 @@ export type {
   NativeLocalFailurePolicy,
   NativeLocalFailureSkipReason,
 } from './native-runtime.ts'
+export { nativeRuntimeOptionIdentity } from './native-runtime-registry.ts'
 export {
   isNativeTransientAccountError,
   NativeTransientAccountError,

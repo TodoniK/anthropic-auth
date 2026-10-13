@@ -5,6 +5,7 @@ import {
   type AccountCommandStatusProjection,
   type AccountStorage,
   type ApiKeyAccount,
+  acquireNativeAccountRuntime,
   applyCustomHeaders,
   assertNotCustodyTombstone,
   authorize,
@@ -43,7 +44,6 @@ import {
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
   createEmptyStorage,
-  createNativeAccountRuntime,
   createNativeUsagePublisher,
   createProviderErrorResponseScope,
   createSseFramer,
@@ -1189,7 +1189,7 @@ const anthropicAuthPlugin = async (
   }
 
   const nativePaths = await resolveNativePoolPaths(accountStoragePath)
-  const nativeAccounts = createNativeAccountRuntime({
+  const nativeAccounts = acquireNativeAccountRuntime({
     paths: nativePaths,
     host: 'opencode',
     local: runtimeOverrides.nativeLocal,
@@ -1509,6 +1509,7 @@ const anthropicAuthPlugin = async (
   async function closeOpenCodeScopedRuntime(
     _storagePath = accountStoragePath,
   ): Promise<void> {
+    vaultWatch?.close()
     await usagePublications.drain()
     nativeAccounts.close()
   }
@@ -2881,9 +2882,19 @@ const anthropicAuthPlugin = async (
   }
   const canStartNativeServices =
     initialStorage !== null && process.env.OPENCODE_AUTH_CONTENT === undefined
+  const vaultWatch =
+    canStartNativeServices && isScopedCustodyActive(initialStorage)
+      ? nativeAccounts.vault.watch({
+          intervalMs: runtimeOverrides.scopedRosterPollIntervalMs ?? 2000,
+          shouldRefresh: () => process.env.OPENCODE_AUTH_CONTENT === undefined,
+          onRefresh: () => refreshSidebarQuota(),
+          setInterval: runtimeTimers.setInterval,
+          clearInterval: runtimeTimers.clearInterval,
+        })
+      : undefined
   const fallbackRefreshReady = canStartNativeServices
-    ? (isScopedCustodyActive(initialStorage)
-        ? nativeAccounts.vault.refresh().then(() => refreshNativeFallbacks())
+    ? (vaultWatch
+        ? vaultWatch.ready.then(() => refreshNativeFallbacks())
         : refreshNativeFallbacks()
       ).catch(() => {})
     : Promise.resolve()
@@ -2894,19 +2905,6 @@ const anthropicAuthPlugin = async (
         jitterMs(MAIN_AUTH_REFRESH_TICK_JITTER_MS))
     : null
   fallbackRefreshTimer?.unref?.()
-  const rosterRefreshTimer =
-    canStartNativeServices &&
-    isScopedCustodyActive(initialStorage) &&
-    runtimeOverrides.scopedRosterPollIntervalMs !== 0
-      ? runtimeTimers.setInterval(() => {
-          if (process.env.OPENCODE_AUTH_CONTENT !== undefined) return
-          void nativeAccounts.vault
-            .refresh()
-            .then(() => refreshSidebarQuota())
-            .catch(() => {})
-        }, runtimeOverrides.scopedRosterPollIntervalMs ?? 2000)
-      : null
-  rosterRefreshTimer?.unref?.()
   const fallbackCustodyStateFor = (
     accountId: string,
     storage: AccountStorage | null,
@@ -3890,7 +3888,6 @@ const anthropicAuthPlugin = async (
     try {
       if (fallbackRefreshTimer)
         runtimeTimers.clearInterval(fallbackRefreshTimer)
-      if (rosterRefreshTimer) runtimeTimers.clearInterval(rosterRefreshTimer)
     } catch (error) {
       logger.warn('fallback-background', 'failed to stop', {
         error: error instanceof Error ? error.message : String(error),

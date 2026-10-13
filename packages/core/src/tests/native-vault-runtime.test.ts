@@ -3,6 +3,7 @@ import * as filesystem from 'node:fs/promises'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import * as vaultRoster from '@cortexkit/common-auth/claustrum'
 import {
   mutateVaultRoster,
   projectVaultRoster,
@@ -32,7 +33,7 @@ import { QuotaManager } from '../quota-manager.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
-const { test, deferCleanup, gate } = createTestLifetimeSuite()
+const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
 const uuid = '11111111-2222-4333-8444-555555555555'
 const uuid2 = '22222222-2222-4333-8444-555555555555'
 const id = 'oauth:anthropic'
@@ -304,6 +305,132 @@ test('vault close interrupts a pending connection and closes its late client exa
   connected.open()
   await lateClosed.wait
   expect(f.counts.closes).toBe(1)
+})
+
+test('shared discovery publishes the primary pin once for concurrent consumers', async () => {
+  const f = await fixture()
+  const a = acquireNativeVaultRuntime(f.options)
+  const b = acquireNativeVaultRuntime(f.options)
+  deferCleanup(() => {
+    a.close()
+    b.close()
+  })
+  const publish = spyOn(vaultRoster, 'mutateVaultRoster')
+  deferCleanup(() => publish.mockRestore())
+  await Promise.all([a.refresh(), b.refresh()])
+  expect(f.counts.lists).toBe(1)
+  // Discovery and primary-account settings use two roster transactions in
+  // total, not another settings transaction for each waiting caller.
+  expect(publish).toHaveBeenCalledTimes(2)
+})
+
+test('a released observer with a pending notification cannot stop the surviving vault poller', async () => {
+  const f = await fixture()
+  const a = acquireNativeVaultRuntime(f.options)
+  const b = acquireNativeVaultRuntime(f.options)
+  const entered = gate()
+  const release = gate()
+  const thirdTick = gate()
+  const timers = new Set<ReturnType<typeof setInterval>>()
+  let ticks = 0
+  const timerOptions = {
+    intervalMs: 200,
+    setInterval: ((fn: () => void, ms: number) => {
+      const timer = setInterval(() => {
+        fn()
+        if (++ticks === 3) thirdTick.open()
+      }, ms)
+      timers.add(timer)
+      return timer
+    }) as typeof setInterval,
+    clearInterval: ((timer: ReturnType<typeof setInterval>) => {
+      timers.delete(timer)
+      clearInterval(timer)
+    }) as typeof clearInterval,
+  }
+  deferCleanup(() => {
+    a.close()
+    b.close()
+    for (const timer of timers) clearInterval(timer)
+  })
+  const old = a.watch({
+    ...timerOptions,
+    onRefresh: () => {
+      entered.open()
+      return release.wait
+    },
+  })
+  trackDetached(old.ready)
+  const current = b.watch(timerOptions)
+  trackDetached(current.ready)
+  await entered.wait
+  a.close()
+  await thirdTick.wait
+  expect(timers.size).toBe(1)
+  expect(f.counts.lists).toBeGreaterThan(1)
+  await b.authorize('main')
+  release.open()
+  b.close()
+  expect(timers.size).toBe(0)
+  expect(f.counts.closes).toBe(1)
+}, 10_000)
+
+test('shared vault consumers isolate connection, enrollment and every store path', async () => {
+  const f = await fixture()
+  const a = acquireNativeVaultRuntime(f.options)
+  deferCleanup(() => a.close())
+  await a.authorize('main')
+  for (const change of [
+    { host: 'pi' as const },
+    {
+      identity: {
+        harness: 'pi',
+        project_root: '/other-project',
+        session: 'other-session',
+      },
+    },
+    { paths: { ...f.paths, storageId: 'other-store' } },
+    { connect: async () => f.client },
+    {
+      readToken: async () => ({ token: '01'.repeat(32), token_generation: 1 }),
+    },
+    { now: () => now },
+    { discover: async () => ({ view: 'other', credentials: [], skipped: [] }) },
+    {
+      env: {
+        ...f.env,
+        CLAUSTRUM_SUBC_CONNECTION: join(f.paths.config, 'other-connection'),
+      },
+    },
+    {
+      env: {
+        ...f.env,
+        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: `${f.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE}.other`,
+      },
+    },
+    ...(
+      [
+        'legacyConfig',
+        'legacyState',
+        'config',
+        'state',
+        'runtime',
+        'journal',
+        'roster',
+      ] as const
+    ).map((field) => ({
+      paths: { ...f.paths, [field]: `${f.paths[field]}.other` },
+    })),
+  ]) {
+    const b = acquireNativeVaultRuntime({ ...f.options, ...change })
+    deferCleanup(() => b.close())
+    // Reporting a receipt from another consumer must never cross the key boundary.
+    const receipt = await a.authorize('main')
+    await expect(b.reportFailure(receipt, 401, 'direct')).rejects.toMatchObject(
+      { code: 'no-receipt' },
+    )
+    b.close()
+  }
 })
 
 test('incomplete and unasserted vault lists retain prior accounts and cannot silently delete them', async () => {

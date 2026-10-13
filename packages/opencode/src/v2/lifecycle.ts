@@ -25,9 +25,7 @@ export function startNativeAnthropicLifecycle(
       snapshot.policyStorage.relay.transport !== 'http'
     )
       return
-    if (snapshot.mode === 'claustrum') await runtime.vault.refresh(abort.signal)
-    const current =
-      snapshot.mode === 'claustrum' ? await runtime.read() : snapshot
+    const current = snapshot
     const interval = getQuotaCheckIntervalMs(current.policyStorage)
     for (const account of current.accounts) {
       if (abort.signal.aborted) return
@@ -49,7 +47,7 @@ export function startNativeAnthropicLifecycle(
     }
   }
   const tick = () => {
-    if (stopped || inFlight) return
+    if (stopped || inFlight) return inFlight
     inFlight = run()
       .catch(() => {
         if (!abort.signal.aborted)
@@ -61,14 +59,24 @@ export function startNativeAnthropicLifecycle(
       .finally(() => {
         inFlight = undefined
       })
+    return inFlight
   }
-  const timer = setInterval(tick, 60_000)
-  timer.unref?.()
-  tick()
+  const watch = runtime.vault.watch({
+    intervalMs: 60_000,
+    onRefresh: tick,
+    shouldRefresh: async () => {
+      const snapshot = await runtime.read()
+      return (
+        snapshot.policyStorage.relay?.enabled !== true ||
+        snapshot.policyStorage.relay.transport === 'http'
+      )
+    },
+  })
+  void watch.ready.catch(() => {})
   return {
     async dispose() {
       stopped = true
-      clearInterval(timer)
+      watch.close()
       abort.abort()
       await inFlight
     },
