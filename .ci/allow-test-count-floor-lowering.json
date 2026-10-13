@@ -1,0 +1,7 @@
+{
+  "reason": "Owner-approved removal of native-cutover legacy scoped runtime, sidecar manager/writer tests and precisely named retired test blocks. Supported native migration, seed, custody, quota and policy coverage remains; live old-format fixtures are pinned to published 1.23.0 bytes. Core 1799→1737 and OpenCode offline 2130→2000 are measured suite reductions, not assertion rewrites. Pi remains 280. The OpenCode floor uses the reviewed offline measurement; its registry-dependent packed-host CI gate remains unchanged.",
+  "lowering": {
+    "core": { "from": 1765, "to": 1737 },
+    "opencode": { "from": 2111, "to": 2000 }
+  }
+}
