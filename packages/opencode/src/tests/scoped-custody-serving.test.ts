@@ -168,6 +168,23 @@ async function readNativeAccounts(fixture: NativeOpencodeFixture) {
   }
 }
 
+/** Publish the inventory change independently of the next model request, as the background vault watch does. */
+async function publishScopedRoster(
+  fixture: NativeOpencodeFixture,
+  client: NativeCustodyClient,
+) {
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+    vault: { connect: async () => client },
+  })
+  try {
+    await runtime.vault.refresh()
+  } finally {
+    runtime.close()
+  }
+}
+
 /** The OpenCode auth entry exactly as the migration left it in host auth. */
 function migratedActivation(fixture: NativeOpencodeFixture) {
   return async () =>
@@ -424,6 +441,42 @@ describe('OpenCode scoped custody serving', () => {
     expect(polls.size).toBe(0)
     expect(intervals.size).toBe(0)
   }, 15_000)
+
+  test('native vault quota identity rejects an unbound receipt without a legacy roster flag', async () => {
+    const { root, plugins } = await startBody('opencode-vault-identity-')
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'fd'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: scopedLegacyConfig(),
+    })
+    expect(
+      (await readNativeAccounts(fixture)).policyStorage.claustrum?.scopedRoster,
+    ).toBeUndefined()
+    const client: NativeCustodyClient = {
+      listScoped: async () => ({ view: 'identity', rows: [mainRow] }),
+      getScoped: async () => {
+        throw new Error('no credential read expected')
+      },
+      reportAuthFailureScoped: async () => {},
+      close: () => {},
+    }
+    const plugin = await createPlugin(plugins, fixture, {
+      claustrumScopedConnect: async () => client,
+      scopedRosterPollIntervalMs: 0,
+    })
+    const resolveIdentity = Reflect.get(
+      plugin,
+      '__resolveMainQuotaIdentityForTest',
+    )
+    if (typeof resolveIdentity !== 'function')
+      throw new Error('missing identity test hook')
+    expect(await resolveIdentity('unbound-access')).toMatchObject({
+      stale: true,
+      state: 'on-identity-mismatch',
+    })
+  })
+
   test('vault loader does not freeze a repairable host slot or enrollment refusal', async () => {
     const { root, plugins } = await startBody('opencode-vault-live-admission-')
     const fixture = await migrateScopedSeat(root, {
@@ -526,6 +579,18 @@ describe('OpenCode scoped custody serving', () => {
       })
       if (!loader.fetch) throw new Error('missing fetch')
       await entered.wait
+      const requestWaiting = lifetimes.gate()
+      const vault = Reflect.get(plugin, '__scopedRuntime')
+      const refresh = Reflect.get(vault, 'refresh')
+      if (typeof refresh !== 'function')
+        throw new Error('missing vault refresh')
+      Reflect.set(vault, 'refresh', (...args: unknown[]) => {
+        requestWaiting.open()
+        return Reflect.apply(refresh, vault, args)
+      })
+      lifetimes.deferCleanup(() => {
+        Reflect.set(vault, 'refresh', refresh)
+      })
       const started = performance.now()
       const request = loader.fetch(MESSAGES_URL, EMPTY_POST)
       lifetimes.trackDetached(
@@ -536,6 +601,7 @@ describe('OpenCode scoped custody serving', () => {
       )
       try {
         if (recoverBeforeDeadline) {
+          await requestWaiting.wait
           discovery.open()
           expect((await request).status).toBe(200)
         } else {
@@ -547,6 +613,7 @@ describe('OpenCode scoped custody serving', () => {
           expect(performance.now() - started).toBeLessThan(3000)
           expect(sends).toBe(0)
           discovery.open()
+          await Reflect.get(plugin, '__fallbackRefreshReady')
           expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(
             200,
           )
@@ -637,10 +704,12 @@ describe('OpenCode scoped custody serving', () => {
         { ...mainRow, recordVersion: 11 },
         { ...workRow, state: 'needs_reauth' },
       ]
+      await publishScopedRoster(fixture, client)
       expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
       expect(served.at(-1)).toBe(`Bearer admission-${mainRow.id}`)
 
       rows = rows.map((row) => ({ ...row, state: 'needs_reauth' }))
+      await publishScopedRoster(fixture, client)
       for (let attempt = 0; attempt < 2; attempt++)
         await expect(
           loader.fetch(MESSAGES_URL, EMPTY_POST),

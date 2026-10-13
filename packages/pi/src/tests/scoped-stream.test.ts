@@ -382,7 +382,7 @@ test('a revoked scoped credential never falls back to local auth or a paid API r
   expect(sends).toBe(1)
 })
 
-test('fallback-first discovers a new account on the next turn and honors a live disable', async () => {
+test('fallback-first adopts a newly published account on the next turn and honors a live disable', async () => {
   const f = await fixture('fallback-first')
   globalThis.fetch = Object.assign(async () => success(), {
     preconnect: originalFetch.preconnect,
@@ -391,6 +391,7 @@ test('fallback-first discovers a new account on the next turn and honors a live 
     (await streamCortexKitAnthropic(model, context).result()).stopReason,
   ).toBe('stop')
   f.rows.push(row('oauth:anthropic:new', fixtureAccountIdentity('new')))
+  await (await f.native.service()).vault.refresh()
   expect(
     (await streamCortexKitAnthropic(model, context).result()).stopReason,
   ).toBe('stop')
@@ -422,6 +423,7 @@ for (const mode of [
     const f = await fixture(mode)
     f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
     f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+    await (await f.native.service()).vault.refresh()
     await (await f.native.service()).updateSettings((settings) => ({
       ...settings,
       quota: { enabled: false },
@@ -453,12 +455,14 @@ for (const mode of [
     expect(served).toEqual(['oauth:anthropic:work'])
     f.rows[0] = { ...f.rows[0]!, state: 'active' }
     f.rows[1] = { ...f.rows[1]!, state: 'needs_reauth' }
+    await (await f.native.service()).vault.refresh()
     expect(
       (await streamCortexKitAnthropic(model, context, options).result())
         .stopReason,
     ).toBe('stop')
     expect(served.at(-1)).toBe('oauth:anthropic')
     f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
+    await (await f.native.service()).vault.refresh()
     for (let attempt = 0; attempt < 2; attempt++) {
       const result = await streamCortexKitAnthropic(
         model,
@@ -539,6 +543,7 @@ registerTest.each([500, 401])(
 test('scoped model switches reuse the existing sticky allocator and its Opus reserve preference', async () => {
   const f = await fixture('sticky-balanced')
   f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+  await (await f.native.service()).vault.refresh()
   const served: string[] = []
   globalThis.fetch = Object.assign(
     async (
@@ -1359,6 +1364,7 @@ registerTest.each([
 test('Pi vault default UUID replacement re-places the old session without inheriting quota or changing an unrelated fallback pin', async () => {
   const f = await fixture('sticky-balanced')
   f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+  await (await f.native.service()).vault.refresh()
   const served: string[] = []
   globalThis.fetch = Object.assign(
     async (

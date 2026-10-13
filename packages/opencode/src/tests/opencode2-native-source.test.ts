@@ -20,6 +20,7 @@ import {
   type NativeAccountRuntime,
   type NativeCustodyClient,
   type NativePoolPaths,
+  readNativeAccountsForRequest,
   readNativeEnrollmentMode,
   resolveNativePoolPaths,
   runNativeMigration,
@@ -423,6 +424,7 @@ async function vaultWithFallback() {
     ['oauth:anthropic:work', fallbackIdentity],
   ])
   const states = new Map<string, string>()
+  let discoveries = 0
   const row = (credentialId: string) => ({
     id: credentialId,
     accountId: identities.get(credentialId) ?? '',
@@ -438,6 +440,7 @@ async function vaultWithFallback() {
   })
   const client: NativeCustodyClient = {
     async listScoped() {
+      discoveries++
       return {
         view: `oc2-view-${[...identities.values()].join('-')}-${[...states.values()].join('-')}`,
         rows: [...identities.keys()].map(row),
@@ -485,6 +488,8 @@ async function vaultWithFallback() {
   return {
     paths,
     runtime,
+    client,
+    discoveries: () => discoveries,
     setState: (credentialId: string, state: string) =>
       states.set(credentialId, state),
     setDefaultIdentity: (next: string) => {
@@ -503,6 +508,145 @@ function rawPin(text: string, sessionID: string) {
 }
 
 describe('OC2 source over actual native services', () => {
+  usageTests.test(
+    'healthy native vault requests do not refresh or discover the ready roster',
+    async () => {
+      const f = await vaultWithFallback()
+      const snapshot = await f.runtime.read()
+      expect(snapshot.mode).toBe('claustrum')
+      expect(snapshot.policyStorage.claustrum?.scopedRoster).toBeUndefined()
+      const refresh = spyOn(f.runtime.vault, 'refresh')
+      cleanups.push(() => refresh.mockRestore())
+      const before = f.discoveries()
+      const native = source(f.runtime, f.paths)
+      for (let request = 0; request < 4; request++) {
+        const chosen = await native.chooseAccount({
+          ...scope,
+          sessionID: `healthy-${request}`,
+        })
+        expect(chosen).toBeDefined()
+        expect((await native.authorizeAccount(scope, chosen!))?.route).toBe(
+          'oauth',
+        )
+      }
+      expect(refresh).toHaveBeenCalledTimes(0)
+      expect(f.discoveries() - before).toBe(0)
+    },
+  )
+
+  usageTests.test(
+    'inactive native vault admission coalesces one refresh and serves a recovered account',
+    async () => {
+      const f = await vaultWithFallback()
+      f.setState('oauth:anthropic', 'needs_reauth')
+      f.setState('oauth:anthropic:work', 'needs_reauth')
+      await f.runtime.vault.refresh()
+      expect(
+        (await f.runtime.read()).policyStorage.claustrum?.scopedRoster,
+      ).toBeUndefined()
+      f.setState('oauth:anthropic', 'active')
+      const entered = usageTests.gate()
+      const release = usageTests.gate()
+      const list = f.client.listScoped
+      f.client.listScoped = async (...args) => {
+        entered.open()
+        await release.wait
+        return list(...args)
+      }
+      const refresh = spyOn(f.runtime.vault, 'refresh')
+      cleanups.push(() => refresh.mockRestore())
+      const before = f.discoveries()
+      const requests = [
+        readNativeAccountsForRequest(f.runtime),
+        readNativeAccountsForRequest(f.runtime),
+      ]
+      for (const request of requests)
+        usageTests.trackDetached(
+          request.then(
+            () => {},
+            () => {},
+          ),
+        )
+      try {
+        await entered.wait
+        await Promise.resolve()
+        release.open()
+        const snapshots = await Promise.all(requests)
+        for (const snapshot of snapshots)
+          expect(
+            snapshot.accounts.find((account) => account.id === 'main')?.state,
+          ).toBe('active')
+        expect(refresh).toHaveBeenCalledTimes(1)
+        expect(f.discoveries() - before).toBe(1)
+      } finally {
+        release.open()
+      }
+    },
+  )
+
+  usageTests.test(
+    'inactive native vault admission refreshes once before its fixed refusal',
+    async () => {
+      const f = await vaultWithFallback()
+      f.setState('oauth:anthropic', 'needs_reauth')
+      f.setState('oauth:anthropic:work', 'needs_reauth')
+      await f.runtime.vault.refresh()
+      const refresh = spyOn(f.runtime.vault, 'refresh')
+      cleanups.push(() => refresh.mockRestore())
+      const before = f.discoveries()
+      await expect(
+        readNativeAccountsForRequest(f.runtime),
+      ).rejects.toMatchObject({
+        message:
+          'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+      })
+      expect(refresh).toHaveBeenCalledTimes(1)
+      expect(f.discoveries() - before).toBe(1)
+    },
+  )
+
+  usageTests.test(
+    'inactive native vault admission bounds a stalled refresh at two seconds',
+    async () => {
+      const f = await vaultWithFallback()
+      f.setState('oauth:anthropic', 'needs_reauth')
+      f.setState('oauth:anthropic:work', 'needs_reauth')
+      await f.runtime.vault.refresh()
+      const release = usageTests.gate()
+      const list = f.client.listScoped
+      let calls = 0
+      f.client.listScoped = async (...args) => {
+        calls++
+        await release.wait
+        return list(...args)
+      }
+      const refresh = spyOn(f.runtime.vault, 'refresh')
+      cleanups.push(() => refresh.mockRestore())
+      const started = performance.now()
+      try {
+        await expect(
+          readNativeAccountsForRequest(f.runtime),
+        ).rejects.toMatchObject({
+          message:
+            'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+        })
+        expect(performance.now() - started).toBeGreaterThanOrEqual(1900)
+        expect(performance.now() - started).toBeLessThan(3000)
+        expect(refresh).toHaveBeenCalledTimes(1)
+        expect(calls).toBe(1)
+        f.setState('oauth:anthropic', 'active')
+        release.open()
+        expect(
+          (await readNativeAccountsForRequest(f.runtime)).accounts.find(
+            (account) => account.id === 'main',
+          )?.state,
+        ).toBe('active')
+      } finally {
+        release.open()
+      }
+    },
+  )
+
   for (const mode of [
     'main-first',
     'fallback-first',
@@ -517,6 +661,7 @@ describe('OC2 source over actual native services', () => {
           routing: { mode },
         }))
         f.setState('oauth:anthropic', 'needs_reauth')
+        await f.runtime.vault.refresh()
         const native = source(f.runtime, f.paths)
         const chosen = await native.chooseAccount(scope)
         expect(chosen).toBeDefined()
@@ -526,11 +671,13 @@ describe('OC2 source over actual native services', () => {
         expect(first?.provenance.kind).toBe('vault')
         f.setState('oauth:anthropic', 'active')
         f.setState('oauth:anthropic:work', 'needs_reauth')
+        await f.runtime.vault.refresh()
         expect(await native.chooseAccount(scope)).toBe('main')
         expect((await native.authorizeAccount(scope, 'main'))?.route).toBe(
           'oauth',
         )
         f.setState('oauth:anthropic', 'needs_reauth')
+        await f.runtime.vault.refresh()
         for (let attempt = 0; attempt < 2; attempt++)
           await expect(native.chooseAccount(scope)).rejects.toMatchObject({
             message:

@@ -1937,7 +1937,7 @@ const anthropicAuthPlugin = async (
       const identity = nativeWireIdentity(
         credentialAccountUuid ?? nativePrimaryIdentity,
       )
-      const scopedCustodyActive = isScopedCustodyActive(currentStorage)
+      const scopedCustodyActive = currentSnapshot.mode === 'claustrum'
       const rosterPrimaryAccountId = scopedCustodyActive
         ? currentStorage?.claustrum?.primaryAccount?.accountId
         : undefined

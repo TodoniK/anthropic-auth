@@ -11,6 +11,21 @@ export class NativeVaultNoAccountError extends Error {
   }
 }
 
+const refreshing = new WeakMap<
+  NativeAccountRuntime,
+  Promise<NativeAccountSnapshot>
+>()
+
+function hasActiveVaultAccount(snapshot: NativeAccountSnapshot): boolean {
+  return snapshot.accounts.some(
+    (account) =>
+      account.source === 'vault' &&
+      account.type === 'oauth' &&
+      account.enabled &&
+      account.state === 'active',
+  )
+}
+
 /** A missing roster may be discovery still in progress, not an empty pool. */
 export async function readNativeAccountsForRequest(
   runtime: NativeAccountRuntime,
@@ -18,26 +33,49 @@ export async function readNativeAccountsForRequest(
 ): Promise<NativeAccountSnapshot> {
   signal?.throwIfAborted()
   const snapshot = await runtime.read()
+  signal?.throwIfAborted()
   if (snapshot.mode !== 'claustrum') return snapshot
   const ready = Boolean((await runtime.vault.read())?.view)
+  signal?.throwIfAborted()
+  // A usable published roster is sufficient for routing. Its background watch
+  // owns discovery; model requests must not contend on the roster write lock.
+  if (ready && hasActiveVaultAccount(snapshot)) return snapshot
 
+  let pending = refreshing.get(runtime)
+  if (!pending) {
+    pending = refreshForRequest(runtime, ready).finally(() =>
+      refreshing.delete(runtime),
+    )
+    refreshing.set(runtime, pending)
+  }
+  return waitForRequest(pending, signal)
+}
+
+async function refreshForRequest(
+  runtime: NativeAccountRuntime,
+  ready: boolean,
+): Promise<NativeAccountSnapshot> {
   // Wait at most two seconds for the vault to publish its account inventory.
   // Concurrent requests share discovery: cancelling this request only ends
   // its wait, while runtime.close() cancels discovery for all callers.
   const deadline = new AbortController()
   const timer = setTimeout(() => deadline.abort(), 2000)
-  const combined = signal
-    ? AbortSignal.any([signal, deadline.signal])
-    : deadline.signal
+  const combined = deadline.signal
   try {
     while (!combined.aborted) {
+      let roster: Awaited<ReturnType<NativeAccountRuntime['vault']['refresh']>>
       try {
-        const roster = await runtime.vault.refresh(combined)
-        if (roster?.view) return await runtime.read()
+        roster = await runtime.vault.refresh(combined)
       } catch {
-        signal?.throwIfAborted()
-        if (ready) return await runtime.read()
+        if (ready || combined.aborted) break
       }
+      if (roster?.view) {
+        const snapshot = await runtime.read()
+        if (snapshot.mode !== 'claustrum' || hasActiveVaultAccount(snapshot))
+          return snapshot
+        throw new NativeVaultNoAccountError()
+      }
+      if (ready) break
       if (combined.aborted) break
       await new Promise<void>((resolve) => {
         const finish = () => {
@@ -50,10 +88,23 @@ export async function readNativeAccountsForRequest(
         if (combined.aborted) finish()
       })
     }
-    signal?.throwIfAborted()
-    if (ready) return await runtime.read()
     throw new NativeVaultNoAccountError()
   } finally {
     clearTimeout(timer)
   }
+}
+
+function waitForRequest<T>(
+  pending: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return pending
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason)
+    signal.addEventListener('abort', abort, { once: true })
+    pending
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener('abort', abort))
+    if (signal.aborted) abort()
+  })
 }

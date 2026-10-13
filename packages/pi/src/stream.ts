@@ -955,7 +955,7 @@ async function executeWithFallback(options: {
   onResolvedTools?: (tools: Tool[]) => void
 }): Promise<Response> {
   const native = getPiNativeRuntime(options.storagePath)
-  let snapshot = await native.view(options.streamOptions?.signal)
+  let snapshot = await native.requestView(options.streamOptions?.signal)
   let storage = snapshot.policyStorage
   const accountView = (id: string) =>
     snapshot.accounts.find((account) => account.id === id)

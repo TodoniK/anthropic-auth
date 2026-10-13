@@ -210,7 +210,15 @@ export class PiNativeRuntime {
     }
   }
 
+  /** Read the published inventory even when no account can serve, so /claude can show its sign-in remedy. */
   async view(signal?: AbortSignal): Promise<NativeAccountSnapshot> {
+    const runtime = await this.service()
+    signal?.throwIfAborted()
+    return runtime.read()
+  }
+
+  /** Admit a model request without rediscovering a healthy roster. */
+  async requestView(signal?: AbortSignal): Promise<NativeAccountSnapshot> {
     const runtime = await this.service()
     return readNativeAccountsForRequest(runtime, signal)
   }
