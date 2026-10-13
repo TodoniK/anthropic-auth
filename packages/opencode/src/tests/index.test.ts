@@ -11032,40 +11032,60 @@ describe('auth.loader', () => {
   test('profile hydration keeps its plugin-scoped fetch across test turnover', async () => {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     await useTempAccountFile(createFallbackStorage())
-    const mainProfile = heldResponse()
-    const mainProfileStarted = lifetimeSignal()
-    const fallbackProfileStarted = lifetimeSignal()
+    const firstProfileStarted = lifetimeSignal()
+    const secondLookupArrived = lifetimeSignal()
+    const secondLookupReleased = lifetimeSignal()
+    const lookupAccounts: string[] = []
     const firstFetchCalls: string[] = []
-    globalThis.fetch = mock(
-      withNativeAdmission(
-        (input: string | URL | Request, init?: RequestInit) => {
-          const authorization = new Headers(
-            input instanceof Request ? input.headers : init?.headers,
-          ).get('authorization')
-          if (extractUrl(input).includes('/api/oauth/usage')) {
-            return Promise.resolve(
-              Response.json({
-                five_hour: { utilization: 25 },
-                seven_day: { utilization: 30 },
-              }),
-            )
-          }
-          firstFetchCalls.push(authorization ?? '')
-          if (authorization === 'Bearer sk-ant-oat01-main-access') {
-            mainProfileStarted.raise()
-            return mainProfile.response
-          }
-          fallbackProfileStarted.raise()
+    const answer = withNativeAdmission(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const authorization = new Headers(
+          input instanceof Request ? input.headers : init?.headers,
+        ).get('authorization')
+        if (extractUrl(input).includes('/api/oauth/usage')) {
           return Promise.resolve(
             Response.json({
-              organization: {
-                organization_type: 'claude_team',
-                rate_limit_tier: 'default_claude_max_5x',
-              },
+              five_hour: { utilization: 25 },
+              seven_day: { utilization: 30 },
             }),
           )
-        },
-      ),
+        }
+        firstFetchCalls.push(authorization ?? '')
+        firstProfileStarted.raise()
+        return Promise.resolve(
+          Response.json({
+            organization:
+              authorization === 'Bearer sk-ant-oat01-main-access'
+                ? {
+                    organization_type: 'claude_max',
+                    rate_limit_tier: 'default_claude_max_20x',
+                  }
+                : {
+                    organization_type: 'claude_team',
+                    rate_limit_tier: 'default_claude_max_5x',
+                  },
+          }),
+        )
+      },
+    )
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        // Profiles load one account at a time, in either order, and each
+        // account's lookup runs before its profile request. Hold the second
+        // account's lookup so its profile request is sent only after the swap.
+        if (extractUrl(input).includes('/api/claude_cli/bootstrap')) {
+          const account =
+            new Headers(
+              input instanceof Request ? input.headers : init?.headers,
+            ).get('authorization') ?? ''
+          if (!lookupAccounts.includes(account)) lookupAccounts.push(account)
+          if (lookupAccounts.indexOf(account) === 1) {
+            secondLookupArrived.raise()
+            await secondLookupReleased.raised
+          }
+        }
+        return answer(input, init)
+      },
     ) as unknown as typeof fetch
     const plugin = await getPlugin()
     await plugin.auth.loader(
@@ -11078,33 +11098,33 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
-    // Each route's account lookup (bootstrap) runs before its profile request
-    // and goes through the global fetch of the moment, not the fetch the
-    // plugin captured for profiles. Replace the global fetch only once both
-    // profile requests have been sent, so the replacement can only be
-    // reached by work that does not keep the plugin's own fetch.
-    await mainProfileStarted.raised
-    await fallbackProfileStarted.raised
+    await firstProfileStarted.raised
+    await secondLookupArrived.raised
 
-    const nextTestFetch = mock(() => Promise.resolve(new Response('ok')))
+    // Simulate the next test installing its own global fetch. The second
+    // account's profile request is sent after this point and must still use the fetch
+    // the plugin captured. Quota polls use the global fetch of the moment by
+    // design, so only profile requests are checked here.
+    const nextTestRequests: string[] = []
+    const nextTestFetch = mock((input: string | URL | Request) => {
+      nextTestRequests.push(extractUrl(input))
+      return Promise.resolve(new Response('ok'))
+    })
     globalThis.fetch = nextTestFetch as unknown as typeof fetch
-    mainProfile.release(
-      Response.json({
-        organization: {
-          organization_type: 'claude_max',
-          rate_limit_tier: 'default_claude_max_20x',
-        },
-      }),
-    )
+    secondLookupReleased.raise()
     await waitForSidebarState(
-      (state) => state.fallbacks[0]?.tierLabel === 'Team · Max 5x',
+      (state) =>
+        state.main.tierLabel === 'Max 20x' &&
+        state.fallbacks[0]?.tierLabel === 'Team · Max 5x',
     )
 
     expect(firstFetchCalls.toSorted()).toEqual([
       'Bearer sk-ant-oat01-fallback-access',
       'Bearer sk-ant-oat01-main-access',
     ])
-    expect(nextTestFetch).not.toHaveBeenCalled()
+    expect(
+      nextTestRequests.filter((url) => url.includes('/api/oauth/profile')),
+    ).toEqual([])
   })
 
   test('mock-environment opt-out prevents boot profile network calls', async () => {
