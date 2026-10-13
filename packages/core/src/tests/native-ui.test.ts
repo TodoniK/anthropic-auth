@@ -171,6 +171,51 @@ function setup(
 }
 
 describe('native UI contract', () => {
+  for (const host of ['opencode', 'pi'] as const) {
+    test(`${host} shared vault menu names reauth accounts and the replacement command`, async () => {
+      let state = 'needs_reauth'
+      const menu = createNativeUi({
+        host,
+        interactive: false,
+        readMode: async () => 'claustrum',
+        disconnectVault: unusedDisconnect,
+        dispatch: async () => ({ ok: true, text: '' }),
+        readStatus: async () => 'public status',
+        readAccounts: async () => ({
+          mode: 'claustrum',
+          settings: {},
+          policyStorage: { version: 1, accounts: [] },
+          accounts: [
+            {
+              id: 'main',
+              label: 'Personal Claude',
+              source: 'vault',
+              type: 'oauth',
+              enabled: false,
+              state,
+              credentialId: 'oauth:anthropic',
+            },
+          ],
+        }),
+      })
+      const first = await menu.open(invocation)
+      const lines = first.menu.sections
+        .flatMap((section) => section.lines)
+        .join('\n')
+      expect(lines).toContain(
+        'Personal Claude (oauth:anthropic) needs signing in again.',
+      )
+      expect(lines).toContain(
+        'ck auth login --provider anthropic --id oauth:anthropic --replace',
+      )
+      state = 'active'
+      const second = await menu.open(invocation)
+      expect(
+        second.menu.sections.flatMap((section) => section.lines).join('\n'),
+      ).not.toContain('--replace')
+    })
+  }
+
   test('bundled Pi renderer executes the same checked menu without a second backend', async () => {
     const { menu, calls } = setup('pi')
     const inputs = [

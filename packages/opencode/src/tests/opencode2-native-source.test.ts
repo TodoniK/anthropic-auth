@@ -422,6 +422,7 @@ async function vaultWithFallback() {
     ['oauth:anthropic', identity],
     ['oauth:anthropic:work', fallbackIdentity],
   ])
+  const states = new Map<string, string>()
   const row = (credentialId: string) => ({
     id: credentialId,
     accountId: identities.get(credentialId) ?? '',
@@ -431,14 +432,14 @@ async function vaultWithFallback() {
     serves: ['anthropic'],
     providerIds: [],
     operations: ['read'],
-    state: 'active',
+    state: states.get(credentialId) ?? 'active',
     recordVersion: 7,
     createdAtMs: null,
   })
   const client: NativeCustodyClient = {
     async listScoped() {
       return {
-        view: `oc2-view-${[...identities.values()].join('-')}`,
+        view: `oc2-view-${[...identities.values()].join('-')}-${[...states.values()].join('-')}`,
         rows: [...identities.keys()].map(row),
       }
     },
@@ -484,6 +485,8 @@ async function vaultWithFallback() {
   return {
     paths,
     runtime,
+    setState: (credentialId: string, state: string) =>
+      states.set(credentialId, state),
     setDefaultIdentity: (next: string) => {
       identities.set('oauth:anthropic', next)
     },
@@ -500,6 +503,45 @@ function rawPin(text: string, sessionID: string) {
 }
 
 describe('OC2 source over actual native services', () => {
+  for (const mode of [
+    'main-first',
+    'fallback-first',
+    'sticky-balanced',
+  ] as const) {
+    usageTests.test(
+      `OC2 vault reauth recovers on the next request in ${mode}`,
+      async () => {
+        const f = await vaultWithFallback()
+        await f.runtime.updateSettings((settings) => ({
+          ...settings,
+          routing: { mode },
+        }))
+        f.setState('oauth:anthropic', 'needs_reauth')
+        const native = source(f.runtime, f.paths)
+        const chosen = await native.chooseAccount(scope)
+        expect(chosen).toBeDefined()
+        expect(chosen).not.toBe('main')
+        const first = await native.authorizeAccount(scope, chosen!)
+        expect(first?.route).toBe('oauth')
+        expect(first?.provenance.kind).toBe('vault')
+        f.setState('oauth:anthropic', 'active')
+        f.setState('oauth:anthropic:work', 'needs_reauth')
+        expect(await native.chooseAccount(scope)).toBe('main')
+        expect((await native.authorizeAccount(scope, 'main'))?.route).toBe(
+          'oauth',
+        )
+        f.setState('oauth:anthropic', 'needs_reauth')
+        for (let attempt = 0; attempt < 2; attempt++)
+          await expect(native.chooseAccount(scope)).rejects.toMatchObject({
+            message:
+              'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+          })
+        f.setState('oauth:anthropic', 'active')
+        expect(await native.chooseAccount(scope)).toBe('main')
+      },
+    )
+  }
+
   test('queued newer vault receipts recheck exact-model admission after a relay-config wait', async () => {
     const fixture = await vault([7, 8, 8])
     const native = source(fixture.runtime, fixture.paths)

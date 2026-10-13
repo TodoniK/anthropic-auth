@@ -78,6 +78,10 @@ export interface NativeUiOptions {
    * is treated as unknown custody, which also withholds them.
    */
   readonly readMode: () => Promise<NativeMenuCustodyMode>
+  /** Token-free account names, credential IDs and states used to show which vault account needs re-login and its replacement command. */
+  readonly readAccounts?: () => Promise<
+    import('./native-account-view.ts').NativeAccountSnapshot
+  >
   /**
    * Disconnects this host from the vault; while enrolled, this is the host's
    * only enrollment action. Before ending the enrollment, the callback
@@ -419,6 +423,31 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
             ? VAULT_ACCOUNTS_GUIDANCE
             : UNKNOWN_CUSTODY_GUIDANCE,
         )
+      if (
+        group.id === 'Accounts' &&
+        custody === 'claustrum' &&
+        options.readAccounts
+      ) {
+        try {
+          const snapshot = await options.readAccounts()
+          for (const account of snapshot.accounts) {
+            if (
+              account.source === 'vault' &&
+              account.state === 'needs_reauth' &&
+              account.credentialId
+            )
+              lines.push(
+                scrub(
+                  `${account.label || account.id} (${account.credentialId}) needs signing in again. Run: ck auth login --provider anthropic --id ${account.credentialId} --replace`,
+                ),
+              )
+          }
+        } catch {
+          lines.push(
+            'Vault sign-in status unavailable; reopen /claude to retry.',
+          )
+        }
+      }
       for (const status of group.statuses) {
         if (!readable) {
           lines.push(`${status.label}: status unavailable.`)

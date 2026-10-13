@@ -18,6 +18,7 @@ import {
   type MidConversationEffortTransition,
   type NativeAccountSnapshot,
   type NativeCustodyClient,
+  readNativeEnrollmentMode,
 } from '@cortexkit/anthropic-auth-core'
 import type { Provider, SimpleStreamOptions } from '@earendil-works/pi-ai'
 import type {
@@ -52,12 +53,14 @@ function textImageInput(): Array<'text' | 'image'> {
  * stored. Extension commands such as /claude run before input handlers, so
  * they stay reachable.
  */
-function refuseUnmigratedPrompts(pi: ExtensionAPI, refusal: string) {
-  pi.on('input', (_event, ctx) => {
+function refuseUnmigratedPrompts(pi: ExtensionAPI, storagePath: string) {
+  pi.on('input', async (_event, ctx) => {
     // Prompts for other providers do not use this install's accounts.
     if (ctx.model?.provider !== 'anthropic') return { action: 'continue' }
-    if (ctx.hasUI) ctx.ui.notify(refusal, 'error')
-    else process.stderr.write(`${refusal}\n`)
+    const refusal = await getPiNativeRuntime(storagePath).migrationRefusal()
+    if (!refusal) return { action: 'continue' }
+    if (ctx.hasUI) ctx.ui.notify(refusal.message, 'error')
+    else process.stderr.write(`${refusal.message}\n`)
     return { action: 'handled' }
   })
 }
@@ -254,12 +257,14 @@ export default async function cortexKitPiAnthropicAuth(
     const streamSimple = configuration.streamSimple
     if (!streamSimple)
       throw new Error('Anthropic stream implementation is unavailable')
-    // Read the account list installed by offline migration before registering
-    // the provider, so a vault account list is loaded before Pi first checks
-    // whether this provider is configured. Token authorization happens
-    // separately for each request.
+    // Register vault-backed models even if no account can serve yet, so a
+    // repaired enrollment or re-login takes effect on the next request. Local
+    // credentials still require completed offline migration before serving.
+    const startupMode = await readNativeEnrollmentMode('pi').catch(
+      () => undefined,
+    )
     try {
-      await getPiNativeRuntime(storagePath).view()
+      if (startupMode === 'local') await getPiNativeRuntime(storagePath).view()
     } catch (error) {
       // An install that offline setup has never migrated, such as a 1.x
       // install upgraded in place, must still load: a failed load drops the
@@ -267,9 +272,11 @@ export default async function cortexKitPiAnthropicAuth(
       // Any other failure stops the load as before.
       const refusal = await getPiNativeRuntime(storagePath).migrationRefusal()
       if (!refusal) throw error
-      refuseUnmigratedPrompts(pi, refusal.message)
+      refuseUnmigratedPrompts(pi, storagePath)
     }
     const configured = async () => {
+      const mode = await readNativeEnrollmentMode('pi').catch(() => undefined)
+      if (mode !== 'local') return true
       await requirePiNativeHostAuth()
       let snapshot: NativeAccountSnapshot
       try {

@@ -323,6 +323,7 @@ export function createPiNativeCommands(
     }
   }
   return {
+    readAccounts: async () => (await native.service()).read(),
     dispatch,
     async readStatus(command) {
       const runtime = await native.service()

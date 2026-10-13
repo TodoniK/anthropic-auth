@@ -45,7 +45,6 @@ export * from './native-credential-validation.ts'
 export type {
   NativeCustody,
   NativeCustodyClient,
-  NativeCustodyError,
   NativeCustodyErrorCode,
   NativeCustodyIdentity,
   NativeCustodyInventory,
@@ -55,7 +54,7 @@ export type {
   NativeCustodyReporterSource,
   NativeCustodyRetry,
 } from './native-custody.ts'
-export { createNativeCustody } from './native-custody.ts'
+export { createNativeCustody, NativeCustodyError } from './native-custody.ts'
 export type {
   NativeCustodyActivationErrorCode,
   NativeCustodyActivationHooks,
@@ -178,6 +177,11 @@ export {
   runPiCommandMenu,
 } from './native-ui.ts'
 export * from './native-usage-publication.ts'
+export {
+  NATIVE_VAULT_NO_ACCOUNT_MESSAGE,
+  NativeVaultNoAccountError,
+  readNativeAccountsForRequest,
+} from './native-vault-admission.ts'
 export type {
   NativePiAuthSlot,
   NativePiAuthSlotErrorCode,

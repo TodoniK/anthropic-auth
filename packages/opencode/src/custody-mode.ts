@@ -21,13 +21,15 @@ export class CustodyStateMismatchError extends Error {
 }
 
 /**
- * Native OAuth startup requires a completed migration, an inert host auth
- * marker and verified credential storage. Local mode requires local account
- * rows; vault mode requires a token-free account inventory. Other combinations
- * refuse startup. The letter dimensions describe those states in diagnostics.
- * Ordinary OpenCode API keys remain untouched. The host marker enables the
- * provider but cannot authenticate: each send still validates local credentials
- * or gets fresh authorization for the selected vault account.
+ * Check custody independently from account availability. Modes L/C mean local
+ * and Claustrum vault. Main R/T/X means a real login, inert tombstone, or no
+ * recognized OAuth marker; fallback R/T/M means local rows, token-free vault
+ * inventory, or missing roster. Evidence V/N means verified or unavailable.
+ * Local mode still requires completed migration and local account rows. Vault
+ * mode requires enrollment authority, the host marker and a readable roster,
+ * not an active primary. Each request separately authorizes its chosen account;
+ * the marker enables the provider but cannot authenticate it. Ordinary OpenCode
+ * API-key authentication remains outside this OAuth custody check.
  */
 export function reconcileCustodyStartup(input: {
   mode: 'L' | 'C'

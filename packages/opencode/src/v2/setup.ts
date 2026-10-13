@@ -304,6 +304,7 @@ export async function setupAnthropicAuth(
       host: 'opencode',
       dispatch: capabilities.dispatch,
       readStatus: (command) => capabilities.readStatus(command),
+      readAccounts: () => runtime.read(),
       readMode: enrollment.readMode,
       disconnectVault: enrollment.disconnectVault,
       interactive: true,

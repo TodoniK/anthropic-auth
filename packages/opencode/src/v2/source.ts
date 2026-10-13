@@ -13,12 +13,14 @@ import {
   type NativeCustodyReceipt,
   type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
   type NativePoolPaths,
+  NativeVaultNoAccountError,
   nativeAccountPolicy,
   normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
+  readNativeAccountsForRequest,
   remapModelId,
   StickySessionRouter,
   shouldFallbackStatus,
@@ -259,13 +261,8 @@ export function createNativeAnthropicSource(
         (await options.resolveModelId?.(input)) ?? input.modelID,
       )
       active.signal.throwIfAborted()
-      if (
-        snapshot.mode === 'claustrum' &&
-        !snapshot.accounts.some((account) => account.type === 'oauth')
-      ) {
-        await runtime.vault.refresh(active.signal)
-        active.signal.throwIfAborted()
-        snapshot = await runtime.read()
+      if (snapshot.mode === 'claustrum') {
+        snapshot = await readNativeAccountsForRequest(runtime, active.signal)
         active.signal.throwIfAborted()
       }
       if (snapshot.policyStorage.quota?.enabled !== false) {
@@ -386,6 +383,7 @@ export function createNativeAnthropicSource(
               ]
         if (ordered[0]) return ordered[0].id
       }
+      if (snapshot.mode === 'claustrum') throw new NativeVaultNoAccountError()
       // Fall back to a pay-per-token API key account only when the primary
       // Claude subscription account ('main') has run out: a recent usage
       // reading for main's current account and credential version must show

@@ -20,6 +20,7 @@ import {
   quotaSnapshotHasStandardWindows,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  readNativeAccountsForRequest,
   readNativeMigrationJournal,
   resolveClaustrumConnectionPath,
   resolveNativePoolPaths,
@@ -209,12 +210,9 @@ export class PiNativeRuntime {
     }
   }
 
-  async view(): Promise<NativeAccountSnapshot> {
+  async view(signal?: AbortSignal): Promise<NativeAccountSnapshot> {
     const runtime = await this.service()
-    // Refresh before reading routes so an uninitialized vault list is not
-    // mistaken for a complete empty pool.
-    await runtime.vault.refresh()
-    return runtime.read()
+    return readNativeAccountsForRequest(runtime, signal)
   }
 
   async authorize(

@@ -424,6 +424,239 @@ describe('OpenCode scoped custody serving', () => {
     expect(polls.size).toBe(0)
     expect(intervals.size).toBe(0)
   }, 15_000)
+  test('vault loader does not freeze a repairable host slot or enrollment refusal', async () => {
+    const { root, plugins } = await startBody('opencode-vault-live-admission-')
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'fb'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: scopedLegacyConfig(),
+    })
+    const client: NativeCustodyClient = {
+      listScoped: async () => ({ view: 'live', rows: [mainRow] }),
+      getScoped: async ({ credentialId }) => ({
+        credentialId,
+        accountId: mainRow.accountId!,
+        material: 'live-access',
+        recordVersion: 10,
+        expiresAtMs: Date.now() + 3_600_000,
+      }),
+      reportAuthFailureScoped: async () => {},
+      close: () => {},
+    }
+    globalThis.fetch = (async (_input: unknown, _init?: RequestInit) =>
+      Response.json({ content: [] })) as typeof fetch
+    const hostBytes = await readFile(fixture.hostAuthPath, 'utf8')
+    const enrollmentBytes = await readFile(fixture.enrollmentPath, 'utf8')
+    await writeFile(
+      fixture.hostAuthPath,
+      JSON.stringify({
+        anthropic: { type: 'oauth', access: 'separate-login' },
+      }),
+    )
+    await writeFile(fixture.enrollmentPath, '{broken')
+    const plugin = await createPlugin(plugins, fixture, {
+      claustrumScopedConnect: async () => client,
+      scopedRosterPollIntervalMs: 0,
+    })
+    if (!plugin.auth?.loader) throw new Error('missing auth loader')
+    const loader = await plugin.auth.loader(migratedActivation(fixture), {
+      id: 'anthropic',
+      name: 'Anthropic',
+      source: 'custom',
+      env: [],
+      options: {},
+      models: {},
+    })
+    if (!loader.fetch) throw new Error('missing fetch')
+    await expect(loader.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toThrow()
+    await writeFile(fixture.enrollmentPath, enrollmentBytes)
+    await expect(loader.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toThrow(
+      'OpenCode holds a separate Anthropic login',
+    )
+    await writeFile(fixture.hostAuthPath, hostBytes)
+    expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+  })
+
+  for (const recoverBeforeDeadline of [true, false]) {
+    test(`vault request waits for a missing roster and ${recoverBeforeDeadline ? 'serves' : 'refuses within two seconds then recovers'}`, async () => {
+      const { root, plugins } = await startBody('opencode-vault-roster-wait-')
+      const fixture = await migrateScopedSeat(root, {
+        rows: () => [mainRow],
+        token: 'fc'.repeat(32),
+        expectedCredentials: [mainRow.id],
+        legacyConfig: scopedLegacyConfig(),
+      })
+      await rm(nativeVaultPaths(fixture.paths).roster)
+      const discovery = lifetimes.gate()
+      const entered = lifetimes.gate()
+      const client: NativeCustodyClient = {
+        listScoped: async () => {
+          entered.open()
+          await discovery.wait
+          return { view: 'ready', rows: [mainRow] }
+        },
+        getScoped: async ({ credentialId }) => ({
+          credentialId,
+          accountId: mainRow.accountId!,
+          material: 'ready-access',
+          recordVersion: 10,
+          expiresAtMs: Date.now() + 3_600_000,
+        }),
+        reportAuthFailureScoped: async () => {},
+        close: () => {},
+      }
+      let sends = 0
+      globalThis.fetch = (async (_input: unknown, _init?: RequestInit) => {
+        sends++
+        return Response.json({ content: [] })
+      }) as typeof fetch
+      const plugin = await createPlugin(plugins, fixture, {
+        claustrumScopedConnect: async () => client,
+        scopedRosterPollIntervalMs: 0,
+      })
+      if (!plugin.auth?.loader) throw new Error('missing auth loader')
+      const loader = await plugin.auth.loader(migratedActivation(fixture), {
+        id: 'anthropic',
+        name: 'Anthropic',
+        source: 'custom',
+        env: [],
+        options: {},
+        models: {},
+      })
+      if (!loader.fetch) throw new Error('missing fetch')
+      await entered.wait
+      const started = performance.now()
+      const request = loader.fetch(MESSAGES_URL, EMPTY_POST)
+      lifetimes.trackDetached(
+        request.then(
+          () => {},
+          () => {},
+        ),
+      )
+      try {
+        if (recoverBeforeDeadline) {
+          discovery.open()
+          expect((await request).status).toBe(200)
+        } else {
+          await expect(request).rejects.toMatchObject({
+            message:
+              'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+          })
+          expect(performance.now() - started).toBeGreaterThanOrEqual(1900)
+          expect(performance.now() - started).toBeLessThan(3000)
+          expect(sends).toBe(0)
+          discovery.open()
+          expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(
+            200,
+          )
+        }
+      } finally {
+        discovery.open()
+      }
+    })
+  }
+
+  for (const mode of [
+    'main-first',
+    'fallback-first',
+    'sticky-balanced',
+  ] as const) {
+    test(`vault admission recovers per request with an inactive main in ${mode}`, async () => {
+      const { root, plugins } = await startBody('opencode-vault-admission-')
+      let rows: ScopedInventoryRow[] = [
+        { ...mainRow, state: 'needs_reauth' },
+        workRow,
+      ]
+      const fixture = await migrateScopedSeat(root, {
+        rows: () => rows,
+        token: 'fa'.repeat(32),
+        expectedCredentials: [mainRow.id, workRow.id],
+        legacyConfig: scopedLegacyConfig({
+          routing: { mode },
+          accounts: [
+            {
+              id: 'work',
+              label: 'work',
+              type: 'oauth',
+              enabled: true,
+              refresh: '',
+              claustrumScopedCredentialId: workRow.id,
+              anthropicAccountUuid: workRow.accountId,
+              claustrumScopedState: 'active',
+            },
+          ],
+        }),
+      })
+      const client: NativeCustodyClient = {
+        listScoped: async () => ({ view: 'admission', rows }),
+        getScoped: async ({ credentialId }) => {
+          const row = rows.find((row) => row.id === credentialId)
+          if (row?.state !== 'active') throw new Error('not-active')
+          return {
+            credentialId,
+            accountId: row.accountId!,
+            material: `admission-${credentialId}`,
+            recordVersion: row.recordVersion,
+            expiresAtMs: Date.now() + 3_600_000,
+          }
+        },
+        reportAuthFailureScoped: async () => {},
+        close: () => {},
+      }
+      const served: string[] = []
+      globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+        if (String(input).includes('/api/oauth/usage'))
+          return Response.json({
+            five_hour: { utilization: 0 },
+            seven_day: { utilization: 0 },
+          })
+        served.push(new Headers(init?.headers).get('authorization') ?? '')
+        return Response.json({ content: [] })
+      }) as typeof fetch
+      const plugin = await createPlugin(plugins, fixture, {
+        claustrumScopedConnect: async () => client,
+        scopedRosterPollIntervalMs: 0,
+      })
+      if (!plugin.auth?.loader) throw new Error('missing auth loader')
+      const loader = await plugin.auth.loader(migratedActivation(fixture), {
+        id: 'anthropic',
+        name: 'Anthropic',
+        source: 'custom',
+        env: [],
+        options: {},
+        models: {},
+      })
+      if (!loader.fetch) throw new Error('missing provider fetch')
+      expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+      expect(served).toEqual([`Bearer admission-${workRow.id}`])
+
+      // Re-login changes vault inventory, while the same Anthropic request
+      // handler and OpenCode auth.json activation entry remain installed.
+      rows = [
+        { ...mainRow, recordVersion: 11 },
+        { ...workRow, state: 'needs_reauth' },
+      ]
+      expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+      expect(served.at(-1)).toBe(`Bearer admission-${mainRow.id}`)
+
+      rows = rows.map((row) => ({ ...row, state: 'needs_reauth' }))
+      for (let attempt = 0; attempt < 2; attempt++)
+        await expect(
+          loader.fetch(MESSAGES_URL, EMPTY_POST),
+        ).rejects.toMatchObject({
+          message:
+            'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+        })
+      expect(served).toHaveLength(2)
+      rows = [
+        { ...mainRow, recordVersion: 12 },
+        { ...workRow, state: 'needs_reauth' },
+      ]
+      expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+      expect(served.at(-1)).toBe(`Bearer admission-${mainRow.id}`)
+    })
+  }
 
   test('serves requests using scoped receipts and dynamically adopts newly logged-in accounts without restart', async () => {
     const { root, plugins } = await startBody('opencode-scoped-serving-')

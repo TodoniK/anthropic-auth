@@ -130,10 +130,12 @@ import {
   type NativeAccountSnapshot,
   type NativeAccountView,
   type NativeCustodyClient,
+  NativeCustodyError,
   type NativeCustodyReceipt,
   type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
   type NativeMenuDispatch,
   type NativeUiOptions,
+  NativeVaultNoAccountError,
   nativeMigrationAuthorityPhase,
   normalizeQuotaHeaders,
   type OAuthAccount,
@@ -171,6 +173,7 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   readClaustrumEnrollmentStatus,
+  readNativeAccountsForRequest,
   readNativeEnrollmentMode,
   readNativeHostAuthKind,
   readNativeMigrationJournal,
@@ -1482,12 +1485,9 @@ const anthropicAuthPlugin = async (
   ) => nativeAccounts.reorder(routeIds, movedRouteId)
 
   let initialStorage: AccountStorage | null = null
-  let nativeStartupError: unknown
   try {
     initialStorage = await loadAccounts()
-  } catch (error) {
-    nativeStartupError = error
-  }
+  } catch {}
   function isScopedCustodyActive(
     storage: AccountStorage | null | undefined,
   ): boolean {
@@ -1586,6 +1586,11 @@ const anthropicAuthPlugin = async (
     )
     if (account?.state === 'unsupported-access')
       throw new NativeUnsupportedCredentialError()
+    if (
+      account?.source === 'vault' &&
+      (!account.enabled || account.state !== 'active')
+    )
+      throw new NativeCredentialUnavailableError(account, 'not-active')
     if (account?.type !== 'oauth' || !account.enabled) {
       throw new Error('Native OAuth account is unavailable')
     }
@@ -1618,7 +1623,19 @@ const anthropicAuthPlugin = async (
     checkModelPolicy(account, snapshot.policyStorage)
     let result: NativeOAuthAuthorization
     if (account.source === 'vault') {
-      const receipt = await nativeAccounts.authorizeVault(routeId, signal)
+      const receipt = await nativeAccounts
+        .authorizeVault(routeId, signal)
+        .catch((error) => {
+          signal?.throwIfAborted()
+          if (
+            error instanceof NativeCustodyError &&
+            ['not-active', 'route-declined', 'route-unavailable'].includes(
+              error.code,
+            )
+          )
+            throw new NativeCredentialUnavailableError(account, error.code)
+          throw error
+        })
       result = {
         accessToken: receipt.accessToken,
         expires: receipt.expiresAtMs ?? undefined,
@@ -5511,6 +5528,7 @@ const anthropicAuthPlugin = async (
           host: 'opencode',
           dispatch: dispatchNative,
           readStatus: readNativeStatus,
+          readAccounts: () => nativeAccounts.read(),
           interactive,
         }),
       }
@@ -5887,55 +5905,14 @@ const anthropicAuthPlugin = async (
         }
         latestHostGetAuth = hostGetAuth
         const activation = await hostGetAuth()
-        // Ordinary OpenCode API-key authentication remains unchanged. After
-        // migration, the OAuth marker only enables our provider. Each send must
-        // validate current local credentials or obtain new vault authorization.
+        // Stock API-key authentication is not owned by the OAuth vault path.
         if (activation.type !== 'oauth') return {}
-        if (process.env.OPENCODE_AUTH_CONTENT !== undefined) {
-          return {
-            apiKey: '',
-            fetch: async () => {
-              throw new Error(
-                'Native OAuth cannot serve while OPENCODE_AUTH_CONTENT is set',
-              )
-            },
-          }
-        }
-        // While this host is enrolled with the vault, only the exact native
-        // placeholder enables Claude. Any other OAuth login in OpenCode's slot
-        // is left byte-for-byte as it is and never used, refreshed or checked
-        // with the provider; requests refuse with the way out instead.
-        let enrolled: boolean
-        try {
-          enrolled =
-            (await readNativeEnrollmentMode('opencode')) === 'claustrum'
-        } catch (error) {
-          return {
-            apiKey: '',
-            fetch: async () => {
-              throw error
-            },
-          }
-        }
-        if (enrolled && !isExactNativePlaceholder(activation)) {
-          return {
-            apiKey: '',
-            fetch: async () => {
-              throw new Error(
-                'This host uses the credential vault, but OpenCode holds a separate Anthropic login. Remove it and choose the vault login, or disconnect from the vault.',
-              )
-            },
-          }
-        }
-        if (nativeStartupError) {
-          return {
-            apiKey: '',
-            fetch: async () => {
-              throw nativeStartupError
-            },
-          }
-        }
-        const journal = await readNativeMigrationJournal(nativePaths)
+        // Enrollment and account availability can change while OpenCode is
+        // running. Always install the Anthropic request handler; it rechecks
+        // enrollment, the host marker and roster before authorizing each send.
+        const startupMode = await readNativeEnrollmentMode('opencode').catch(
+          () => undefined,
+        )
         if (
           !bootProfileHydrationStarted &&
           isCustodyTombstoneOAuth(activation, 'anthropic') &&
@@ -5991,8 +5968,52 @@ const anthropicAuthPlugin = async (
               credentialFailure: undefined,
               deferred: false,
             }
+          const mode = await readNativeEnrollmentMode('opencode')
+          if (
+            mode === 'claustrum' &&
+            !isExactNativePlaceholder(currentActivation)
+          )
+            throw new Error(
+              'This host uses the credential vault, but OpenCode holds a separate Anthropic login. Remove it and choose the vault login, or disconnect from the vault.',
+            )
+          assertNativeEnvironment()
+          const primarySnapshot = await readNativeAccountsForRequest(
+            nativeAccounts,
+            signal,
+          )
           requireNativeActivation(currentActivation)
-          const primarySnapshot = await nativeAccounts.read()
+          if (
+            mode === 'claustrum' &&
+            !primarySnapshot.accounts.some(
+              (account) =>
+                account.type === 'oauth' &&
+                account.enabled &&
+                account.state === 'active',
+            )
+          )
+            throw new NativeVaultNoAccountError()
+          const dimensions = fallbackCustodyDimensions(
+            primarySnapshot.policyStorage,
+          )
+          try {
+            reconcileCustodyStartup({
+              mode: mode === 'claustrum' ? 'C' : 'L',
+              main: mainCustodyDimension(currentActivation),
+              fallbacks: mode === 'claustrum' ? 'T' : dimensions.fallbacks,
+              evidence: 'V',
+              authority:
+                mode === 'claustrum'
+                  ? 'committed'
+                  : nativeMigrationAuthorityPhase(
+                      await readNativeMigrationJournal(nativePaths),
+                    ),
+            })
+            custodyStartupMismatchVerdict = undefined
+          } catch (error) {
+            if (error instanceof CustodyStateMismatchError)
+              custodyStartupMismatchVerdict = error.verdict
+            throw error
+          }
           headerRoutingPolicyStorage = primarySnapshot.policyStorage
           const primaryAccount = primarySnapshot.accounts.find(
             (account) => account.id === 'main',
@@ -6171,75 +6192,11 @@ const anthropicAuthPlugin = async (
           refresh?: string
           expires: number
         } = { type: 'oauth', access: '', expires: 0 }
-        const custodyStorage = await loadAccounts(accountStoragePath)
-        if (
-          getClaustrumMode(custodyStorage) === 'claustrum' &&
-          !isScopedCustodyActive(custodyStorage)
-        ) {
-          return {
-            apiKey: '',
-            fetch: async () =>
-              new Response(
-                JSON.stringify({
-                  type: 'error',
-                  error: {
-                    type: 'api_error',
-                    message:
-                      'Run setup to enable scoped Claustrum custody; legacy handle bindings cannot serve requests.',
-                  },
-                }),
-                {
-                  status: 503,
-                  headers: { 'content-type': 'application/json' },
-                },
-              ),
-          }
-        }
-        // Other providers share initialization, so do not block them while
-        // the vault lists Claude accounts. Each Anthropic send separately
-        // checks that its selected vault account can supply credentials.
-        const custodyMode = getClaustrumMode(custodyStorage)
-        const main = mainCustodyDimension(activation)
-        const fallbackDimensions = fallbackCustodyDimensions(custodyStorage)
-        const mainEvidence =
-          custodyMode !== 'claustrum' ||
-          (main === 'T' &&
-            custodyStorage?.claustrum?.primaryAccount?.state === 'active')
-            ? 'V'
-            : 'N'
-        const scopedMainRoute =
-          custodyMode === 'claustrum' &&
-          main === 'T' &&
-          isScopedCustodyActive(custodyStorage)
         if (auth.type === 'oauth') {
-          try {
-            reconcileCustodyStartup({
-              mode: custodyMode === 'claustrum' ? 'C' : 'L',
-              main,
-              fallbacks: fallbackDimensions.fallbacks,
-              evidence: mainEvidence,
-              // Vault files have no migration journal: the host's enrollment
-              // alone authorizes them, and it already selected vault mode.
-              // Local accounts still require the committed migration record.
-              authority:
-                custodyMode === 'claustrum'
-                  ? 'committed'
-                  : nativeMigrationAuthorityPhase(journal),
-            })
-          } catch (error) {
-            if (!(error instanceof CustodyStateMismatchError)) throw error
-            custodyStartupMismatchVerdict = error.verdict
-            return {
-              apiKey: '',
-              fetch: async () => {
-                throw error
-              },
-            }
-          }
-        }
-        if (auth.type === 'oauth') {
-          const initialSnapshot = await nativeAccounts.read()
-          const initialMain = initialSnapshot.accounts.find(
+          const initialSnapshot = await nativeAccounts
+            .read()
+            .catch(() => undefined)
+          const initialMain = initialSnapshot?.accounts.find(
             (account) => account.id === 'main',
           )
           mainAccountId =
@@ -6305,13 +6262,17 @@ const anthropicAuthPlugin = async (
             mainBackgroundRefreshTimer.unref?.()
           }
 
-          if (!scopedMainRoute) startMainBackgroundRefresh()
+          if (startupMode === 'local') startMainBackgroundRefresh()
           quotaManager.seedFallbacksFromAccounts(
             (initialStorage?.accounts ?? []).filter(isOAuthAccount),
           )
           const initialSidebarRouting = await resolveInitialSidebarRouting(() =>
             loadAccounts(accountStoragePath),
-          )
+          ).catch(() => ({
+            freshStorage: null,
+            activeId: undefined,
+            route: 'main' as const,
+          }))
           await writeSidebarState(initialSidebarRouting.freshStorage, {
             activeId: initialSidebarRouting.activeId,
             route: initialSidebarRouting.route,
@@ -8678,6 +8639,8 @@ const anthropicAuthPlugin = async (
                   }
                   if (!resolution) {
                     if (auth.modelDenied) return modelDeniedResponse()
+                    if (isScopedCustodyActive(storage))
+                      throw new NativeVaultNoAccountError()
                     const response = createStickyNoRouteResponse({
                       mainRefreshError:
                         stickyRoutes.storage?.refresh?.mainLastRefreshError,
@@ -9154,6 +9117,8 @@ const anthropicAuthPlugin = async (
                       },
                     )
                     if (fallbackResponse) return wrapResponse(fallbackResponse)
+                    if (error instanceof NativeCredentialUnavailableError)
+                      throw new NativeVaultNoAccountError()
                     throw error
                   }
                 }

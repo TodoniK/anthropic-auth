@@ -24,6 +24,7 @@ export interface PiNativeCommands {
    * no local fallback.
    */
   readMode?: NativeUiOptions['readMode']
+  readAccounts?: NativeUiOptions['readAccounts']
   /**
    * Disconnects Pi from the vault. When left out, Core first restores the
    * Anthropic sign-in that enrollment set aside in Pi's own auth file, then
@@ -64,6 +65,7 @@ export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
         host: 'pi',
         dispatch: backend.dispatch,
         readStatus: backend.readStatus,
+        readAccounts: backend.readAccounts,
         readMode:
           backend.readMode ??
           (() => readNativeEnrollmentMode('pi', process.env)),

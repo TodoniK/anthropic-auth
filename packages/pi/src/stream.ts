@@ -39,6 +39,7 @@ import {
   type NativeAccountSnapshot,
   type NativeAccountView,
   type NativeApiSubject,
+  NativeVaultNoAccountError,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
@@ -954,7 +955,7 @@ async function executeWithFallback(options: {
   onResolvedTools?: (tools: Tool[]) => void
 }): Promise<Response> {
   const native = getPiNativeRuntime(options.storagePath)
-  let snapshot = await native.view()
+  let snapshot = await native.view(options.streamOptions?.signal)
   let storage = snapshot.policyStorage
   const accountView = (id: string) =>
     snapshot.accounts.find((account) => account.id === id)
@@ -1311,6 +1312,7 @@ async function executeWithFallback(options: {
       throw error
     }
     if (!resolution) {
+      if (snapshot.mode === 'claustrum') throw new NativeVaultNoAccountError()
       return createStickyNoRouteResponse({
         mainRefreshError: storage?.refresh?.mainLastRefreshError,
         fallbackReauthLabels: getFallbackReauthLabels(storage),
@@ -1518,6 +1520,7 @@ async function executeWithFallback(options: {
       const fallback = await tryFallbackAccounts()
       if (fallback) return fallback
     }
+    if (snapshot.mode === 'claustrum') throw new NativeVaultNoAccountError()
     return createStickyNoRouteResponse({
       routeQuotas: (storage?.accounts ?? [])
         .filter(isOAuthAccount)

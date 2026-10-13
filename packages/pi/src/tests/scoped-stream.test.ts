@@ -413,6 +413,73 @@ test('fallback-first discovers a new account on the next turn and honors a live 
   })
 })
 
+for (const mode of [
+  'main-first',
+  'fallback-first',
+  'sticky-balanced',
+] as const) {
+  test(`Pi vault reauth recovers on the next request in ${mode}`, async () => {
+    const f = await fixture(mode)
+    f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
+    f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+    await (await f.native.service()).updateSettings((settings) => ({
+      ...settings,
+      quota: { enabled: false },
+    }))
+    const served: string[] = []
+    globalThis.fetch = Object.assign(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        if (String(input).includes('/api/oauth/usage'))
+          return Response.json({
+            five_hour: { utilization: 0 },
+            seven_day: { utilization: 0 },
+          })
+        const index =
+          Number(
+            /vault-test-access-(\d+)$/.exec(
+              new Headers(init?.headers).get('authorization') ?? '',
+            )?.[1],
+          ) - 1
+        served.push(f.gets[index]?.credentialId ?? 'missing receipt')
+        return success()
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    const options = { sessionId: `reauth-${mode}` }
+    expect(
+      (await streamCortexKitAnthropic(model, context, options).result())
+        .stopReason,
+    ).toBe('stop')
+    expect(served).toEqual(['oauth:anthropic:work'])
+    f.rows[0] = { ...f.rows[0]!, state: 'active' }
+    f.rows[1] = { ...f.rows[1]!, state: 'needs_reauth' }
+    expect(
+      (await streamCortexKitAnthropic(model, context, options).result())
+        .stopReason,
+    ).toBe('stop')
+    expect(served.at(-1)).toBe('oauth:anthropic')
+    f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await streamCortexKitAnthropic(
+        model,
+        context,
+        options,
+      ).result()
+      expect(result.stopReason).toBe('error')
+      expect(result.errorMessage).toBe(
+        'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+      )
+    }
+    expect(served).toHaveLength(2)
+    f.rows[0] = { ...f.rows[0]!, state: 'active' }
+    expect(
+      (await streamCortexKitAnthropic(model, context, options).result())
+        .stopReason,
+    ).toBe('stop')
+    expect(served.at(-1)).toBe('oauth:anthropic')
+  })
+}
+
 registerTest.each([500, 401])(
   'relay status %i falls back direct with a fresh version-fenced credential',
   wrapBody(async (relayStatus) => {
@@ -549,8 +616,13 @@ test('an incomplete scoped quota pool cannot spend a paid fallback or issue a mo
   expect(f.gets).toHaveLength(1)
 })
 
-const hostCredentials: Array<{ name: string; credential?: Credential }> = [
+const hostCredentials: Array<{
+  name: string
+  credential?: Credential
+  initiallyInactive?: boolean
+}> = [
   { name: 'empty credential store' },
+  { name: 'inactive vault at provider registration', initiallyInactive: true },
   {
     name: 'stored local API key',
     credential: { type: 'api_key', key: 'must-not-use-local-api-key' },
@@ -568,8 +640,12 @@ const hostCredentials: Array<{ name: string; credential?: Credential }> = [
 
 registerTest.each(hostCredentials)(
   'real Pi model runtime honors custody with $name',
-  wrapBody(async ({ credential }) => {
+  wrapBody(async ({ credential, initiallyInactive }) => {
     const f = await fixture()
+    if (initiallyInactive) {
+      f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
+      await (await f.native.service()).vault.refresh()
+    }
     let writes = 0,
       sends = 0
     const credentials: CredentialStore = {
@@ -657,6 +733,15 @@ registerTest.each(hostCredentials)(
         const registered = host.getModel('anthropic', model.id)
         if (!registered)
           throw new Error('Native Anthropic model was not registered')
+        if (initiallyInactive) {
+          const refused = await host.completeSimple(registered, context)
+          expect(refused.stopReason).toBe('error')
+          expect(refused.errorMessage).toBe(
+            'No vault account can serve this request. Open /claude to see which account needs signing in again.',
+          )
+          expect(sends).toBe(0)
+          f.rows[0] = { ...f.rows[0]!, state: 'active' }
+        }
         expect(
           (await host.completeSimple(registered, context)).stopReason,
         ).toBe('stop')
