@@ -1,17 +1,17 @@
 {
   "floors": {
-    "core": 1737,
-    "opencode": 1938,
+    "core": 1748,
+    "opencode": 1988,
     "pi": 280
   },
   "measurement": {
-    "head": "cea5f5c5c4a8cb190fd218e08c90c4972e3c580f",
+    "head": "3784437b176a3f7d475cc1abc74a72764352f66e",
     "dirtyPaths": 0
   },
   "evidence": {
-    "_note": "GitHub CI measurements on main cea5f5c5 (run 38453047113), which includes the packed-host OpenCode cases.",
-    "core": "Core: 1737 pass.",
-    "opencode": "OpenCode: 1938 pass, including packed OpenCode 1/2 host cases.",
-    "pi": "Pi: 280 pass."
+    "_note": "Release run 38592815111 measured successful unit-suite counts at 3784437b with Bun 1.3.14. Floors are raised to those measurements; core and opencode remain deliberately below v2.0.0 after removing 1.x code and its dedicated tests.",
+    "core": "Release run 38592815111 reported MEASURED: core 1748.",
+    "opencode": "Release run 38592815111 reported MEASURED: opencode 1988, including packed OpenCode 1/2 host cases.",
+    "pi": "Release run 38592815111 reported MEASURED: pi 280."
   }
 }

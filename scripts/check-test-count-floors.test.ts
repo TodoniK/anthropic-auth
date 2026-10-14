@@ -29,10 +29,12 @@ function runGit(cwd: string, args: string[]) {
       cwd,
       env: {
         ...env,
-        GIT_AUTHOR_NAME: 'Test Runner',
-        GIT_AUTHOR_EMAIL: 'test@example.com',
-        GIT_COMMITTER_NAME: 'Test Runner',
-        GIT_COMMITTER_EMAIL: 'test@example.com',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_AUTHOR_NAME: 'Fixture',
+        GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
+        GIT_COMMITTER_NAME: 'Fixture',
+        GIT_COMMITTER_EMAIL: 'fixture@example.invalid',
       },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -419,8 +421,9 @@ async function makeReleaseHistory(
 test('release compares with the last tag, not HEAD^, when floor lowered earlier', async () => {
   const current = { core: 10, opencode: 20, pi: 30 }
   const cwd = await makeReleaseHistory({ ...current, core: 11 }, current)
-  // The old release gate was green because HEAD^ already carried the lower floor.
-  expect(runGate(cwd, current, 'HEAD^').exitCode).toBe(0)
+  const intermediate = runGate(cwd, current, 'HEAD^')
+  expect(intermediate.exitCode).toBe(1)
+  expect(intermediate.output).toContain('no deliberate-lowering marker')
   const result = runReleaseGate(cwd, current)
   expect(result.exitCode, result.output).toBe(1)
   expect(result.output).toContain(
@@ -568,6 +571,171 @@ test('release refuses a repository with no previous version tag', async () => {
   const result = runReleaseGate(cwd, floors)
   expect(result.exitCode).toBe(2)
   expect(result.output).toContain('no previous release tag to compare')
+})
+
+const releaseFloors = { core: 1765, opencode: 2111, pi: 264 }
+const loweredFloors = { core: 1748, opencode: 1988, pi: 280 }
+const releaseLowering: LoweringMarker = {
+  reason:
+    'Removed 1.x code and its dedicated tests after the 2.0 native cutover',
+  lowering: {
+    core: { from: 1765, to: 1748 },
+    opencode: { from: 2111, to: 1988 },
+  },
+}
+
+async function makeLoweringPr(
+  targetFloors: Floors,
+  branchFloors = loweredFloors,
+  marker: LoweringMarker | undefined = releaseLowering,
+) {
+  const cwd = await mkdtemp(join(tmpdir(), 'test-count-lowering-'))
+  workspaces.push(cwd)
+  runGit(cwd, ['init', '--initial-branch=main'])
+  runGit(cwd, ['commit', '--allow-empty', '-m', 'seed measurement subject'])
+  const head = runGit(cwd, ['rev-parse', 'HEAD'])
+  await writeFloors(cwd, releaseFloors, { head, dirtyPaths: 0 })
+  runGit(cwd, ['add', '.ci/test-count-floors.json'])
+  runGit(cwd, ['commit', '-m', 'record release floors'])
+  runGit(cwd, ['tag', '-a', 'v2.0.0', '-m', 'last stable release'])
+  await writeFloors(cwd, targetFloors, { head, dirtyPaths: 0 })
+  runGit(cwd, ['add', '.ci/test-count-floors.json'])
+  runGit(cwd, ['commit', '--allow-empty', '-m', 'advance merge target'])
+  runGit(cwd, ['checkout', '-b', 'feature'])
+  await writeFloors(cwd, branchFloors, { head, dirtyPaths: 0 })
+  if (marker) {
+    await writeFile(
+      join(cwd, '.ci', 'allow-test-count-floor-lowering.json'),
+      `${JSON.stringify(marker, null, 2)}\n`,
+    )
+  }
+  runGit(cwd, ['add', '.ci'])
+  runGit(cwd, ['commit', '--allow-empty', '-m', 'prepare lowering PR'])
+  return cwd
+}
+
+test('a lowering PR authorizes from the last release floor, not the merge target', async () => {
+  const cwd = await makeLoweringPr({ core: 1750, opencode: 2000, pi: 280 })
+  const result = runGate(cwd, loweredFloors)
+  expect(result.exitCode, result.output).toBe(0)
+  expect(result.output).toContain('deliberate lowering authorized')
+})
+
+test('an intermediate PR keeps the lowering marker until the lowered floors ship', async () => {
+  const cwd = await makeLoweringPr(loweredFloors)
+  const result = runGate(cwd, loweredFloors)
+  expect(result.exitCode, result.output).toBe(0)
+  expect(result.output).toContain('deliberate lowering authorized')
+})
+
+test('an intermediate PR without the release lowering marker fails', async () => {
+  const cwd = await makeLoweringPr(loweredFloors)
+  runGit(cwd, ['rm', '.ci/allow-test-count-floor-lowering.json'])
+  runGit(cwd, ['commit', '-m', 'drop lowering marker too soon'])
+  const result = runGate(cwd, loweredFloors)
+  expect(result.exitCode, result.output).toBe(1)
+  expect(result.output).toContain('no deliberate-lowering marker')
+})
+
+test('the release run accepts the same marker against v2.0.0 floors', async () => {
+  const cwd = await makeLoweringPr(loweredFloors)
+  runGit(cwd, ['tag', '-a', 'v2.0.1', '-m', 'ship lowered floors'])
+  const result = runReleaseGate(cwd, loweredFloors, '2.0.1')
+  expect(result.exitCode, result.output).toBe(0)
+  expect(result.output).toContain('deliberate lowering authorized')
+})
+
+test('the marker is stale on the next PR after a release ships the lowered floors', async () => {
+  const cwd = await makeLoweringPr(loweredFloors)
+  runGit(cwd, ['tag', '-a', 'v2.0.1', '-m', 'ship lowered floors'])
+  runGit(cwd, ['commit', '--allow-empty', '-m', 'next PR'])
+  const result = runGate(cwd, loweredFloors, 'HEAD^')
+  expect(result.exitCode, result.output).toBe(1)
+  expect(result.output).toContain(
+    'stale deliberate-lowering marker must be removed',
+  )
+  runGit(cwd, ['rm', '.ci/allow-test-count-floor-lowering.json'])
+  runGit(cwd, ['commit', '-m', 'remove shipped lowering marker'])
+  expect(runGate(cwd, loweredFloors, 'HEAD~2').exitCode).toBe(0)
+})
+
+test('a marker from the merge target instead of the last release fails', async () => {
+  const target = { core: 1750, opencode: 2000, pi: 280 }
+  const cwd = await makeLoweringPr(target, loweredFloors, {
+    ...releaseLowering,
+    lowering: {
+      core: { from: target.core, to: loweredFloors.core },
+      opencode: { from: target.opencode, to: loweredFloors.opencode },
+    },
+  })
+  const result = runGate(cwd, loweredFloors)
+  expect(result.exitCode, result.output).toBe(1)
+  expect(result.output).toContain('core marker must declare from 1765 to 1748')
+})
+
+test.each([0, 1])(
+  'raising floors to the release floors plus %i makes the marker stale',
+  async (extra) => {
+    const raised = {
+      core: releaseFloors.core + extra,
+      opencode: releaseFloors.opencode + extra,
+      pi: loweredFloors.pi,
+    }
+    const cwd = await makeLoweringPr(loweredFloors, raised)
+    const result = runGate(cwd, raised)
+    expect(result.exitCode, result.output).toBe(1)
+    expect(result.output).toContain(
+      'stale deliberate-lowering marker must be removed',
+    )
+  },
+)
+
+test.each([{ withMarker: false }, { withMarker: true }])(
+  'lowering versus the merge target at or above the release floor fails (marker=$withMarker)',
+  async ({ withMarker }) => {
+    const branch = { ...releaseFloors, core: 1770 }
+    const cwd = await makeLoweringPr({ ...branch, core: 1780 }, branch, {
+      reason: 'Unshipped additions cannot be deliberately lowered.',
+      lowering: { core: { from: 1765, to: 1770 } },
+    })
+    if (!withMarker) {
+      runGit(cwd, ['rm', '.ci/allow-test-count-floor-lowering.json'])
+      runGit(cwd, ['commit', '-m', 'no lowering marker'])
+    }
+    const result = runGate(cwd, branch)
+    expect(result.exitCode, result.output).toBe(1)
+    expect(result.output).toContain(
+      'core branch floor 1770 < merge target floor 1780',
+    )
+  },
+)
+
+test('PR baseline skips prerelease tags carrying the lowered floors', async () => {
+  const cwd = await makeLoweringPr(loweredFloors)
+  runGit(cwd, ['tag', '-a', 'v2.0.1-rc.1', 'main', '-m', 'prerelease floors'])
+  const pr = runGate(cwd, loweredFloors)
+  expect(pr.exitCode, pr.output).toBe(0)
+  expect(pr.output).toContain('deliberate lowering authorized')
+})
+
+test('release baseline skips prerelease tags carrying the lowered floors', async () => {
+  const cwd = await makeLoweringPr(loweredFloors)
+  runGit(cwd, ['tag', '-a', 'v2.0.1-rc.1', 'main', '-m', 'prerelease floors'])
+  runGit(cwd, ['tag', '-a', 'v2.0.1', '-m', 'stable release'])
+  const release = runReleaseGate(cwd, loweredFloors, '2.0.1')
+  expect(release.exitCode, release.output).toBe(0)
+  expect(release.output).toContain('deliberate lowering authorized')
+})
+
+test('PR resolves the latest stable tag reachable from the merge target', async () => {
+  const cwd = await makeLoweringPr(loweredFloors)
+  runGit(cwd, ['checkout', '-b', 'unrelated-release', 'v2.0.0'])
+  runGit(cwd, ['commit', '--allow-empty', '-m', 'release on another branch'])
+  runGit(cwd, ['tag', '-a', 'v9.0.0', '-m', 'unreachable release'])
+  runGit(cwd, ['checkout', 'feature'])
+  const result = runGate(cwd, loweredFloors)
+  expect(result.exitCode, result.output).toBe(0)
+  expect(result.output).toContain('deliberate lowering authorized')
 })
 
 async function capturedCiFloorStep() {

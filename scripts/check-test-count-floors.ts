@@ -232,54 +232,30 @@ function compareReleaseTags(left: string, right: string): number {
   return 0
 }
 
-function resolveReleaseBaseline(
-  releaseRef: string,
-  releaseVersion: string | undefined,
-  floorFile: string,
-): ReleaseBaseline | string {
-  if (
-    !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(
-      releaseRef,
-    )
-  ) {
-    return 'release ref must be a version tag'
-  }
-  if (releaseVersion !== releaseRef.slice(1)) {
-    return 'release version does not match checked-out tag'
-  }
-  const listed = gitOutput(['tag', '--list', 'v*'])
-  if (listed === undefined) return 'could not inspect release tags'
+function releaseTags(mergedRef?: string): string[] | undefined {
+  const args = ['tag', '--list', 'v*']
+  if (mergedRef) args.push('--merged', mergedRef)
+  const listed = gitOutput(args)
+  if (listed === undefined) return undefined
   // Git's version sort puts `v1.24.0-rc.1` after `v1.24.0` in descending
   // order. SemVer precedence does the opposite; preserve that distinction so
   // a prerelease cannot accidentally become the comparison baseline.
-  const tags = listed
+  return listed
     .split('\n')
     .filter((tag) =>
       /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(tag),
     )
     .sort((a, b) => compareReleaseTags(b, a))
-  if (tags[0] !== releaseRef) return 'release ref is not the latest release tag'
-  if (tags.slice(1).some((tag) => compareReleaseTags(tag, releaseRef) === 0)) {
-    return 'ambiguous release tags have equal version precedence'
-  }
-  const tagCommit = gitOutput([
-    'rev-parse',
-    '--verify',
-    `${releaseRef}^{commit}`,
-  ])
-  const head = gitOutput(['rev-parse', '--verify', 'HEAD'])
-  if (!head || !tagCommit || head !== tagCommit) {
-    return 'release tag does not identify checkout HEAD'
-  }
-  const previousTag = tags[1]
-  if (!previousTag) return 'no previous release tag to compare'
-  const ancestry = Bun.spawnSync(
-    ['git', 'merge-base', '--is-ancestor', previousTag, 'HEAD'],
-    { stdout: 'pipe', stderr: 'pipe' },
-  )
-  if (ancestry.exitCode !== 0) {
-    return `previous release tag ${previousTag} is not an ancestor of ${releaseRef}`
-  }
+}
+
+function stableReleaseTags(tags: string[]): string[] {
+  return tags.filter((tag) => /^v\d+\.\d+\.\d+(?:\+[0-9A-Za-z.-]+)?$/.test(tag))
+}
+
+function readReleaseBaseline(
+  previousTag: string,
+  floorFile: string,
+): ReleaseBaseline | string {
   let document: FloorDocument | undefined
   try {
     document = readMergeTargetFloors(previousTag, floorFile)
@@ -301,6 +277,65 @@ function resolveReleaseBaseline(
     floors: { ...VERIFIED_INITIAL_RELEASE_FLOORS },
     initial: true,
   }
+}
+
+function resolveMergeTargetReleaseBaseline(
+  baseRef: string,
+  floorFile: string,
+): ReleaseBaseline | string | undefined {
+  const listed = releaseTags(baseRef)
+  if (!listed) return 'could not inspect release tags'
+  const tags = stableReleaseTags(listed)
+  const latestTag = tags[0]
+  // Before the first stable release, use the merge target's test-count floors
+  // as the baseline.
+  if (!latestTag) return undefined
+  if (tags.slice(1).some((tag) => compareReleaseTags(tag, latestTag) === 0)) {
+    return 'ambiguous release tags have equal version precedence'
+  }
+  return readReleaseBaseline(latestTag, floorFile)
+}
+
+function resolveReleaseBaseline(
+  releaseRef: string,
+  releaseVersion: string | undefined,
+  floorFile: string,
+): ReleaseBaseline | string {
+  if (
+    !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(
+      releaseRef,
+    )
+  ) {
+    return 'release ref must be a version tag'
+  }
+  if (releaseVersion !== releaseRef.slice(1)) {
+    return 'release version does not match checked-out tag'
+  }
+  const tags = releaseTags()
+  if (!tags) return 'could not inspect release tags'
+  if (tags[0] !== releaseRef) return 'release ref is not the latest release tag'
+  if (tags.slice(1).some((tag) => compareReleaseTags(tag, releaseRef) === 0)) {
+    return 'ambiguous release tags have equal version precedence'
+  }
+  const tagCommit = gitOutput([
+    'rev-parse',
+    '--verify',
+    `${releaseRef}^{commit}`,
+  ])
+  const head = gitOutput(['rev-parse', '--verify', 'HEAD'])
+  if (!head || !tagCommit || head !== tagCommit) {
+    return 'release tag does not identify checkout HEAD'
+  }
+  const previousTag = stableReleaseTags(tags.slice(1))[0]
+  if (!previousTag) return 'no previous release tag to compare'
+  const ancestry = Bun.spawnSync(
+    ['git', 'merge-base', '--is-ancestor', previousTag, 'HEAD'],
+    { stdout: 'pipe', stderr: 'pipe' },
+  )
+  if (ancestry.exitCode !== 0) {
+    return `previous release tag ${previousTag} is not an ancestor of ${releaseRef}`
+  }
+  return readReleaseBaseline(previousTag, floorFile)
 }
 
 function stampError(
@@ -460,7 +495,7 @@ async function main() {
   let targetDocument: FloorDocument | undefined
   let targetRef: string
   let targetLabel: string
-  let initialReleaseBaseline = false
+  let releaseBaseline: ReleaseBaseline | undefined
   if (options.releaseRef) {
     const release = resolveReleaseBaseline(
       options.releaseRef,
@@ -476,7 +511,7 @@ async function main() {
     targetDocument = release.document
     targetRef = release.baseRef
     targetLabel = 'release baseline'
-    initialReleaseBaseline = release.initial
+    releaseBaseline = release
   } else {
     targetRef = options.baseRef as string
     targetDocument = readMergeTargetFloors(targetRef, options.floorFile)
@@ -493,6 +528,16 @@ async function main() {
     }
     targetFloors = targetDocument.floors
     targetLabel = 'merge target'
+    const release = resolveMergeTargetReleaseBaseline(
+      targetRef,
+      options.floorFile,
+    )
+    if (typeof release === 'string') {
+      console.error(verdict('UNCHECKED', 'none', release))
+      process.exitCode = 2
+      return
+    }
+    releaseBaseline = release
   }
 
   const branchStampError = stampError(branchDocument, 'HEAD', 'branch')
@@ -508,9 +553,22 @@ async function main() {
       process.exitCode = 2
       return
     }
-  } else if (initialReleaseBaseline) {
+  }
+  if (releaseBaseline?.document && releaseBaseline.baseRef !== targetRef) {
+    const releaseStampError = stampError(
+      releaseBaseline.document,
+      releaseBaseline.baseRef,
+      'release baseline',
+    )
+    if (releaseStampError) {
+      console.error(verdict('UNCHECKED', 'none', releaseStampError))
+      process.exitCode = 2
+      return
+    }
+  }
+  if (releaseBaseline?.initial) {
     console.log(
-      `BASELINE: verified initial release baseline after ${targetRef}`,
+      `BASELINE: verified initial release baseline after ${releaseBaseline.baseRef}`,
     )
   }
 
@@ -530,30 +588,44 @@ async function main() {
     }
   }
 
+  // A lowering survives merges until a stable release ships it. The moving
+  // merge target still forbids dropping unshipped additions to the floors.
+  const baselineFloors = releaseBaseline?.floors ?? targetFloors
+  const baselineLabel = releaseBaseline ? 'release baseline' : targetLabel
   const lowered = packageNames.filter(
-    (packageName) => branchFloors[packageName] < targetFloors[packageName],
+    (packageName) => branchFloors[packageName] < baselineFloors[packageName],
   )
   const marker = await readLoweringMarker()
-  const invalidMarker = markerError(marker, lowered, branchFloors, targetFloors)
+  const invalidMarker = markerError(
+    marker,
+    lowered,
+    branchFloors,
+    baselineFloors,
+  )
   if (marker && lowered.length === 0) {
     failures.push('RATCHET: stale deliberate-lowering marker must be removed')
   }
   for (const packageName of packageNames) {
-    if (lowered.includes(packageName)) continue
-    console.log(
-      `RATCHET: ${packageName} branch floor ${branchFloors[packageName]} >= ${targetLabel} floor ${targetFloors[packageName]}`,
-    )
+    if (branchFloors[packageName] >= targetFloors[packageName]) {
+      console.log(
+        `RATCHET: ${packageName} branch floor ${branchFloors[packageName]} >= ${targetLabel} floor ${targetFloors[packageName]}`,
+      )
+    } else if (!lowered.includes(packageName)) {
+      failures.push(
+        `RATCHET: ${packageName} branch floor ${branchFloors[packageName]} < ${targetLabel} floor ${targetFloors[packageName]} (not below ${baselineLabel} floor ${baselineFloors[packageName]})`,
+      )
+    }
   }
   if (lowered.length > 0 && invalidMarker) {
     for (const packageName of lowered) {
       failures.push(
-        `RATCHET: ${packageName} branch floor ${branchFloors[packageName]} < ${targetLabel} floor ${targetFloors[packageName]} (${invalidMarker})`,
+        `RATCHET: ${packageName} branch floor ${branchFloors[packageName]} < ${baselineLabel} floor ${baselineFloors[packageName]} (${invalidMarker})`,
       )
     }
   } else if (lowered.length > 0 && marker) {
     for (const packageName of lowered) {
       console.log(
-        `RATCHET: ${packageName} branch floor ${branchFloors[packageName]} < ${targetLabel} floor ${targetFloors[packageName]}; deliberate lowering authorized: ${marker.reason}`,
+        `RATCHET: ${packageName} branch floor ${branchFloors[packageName]} < ${baselineLabel} floor ${baselineFloors[packageName]}; deliberate lowering authorized: ${marker.reason}`,
       )
     }
   }

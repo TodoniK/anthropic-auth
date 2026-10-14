@@ -1,0 +1,7 @@
+{
+  "reason": "Removed 1.x code and its dedicated tests after the 2.0 native cutover",
+  "lowering": {
+    "core": { "from": 1765, "to": 1748 },
+    "opencode": { "from": 2111, "to": 1988 }
+  }
+}
