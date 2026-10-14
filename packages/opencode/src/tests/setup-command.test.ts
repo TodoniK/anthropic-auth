@@ -9,7 +9,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { Writable } from 'node:stream'
 import {
   createNativeAccountRuntime,
@@ -64,7 +64,7 @@ function createMockRunner(
 ): CommandRunner {
   return {
     async run(command, args) {
-      const handler = handlers[command]
+      const handler = handlers[command] ?? handlers[basename(command)]
       if (handler) return handler(args)
       return { exitCode: 0, stdout: '', stderr: '' }
     },
@@ -87,9 +87,15 @@ describe('setup wizard command', () => {
   test('dry run reports planned actions and does not modify disk', async () => {
     const root = await mkdtemp(join(tmpdir(), 'setup-dry-run-'))
     testDirs.push(root)
+    const bin = join(root, 'bin')
+    await mkdir(bin)
+    for (const host of ['opencode', 'pi', 'ck']) {
+      await writeFile(join(bin, host), '', { mode: 0o755 })
+    }
 
     const env: NodeJS.ProcessEnv = {
       HOME: root,
+      PATH: bin,
       OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
         root,
         'unavailable-subc-connection.json',

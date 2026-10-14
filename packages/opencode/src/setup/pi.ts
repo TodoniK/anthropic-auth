@@ -12,8 +12,9 @@ import type { CommandRunner } from './types.ts'
 
 export function isPiPackageInstalled(
   env: NodeJS.ProcessEnv = process.env,
+  agentDir: string = getPiAgentDir(env),
 ): boolean {
-  const settingsPath = join(getPiAgentDir(env), 'settings.json')
+  const settingsPath = join(agentDir, 'settings.json')
   if (!existsSync(settingsPath)) return false
   try {
     const content = JSON.parse(readFileSyncUtf8(settingsPath))
