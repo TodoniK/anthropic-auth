@@ -11,6 +11,12 @@ import {
   ClaustrumEnrollmentManager,
   getClaustrumEnrollmentPaths,
 } from '../claustrum-enrollment.ts'
+import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  setLogLevel,
+} from '../logger.ts'
 import { updateNativeRuntime } from '../native-runtime.ts'
 import { QuotaManager } from '../quota-manager.ts'
 import { StickySessionRouter } from '../sticky-routing.ts'
@@ -117,6 +123,121 @@ test('sticky writes publish normally while their lease remains owned', async () 
   expect(JSON.parse(await readFile(path, 'utf8')).assignments).toEqual({})
 })
 
+for (const operation of ['touch', 'delete', 'assign'] as const) {
+  test(`sticky resolve ${operation} keeps its decision on lease loss and logs one refusal`, async () => {
+    const directory = await fixture()
+    const now = Date.now()
+    const input = {
+      sessionId: 'sensitive-session',
+      family: 'general' as const,
+      candidates:
+        operation === 'delete'
+          ? []
+          : [
+              {
+                accountId: 'sensitive-account',
+                order: 0,
+                quota: { kind: 'unknown' as const },
+              },
+            ],
+      retainAccountIds: new Set(['sensitive-account']),
+      storage: null,
+      inputBytes: 1,
+    }
+    const key = createHash('sha256').update(input.sessionId).digest('hex')
+    const seed = JSON.stringify({
+      version: 1,
+      updatedAt: now,
+      assignments: {
+        [key]: {
+          accountId: 'sensitive-account',
+          family: operation === 'delete' ? 'fable' : 'general',
+          assignedAt: now,
+          lastSeenAt: now,
+          initialInputBytes: 1,
+          quotaCheckedAt: 0,
+        },
+      },
+    })
+    async function routerAt(path: string) {
+      if (operation === 'delete') await writeFile(path, seed, { mode: 0o600 })
+      const router = new StickySessionRouter({ path, now: () => now })
+      const seam = router as unknown as {
+        refreshStateIfChanged(): Promise<void>
+        writeState(
+          state: unknown,
+          beforeRename: () => Promise<void>,
+          prune?: boolean,
+        ): Promise<void>
+      }
+      if (operation === 'touch') {
+        const refreshState = seam.refreshStateIfChanged.bind(router)
+        seam.refreshStateIfChanged = async () => {
+          await refreshState()
+          // An assignment can arrive after the initial cache read but before
+          // the locked read. That makes resolve use its locked touch branch.
+          await writeFile(path, seed, { mode: 0o600 })
+        }
+      }
+      return { router, seam }
+    }
+    const healthy = await routerAt(join(directory, 'healthy.json'))
+    const expected = await healthy.router.resolve(input)
+    if (operation === 'delete') expect(expected).toBeNull()
+    else
+      expect(expected).toMatchObject({
+        accountId: 'sensitive-account',
+        created: operation === 'assign',
+      })
+    const path = join(directory, 'displaced.json')
+    const { router, seam } = await routerAt(path)
+    const entered = lifetime.gate()
+    const resume = lifetime.gate()
+    const writeState = seam.writeState.bind(router)
+    seam.writeState = async (...args) => {
+      entered.open()
+      await resume.wait
+      await writeState(...args)
+    }
+    const logs: LogTestRecord[] = []
+    const previousLevel = getLogLevel()
+    setLogLevel('warn')
+    __setLogTestSink((record) => logs.push(record))
+    lifetime.deferCleanup(() => {
+      __setLogTestSink(null)
+      setLogLevel(previousLevel)
+    })
+    const running = router.resolve(input).catch((error: unknown) => error)
+    lifetime.trackDetached(running)
+    await entered.wait
+    const successor = await replaceLease(path, 'write')
+    const published = `${JSON.stringify({
+      version: 1,
+      updatedAt: now,
+      assignments: {
+        [key]: {
+          ...JSON.parse(seed).assignments[key],
+          accountId: 'successor-account',
+        },
+      },
+    })}\n`
+    await successor.assertOwned()
+    await writeFile(path, published, { mode: 0o600 })
+    resume.open()
+    expect(await running).toEqual(expected)
+    expect(await readFile(path, 'utf8')).toBe(published)
+    expect(logs).toEqual([
+      {
+        level: 'warn',
+        channel: 'sticky-routing',
+        message: 'assignment write refused',
+        payload: { operation, reason: 'ownership-lost' },
+      },
+    ])
+    await successor.assertOwned()
+  })
+}
+
 test('enrollment reconcile refuses a replaced lease and preserves successor state', async () => {
   const paths = getClaustrumEnrollmentPaths(join(await fixture(), 'token.json'))
   const entered = lifetime.gate()
@@ -203,7 +324,7 @@ test('enrollment token publication refuses lease loss during token staging', asy
 })
 
 for (const kind of ['main', 'fallback'] as const) {
-  test(`${kind} quota completion refuses a replaced lease before updating cache or callbacks`, async () => {
+  test(`${kind} quota completion drops a replaced lease without cache, error or failed-poll bookkeeping`, async () => {
     const path = join(await fixture(), 'accounts.json')
     const previous = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
     process.env.OPENCODE_ANTHROPIC_AUTH_FILE = path
@@ -215,12 +336,21 @@ for (const kind of ['main', 'fallback'] as const) {
     const entered = lifetime.gate()
     const resume = lifetime.gate()
     let callbacks = 0
+    let errors = 0
+    let now = 1_000
     const manager = new QuotaManager({
       storage: null,
-      fetchQuotaSnapshot: async () => {
-        entered.open()
-        await resume.wait
-        return { checkedAt: Date.now() }
+      now: () => now,
+      fetchQuotaSnapshot: async (_request, dispatch) => {
+        await dispatch(
+          async () => {
+            entered.open()
+            await resume.wait
+            return Response.json({})
+          },
+          async () => {},
+        )
+        return { checkedAt: now }
       },
       onMainQuotaFetched: () => {
         callbacks++
@@ -228,8 +358,26 @@ for (const kind of ['main', 'fallback'] as const) {
       onFallbackQuotaFetched: () => {
         callbacks++
       },
+      onApiError: () => {
+        errors++
+      },
+      onFallbackApiError: () => {
+        errors++
+      },
     })
     lifetime.deferCleanup(() => manager.close())
+    const cached = {
+      quota: { accountIdentity: 'account', source: 'headers' as const },
+      refreshAfter: 100_000,
+      checkedAt: 1,
+    }
+    if (kind === 'main') manager.setMain('account', cached)
+    else manager.setFallback('account', cached, undefined)
+    const spacing = manager as unknown as {
+      lastApiCallAt?: number
+      lastMainPollAttempt?: unknown
+    }
+    const previousPoll = spacing.lastMainPollAttempt
     const running = (
       kind === 'main'
         ? manager.refreshMainWithMetadata('account', 'synthetic-token')
@@ -247,18 +395,25 @@ for (const kind of ['main', 'fallback'] as const) {
         ? 'opencode-main-quota-refresh'
         : 'opencode-fallback-quota-refresh-account',
     )
+    const physicalSpacing = spacing.lastApiCallAt
+    now = 2_000
     resume.open()
     const outcome = await running
+    expect(errors).toBe(0)
     expect(callbacks).toBe(0)
     expect(
       kind === 'main'
         ? manager.getMain('account')
         : manager.getFallback('account'),
-    ).toBeNull()
-    expect(outcome).toBeInstanceOf(Error)
-    expect((outcome as Error).message).toBe(
-      'Account file lock ownership was lost',
-    )
+    ).toBe(cached)
+    expect(outcome).toEqual({ quota: cached.quota, fetched: false })
+    expect(manager.getLastApiError()).toBeUndefined()
+    expect(manager.getMainQuotaErrorGeneration()).toBe(0)
+    expect(manager.isBackedOff()).toBe(false)
+    expect(manager.isFallbackBackedOff('account')).toBe(false)
+    expect(spacing.lastMainPollAttempt).toBe(previousPoll)
+    expect(spacing.lastApiCallAt).toBe(physicalSpacing)
+    if (kind === 'main') expect(manager.isMainStale()).toBe(true)
     await successor.assertOwned()
   })
 }

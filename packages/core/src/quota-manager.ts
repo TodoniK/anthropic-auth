@@ -1025,13 +1025,16 @@ export class QuotaManager {
           throw new Error('Quota refresh is already in progress')
         }
         try {
+          const previousPollAttempt = this.lastMainPollAttempt
+          let pollAttempt: typeof this.lastMainPollAttempt
           let fetchStartedAt = this.now()
           let dispatched = false
           const dispatch = this._quotaDispatch(
             (at) => {
               if (!dispatched) fetchStartedAt = at
               dispatched = true
-              this.lastMainPollAttempt = { accountId: mainAccountId, at }
+              pollAttempt = { accountId: mainAccountId, at }
+              this.lastMainPollAttempt = pollAttempt
             },
             async () => {
               await fileLock.assertOwned()
@@ -1049,7 +1052,20 @@ export class QuotaManager {
                 fetchImpl: this._quotaFetch(dispatch),
                 now: this.now,
               })
-          await fileLock.assertOwned()
+          try {
+            await fileLock.assertOwned()
+          } catch {
+            // The GET succeeded but its completion no longer belongs to this
+            // writer. Preserve physical GET spacing, not a failed-poll throttle.
+            if (pollAttempt && this.lastMainPollAttempt === pollAttempt)
+              this.lastMainPollAttempt = previousPollAttempt
+            return {
+              quota: this.getMain(mainAccountId)?.quota ?? {
+                accountIdentity: mainAccountId,
+              },
+              fetched: false,
+            }
+          }
           const now = this.now()
           if (
             this.mainQuotaIdentityKnown &&
@@ -1176,7 +1192,17 @@ export class QuotaManager {
                 fetchImpl: this._quotaFetch(dispatch),
                 now: this.now,
               })
-          await fileLock.assertOwned()
+          try {
+            await fileLock.assertOwned()
+          } catch {
+            // Ownership loss is not a provider failure and must not arm backoff.
+            return {
+              quota: this.getFallback(accountId, account)?.quota ?? {
+                accountIdentity: accountId,
+              },
+              fetched: false,
+            }
+          }
           const now = this.now()
           if ((this.fallbackGenerations.get(accountId) ?? 0) !== generation) {
             return {

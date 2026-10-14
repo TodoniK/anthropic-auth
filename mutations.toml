@@ -609,7 +609,7 @@ test_file = "packages/core/src/tests/locked-publication.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/locked-publication.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["sticky queued touch refuses a replaced lease and preserves successor assignments"]
+expect_red = ["sticky queued touch refuses a replaced lease and preserves successor assignments", "sticky resolve touch keeps its decision on lease loss and logs one refusal", "sticky resolve delete keeps its decision on lease loss and logs one refusal", "sticky resolve assign keeps its decision on lease loss and logs one refusal"]
 expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
@@ -659,19 +659,19 @@ broad_id = "{name}"
 id = "main-quota-completion-ownership-fence"
 guards = "Main quota completion must not update cache or fetched callbacks after its lease is replaced."
 file = "packages/core/src/quota-manager.ts"
-old = '''          await fileLock.assertOwned()
-          const now = this.now()
-          if (
-            this.mainQuotaIdentityKnown'''
-new = '''          // NON-VACUITY BREAK: accept displaced main quota completion
-          const now = this.now()
-          if (
-            this.mainQuotaIdentityKnown'''
+old = '''          try {
+            await fileLock.assertOwned()
+          } catch {
+            // The GET succeeded but its completion no longer belongs to this'''
+new = '''          try {
+            // NON-VACUITY BREAK: accept displaced main quota completion
+          } catch {
+            // The GET succeeded but its completion no longer belongs to this'''
 test_file = "packages/core/src/tests/locked-publication.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/locked-publication.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["main quota completion refuses a replaced lease before updating cache or callbacks"]
+expect_red = ["main quota completion drops a replaced lease without cache, error or failed-poll bookkeeping"]
 expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
@@ -681,17 +681,19 @@ broad_id = "{name}"
 id = "fallback-quota-completion-ownership-fence"
 guards = "Fallback quota completion must not update cache or fetched callbacks after its lease is replaced."
 file = "packages/core/src/quota-manager.ts"
-old = '''          await fileLock.assertOwned()
-          const now = this.now()
-          if ((this.fallbackGenerations.get(accountId) ?? 0) !== generation) {'''
-new = '''          // NON-VACUITY BREAK: accept displaced fallback quota completion
-          const now = this.now()
-          if ((this.fallbackGenerations.get(accountId) ?? 0) !== generation) {'''
+old = '''          try {
+            await fileLock.assertOwned()
+          } catch {
+            // Ownership loss is not a provider failure and must not arm backoff.'''
+new = '''          try {
+            // NON-VACUITY BREAK: accept displaced fallback quota completion
+          } catch {
+            // Ownership loss is not a provider failure and must not arm backoff.'''
 test_file = "packages/core/src/tests/locked-publication.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/locked-publication.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["fallback quota completion refuses a replaced lease before updating cache or callbacks"]
+expect_red = ["fallback quota completion drops a replaced lease without cache, error or failed-poll bookkeeping"]
 expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"

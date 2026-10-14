@@ -16,6 +16,7 @@ import {
   type OAuthQuotaSnapshot,
   quotaSnapshotPassesModelScope,
 } from './accounts.ts'
+import { logger } from './logger.ts'
 import { isClaudeFableOrMythos5Model } from './models.ts'
 import type { NativeVaultRosterDocument } from './native-roster-seed.ts'
 import {
@@ -670,6 +671,32 @@ export class StickySessionRouter {
     this.loaded = true
   }
 
+  private async writeResolutionState(
+    state: StickyRouteState,
+    assertOwned: () => Promise<void>,
+    operation: 'touch' | 'delete' | 'assign',
+  ) {
+    let ownershipLost = false
+    try {
+      await this.writeState(state, async () => {
+        try {
+          await assertOwned()
+        } catch (error) {
+          ownershipLost = true
+          throw error
+        }
+      })
+    } catch (error) {
+      if (!ownershipLost) throw error
+      // Saving an assignment is bookkeeping: a displaced writer must not fail
+      // the already-computed route or overwrite the successor's state.
+      logger.warn('sticky-routing', 'assignment write refused', {
+        operation,
+        reason: 'ownership-lost',
+      })
+    }
+  }
+
   /** Import legacy session pins only after vault account discovery produces a complete verified roster. No empty routing file is published while that roster is incomplete. */
   async prepareLegacySeed(knownRoster?: NativeVaultRosterDocument | null) {
     const seed = this.options.vaultSeed
@@ -902,7 +929,11 @@ export class StickySessionRouter {
         !input.excludeAccountIds?.has(this.logicalAccountId(current))
       ) {
         current.lastSeenAt = this.now()
-        await this.writeState(state, () => lock.assertOwned())
+        await this.writeResolutionState(
+          state,
+          () => lock.assertOwned(),
+          'touch',
+        )
         return {
           accountId: this.logicalAccountId(current),
           assignment: { ...current },
@@ -942,7 +973,11 @@ export class StickySessionRouter {
       if (!selected) {
         if (current) {
           delete state.assignments[key]
-          await this.writeState(state, () => lock.assertOwned())
+          await this.writeResolutionState(
+            state,
+            () => lock.assertOwned(),
+            'delete',
+          )
         }
         return null
       }
@@ -961,7 +996,7 @@ export class StickySessionRouter {
         quotaCheckedAt: selectedQuota ? snapshotCheckedAt(selectedQuota) : 0,
       }
       state.assignments[key] = assignment
-      await this.writeState(state, () => lock.assertOwned())
+      await this.writeResolutionState(state, () => lock.assertOwned(), 'assign')
       return {
         accountId: selected.accountId,
         assignment: { ...assignment },
