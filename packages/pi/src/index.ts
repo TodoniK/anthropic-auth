@@ -114,7 +114,8 @@ export default async function cortexKitPiAnthropicAuth(
     await closePiNativeRuntime(storagePath)
   })
 
-  const configuration: ProviderConfig = {
+  // Keep the catalog chat-only even when Pi also accepts image/classifier models.
+  const configuration = {
     name: 'Anthropic (CortexKit OAuth)',
     baseUrl: 'https://api.anthropic.com',
     api: 'cortexkit-anthropic-messages',
@@ -251,7 +252,7 @@ export default async function cortexKitPiAnthropicAuth(
           ? effortHistoryBySession.get(options.sessionId)
           : undefined,
       ),
-  }
+  } satisfies ProviderConfig
 
   async function configureProvider() {
     const streamSimple = configuration.streamSimple
@@ -323,8 +324,8 @@ export default async function cortexKitPiAnthropicAuth(
         (configuration.models ?? []).map((model) => ({
           ...model,
           provider: 'anthropic',
-          api: model.api ?? 'cortexkit-anthropic-messages',
-          baseUrl: model.baseUrl ?? 'https://api.anthropic.com',
+          api: configuration.api,
+          baseUrl: configuration.baseUrl,
         })),
       // Preserve the legacy provider's simplified option surface for raw calls.
       stream: (model, context, options) =>

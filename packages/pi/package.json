@@ -39,8 +39,8 @@
     "@cortexkit/anthropic-auth-core": "2.0.1"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.86.1",
-    "@earendil-works/pi-coding-agent": ">=0.86.1",
-    "@earendil-works/pi-tui": ">=0.86.1"
+    "@earendil-works/pi-ai": ">=0.86.1 <2",
+    "@earendil-works/pi-coding-agent": ">=0.86.1 <2",
+    "@earendil-works/pi-tui": ">=0.86.1 <2"
   }
 }
