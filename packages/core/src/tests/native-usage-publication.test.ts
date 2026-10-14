@@ -72,6 +72,28 @@ test('advisory usage publication starts after handoff and drains every write', a
   expect(finished).toBe(2)
 })
 
+test('observed quota publication keeps its join until the already-started write settles', async () => {
+  const publisher = createNativeUsagePublisher('native-auth')
+  const release = gate()
+  let joined = false
+  let drained = false
+  const write = release.wait.then(() => 'saved')
+  const joining = publisher.observe(write).then(() => {
+    joined = true
+  })
+  const draining = publisher.drain().then(() => {
+    drained = true
+  })
+  await Promise.resolve()
+  expect(joined).toBe(false)
+  expect(drained).toBe(false)
+  release.open()
+  await joining
+  await draining
+  expect(joined).toBe(true)
+  expect(drained).toBe(true)
+})
+
 test('every publication rejection is absorbed with one fixed closed diagnostic', async () => {
   const records: LogTestRecord[] = []
   const previous = getLogLevel()

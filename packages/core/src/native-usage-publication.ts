@@ -79,20 +79,27 @@ function logPublicationFailure(channel: string, error: unknown): void {
 /** Own advisory writes for one host instance and join them before runtime close. */
 export function createNativeUsagePublisher(channel: string) {
   const pending = new Set<Promise<void>>()
+  const observe = (write: Promise<unknown>): Promise<void> => {
+    const work = write.then(
+      () => {},
+      (error: unknown) => logPublicationFailure(channel, error),
+    )
+    pending.add(work)
+    void work.then(
+      () => pending.delete(work),
+      () => pending.delete(work),
+    )
+    return work
+  }
   return {
+    // Quota writes start at header receipt, but attempt end still joins their
+    // settled outcome so the next account choice can read any saved quota.
+    observe,
     publish(write: () => Promise<unknown>): void {
       // A new event-loop turn gives the host its response before bookkeeping
       // starts, including when the writer does synchronous work before await.
-      const work = new Promise<void>((resolve) => setTimeout(resolve, 0))
-        .then(write)
-        .then(
-          () => {},
-          (error: unknown) => logPublicationFailure(channel, error),
-        )
-      pending.add(work)
-      void work.then(
-        () => pending.delete(work),
-        () => pending.delete(work),
+      void observe(
+        new Promise<void>((resolve) => setTimeout(resolve, 0)).then(write),
       )
     },
     async drain(): Promise<void> {

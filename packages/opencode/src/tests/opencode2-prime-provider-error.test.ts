@@ -3,16 +3,26 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  __setLogTestSink,
   captureNativeLocalPoolBinding,
   createNativeAccountRuntime,
   createNativePoolStore,
+  getLogLevel,
+  type LogTestRecord,
   type NativeAccountRuntime,
   type ProviderAccountUuid,
   resolveNativePoolPaths,
   runNativeMigration,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
+import {
+  installOpenCode2Auth,
+  type OpenCode2HookContext,
+} from '@cortexkit/common-auth/opencode2'
 import { fingerprintOf } from '@cortexkit/common-auth/store'
+import type { SessionHooks } from '@opencode/plugin/promise/session'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
+import { NativeRuntimeError } from '../../../core/src/native-runtime'
 import { PROVIDER_ERROR_REDACTION } from '../../../core/src/provider-error.ts'
 import {
   createTestLifetimeSuite,
@@ -525,6 +535,10 @@ async function primeFixture(
   }
   return {
     runtime,
+    store,
+    source: observed,
+    paths,
+    own: (cleanup: () => unknown) => undo.push(cleanup),
     seen,
     classified,
     outcomes,
@@ -543,6 +557,337 @@ const expectNoCredential = (records: readonly string[]) => {
 
 const primeCounters = async (runtime: NativeAccountRuntime) =>
   (await runtime.read()).accounts.find((account) => account.id === 'main')
+
+/** Hold one quota write without acquiring the credential-file locks needed by refresh. */
+function holdQuota(fixture: Awaited<ReturnType<typeof primeFixture>>) {
+  const entered = gate()
+  const release = gate()
+  const retired = gate()
+  const ending = gate()
+  const publish = fixture.runtime.publishLocal.bind(fixture.runtime)
+  const classify = fixture.source.limitFromResponse?.bind(fixture.source)
+  const end = fixture.source.onAttemptEnd?.bind(fixture.source)
+  let held = false
+  let refusal: Error | undefined
+  const publication = spyOn(fixture.runtime, 'publishLocal').mockImplementation(
+    async (subject, patch) => {
+      if (patch.quota && !held) {
+        held = true
+        entered.open()
+        await release.wait
+        // Model a refused quota write after refresh has finished. Refreshing
+        // the same account alone does not invalidate quota; a real final write
+        // also checks lock ownership and whether the host still has authority.
+        if (refusal) throw refusal
+      }
+      return publish(subject, patch)
+    },
+  )
+  const classification = spyOn(
+    fixture.source,
+    'limitFromResponse',
+  ).mockImplementation(async (input) => {
+    const result = await classify?.(input)
+    if (input.status === 401) {
+      const read = await fixture.store.read()
+      const credential =
+        read.status === 'ready' ? read.rows[0]?.credential : undefined
+      expect(credential?.type === 'oauth' && credential.access).toBe(ROTATED)
+      retired.open()
+    }
+    return result
+  })
+  const attemptEnd = spyOn(fixture.source, 'onAttemptEnd').mockImplementation(
+    (input, outcome) => {
+      ending.open()
+      return end?.(input, outcome)
+    },
+  )
+  fixture.own(() => publication.mockRestore())
+  fixture.own(() => classification.mockRestore())
+  fixture.own(() => attemptEnd.mockRestore())
+  return {
+    entered,
+    retired,
+    ending,
+    release,
+    refuse(error: Error) {
+      refusal = error
+    },
+  }
+}
+
+function publicationRecords() {
+  const records: LogTestRecord[] = []
+  const previous = getLogLevel()
+  setLogLevel('debug')
+  __setLogTestSink((record) => records.push(record))
+  deferCleanup(() => {
+    __setLogTestSink(null)
+    setLogLevel(previous)
+  })
+  return records
+}
+
+/** Drive the model/HTTP/retry hooks; the shared installer starts and ends attempts. */
+async function modelSender(
+  fixture: Awaited<ReturnType<typeof primeFixture>>,
+  provider: ReturnType<typeof startProvider>,
+) {
+  type Handlers = {
+    [K in keyof SessionHooks]?: (draft: SessionHooks[K]) => void | Promise<void>
+  }
+  const handlers: Handlers = {}
+  const hook: OpenCode2HookContext['session']['hook'] = async (
+    name,
+    callback,
+  ) => {
+    handlers[name] = callback as Handlers[typeof name]
+    return {
+      dispose: async () => {
+        delete handlers[name]
+      },
+    }
+  }
+  const native = adapterModule.createNativeAnthropicAdapter({
+    source: fixture.source,
+  })
+  const warnings: string[] = []
+  const installation = await installOpenCode2Auth(
+    { session: { hook } },
+    native.adapter,
+    {
+      logger: {
+        warn: (message) => {
+          warnings.push(message)
+        },
+      },
+    },
+  )
+  fixture.own(async () => {
+    await installation.dispose()
+    native.dispose()
+  })
+  const run = async <K extends keyof SessionHooks>(
+    name: K,
+    draft: SessionHooks[K],
+  ) => {
+    const handler = handlers[name]
+    if (!handler) throw new Error('The model hook was not installed')
+    await handler(draft)
+  }
+  const identity = {
+    sessionID: 'ses_held_model' as SessionHooks['model.request']['sessionID'],
+    agent: 'build' as SessionHooks['model.request']['agent'],
+    model: {
+      providerID: 'anthropic',
+      id: 'claude-haiku-4-5',
+    } as SessionHooks['model.request']['model'],
+    kind: 'primary' as const,
+  }
+  return {
+    warnings,
+    async send() {
+      for (let index = 0; index < 2; index++) {
+        const model = { ...identity, headers: {} }
+        await run('model.request', model)
+        const headers = new Headers(model.headers)
+        headers.set('content-type', 'application/json')
+        const http = {
+          ...identity,
+          request: new Request('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              model: identity.model.id,
+              max_tokens: 16,
+              stream: false,
+              messages: [{ role: 'user', content: 'Say ok' }],
+            }),
+          }),
+        }
+        await run('http.request', http)
+        const reply = {
+          ...identity,
+          request: http.request,
+          response: await provider.fetch(http.request),
+        }
+        await run('http.response', reply)
+        if (reply.response.ok)
+          return {
+            status: reply.response.status,
+            data: await reply.response.json(),
+          }
+        await reply.response.body?.cancel()
+        const retry: SessionHooks['retry'] = {
+          ...identity,
+          attempt: index + 1,
+          error: {
+            type: 'api',
+            message: 'Provider refused the request',
+            status: reply.response.status,
+          },
+          decision: { retry: false },
+        }
+        await run('retry', retry)
+        if (!retry.decision.retry)
+          throw new Error('The model request was not retried')
+      }
+      throw new Error('The model request retry budget was exhausted')
+    },
+  }
+}
+
+for (const [code, level] of [
+  ['publication-refused', 'error'],
+  ['runtime-io', 'warn'],
+] as const) {
+  test(`OC2 model request retries after a held ${code} quota publication with one ${level} diagnostic`, async () => {
+    let fixture: Awaited<ReturnType<typeof primeFixture>>
+    let quotaAtRetry: unknown = 'retry not reached'
+    const provider = startProvider(suite, async (token, index) => {
+      if (index === 0)
+        return new Response(echoError('authentication_error', token), {
+          status: 401,
+          headers: echoHeaders(token, 'req_model_rejected'),
+        })
+      quotaAtRetry = (await primeCounters(fixture.runtime))?.quota
+      return usageReply('req_model_retry')
+    })
+    const records = publicationRecords()
+    fixture = await primeFixture(provider, false)
+    const quota = holdQuota(fixture)
+    quota.refuse(new NativeRuntimeError(code))
+    const model = await modelSender(fixture, provider)
+    const sending = model.send()
+    suite.trackDetached(sending)
+    await quota.entered.wait
+    await quota.retired.wait
+    await quota.ending.wait
+    expect(provider.sent).toEqual([FIRST])
+    quota.release.open()
+
+    expect(await sending).toMatchObject({
+      status: 200,
+      data: { content: [{ type: 'text', text: 'ok' }] },
+    })
+    expect(provider.sent).toEqual([FIRST, ROTATED])
+    expect(quotaAtRetry).toBeUndefined()
+    await fixture.source.close()
+    expect(model.warnings).toEqual([])
+    expect(
+      records.filter(
+        (record) => record.message === 'Account usage publication unavailable',
+      ),
+    ).toEqual([
+      {
+        level,
+        channel: 'native-auth',
+        message: 'Account usage publication unavailable',
+        payload: { name: 'NativeRuntimeError', code },
+      },
+    ])
+  })
+}
+
+test('OC2 Prime retries after a held quota publication is refused after credential retirement', async () => {
+  let fixture: Awaited<ReturnType<typeof primeFixture>>
+  let quotaAtRetry: unknown = 'retry not reached'
+  const provider = startProvider(suite, async (token, index) => {
+    if (index === 0)
+      return new Response(echoError('authentication_error', token), {
+        status: 401,
+        headers: echoHeaders(token, 'req_held_rejected'),
+      })
+    quotaAtRetry = (await primeCounters(fixture.runtime))?.quota
+    return usageReply('req_held_retry')
+  })
+  const records = publicationRecords()
+  fixture = await primeFixture(provider, false)
+  const quota = holdQuota(fixture)
+  quota.refuse(new NativeRuntimeError('publication-refused'))
+  const sending = fixture.send()
+  suite.trackDetached(sending)
+  await quota.entered.wait
+  await quota.retired.wait
+  await quota.ending.wait
+  expect(provider.sent).toEqual([FIRST])
+  expect((await primeCounters(fixture.runtime))?.quota).toBeUndefined()
+  quota.release.open()
+
+  expect(await sending).toMatchObject({ ok: true, status: 200 })
+  expect(provider.sent).toEqual([FIRST, ROTATED])
+  expect(quotaAtRetry).toBeUndefined()
+  expect(
+    (await primeCounters(fixture.runtime))?.quota?.five_hour?.remainingPercent,
+  ).toBe(75)
+  await fixture.source.close()
+  expect(
+    records.filter(
+      (record) => record.message === 'Account usage publication unavailable',
+    ),
+  ).toEqual([
+    {
+      level: 'error',
+      channel: 'native-auth',
+      message: 'Account usage publication unavailable',
+      payload: { name: 'NativeRuntimeError', code: 'publication-refused' },
+    },
+  ])
+})
+
+test('OC2 attempt end joins a held successful quota publication before a later account choice', async () => {
+  const provider = startProvider(suite, () => {
+    const response = usageReply('req_saved_quota')
+    response.headers.set('anthropic-ratelimit-unified-5h-utilization', '1')
+    response.headers.set('anthropic-ratelimit-unified-7d-utilization', '1')
+    return response
+  })
+  const records = publicationRecords()
+  const fixture = await primeFixture(provider, false)
+  await fixture.runtime.addApi({
+    routeId: 'paid',
+    apiKey: 'synthetic-paid-account',
+    baseURL: 'https://api.anthropic.com',
+    authHeader: 'x-api-key',
+  })
+  const quota = holdQuota(fixture)
+  let completed = false
+  const sending = fixture.send().then((result) => {
+    completed = true
+    return result
+  })
+  suite.trackDetached(sending)
+  await quota.entered.wait
+  await quota.ending.wait
+  expect(completed).toBe(false)
+  expect((await primeCounters(fixture.runtime))?.quota).toBeUndefined()
+  expect(completed).toBe(false)
+  quota.release.open()
+  expect(await sending).toMatchObject({ ok: true, status: 200 })
+  expect(
+    await fixture.source.chooseAccount({
+      providerID: 'anthropic',
+      modelID: 'claude-haiku-4-5',
+      sessionID: 'later-saved-quota-choice',
+      agent: 'build',
+      kind: 'primary',
+      rerouteFrom: {
+        accountId: 'main',
+        limit: { reason: 'provider-503', status: 503 },
+      },
+    }),
+  ).toBe('paid')
+  expect(
+    (await primeCounters(fixture.runtime))?.quota?.five_hour?.remainingPercent,
+  ).toBe(0)
+  await fixture.source.close()
+  expect(
+    records.filter(
+      (record) => record.message === 'Account usage publication unavailable',
+    ),
+  ).toEqual([])
+})
 
 test('OC2 Prime records one successful send usage and keeps no credential afterwards', async () => {
   const provider = startProvider(suite, () => usageReply('req_prime_success'))

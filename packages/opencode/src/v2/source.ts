@@ -604,14 +604,16 @@ export function createNativeAnthropicSource(
         ...(identity ? { accountIdentity: identity } : {}),
       }
       state.quota = mergeHeaderQuotaForPersistence(state.quota, incoming)
-      // Save these quota headers against the exact account and credential
-      // version that served this request (its provenance), so another
-      // credential never inherits them. The write is started, not awaited:
+      // Publish these headers with the provenance of the send that observed
+      // them. The runtime's account and authority fences decide whether to
+      // keep the observation. The write is started, not awaited:
       // streaming never waits on file locks. onAttemptEnd awaits it, so any
-      // account choice after this attempt reads the saved quota.
-      const pending = publish(input.provenance, state, { quota: state.quota })
+      // account choice after this attempt reads the saved quota. A refused
+      // observation is logged and dropped, never a failure of the request.
+      const pending = usagePublications.observe(
+        publish(input.provenance, state, { quota: state.quota }),
+      )
       publications.set(input.provenance, pending)
-      void pending.catch(() => {})
       return incoming
     },
     async limitFromResponse(input) {
