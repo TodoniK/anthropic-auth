@@ -9,6 +9,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Setup can now find OpenCode, Pi and the Claustrum `ck` CLI on Windows, so it can configure them. Before, it reported "Neither OpenCode nor Pi was detected" when they were installed through npm or Bun launchers, or as OpenCode Desktop, or before OpenCode had written a config file.
 - Windows vault enrollment works: `@cortexkit/claustrum-client` moves to 0.9.0, the first version that writes the enrollment token owner-only on Windows. Mac and Linux behavior is unchanged, and existing enrollments keep working.
 - OpenCode 2: a request that retried after a 401 no longer fails with "Native Prime was not completed" when its first attempt's quota save was refused.
+- Move to `@cortexkit/common-auth` 0.15.0, which closes a lock race that could let two writers hold the same file lock and writes private files owner-only on Windows.
 - Session routing, vault enrollment and quota updates check that they still hold their file lock right before saving. A rare lock race could otherwise let two writers save at once and drop a session's account pin. A displaced save keeps the request's route and skips saving.
 
 ### For integrators
