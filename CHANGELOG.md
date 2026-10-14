@@ -2,16 +2,19 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
-
-- Core is now an internal package of the OpenCode and Pi hosts, apart from the public, stable identity, header, billing and signing APIs documented in its README. Remove legacy sidecar loader/writer and pre-native scoped-runtime exports and their dedicated tests; preserve offline migration and vault-seed readers. This cleanup ships with the next user-facing release; package versions are unchanged.
-- Share native settings section updates and the operation that removes CacheKeep's previous hour limits when selecting an always-on keep-warm schedule, without changing host command behavior.
-
 ## 2.0.1
 
 ### Fixes
 
-- Setup now detects OpenCode, Pi and ck on Windows when installed through npm or Bun launchers, or as OpenCode Desktop.
+- Setup can now find OpenCode, Pi and the Claustrum `ck` CLI on Windows, so it can configure them. Before, it reported "Neither OpenCode nor Pi was detected" when they were installed through npm or Bun launchers, or as OpenCode Desktop, or before OpenCode had written a config file.
+- Windows vault enrollment works: `@cortexkit/claustrum-client` moves to 0.9.0, the first version that writes the enrollment token owner-only on Windows. Mac and Linux behavior is unchanged, and existing enrollments keep working.
+- OpenCode 2: a request that retried after a 401 no longer fails with "Native Prime was not completed" when its first attempt's quota save was refused.
+- Session routing, vault enrollment and quota updates check that they still hold their file lock right before saving. A rare lock race could otherwise let two writers save at once and drop a session's account pin. A displaced save keeps the request's route and skips saving.
+
+### For integrators
+
+- `@cortexkit/anthropic-auth-core` is now an internal package of the OpenCode and Pi plugins. Its public, stable API is the identity, header, billing and signing functions listed in its README; everything else may change in any release.
+- Removed from Core's exports: the 1.x scoped vault-custody modules (Core's own `ClaustrumScopedCustody`, the scoped roster and `ClaustrumScopedRuntime`), the 1.x sidecar account-file loaders and writers and `FallbackAccountManager`, and the sidecar routing-mode writer. The 2.0 native account runtime replaced all of them.
 
 ## 2.0.0
 
