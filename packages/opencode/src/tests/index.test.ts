@@ -7550,6 +7550,8 @@ describe('auth.loader', () => {
   })
 
   test('/claude-quota preserves fresher routing from another session', async () => {
+    const releaseStartupQuota = bodyLifetime().gate()
+    const startupSidebarMerged = bodyLifetime().gate()
     await useTempAccountFile(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
@@ -7573,14 +7575,15 @@ describe('auth.loader', () => {
     )
     globalThis.fetch = mock((input: string | URL | Request) => {
       if (extractUrl(input).includes('/api/oauth/usage')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              five_hour: { utilization: 0.25 },
-              seven_day: { utilization: 0.3 },
-            }),
-            { status: 200 },
-          ),
+        return releaseStartupQuota.wait.then(
+          () =>
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 0.25 },
+                seven_day: { utilization: 0.3 },
+              }),
+              { status: 200 },
+            ),
         )
       }
       return Promise.resolve(new Response('{}', { status: 200 }))
@@ -7598,6 +7601,17 @@ describe('auth.loader', () => {
       { models: {} },
     )
     await seedSidebarRouting('fallback-b', 'fallback-first', Date.now())
+
+    // The startup fallback-quota sweep publishes routing independently of menu
+    // opening. Let its display-only merge learn the sibling's fresh route before
+    // aging the file; draining alone cannot join a write not yet enqueued.
+    __setSidebarStateWriteTestHooks({
+      afterMergeRead: () => startupSidebarMerged.open(),
+    })
+    releaseStartupQuota.open()
+    await startupSidebarMerged.wait
+    await drainSidebarWrites()
+    __setSidebarStateWriteTestHooks(null)
 
     await expectHandledCommandResponse(
       plugin['command.execute.before']({
