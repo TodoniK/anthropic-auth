@@ -98,7 +98,7 @@ test('rejects unsupported published producer versions before copying declaration
   )
 
   await expect(closeNativeTypeDeclarations(dist, producer)).rejects.toThrow(
-    'Expected published common-auth 0.14.2, got 0.9.0',
+    'Expected published common-auth 0.15.0, got 0.9.0',
   )
   expect(await readdir(dist)).not.toContain('internal-types')
 })
@@ -111,7 +111,7 @@ test('copies the complete published relative declaration graph including cycles 
     producer,
     'package.json',
     JSON.stringify({
-      version: '0.14.2',
+      version: '0.15.0',
       exports: { './store': { types: './dist/store/index.d.ts' } },
     }),
   )
@@ -194,13 +194,14 @@ test('closure refuses declaration dependencies escaping the packed tree', async 
   )
 })
 
-test('Core bundles published preferences but keeps jsonc-parser external', async () => {
+test('Core bundles published preferences but keeps jsonc-parser and private-files external', async () => {
   const root = await fixture()
   const entrypoint = join(root, 'preferences.ts')
   const outfile = join(root, 'preferences.js')
   await writeFile(
     entrypoint,
-    `export { readTuiPreferences } from '@cortexkit/common-auth/tui-prefs';`,
+    `export { readTuiPreferences } from '@cortexkit/common-auth/tui-prefs';
+     export { writeJsonAtomic } from '@cortexkit/common-auth/fs';`,
   )
   await bundleCore({ entrypoint, outfile })
   const source = await readFile(outfile, 'utf8')
@@ -208,6 +209,7 @@ test('Core bundles published preferences but keeps jsonc-parser external', async
     (edge) => edge.specifier,
   )
   expect(specifiers).toContain('jsonc-parser')
+  expect(specifiers).toContain('@cortexkit/private-files')
   expect(
     specifiers.some((specifier) =>
       specifier.startsWith('@cortexkit/common-auth'),
@@ -232,6 +234,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     await readFile(join(core, 'package.json'), 'utf8'),
   )
   expect(manifest.dependencies['jsonc-parser']).toBe('^3.3.1')
+  expect(manifest.dependencies['@cortexkit/private-files']).toBe('0.2.1')
   expect(manifest.dependencies['@cortexkit/common-auth']).toBeUndefined()
   const consumer = join(root, 'prefix')
   await put(
@@ -265,6 +268,20 @@ test('packed Core types and Node runtime work in a fresh consumer without common
       /(?:^|\/)@cortexkit\/common-auth(?:\/|$)/.test(path),
     ),
   ).toBe(false)
+  const privateFilesManifests = allInstalled.filter((path) =>
+    /(?:^|\/)@cortexkit\/private-files\/package\.json$/.test(path),
+  )
+  console.log(
+    `Packed consumer private-files copies: ${privateFilesManifests.length}`,
+  )
+  expect(privateFilesManifests).toHaveLength(1)
+  const privateFilesManifest = JSON.parse(
+    await readFile(
+      join(consumer, 'node_modules', privateFilesManifests[0]!),
+      'utf8',
+    ),
+  )
+  expect(privateFilesManifest.version).toBe('0.2.1')
   console.log(await verifyNativeTypeClosure(join(installed, 'dist')))
   // Parse every published declaration, including ones not re-exported yet.
   const declarations = await declarationFiles(join(installed, 'dist'))

@@ -15,6 +15,7 @@ interface CoreBundleOptions {
 const RUNTIME_EXTERNALS = [
   'xxhash-wasm',
   '@cortexkit/claustrum-client',
+  '@cortexkit/private-files',
   'jsonc-parser',
 ]
 

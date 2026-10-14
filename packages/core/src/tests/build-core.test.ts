@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { bundleCore } from '../../scripts/build.ts'
@@ -46,6 +46,44 @@ test('bundles shared store and file primitives into an independent Node entrypoi
   expect(emitted).not.toMatch(
     /\b(?:from\s*|import\s*\(|require\s*\()\s*['"]@cortexkit\/common-auth/,
   )
+  expect(emitted).toContain('@cortexkit/private-files')
+  const pack = Bun.spawnSync(
+    [
+      process.execPath,
+      'pm',
+      'pack',
+      '--ignore-scripts',
+      '--destination',
+      outputRoot,
+    ],
+    {
+      cwd: dirname(
+        dirname(fileURLToPath(import.meta.resolve('@cortexkit/private-files'))),
+      ),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  )
+  expect(pack.exitCode, pack.stderr.toString()).toBe(0)
+  const archives = (await readdir(outputRoot)).filter((path) =>
+    path.endsWith('.tgz'),
+  )
+  expect(archives).toHaveLength(1)
+  await writeFile(
+    join(outputRoot, 'package.json'),
+    JSON.stringify({
+      private: true,
+      type: 'module',
+      dependencies: {
+        '@cortexkit/private-files': `file:./${archives[0]}`,
+      },
+    }),
+  )
+  const install = Bun.spawnSync(
+    [process.execPath, 'install', '--production', '--ignore-scripts'],
+    { cwd: outputRoot, stdout: 'pipe', stderr: 'pipe' },
+  )
+  expect(install.exitCode, install.stderr.toString()).toBe(0)
   const child = Bun.spawn(['node', outfile, outputRoot], {
     cwd: outputRoot,
     stdout: 'pipe',
