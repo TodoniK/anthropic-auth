@@ -41,10 +41,13 @@ export function getOpenCodeAuthPath(
   return join(getOpenCodeDataDir(env), 'auth.json')
 }
 
-export function getPiAgentDir(env: NodeJS.ProcessEnv = process.env): string {
+export function getPiAgentDir(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const configured = env.PI_CODING_AGENT_DIR?.trim() || env.PI_AGENT_DIR?.trim()
   if (configured) return resolve(configured)
-  return join(homedir(), '.pi', 'agent')
+  return join(getHostHome(env, platform), '.pi', 'agent')
 }
 
 export function getPiAuthPath(env: NodeJS.ProcessEnv = process.env): string {

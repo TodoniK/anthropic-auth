@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 import {
   connectClaustrumEnrollmentClient,
   resolveClaustrumConnectionPath,
@@ -11,6 +11,7 @@ import { detectOpenCodeConfigFile } from './opencode-config.ts'
 import {
   getHostHome,
   getOpenCodeConfigDir,
+  getPiAgentDir,
   OPENCODE_PACKAGE_NAME,
 } from './paths.ts'
 import { hasPiLocalAnthropicAuth, isPiPackageInstalled } from './pi.ts'
@@ -108,10 +109,7 @@ export async function detectPi(
   options: DetectionOptions = {},
 ): Promise<HostDetection> {
   const platform = options.platform ?? process.platform
-  const configured = env.PI_CODING_AGENT_DIR?.trim()
-  const agentDir = configured
-    ? resolve(configured)
-    : join(getHostHome(env, platform), '.pi', 'agent')
+  const agentDir = getPiAgentDir(env, platform)
   const hasAgentDir = existsSync(agentDir)
   const executable = findHostExecutable('pi', env, platform)
   const installed = hasAgentDir || executable !== null

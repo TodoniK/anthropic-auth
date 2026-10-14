@@ -8,8 +8,9 @@ export function findHostExecutable(
   platform: NodeJS.Platform,
 ): string | null {
   const windows = platform === 'win32'
+  // npm also installs an extensionless shell script; prefer launchers Windows can execute.
   const names = windows
-    ? [name, `${name}.exe`, `${name}.cmd`, `${name}.bat`]
+    ? [`${name}.exe`, `${name}.cmd`, `${name}.bat`, name]
     : [name]
   for (const directory of (env.PATH ?? '').split(windows ? ';' : delimiter)) {
     if (!directory) continue

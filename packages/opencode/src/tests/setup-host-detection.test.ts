@@ -182,6 +182,7 @@ describe('setup host detection without shell PATH lookup', () => {
     mkdirSync(agentDir)
     env.OPENCODE_CONFIG_DIR = `  ${configDir}/../config-override  `
     env.PI_CODING_AGENT_DIR = `  ${agentDir}/../pi-override  `
+    env.PI_AGENT_DIR = join(root, 'ignored-pi-agent')
     const { mock } = runner()
 
     const detection = await detectAll(env, mock, win32)
@@ -323,11 +324,11 @@ describe('shared OpenCode, Pi and ck PATH lookup', () => {
       ])
     })
 
-    test(`${name} prefers bare name then exe then cmd then bat in one Windows PATH directory`, async () => {
+    test(`${name} prefers exe then cmd then bat then bare name in one Windows PATH directory`, async () => {
       const { bin, env } = fixture()
       for (const extension of ['', '.exe', '.cmd', '.bat'])
         file(join(bin, `${name}${extension}`))
-      for (const extension of ['', '.exe', '.cmd', '.bat']) {
+      for (const extension of ['.exe', '.cmd', '.bat', '']) {
         const launcher = join(bin, `${name}${extension}`)
         const batch = extension === '.cmd' || extension === '.bat'
         const { mock, calls } = runner(batch ? 'cmd.exe' : launcher)
@@ -393,4 +394,46 @@ describe('shared OpenCode, Pi and ck PATH lookup', () => {
       ).toBeNull()
     })
   }
+})
+
+describe('Windows launcher and Pi directory compatibility', () => {
+  test('prefers the npm opencode.cmd launcher over its extensionless shell script', async () => {
+    const { bin, env } = fixture()
+    file(join(bin, 'opencode'))
+    const launcher = file(join(bin, 'opencode.cmd'))
+    const { mock, calls } = runner('cmd.exe')
+
+    const detection = await detectOpenCode(env, mock, win32)
+
+    expect(detection.installed).toBe(true)
+    expect(detection.version).toBe('1.18.35')
+    expect(calls).toEqual([
+      {
+        command: 'cmd.exe',
+        args: ['/d', '/s', '/c', launcher, '--version'],
+        env,
+      },
+    ])
+  })
+
+  test('detects Pi and its installed extension through the PI_AGENT_DIR fallback', async () => {
+    const { root, env } = fixture()
+    const agentDir = join(root, 'legacy-pi-agent')
+    env.PI_CODING_AGENT_DIR = '  '
+    env.PI_AGENT_DIR = `  ${agentDir}/../legacy-pi-agent  `
+    mkdirSync(agentDir)
+    writeFileSync(
+      join(agentDir, 'settings.json'),
+      JSON.stringify({ packages: ['npm:@cortexkit/pi-anthropic-auth'] }),
+    )
+    const { mock, calls } = runner()
+
+    const detection = await detectPi(env, mock, win32)
+
+    expect(detection.installed).toBe(true)
+    expect(detection.configPath).toBe(resolve(agentDir))
+    expect(detection.pluginInstalled).toBe(true)
+    expect(detection.version).toBeNull()
+    expect(calls).toEqual([])
+  })
 })
