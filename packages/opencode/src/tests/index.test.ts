@@ -11038,6 +11038,19 @@ describe('auth.loader', () => {
     const firstProfileStarted = lifetimeSignal()
     const secondLookupArrived = lifetimeSignal()
     const secondLookupReleased = lifetimeSignal()
+    const profilesPublished = lifetimeSignal()
+    // Profile responses and their persisted sidebar publications settle separately.
+    // Observe the committed labels instead of racing metadata writes with a polling budget.
+    __setSidebarStateWriteTestHooks({
+      afterRename: async () => {
+        const state = await getSidebarState()
+        if (
+          state.main.tierLabel === 'Max 20x' &&
+          state.fallbacks[0]?.tierLabel === 'Team · Max 5x'
+        )
+          profilesPublished.raise()
+      },
+    })
     const lookupAccounts: string[] = []
     const firstFetchCalls: string[] = []
     const answer = withNativeAdmission(
@@ -11115,11 +11128,10 @@ describe('auth.loader', () => {
     })
     globalThis.fetch = nextTestFetch as unknown as typeof fetch
     secondLookupReleased.raise()
-    await waitForSidebarState(
-      (state) =>
-        state.main.tierLabel === 'Max 20x' &&
-        state.fallbacks[0]?.tierLabel === 'Team · Max 5x',
-    )
+    await profilesPublished.raised
+    const state = await getSidebarState()
+    expect(state.main.tierLabel).toBe('Max 20x')
+    expect(state.fallbacks[0]?.tierLabel).toBe('Team · Max 5x')
 
     expect(firstFetchCalls.toSorted()).toEqual([
       'Bearer sk-ant-oat01-fallback-access',
