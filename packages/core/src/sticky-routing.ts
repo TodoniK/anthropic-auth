@@ -652,15 +652,15 @@ export class StickySessionRouter {
 
   private async writeState(
     state: StickyRouteState,
+    beforeRename: () => Promise<void>,
     prune = true,
-    beforeRename?: () => Promise<void>,
   ) {
     if (prune) this.prune(state)
     state.updatedAt = this.now()
     const tempPath = `${this.options.path}.${randomUUID()}.tmp`
     try {
       await writeFile(tempPath, `${JSON.stringify(state)}\n`, { mode: 0o600 })
-      await beforeRename?.()
+      await beforeRename()
       await rename(tempPath, this.options.path)
     } finally {
       await rm(tempPath, { force: true }).catch(() => {})
@@ -729,7 +729,7 @@ export class StickySessionRouter {
       state.vaultLegacySeed = 'complete'
       // Seed and marker share one rename. Pruning here would remove live pins
       // written during deferral, so leave their lifetime to ordinary routing.
-      await this.writeState(state, false, () => lock.assertOwned())
+      await this.writeState(state, () => lock.assertOwned(), false)
       this.seedFinalized = true
     } finally {
       await lock.release()
@@ -756,7 +756,7 @@ export class StickySessionRouter {
           const assignment = state.assignments[key]
           if (!assignment) return
           assignment.lastSeenAt = this.now()
-          await this.writeState(state)
+          await this.writeState(state, () => lock.assertOwned())
         } finally {
           await lock.release()
         }
@@ -902,7 +902,7 @@ export class StickySessionRouter {
         !input.excludeAccountIds?.has(this.logicalAccountId(current))
       ) {
         current.lastSeenAt = this.now()
-        await this.writeState(state)
+        await this.writeState(state, () => lock.assertOwned())
         return {
           accountId: this.logicalAccountId(current),
           assignment: { ...current },
@@ -942,7 +942,7 @@ export class StickySessionRouter {
       if (!selected) {
         if (current) {
           delete state.assignments[key]
-          await this.writeState(state)
+          await this.writeState(state, () => lock.assertOwned())
         }
         return null
       }
@@ -961,7 +961,7 @@ export class StickySessionRouter {
         quotaCheckedAt: selectedQuota ? snapshotCheckedAt(selectedQuota) : 0,
       }
       state.assignments[key] = assignment
-      await this.writeState(state)
+      await this.writeState(state, () => lock.assertOwned())
       return {
         accountId: selected.accountId,
         assignment: { ...assignment },
@@ -984,7 +984,7 @@ export class StickySessionRouter {
       const state = await this.readState()
       if (!(key in state.assignments)) return
       delete state.assignments[key]
-      await this.writeState(state)
+      await this.writeState(state, () => lock.assertOwned())
     } finally {
       await lock.release()
     }

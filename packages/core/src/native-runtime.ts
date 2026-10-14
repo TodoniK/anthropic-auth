@@ -835,6 +835,7 @@ async function writeNativeRuntimeOutcome(
           if (decision === 'skip') return { status: 'skipped' }
           try {
             await hooks.beforePublish?.()
+            if (hooks.beforePublish) await lock.assertOwned()
           } catch {
             throw new NativeRuntimeError('publication-refused')
           }

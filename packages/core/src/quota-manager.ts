@@ -1049,6 +1049,7 @@ export class QuotaManager {
                 fetchImpl: this._quotaFetch(dispatch),
                 now: this.now,
               })
+          await fileLock.assertOwned()
           const now = this.now()
           if (
             this.mainQuotaIdentityKnown &&
@@ -1175,6 +1176,7 @@ export class QuotaManager {
                 fetchImpl: this._quotaFetch(dispatch),
                 now: this.now,
               })
+          await fileLock.assertOwned()
           const now = this.now()
           if ((this.fallbackGenerations.get(accountId) ?? 0) !== generation) {
             return {

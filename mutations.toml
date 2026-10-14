@@ -598,3 +598,119 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "sticky-routing-final-ownership-fence"
+guards = "A displaced routing writer must preserve assignments published by the successor lease."
+file = "packages/core/src/sticky-routing.ts"
+old = "await beforeRename()"
+new = "// NON-VACUITY BREAK: publish a displaced routing snapshot"
+test_file = "packages/core/src/tests/locked-publication.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/locked-publication.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["sticky queued touch refuses a replaced lease and preserves successor assignments"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "enrollment-state-final-ownership-fence"
+guards = "A displaced enrollment reconcile must not overwrite the successor ceremony state."
+file = "packages/core/src/claustrum-enrollment.ts"
+old = '''    await chmod(temporary, 0o600)
+    await beforeRename()
+    await rename(temporary, path)'''
+new = '''    await chmod(temporary, 0o600)
+    // NON-VACUITY BREAK: publish displaced ceremony state
+    await rename(temporary, path)'''
+test_file = "packages/core/src/tests/locked-publication.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/locked-publication.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["enrollment reconcile refuses a replaced lease and preserves successor state"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "enrollment-token-final-ownership-fence"
+guards = "Token staging must not let a displaced enrollment holder replace the successor credential."
+file = "packages/core/src/claustrum-enrollment.ts"
+old = '''    await writeTokenFile(staged, value)
+    await beforeRename()
+    await rename(staged, path)'''
+new = '''    await writeTokenFile(staged, value)
+    // NON-VACUITY BREAK: publish a displaced enrollment token
+    await rename(staged, path)'''
+test_file = "packages/core/src/tests/locked-publication.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/locked-publication.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["enrollment token publication refuses lease loss during token staging"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "main-quota-completion-ownership-fence"
+guards = "Main quota completion must not update cache or fetched callbacks after its lease is replaced."
+file = "packages/core/src/quota-manager.ts"
+old = '''          await fileLock.assertOwned()
+          const now = this.now()
+          if (
+            this.mainQuotaIdentityKnown'''
+new = '''          // NON-VACUITY BREAK: accept displaced main quota completion
+          const now = this.now()
+          if (
+            this.mainQuotaIdentityKnown'''
+test_file = "packages/core/src/tests/locked-publication.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/locked-publication.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["main quota completion refuses a replaced lease before updating cache or callbacks"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "fallback-quota-completion-ownership-fence"
+guards = "Fallback quota completion must not update cache or fetched callbacks after its lease is replaced."
+file = "packages/core/src/quota-manager.ts"
+old = '''          await fileLock.assertOwned()
+          const now = this.now()
+          if ((this.fallbackGenerations.get(accountId) ?? 0) !== generation) {'''
+new = '''          // NON-VACUITY BREAK: accept displaced fallback quota completion
+          const now = this.now()
+          if ((this.fallbackGenerations.get(accountId) ?? 0) !== generation) {'''
+test_file = "packages/core/src/tests/locked-publication.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/locked-publication.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["fallback quota completion refuses a replaced lease before updating cache or callbacks"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "runtime-post-hook-ownership-fence"
+guards = "An asynchronous publication hook must not let a displaced runtime writer overwrite successor metadata."
+file = "packages/core/src/native-runtime.ts"
+old = '''            await hooks.beforePublish?.()
+            if (hooks.beforePublish) await lock.assertOwned()'''
+new = '''            await hooks.beforePublish?.()
+            // NON-VACUITY BREAK: publish after runtime lease loss in the hook'''
+test_file = "packages/core/src/tests/locked-publication.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/locked-publication.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtime publication rechecks its lease after the asynchronous publication hook"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

@@ -326,6 +326,7 @@ async function refuseWritableAncestor(parent: string): Promise<void> {
 async function writeStateAtomic(
   path: string,
   state: EnrollmentState,
+  beforeRename: () => Promise<void>,
 ): Promise<void> {
   const parent = dirname(path)
   await mkdir(parent, { recursive: true, mode: 0o700 })
@@ -346,10 +347,33 @@ async function writeStateAtomic(
     await descriptor.close()
     descriptor = undefined
     await chmod(temporary, 0o600)
+    await beforeRename()
     await rename(temporary, path)
   } finally {
     await descriptor?.close().catch(() => {})
     await unlink(temporary).catch(() => {})
+  }
+}
+
+async function writeTokenAtomic(
+  path: string,
+  value: EnrollmentTokenFile,
+  writeTokenFile: typeof writeEnrollmentTokenFile,
+  beforeRename: () => Promise<void>,
+): Promise<void> {
+  const staged = join(
+    dirname(path),
+    `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
+  )
+  try {
+    // The client writes token bytes with owner-only permissions or Windows ACLs
+    // but cannot check the ceremony lock before replacing the token. Stage through
+    // the client, then check ownership immediately before renaming into place.
+    await writeTokenFile(staged, value)
+    await beforeRename()
+    await rename(staged, path)
+  } finally {
+    await unlink(staged).catch(() => {})
   }
 }
 
@@ -502,7 +526,9 @@ export class ClaustrumEnrollmentManager {
             tokenGeneration: token.token_generation,
             updatedAt: this.#now(),
           }
-          await writeStateAtomic(this.#paths.statePath, approved)
+          await writeStateAtomic(this.#paths.statePath, approved, () =>
+            lock.assertOwned(),
+          )
           state = approved
         }
         return {
@@ -523,7 +549,9 @@ export class ClaustrumEnrollmentManager {
           errorCode: 'missing_token',
           updatedAt: this.#now(),
         }
-        await writeStateAtomic(this.#paths.statePath, blocked)
+        await writeStateAtomic(this.#paths.statePath, blocked, () =>
+          lock.assertOwned(),
+        )
         return statusFromState(blocked)
       }
       if (state && state.phase !== 'pending') return statusFromState(state)
@@ -539,7 +567,9 @@ export class ClaustrumEnrollmentManager {
         }
         if (!TOKEN_RE.test(state.requestSecret))
           throw new Error('invalid minted Claustrum enrollment secret')
-        await writeStateAtomic(this.#paths.statePath, state)
+        await writeStateAtomic(this.#paths.statePath, state, () =>
+          lock.assertOwned(),
+        )
       }
 
       if (!state.requestId) {
@@ -556,7 +586,9 @@ export class ClaustrumEnrollmentManager {
             requestId: proposed.requestId,
             updatedAt: this.#now(),
           }
-          await writeStateAtomic(this.#paths.statePath, state)
+          await writeStateAtomic(this.#paths.statePath, state, () =>
+            lock.assertOwned(),
+          )
         } catch (error) {
           if (error instanceof ClaustrumCredentialError) {
             if (
@@ -576,7 +608,9 @@ export class ClaustrumEnrollmentManager {
               errorCode: error.code,
               updatedAt: this.#now(),
             }
-            await writeStateAtomic(this.#paths.statePath, blocked)
+            await writeStateAtomic(this.#paths.statePath, blocked, () =>
+              lock.assertOwned(),
+            )
             return statusFromState(blocked)
           }
           throw error
@@ -598,13 +632,20 @@ export class ClaustrumEnrollmentManager {
             proposedName: state.proposedName,
             updatedAt: this.#now(),
           }
-          await writeStateAtomic(this.#paths.statePath, denied)
+          await writeStateAtomic(this.#paths.statePath, denied, () =>
+            lock.assertOwned(),
+          )
           return statusFromState(denied)
         }
-        await this.#writeTokenFile(this.#paths.tokenPath, {
-          token: outcome.token,
-          token_generation: outcome.tokenGeneration,
-        })
+        await writeTokenAtomic(
+          this.#paths.tokenPath,
+          {
+            token: outcome.token,
+            token_generation: outcome.tokenGeneration,
+          },
+          this.#writeTokenFile,
+          () => lock.assertOwned(),
+        )
         const approved: ApprovedEnrollmentState = {
           version: 1,
           phase: 'approved',
@@ -613,7 +654,9 @@ export class ClaustrumEnrollmentManager {
           tokenGeneration: outcome.tokenGeneration,
           updatedAt: this.#now(),
         }
-        await writeStateAtomic(this.#paths.statePath, approved)
+        await writeStateAtomic(this.#paths.statePath, approved, () =>
+          lock.assertOwned(),
+        )
         return statusFromState(approved)
       } catch (error) {
         if (!(error instanceof ClaustrumCredentialError)) throw error
@@ -635,7 +678,9 @@ export class ClaustrumEnrollmentManager {
           errorCode: error.code,
           updatedAt: this.#now(),
         }
-        await writeStateAtomic(this.#paths.statePath, blocked)
+        await writeStateAtomic(this.#paths.statePath, blocked, () =>
+          lock.assertOwned(),
+        )
         return statusFromState(blocked)
       }
     } finally {
