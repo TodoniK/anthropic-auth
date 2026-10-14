@@ -746,6 +746,16 @@ describe('Claustrum custody tombstones', () => {
       expect(vaultReads).toContain(VAULT_MAIN_CREDENTIAL)
       expect(outbound).toEqual([])
       listingGate.open()
+      // Let startup discovery commit and release its cross-runtime lease before
+      // disposal aborts its wait. A peer refresh may otherwise serve the old
+      // committed roster while that cancelled discovery still holds the lease.
+      const startup =
+        '__fallbackRefreshReady' in stale
+          ? stale.__fallbackRefreshReady
+          : undefined
+      if (!(startup instanceof Promise))
+        throw new Error('Plugin did not expose its startup fallback refresh')
+      await startup
       await disposePlugin(plugins, stale)
 
       // The vault inventory refresh rebinds main to the account the vault serves.

@@ -18987,23 +18987,46 @@ describe('auth.loader', () => {
 
     test('header push persists source headers and refreshes sidebar checkedAt without a usage poll', async () => {
       await useTempAccountFile(harvestStorage())
-      let usageCalls = 0
-      globalThis.fetch = mock(
-        withNativeAdmission((input: string | URL | Request) => {
-          if (extractUrl(input).includes('/api/oauth/usage')) usageCalls++
-          return Promise.resolve(new Response('ok', { headers: quotaHeaders }))
-        }),
-      ) as unknown as typeof fetch
-      const result = await loadFetch()
-
-      await result.fetch(MESSAGES_URL, EMPTY_POST)
-      const state = await waitForSidebarState(
-        (value) => value.main.quota?.five_hour?.usedPercent === 78,
+      const published = bodyLifetime().gate()
+      const sidebarPath = getSidebarStateFile()
+      // Returning the model response does not join quota persistence or its
+      // sidebar refresh. Wait for the atomic sidebar publication containing
+      // these headers, rather than assuming it fits a polling deadline.
+      __setSidebarStateWriteTestHooks(
+        {
+          afterRename: async () => {
+            const state = await getSidebarState(sidebarPath)
+            if (state.main.quota?.five_hour?.usedPercent === 78)
+              published.open()
+          },
+        },
+        sidebarPath,
       )
+      try {
+        let usageCalls = 0
+        globalThis.fetch = mock(
+          withNativeAdmission((input: string | URL | Request) => {
+            if (extractUrl(input).includes('/api/oauth/usage')) usageCalls++
+            return Promise.resolve(
+              new Response('ok', { headers: quotaHeaders }),
+            )
+          }),
+        ) as unknown as typeof fetch
+        const result = await loadFetch()
 
-      expect(state.main.quota?.five_hour?.usedPercent).toBe(78)
-      expect(state.lastUpdated).toBeGreaterThan(0)
-      expect(usageCalls).toBe(0)
+        await result.fetch(MESSAGES_URL, EMPTY_POST)
+        await published.wait
+        const state = await getSidebarState(sidebarPath)
+        const storage = await readAccountStorage()
+
+        expect(state.main.quota?.five_hour?.usedPercent).toBe(78)
+        expect(state.lastUpdated).toBeGreaterThan(0)
+        expect(storage?.quota?.mainQuota?.source).toBe('headers')
+        expect(storage?.quota?.mainQuotaCheckedAt).toBeGreaterThan(0)
+        expect(usageCalls).toBe(0)
+      } finally {
+        __setSidebarStateWriteTestHooks(null, sidebarPath)
+      }
     })
 
     test('successful harvest emits one quota debug record without raw headers', async () => {
