@@ -14,27 +14,29 @@ type HostRuntimeFixture = {
   id: string
   label: string
   core: string
-  keymap: string
+  keymap?: string
   solid: string
   solidJs: string
+  additionalKeymapRuntimeModules: boolean
 }
 
 const hostRuntimeFixtures: [HostRuntimeFixture, HostRuntimeFixture] = [
   {
     id: 'opencode-1-18-18',
-    label: 'OpenCode 1.18.18',
+    label: 'OpenCode 1.18.18 OpenTUI/Solid library pair',
     core: '0.4.5',
     keymap: '0.4.5',
     solid: '0.4.5',
     solidJs: '1.9.10',
+    additionalKeymapRuntimeModules: true,
   },
   {
     id: 'opencode-2-0-22',
-    label: 'OpenCode 2.0.22',
+    label: 'OpenCode 2.0.22 OpenTUI/Solid library-only pair',
     core: '0.5.14',
-    keymap: '0.5.14',
     solid: '0.5.14',
     solidJs: '1.9.15',
+    additionalKeymapRuntimeModules: false,
   },
 ]
 
@@ -137,11 +139,17 @@ async function runPackedHostRuntimeProbe(
   const installRoot = join(fixtureRoot, 'install')
   const home = join(fixtureRoot, 'home')
   const tmp = join(fixtureRoot, 'tmp')
+  const sidebarStateFile = join(fixtureRoot, 'sidebar-state.json')
+  const sidebarRouteMarker = `smoke-route-${host.id}`
   const xdgCache = join(home, 'cache')
   const xdgConfig = join(home, 'config')
   const xdgData = join(home, 'data')
   const xdgState = join(home, 'state')
   const bunInstallCache = join(fixtureRoot, 'bun-install-cache')
+  const cacheKeepDir = join(fixtureRoot, 'cachekeep')
+  const quotaFeedDir = join(fixtureRoot, 'quota-feed')
+  const dumpDir = join(fixtureRoot, 'dumps')
+  const rpcDir = join(fixtureRoot, 'rpc')
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: home,
@@ -153,19 +161,60 @@ async function runPackedHostRuntimeProbe(
     TMPDIR: tmp,
     BUN_INSTALL_CACHE_DIR: bunInstallCache,
     OPENCODE_TUI_PREFERENCES_FILE: join(fixtureRoot, 'tui-preferences.jsonc'),
-    OPENCODE_ANTHROPIC_AUTH_RPC_DIR: join(fixtureRoot, 'rpc'),
+    OPENCODE_ANTHROPIC_AUTH_FILE: join(fixtureRoot, 'anthropic-auth.json'),
+    OPENCODE_ANTHROPIC_AUTH_STATE_FILE: join(
+      fixtureRoot,
+      'anthropic-state.json',
+    ),
+    OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE: join(
+      fixtureRoot,
+      'routing-state.json',
+    ),
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+      fixtureRoot,
+      'claustrum-enrollment.json',
+    ),
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+      fixtureRoot,
+      'claustrum-connection.json',
+    ),
+    OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE: sidebarStateFile,
+    OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR: cacheKeepDir,
+    OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR: quotaFeedDir,
+    OPENCODE_ANTHROPIC_AUTH_DUMP_DIR: dumpDir,
+    OPENCODE_ANTHROPIC_AUTH_RPC_DIR: rpcDir,
   }
 
-  await Promise.all([
-    mkdir(installRoot, { recursive: true }),
-    mkdir(home, { recursive: true }),
-    mkdir(tmp, { recursive: true }),
-    mkdir(xdgCache, { recursive: true }),
-    mkdir(xdgConfig, { recursive: true }),
-    mkdir(xdgData, { recursive: true }),
-    mkdir(xdgState, { recursive: true }),
-    mkdir(bunInstallCache, { recursive: true }),
-  ])
+  const directories = [
+    installRoot,
+    home,
+    tmp,
+    xdgCache,
+    xdgConfig,
+    xdgData,
+    xdgState,
+    bunInstallCache,
+    cacheKeepDir,
+    quotaFeedDir,
+    dumpDir,
+    rpcDir,
+  ]
+  const created = await Promise.allSettled(
+    directories.map((directory) => mkdir(directory, { recursive: true })),
+  )
+  const rejected = created.find(
+    (result): result is PromiseRejectedResult => result.status === 'rejected',
+  )
+  if (rejected) throw rejected.reason
+  await writeFile(
+    sidebarStateFile,
+    JSON.stringify({
+      main: { quota: null },
+      fallbacks: [],
+      route: sidebarRouteMarker,
+      lastUpdated: Date.now(),
+    }),
+  )
   await writeFile(
     join(installRoot, 'package.json'),
     JSON.stringify(
@@ -176,12 +225,13 @@ async function runPackedHostRuntimeProbe(
           [corePackageName]: `file:${coreTarball}`,
           [packageName]: `file:${tarball}`,
           '@opentui/core': host.core,
-          '@opentui/keymap': host.keymap,
+          ...(host.keymap ? { '@opentui/keymap': host.keymap } : {}),
           '@opentui/solid': host.solid,
           'solid-js': host.solidJs,
         },
         overrides: {
           [corePackageName]: `file:${coreTarball}`,
+          'solid-js': host.solidJs,
         },
       },
       null,
@@ -195,7 +245,7 @@ async function runPackedHostRuntimeProbe(
     ['install', '--production'],
     installRoot,
     env,
-    180_000,
+    120_000,
     true,
   )
 
@@ -206,12 +256,16 @@ async function runPackedHostRuntimeProbe(
     'opencode-anthropic-auth',
   )
   const probe = `
+import { createTestRenderer } from "@opentui/core/testing";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { render } from "@opentui/solid";
 
 const packageRoot = process.argv[1];
 const missingHelper = process.argv[2] || "";
+const includeKeymapRuntime = process.argv[3] === "keymap";
+const sidebarRouteMarker = ${JSON.stringify(sidebarRouteMarker)};
 const loadedPaths = [];
 
 // Observe the packed TUI path only; the host configure helper owns runtime registration.
@@ -225,8 +279,10 @@ Bun.plugin({
   },
 });
 
-const { runtimeModules: keymapRuntimeModules } = await import("@opentui/keymap/runtime-modules");
 const { ensureRuntimePluginSupport } = await import("@opentui/solid/runtime-plugin-support/configure");
+const keymapRuntimeModules = includeKeymapRuntime
+  ? (await import("@opentui/keymap/runtime-modules")).runtimeModules
+  : {};
 const additional = { ...keymapRuntimeModules };
 if (missingHelper) {
   const solidRuntime = await import("@opentui/solid");
@@ -240,75 +296,89 @@ if (missingHelper) {
 }
 ensureRuntimePluginSupport({ additional });
 
-const probeIntervals = [];
-const nativeSetInterval = globalThis.setInterval;
-globalThis.setInterval = (...args) => {
-  const interval = nativeSetInterval(...args);
-  interval.unref?.();
-  probeIntervals.push(interval);
-  return interval;
+const entry = await import(pathToFileURL(join(packageRoot, "src/tui/entry.mjs")).href);
+if (entry.default?.id !== "cortexkit.anthropic-auth" || typeof entry.default?.tui !== "function") {
+  throw new Error("packed TUI entry export shape is invalid");
+}
+const registeredPlugins = [];
+let eventSubscriptions = 0;
+let eventUnsubscriptions = 0;
+const api = {
+  event: {
+    on() {
+      eventSubscriptions++;
+      return () => { eventUnsubscriptions++; };
+    },
+  },
+  theme: {
+    current: {
+      accent: "#3366ff",
+      background: "#000000",
+      borderActive: "#ffffff",
+      error: "#ff0000",
+      success: "#00ff00",
+      text: "#ffffff",
+      textMuted: "#888888",
+      warning: "#ffff00",
+    },
+  },
+  slots: { register(plugin) { registeredPlugins.push(plugin); } },
+  state: { path: { directory: packageRoot } },
+  route: { current: () => ({ type: "home" }) },
 };
-
+await entry.default.tui(api);
+if (registeredPlugins.length !== 1) {
+  throw new Error("packed TUI did not register exactly one host sidebar plugin");
+}
+const sidebar = registeredPlugins[0].slots.sidebar_content;
+if (typeof sidebar !== "function") throw new Error("missing registered sidebar slot");
+const testSetup = await createTestRenderer({ width: 80, height: 24 });
+let renderFailure;
+let frame = "";
 try {
-  const entry = await import(pathToFileURL(join(packageRoot, "src/tui/entry.mjs")).href);
-  if (entry.default?.id !== "cortexkit.anthropic-auth" || typeof entry.default?.tui !== "function") {
-    throw new Error("packed TUI entry export shape is invalid");
-  }
-  let registrations = 0;
-  const registeredPlugins = [];
-  let failure;
   try {
-    await entry.default.tui({
-      slots: {
-        register(value) {
-          if (typeof value.slots.sidebar_content !== "function") {
-            throw new Error("missing sidebar slot");
-          }
-          registrations++;
-          registeredPlugins.push(value);
-        },
-      },
-      state: { path: { directory: packageRoot } },
-      route: { current: () => ({ type: "home" }) },
-    });
+    await render(
+      () => sidebar({}, { session_id: "smoke-session" }),
+      testSetup.renderer,
+    );
+    // Drain the sidebar's initial state-file refresh before checking its frame.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    await testSetup.flush();
+    frame = testSetup.captureCharFrame();
   } catch (error) {
-    failure = error;
-  }
-
-  const compiledLoaded = loadedPaths.some((path) => path.includes("tui-compiled"));
-  const rawLoaded = loadedPaths.some((path) => path.endsWith("/src/tui.tsx"));
-  if (missingHelper) {
-    if (!failure) {
-      const sidebar = registeredPlugins[0]?.slots.sidebar_content;
-      if (typeof sidebar !== "function") {
-        throw new Error("negative control registered no sidebar to exercise the renderer");
-      }
-      try {
-        sidebar({}, { session_id: "negative-control" });
-      } catch (error) {
-        failure = error;
-      }
-    }
-    if (!failure) {
-      throw new Error("compiled TUI loaded even though the host renderer omitted " + missingHelper);
-    }
-    if (!String(failure).includes(missingHelper)) {
-      throw new Error("compiled TUI failed for the wrong reason after omitting " + missingHelper + ": " + failure);
-    }
-    if (!compiledLoaded || rawLoaded) {
-      throw new Error("negative control did not fail on the compiled TUI path");
-    }
-    console.log("negative host-runtime control rejected the compiled TUI without " + missingHelper);
-  } else {
-    if (failure) throw failure;
-    if (registrations !== 1 || !compiledLoaded || rawLoaded) {
-      throw new Error("host runtime did not invoke the packed compiled TUI path");
-    }
-    console.log("actual host runtime invoked the packed compiled TUI path");
+    renderFailure = error;
   }
 } finally {
-  for (const interval of probeIntervals) clearInterval(interval);
+  await testSetup.renderer.destroy();
 }
+
+const compiledLoaded = loadedPaths.some((path) => path.includes("tui-compiled"));
+const rawLoaded = loadedPaths.some((path) => path.endsWith("/src/tui.tsx"));
+if (!compiledLoaded || rawLoaded) {
+  throw new Error("host renderer did not load the packed compiled TUI path");
+}
+if (eventSubscriptions !== eventUnsubscriptions) {
+  throw new Error("sidebar renderer cleanup left host event subscriptions active");
+}
+if (missingHelper) {
+  if (!renderFailure) {
+    throw new Error("sidebar rendered even though the host renderer omitted " + missingHelper);
+  }
+  if (!String(renderFailure).includes(missingHelper)) {
+    throw new Error("sidebar failed for the wrong reason after omitting " + missingHelper + ": " + renderFailure);
+  }
+  console.log("negative renderer control rejected the packed sidebar without " + missingHelper);
+  process.exit(0);
+}
+if (renderFailure) throw renderFailure;
+if (!frame.includes(sidebarRouteMarker) || !frame.includes("Waiting for quota")) {
+  throw new Error("headless renderer output did not contain the expected sidebar nodes: " + frame);
+}
+if (eventSubscriptions !== 2) {
+  throw new Error("sidebar did not subscribe to both host events");
+}
+console.log("real host renderer captured the packed sidebar route and quota nodes");
+process.exit(0);
 `
 
   runBounded(
@@ -318,11 +388,12 @@ try {
       '-e',
       probe,
       installedPackageRoot,
-      ...(missingHelper ? [missingHelper] : []),
+      missingHelper ?? '',
+      host.additionalKeymapRuntimeModules ? 'keymap' : '',
     ],
     installRoot,
     env,
-    60_000,
+    30_000,
   )
 }
 
@@ -428,7 +499,7 @@ try {
   const negativeHost = {
     ...hostRuntimeFixtures[1],
     id: 'opencode-2-0-22-missing-create-component',
-    label: 'OpenCode 2.0.22 negative control',
+    label: 'OpenCode 2.0.22 OpenTUI/Solid library-only negative control',
   }
   await runPackedHostRuntimeProbe(
     tempRoot,
