@@ -95,6 +95,8 @@ function runBounded(
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: timeoutMs,
+    // Renderer signal handlers must not keep this owned child alive after its budget.
+    killSignal: 'SIGKILL',
     maxBuffer: 20 * 1024 * 1024,
   })
 
@@ -358,9 +360,30 @@ if (registeredPlugins.length !== 1) {
 }
 const sidebar = registeredPlugins[0].slots.sidebar_content;
 if (typeof sidebar !== "function") throw new Error("missing registered sidebar slot");
-const testSetup = await createTestRenderer({ width: 80, height: 24 });
+let completeRendererDestroy;
+const rendererDestroyed = new Promise((resolve) => {
+  completeRendererDestroy = resolve;
+});
+const testSetup = await createTestRenderer({
+  width: 80,
+  height: 24,
+  onDestroy() { completeRendererDestroy(); },
+});
 let renderFailure;
 let frame = testSetup.captureCharFrame();
+let settleSidebarFrame;
+const sidebarFrame = new Promise((resolve) => { settleSidebarFrame = resolve; });
+const observeFrame = () => {
+  try {
+    const captured = testSetup.captureCharFrame();
+    if (captured.includes(sidebarRouteMarker) && captured.includes("Waiting for quota")) {
+      settleSidebarFrame({ frame: captured });
+    }
+  } catch (error) {
+    settleSidebarFrame({ error });
+  }
+};
+testSetup.renderer.on("frame", observeFrame);
 let renderEntered = false;
 let sidebarInvoked = false;
 try {
@@ -370,16 +393,19 @@ try {
       sidebarInvoked = true;
       return sidebar({}, { session_id: "smoke-session" });
     }, testSetup.renderer);
-    frame = testSetup.captureCharFrame();
-    while (!frame.includes(sidebarRouteMarker) || !frame.includes("Waiting for quota")) {
-      await testSetup.renderOnce();
-      frame = testSetup.captureCharFrame();
-    }
+    testSetup.renderer.requestRender();
+    const captured = await sidebarFrame;
+    if ("error" in captured) throw captured.error;
+    frame = captured.frame;
   } catch (error) {
     renderFailure = error;
   }
 } finally {
-  await testSetup.renderer.destroy();
+  testSetup.renderer.off("frame", observeFrame);
+  settleSidebarFrame({ cancelled: true });
+  // destroy() can defer teardown until an active frame finishes.
+  testSetup.renderer.destroy();
+  await rendererDestroyed;
 }
 
 const compiledLoaded = loadedPaths.some((path) => path.includes("tui-compiled"));
@@ -397,7 +423,11 @@ if (nonCallableHelper) {
   if (!renderFailure) {
     throw new Error("sidebar rendered even though the host renderer made " + nonCallableHelper + " non-callable");
   }
-  if (!String(renderFailure).includes(nonCallableHelper)) {
+  if (
+    !(renderFailure instanceof TypeError) ||
+    !String(renderFailure).includes(nonCallableHelper) ||
+    !/not (?:a function|callable)/i.test(renderFailure.message)
+  ) {
     throw new Error("sidebar failed for the wrong reason with non-callable " + nonCallableHelper + ": " + renderFailure);
   }
   console.log("non-callable-helper control failed during packed sidebar rendering: " + nonCallableHelper);
@@ -418,6 +448,9 @@ process.exit(0);
     `${host.label} packed TUI host-runtime probe${nonCallableHelper ? ` with non-callable ${nonCallableHelper}` : ''}`,
     'bun',
     [
+      // Select Solid's reactive client before the host's imports are resolved.
+      '--preload',
+      '@opentui/solid/preload',
       '-e',
       probe,
       installedPackageRoot,
