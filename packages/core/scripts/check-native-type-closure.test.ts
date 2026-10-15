@@ -74,6 +74,32 @@ test('recognizes import, export, inline import types and reference edges without
     ['path', './ambient.d.ts'],
     ['types', 'node'],
   ])
+  expect(
+    moduleReferences(source).map(({ start, end }) => source.slice(start, end)),
+  ).toEqual([
+    "'./a.js'",
+    "'./b.js'",
+    "'./c.js'",
+    "'./d.js'",
+    "'./e.js'",
+    '"./ambient.d.ts"',
+    '"node"',
+  ])
+})
+
+test('recognizes runtime dynamic import edges and exact ranges without matching prose', () => {
+  const source = `
+    export const load = () => import('./chunk.js');
+    export const computed = (path) => import(path);
+    // import('./not-an-import.js')
+    const prose = "import('./also-not-an-import.js')";
+  `
+  expect(
+    moduleReferences(source, false).map(({ specifier, start, end }) => [
+      specifier,
+      source.slice(start, end),
+    ]),
+  ).toEqual([['./chunk.js', "'./chunk.js'"]])
 })
 
 test('rejects unsupported published producer versions before copying declarations', async () => {

@@ -53,7 +53,7 @@ export function moduleReferences(
     ].includes(node.type)
       ? node.source
       : node.type === 'TSImportType'
-        ? node.argument
+        ? node.source
         : node.type === 'TSExternalModuleReference'
           ? node.expression
           : node.type === 'CallExpression' &&
