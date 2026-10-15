@@ -133,7 +133,7 @@ async function runPackedHostRuntimeProbe(
   tarball: string,
   coreTarball: string,
   host: HostRuntimeFixture,
-  missingHelper?: string,
+  nonCallableHelper?: string,
 ): Promise<void> {
   const fixtureRoot = join(tempRoot, host.id)
   const installRoot = join(fixtureRoot, 'install')
@@ -263,7 +263,7 @@ import { pathToFileURL } from "node:url";
 import { render } from "@opentui/solid";
 
 const packageRoot = process.argv[1];
-const missingHelper = process.argv[2] || "";
+const nonCallableHelper = process.argv[2] || "";
 const includeKeymapRuntime = process.argv[3] === "keymap";
 const sidebarRouteMarker = ${JSON.stringify(sidebarRouteMarker)};
 const loadedPaths = [];
@@ -284,19 +284,37 @@ const keymapRuntimeModules = includeKeymapRuntime
   ? (await import("@opentui/keymap/runtime-modules")).runtimeModules
   : {};
 const additional = { ...keymapRuntimeModules };
-if (missingHelper) {
+if (nonCallableHelper) {
   const solidRuntime = await import("@opentui/solid");
-  if (typeof solidRuntime[missingHelper] !== "function") {
-    throw new Error("negative control helper is absent from the real host runtime: " + missingHelper);
+  if (typeof solidRuntime[nonCallableHelper] !== "function") {
+    throw new Error("non-callable-helper control target is absent from the real host runtime: " + nonCallableHelper);
   }
-  // Remove one real renderer export to prove the compiled import needs it.
-  additional["@opentui/solid"] = Object.fromEntries(
-    Object.entries(solidRuntime).filter(([name]) => name !== missingHelper),
-  );
+  const solidWithNonCallableHelper = {
+    ...solidRuntime,
+    [nonCallableHelper]: undefined,
+  };
+  if (
+    !Object.prototype.hasOwnProperty.call(
+      solidWithNonCallableHelper,
+      nonCallableHelper,
+    ) || typeof solidWithNonCallableHelper[nonCallableHelper] !== "undefined"
+  ) {
+    throw new Error("non-callable-helper control did not preserve the named export");
+  }
+  additional["@opentui/solid"] = solidWithNonCallableHelper;
 }
 ensureRuntimePluginSupport({ additional });
 
-const entry = await import(pathToFileURL(join(packageRoot, "src/tui/entry.mjs")).href);
+let entry;
+try {
+  entry = await import(pathToFileURL(join(packageRoot, "src/tui/entry.mjs")).href);
+} catch (error) {
+  if (nonCallableHelper) {
+    throw new Error("non-callable-helper control failed during entry import before rendering: " + error);
+  }
+  throw error;
+}
+const entryImported = true;
 if (entry.default?.id !== "cortexkit.anthropic-auth" || typeof entry.default?.tui !== "function") {
   throw new Error("packed TUI entry export shape is invalid");
 }
@@ -326,7 +344,15 @@ const api = {
   state: { path: { directory: packageRoot } },
   route: { current: () => ({ type: "home" }) },
 };
-await entry.default.tui(api);
+try {
+  await entry.default.tui(api);
+} catch (error) {
+  if (nonCallableHelper) {
+    throw new Error("non-callable-helper control failed during TUI setup before rendering: " + error);
+  }
+  throw error;
+}
+const setupCompleted = true;
 if (registeredPlugins.length !== 1) {
   throw new Error("packed TUI did not register exactly one host sidebar plugin");
 }
@@ -334,17 +360,21 @@ const sidebar = registeredPlugins[0].slots.sidebar_content;
 if (typeof sidebar !== "function") throw new Error("missing registered sidebar slot");
 const testSetup = await createTestRenderer({ width: 80, height: 24 });
 let renderFailure;
-let frame = "";
+let frame = testSetup.captureCharFrame();
+let renderEntered = false;
+let sidebarInvoked = false;
 try {
   try {
-    await render(
-      () => sidebar({}, { session_id: "smoke-session" }),
-      testSetup.renderer,
-    );
-    // Drain the sidebar's initial state-file refresh before checking its frame.
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    await testSetup.flush();
+    renderEntered = true;
+    await render(() => {
+      sidebarInvoked = true;
+      return sidebar({}, { session_id: "smoke-session" });
+    }, testSetup.renderer);
     frame = testSetup.captureCharFrame();
+    while (!frame.includes(sidebarRouteMarker) || !frame.includes("Waiting for quota")) {
+      await testSetup.renderOnce();
+      frame = testSetup.captureCharFrame();
+    }
   } catch (error) {
     renderFailure = error;
   }
@@ -354,20 +384,23 @@ try {
 
 const compiledLoaded = loadedPaths.some((path) => path.includes("tui-compiled"));
 const rawLoaded = loadedPaths.some((path) => path.endsWith("/src/tui.tsx"));
+if (!entryImported || !setupCompleted || !renderEntered || !sidebarInvoked) {
+  throw new Error("packed compiled sidebar did not enter the shared renderer path");
+}
 if (!compiledLoaded || rawLoaded) {
   throw new Error("host renderer did not load the packed compiled TUI path");
 }
 if (eventSubscriptions !== eventUnsubscriptions) {
   throw new Error("sidebar renderer cleanup left host event subscriptions active");
 }
-if (missingHelper) {
+if (nonCallableHelper) {
   if (!renderFailure) {
-    throw new Error("sidebar rendered even though the host renderer omitted " + missingHelper);
+    throw new Error("sidebar rendered even though the host renderer made " + nonCallableHelper + " non-callable");
   }
-  if (!String(renderFailure).includes(missingHelper)) {
-    throw new Error("sidebar failed for the wrong reason after omitting " + missingHelper + ": " + renderFailure);
+  if (!String(renderFailure).includes(nonCallableHelper)) {
+    throw new Error("sidebar failed for the wrong reason with non-callable " + nonCallableHelper + ": " + renderFailure);
   }
-  console.log("negative renderer control rejected the packed sidebar without " + missingHelper);
+  console.log("non-callable-helper control failed during packed sidebar rendering: " + nonCallableHelper);
   process.exit(0);
 }
 if (renderFailure) throw renderFailure;
@@ -382,13 +415,13 @@ process.exit(0);
 `
 
   runBounded(
-    `${host.label} packed TUI host-runtime probe${missingHelper ? ` without ${missingHelper}` : ''}`,
+    `${host.label} packed TUI host-runtime probe${nonCallableHelper ? ` with non-callable ${nonCallableHelper}` : ''}`,
     'bun',
     [
       '-e',
       probe,
       installedPackageRoot,
-      missingHelper ?? '',
+      nonCallableHelper ?? '',
       host.additionalKeymapRuntimeModules ? 'keymap' : '',
     ],
     installRoot,
@@ -498,8 +531,9 @@ try {
   }
   const negativeHost = {
     ...hostRuntimeFixtures[1],
-    id: 'opencode-2-0-22-missing-create-component',
-    label: 'OpenCode 2.0.22 OpenTUI/Solid library-only negative control',
+    id: 'opencode-2-0-22-non-callable-create-component',
+    label:
+      'OpenCode 2.0.22 OpenTUI/Solid library-only non-callable-helper control',
   }
   await runPackedHostRuntimeProbe(
     tempRoot,
@@ -509,7 +543,7 @@ try {
     'createComponent',
   )
   check(
-    'negative control rejects the compiled TUI without createComponent',
+    'non-callable-helper control rejects the rendered sidebar for createComponent',
     true,
   )
 
