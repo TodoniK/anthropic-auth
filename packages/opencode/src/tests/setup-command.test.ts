@@ -1,3 +1,4 @@
+import * as sqlite from 'bun:sqlite'
 import { describe, expect, spyOn } from 'bun:test'
 import * as fsSync from 'node:fs'
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
@@ -21,7 +22,9 @@ import {
   getHostClaustrumEnrollmentPaths,
   inspectNativeHostAuthEntry,
   NativeMigrationError,
+  nativePiAuthSlotPaths,
   type ProviderAccountUuid,
+  readNativeEnrollmentMode,
   readNativeMigrationJournal,
   resetClaudeCodeIdentityCachesForTest,
   resolveLocalRoutingDestination,
@@ -45,12 +48,17 @@ import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.t
 import { cliDiagnosticsDirectory } from '../cli-failure.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
 import { runSetupCommand } from '../setup/command.ts'
-import { NativeVaultActivationError } from '../setup/native-activation.ts'
+import {
+  completeNativeVaultActivation,
+  NativeVaultActivationError,
+  preflightNativeVaultForHost,
+} from '../setup/native-activation.ts'
 import {
   migrateNativeLocalForHost,
   SEPARATE_HOST_LOGIN_NOTICE,
 } from '../setup/native-local.ts'
 import { resolveNativeSetupPaths } from '../setup/native-paths.ts'
+import { getOpenCodeAuthPath, getPiAuthPath } from '../setup/paths.ts'
 import { ProcessFenceViolationError } from '../setup/process-fence.ts'
 import type { CommandRunner, ProcessFence } from '../setup/types.ts'
 import { CLAUDE_POOL_LOGIN_STEP } from '../v2/activation.ts'
@@ -1190,8 +1198,9 @@ async function sendSetupOc2(
   }
 }
 
-function watchDataDirectory(directory: string) {
+function watchDataDirectory(directory: string, allowedPaths: string[] = []) {
   const hits: string[] = []
+  const accesses: string[] = []
   const restores: Array<() => void> = []
   for (const [module, names] of [
     [
@@ -1233,17 +1242,28 @@ function watchDataDirectory(directory: string) {
       const original = target[name]!
       const spy = spyOn(target, name).mockImplementation(
         (...args: unknown[]) => {
+          const accessed = args
+            .slice(
+              0,
+              name.includes('rename') || name.includes('copyFile') ? 2 : 1,
+            )
+            .filter(
+              (arg) =>
+                typeof arg === 'string' &&
+                (arg === directory || arg.startsWith(`${directory}/`)),
+            ) as string[]
+          // Migration from OpenCode 1 ensures the auth directory exists even when its API-key slot is unchanged.
+          const authDirectory =
+            name === 'mkdir' &&
+            args[0] === directory &&
+            allowedPaths.includes(join(directory, 'auth.json')) &&
+            (args[1] as { recursive?: boolean; mode?: number } | undefined)
+              ?.recursive === true &&
+            (args[1] as { mode?: number } | undefined)?.mode === 0o700
+          if (!authDirectory) accesses.push(...accessed)
           if (
-            args
-              .slice(
-                0,
-                name.includes('rename') || name.includes('copyFile') ? 2 : 1,
-              )
-              .some(
-                (arg) =>
-                  typeof arg === 'string' &&
-                  (arg === directory || arg.startsWith(`${directory}/`)),
-              )
+            !authDirectory &&
+            accessed.some((path) => !allowedPaths.includes(path))
           ) {
             hits.push(`${name}:${String(args[0])}`)
             throw new Error(
@@ -1256,6 +1276,62 @@ function watchDataDirectory(directory: string) {
       restores.push(() => spy.mockRestore())
     }
   }
+  const databases = sqlite as unknown as Record<
+    string,
+    (...args: unknown[]) => unknown
+  >
+  const Database = sqlite.Database
+  const checkDatabase = (path: unknown) => {
+    const filename = String(path)
+    if (filename === directory || filename.startsWith(`${directory}/`)) {
+      hits.push(`Database:${filename}`)
+      throw new Error('Setup must not open an OpenCode database')
+    }
+  }
+  const open = Database.open
+  const openSpy = spyOn(Database, 'open').mockImplementation((...args) => {
+    checkDatabase(args[0])
+    return Reflect.apply(open, Database, args)
+  })
+  const databaseSpy = spyOn(databases, 'Database').mockImplementation(
+    (...args: unknown[]) => {
+      checkDatabase(args[0])
+      return Reflect.construct(Database, args)
+    },
+  )
+  Object.assign(databaseSpy, { open: openSpy })
+  restores.push(() => openSpy.mockRestore())
+  restores.push(() => databaseSpy.mockRestore())
+  return {
+    hits,
+    accesses,
+    restore: () => {
+      for (const restore of restores.splice(0)) restore()
+    },
+  }
+}
+
+function forbidSetupReads(paths: string[]) {
+  const hits: string[] = []
+  const restores: Array<() => void> = []
+  for (const [module, name] of [
+    [fsPromises, 'readFile'],
+    [fsSync, 'readFileSync'],
+  ] as const) {
+    const target = module as unknown as Record<
+      string,
+      (...args: unknown[]) => unknown
+    >
+    const original = target[name]!
+    const spy = spyOn(target, name).mockImplementation((...args: unknown[]) => {
+      if (paths.includes(String(args[0]))) {
+        hits.push(String(args[0]))
+        throw new Error('Local authority must not be read during vault setup')
+      }
+      return original(...args)
+    })
+    restores.push(() => spy.mockRestore())
+  }
   return {
     hits,
     restore: () => {
@@ -1263,6 +1339,87 @@ function watchDataDirectory(directory: string) {
     },
   }
 }
+
+function verifiedSetupInventory() {
+  return {
+    view: 'fixture',
+    skipped: [],
+    credentials: [
+      {
+        credentialId: 'oauth:anthropic',
+        credentialType: 'oauth' as const,
+        accountIdentity: SETUP_UUID,
+        state: 'active' as const,
+      },
+    ],
+  }
+}
+
+function fenceCompletedSetupWrites() {
+  const protectedPaths = new Set<string>()
+  const hits: string[] = []
+  const restores: Array<() => void> = []
+  const target = fsPromises as unknown as Record<
+    string,
+    (...args: unknown[]) => unknown
+  >
+  for (const name of [
+    'writeFile',
+    'appendFile',
+    'rename',
+    'unlink',
+    'rm',
+    'copyFile',
+  ]) {
+    const original = target[name]!
+    const spy = spyOn(target, name).mockImplementation((...args: unknown[]) => {
+      const paths = args.slice(
+        0,
+        name === 'rename' || name === 'copyFile' ? 2 : 1,
+      )
+      if (paths.some((path) => protectedPaths.has(String(path)))) {
+        hits.push(`${name}:${paths.map(String).join(' -> ')}`)
+        throw new Error(
+          'Completed setup provider files must not be written again',
+        )
+      }
+      return original(...args)
+    })
+    restores.push(() => spy.mockRestore())
+  }
+  return {
+    hits,
+    protect: (paths: string[]) => {
+      for (const path of paths) protectedPaths.add(path)
+    },
+    restore: () => {
+      for (const restore of restores.splice(0)) restore()
+    },
+  }
+}
+
+lifetimes.test(
+  'the data-directory spy records caught SQLite constructor and static opens',
+  async () => {
+    const f = await callbackFixture()
+    const path = join(dirname(f.plan.hostAuthPath), 'unexpected.sqlite')
+    const data = watchDataDirectory(dirname(f.plan.hostAuthPath))
+    try {
+      for (const open of [
+        () => new sqlite.Database(path),
+        () => sqlite.Database.open(path),
+      ]) {
+        try {
+          open().close()
+        } catch {}
+      }
+      expect(data.hits).toEqual([`Database:${path}`, `Database:${path}`])
+    } finally {
+      data.restore()
+    }
+    expect(existsSync(path)).toBe(false)
+  },
+)
 
 lifetimes.test(
   'acceptance 1: offline OC2 setup, registered fixture login and first native Bearer request',
@@ -1990,6 +2147,109 @@ for (const generation of ['1', 'both'] as const) {
   )
 }
 
+for (const authority of [
+  'empty-init-with-legacy',
+  'completed-absent-slot',
+] as const) {
+  for (const exchange of ['success', 'failure'] as const) {
+    lifetimes.test(
+      `--login ${authority} ${exchange} preserves callback ownership and absent-slot safety`,
+      async () => {
+        const f = await callbackFixture()
+        if (authority === 'empty-init-with-legacy') {
+          expect(await runSetupCommand(['--yes', '--opencode=2'], f.io)).toBe(0)
+          await writeSetupJson(f.plan.legacyConfigPath, {
+            version: 1,
+            refresh: { enabled: false },
+          })
+          await writeSetupJson(f.plan.legacyStatePath, {})
+        } else {
+          await migrateNativeLocalForHost('opencode', {
+            env: f.env,
+            fence: f.io.fence,
+            paths: f.plan,
+            removePiAnthropicAuth: false,
+          })
+          const journal = await readNativeMigrationJournal(f.plan.paths)
+          await writeSetupJson(f.plan.paths.journal, {
+            ...journal,
+            phase: 'committed',
+          })
+          await rm(f.plan.hostAuthPath)
+        }
+        const before = await setupBytes(f.plan)
+        let committed: typeof before | undefined
+        const writes = fenceCompletedSetupWrites()
+        lifetimes.deferCleanup(writes.restore)
+        let exchanges = 0
+        let migrations = 0
+        await withSetupBootstrap(async (lookups) => {
+          expect(
+            await runSetupCommand(['--yes', '--login', '--opencode=1'], {
+              ...f.io,
+              localLogin: async () => {
+                exchanges++
+                if (exchange === 'failure')
+                  throw new Error('Fixture exchange refused')
+                return {
+                  accountIdentity: SETUP_UUID,
+                  credential: {
+                    type: 'oauth',
+                    access: SETUP_ACCESS,
+                    refresh: 'fixture-refresh',
+                    expires: Date.now() + 28_800_000,
+                  },
+                }
+              },
+              migrateLocal: async (host, options) => {
+                migrations++
+                expect(options.login).toBeDefined()
+                await migrateNativeLocalForHost(host, options)
+                committed = await setupBytes(f.plan)
+                writes.protect(committed.map(([path]) => String(path)))
+              },
+            }),
+          ).toBe(exchange === 'success' ? 0 : 1)
+          expect(lookups).toEqual(
+            exchange === 'success' ? [`Bearer ${SETUP_ACCESS}`] : [],
+          )
+        })
+        expect(exchanges).toBe(1)
+        expect(migrations).toBe(1)
+        expect(writes.hits).toEqual([])
+        if (exchange === 'failure') {
+          expect(await setupBytes(f.plan)).toEqual(before)
+          expect(existsSync(f.plan.hostAuthPath)).toBe(false)
+          return
+        }
+        expect(committed).toBeDefined()
+        expect(await setupBytes(f.plan)).toEqual(committed!)
+        expect(await readNativeMigrationJournal(f.plan.paths)).toMatchObject({
+          phase: 'retired',
+          ...(authority === 'empty-init-with-legacy'
+            ? { version: 5, kind: 'legacy-import' }
+            : { version: 4 }),
+        })
+        expect(
+          inspectNativeHostAuthEntry(
+            'opencode',
+            JSON.parse(await readFile(f.plan.hostAuthPath, 'utf8')),
+          ).kind,
+        ).toBe('activation')
+        const pool = await createNativePoolStore({
+          paths: f.plan.paths,
+          quota: nativeQuotaCodec,
+        }).read()
+        expect(pool.status).toBe('ready')
+        if (pool.status !== 'ready')
+          throw new Error('Fixture login pool is not ready')
+        expect(pool.rows).toHaveLength(1)
+        expect(pool.rows[0]?.credentialEpoch).toBe(1)
+      },
+    )
+  }
+}
+
 lifetimes.test(
   'OpenCode login stays committed when Pi exchange fails later in the shared run',
   async () => {
@@ -2000,6 +2260,7 @@ lifetimes.test(
     })
     const pi = await resolveNativeSetupPaths('pi', f.env)
     const beforePi = await setupBytes(pi)
+    let committedOpenCode: Awaited<ReturnType<typeof setupBytes>> | undefined
     const calls: string[] = []
     await withSetupBootstrap(async (lookups) => {
       expect(
@@ -2007,7 +2268,10 @@ lifetimes.test(
           ...f.io,
           localLogin: async (host) => {
             calls.push(host)
-            if (host === 'pi') throw new Error('Fixture Pi exchange failed')
+            if (host === 'pi') {
+              committedOpenCode = await setupBytes(f.plan)
+              throw new Error('Fixture Pi exchange failed')
+            }
             return {
               accountIdentity: SETUP_UUID,
               credential: {
@@ -2023,6 +2287,8 @@ lifetimes.test(
       expect(lookups).toEqual([`Bearer ${SETUP_ACCESS}`])
     })
     expect(calls).toEqual(['opencode', 'pi'])
+    expect(committedOpenCode).toBeDefined()
+    expect(await setupBytes(f.plan)).toEqual(committedOpenCode!)
     expect((await readNativeMigrationJournal(f.plan.paths))?.phase).toBe(
       'retired',
     )
@@ -2041,6 +2307,7 @@ lifetimes.test(
     const pi = await resolveNativeSetupPaths('pi', f.env)
     const events: string[] = []
     const granted = new Set<string>()
+    const protectedPaths = []
     for (const plan of [f.plan, pi])
       for (const path of [
         plan.paths.config,
@@ -2048,6 +2315,7 @@ lifetimes.test(
         plan.paths.runtime,
         plan.paths.journal,
       ]) {
+        protectedPaths.push(path)
         await mkdir(dirname(path), { recursive: true })
         await writeFile(path, '{malformed-local-file', { mode: 0o600 })
       }
@@ -2055,8 +2323,8 @@ lifetimes.test(
       setupBytes(f.plan),
       setupBytes(pi),
     ])
-    const { preflightNativeVaultForHost, completeNativeVaultActivation } =
-      await import('../setup/native-activation.ts')
+    const reads = forbidSetupReads(protectedPaths)
+    lifetimes.deferCleanup(reads.restore)
     expect(
       await runSetupCommand(['--yes', '--claustrum', '--opencode=2'], {
         ...f.io,
@@ -2108,6 +2376,20 @@ lifetimes.test(
         },
         vaultActivate: async (host, options, preflight) => {
           events.push(`activate:${host}`)
+          expect(await readNativeEnrollmentMode(host, f.env)).toBe('claustrum')
+          const enrollment = getHostClaustrumEnrollmentPaths(host, f.env)
+          expect(
+            JSON.parse(await readFile(enrollment.statePath, 'utf8')),
+          ).toMatchObject({
+            phase: 'approved',
+            proposedName: `anthropic-auth-${host}`,
+          })
+          expect(
+            JSON.parse(await readFile(enrollment.tokenPath, 'utf8')),
+          ).toEqual({
+            token: 'c'.repeat(64),
+            token_generation: 1,
+          })
           if (host === 'opencode')
             await expect(
               stat(join(dirname(f.plan.legacyConfigPath), 'opencode.jsonc')),
@@ -2164,6 +2446,8 @@ lifetimes.test(
       'discover:pi',
       'register:pi',
     ])
+    expect(reads.hits).toEqual([])
+    reads.restore()
     expect(await setupBytes(f.plan)).toEqual(before[0]!)
     expect(
       (await setupBytes(pi)).filter(([path]) => path !== pi.hostAuthPath),
@@ -2254,14 +2538,35 @@ lifetimes.test(
       claustrum: true,
     })
     const connect = io.connect!
-    const { completeNativeVaultActivation } = await import(
-      '../setup/native-activation.ts'
-    )
+    let registered = 0
+    let activated: Awaited<ReturnType<typeof setupBytes>> | undefined
+    const writes = fenceCompletedSetupWrites()
+    lifetimes.deferCleanup(writes.restore)
+    const { stashPath, placeholderKey } = nativePiAuthSlotPaths({
+      env: f.env,
+      authPath: pi.hostAuthPath,
+    })
     expect(
       await runSetupCommand(['-y', '--claustrum', '--remove-pi-auth'], {
         ...io,
         terminal: f.io.terminal,
-        runner: f.io.runner,
+        runner: {
+          run: async (_file, args) => {
+            expect(args).not.toContain('--remove-pi-auth')
+            if (args[0] === 'install') {
+              registered++
+              expect(
+                JSON.parse(await readFile(pi.hostAuthPath, 'utf8')).anthropic,
+              ).toEqual({ type: 'api_key', key: placeholderKey })
+              activated = await setupBytes(pi)
+              writes.protect([
+                ...activated.map(([path]) => String(path)),
+                stashPath,
+              ])
+            }
+            return { exitCode: 0, stdout: '1.0.0', stderr: '' }
+          },
+        },
         fence: f.io.fence,
         connect: async (input) => {
           expect(input.connectionFile).toBe(
@@ -2291,6 +2596,14 @@ lifetimes.test(
           ),
       }),
     ).toBe(0)
+    expect(registered).toBe(1)
+    expect(writes.hits).toEqual([])
+    expect(activated).toBeDefined()
+    expect(await setupBytes(pi)).toEqual(activated!)
+    expect(await readFile(stashPath, 'utf8')).toContain(
+      SETUP_HOST_LOGIN.refresh,
+    )
+    expect(await readNativeEnrollmentMode('pi', f.env)).toBe('claustrum')
     expect(await readNativeMigrationJournal(pi.paths)).toBeUndefined()
     expect(
       inspectNativeHostAuthEntry(
@@ -2377,6 +2690,138 @@ lifetimes.test(
   },
 )
 
+for (const generation of ['1', '2', 'both'] as const) {
+  lifetimes.test(
+    `shared registration ${generation} owns config writes and opens only the permitted OpenCode data file`,
+    async () => {
+      const f = await callbackFixture()
+      await writeSetupJson(f.plan.hostAuthPath, {
+        anthropic: { type: 'api', key: 'fixture-key' },
+      })
+      const data = watchDataDirectory(
+        dirname(f.plan.hostAuthPath),
+        generation === '2' ? [] : [getOpenCodeAuthPath(f.env)],
+      )
+      let migrations = 0
+      try {
+        expect(
+          await runSetupCommand(['--yes', `--opencode=${generation}`], {
+            ...f.io,
+            migrateLocal: async (host, options) => {
+              expect(host).toBe('opencode')
+              migrations++
+              await migrateNativeLocalForHost(host, options)
+            },
+          }),
+        ).toBe(0)
+        expect(data.hits).toEqual([])
+        expect([...new Set(data.accesses)]).toEqual(
+          generation === '2' ? [] : [f.plan.hostAuthPath],
+        )
+      } finally {
+        data.restore()
+      }
+      const config = dirname(f.plan.legacyConfigPath)
+      expect(await readFile(join(config, 'opencode.jsonc'), 'utf8')).toContain(
+        '@cortexkit/opencode-anthropic-auth@',
+      )
+      if (generation === '2') {
+        expect(existsSync(join(config, 'tui.jsonc'))).toBe(false)
+        expect(migrations).toBe(0)
+      } else {
+        expect(await readFile(join(config, 'tui.jsonc'), 'utf8')).toContain(
+          '@cortexkit/opencode-anthropic-auth@',
+        )
+        expect(migrations).toBe(1)
+        expect((await readNativeMigrationJournal(f.plan.paths))?.kind).not.toBe(
+          'empty-init',
+        )
+        expect(f.screen()).not.toContain(CLAUDE_POOL_LOGIN_STEP)
+      }
+      expect(await readNativeEnrollmentMode('opencode', f.env)).toBe('local')
+    },
+  )
+}
+
+lifetimes.test(
+  'OpenCode both plus Pi login commits one credential epoch and one authority per host before write-free migrate',
+  async () => {
+    const f = await callbackFixture({
+      opencode: true,
+      pi: true,
+      claustrum: false,
+    })
+    const pi = await resolveNativeSetupPaths('pi', f.env)
+    const committed = new Map<string, Awaited<ReturnType<typeof setupBytes>>>()
+    const writes = fenceCompletedSetupWrites()
+    lifetimes.deferCleanup(writes.restore)
+    const calls: string[] = []
+    await withSetupBootstrap(async (lookups) => {
+      expect(
+        await runSetupCommand(['--yes', '--login', '--opencode=both'], {
+          ...f.io,
+          localLogin: async (host) => {
+            calls.push(`exchange:${host}`)
+            if (host === 'pi')
+              expect(await setupBytes(f.plan)).toEqual(
+                committed.get('opencode')!,
+              )
+            return {
+              accountIdentity: SETUP_UUID,
+              credential: {
+                type: 'oauth',
+                access: `${SETUP_ACCESS}-${host}`,
+                refresh: `fixture-${host}`,
+                expires: Date.now() + 28_800_000,
+              },
+            }
+          },
+          migrateLocal: async (host, options) => {
+            calls.push(`signInLocal:${host}`)
+            expect(options.login).toBeDefined()
+            await migrateNativeLocalForHost(host, options)
+            const plan = host === 'pi' ? pi : f.plan
+            committed.set(host, await setupBytes(plan))
+            writes.protect(committed.get(host)!.map(([path]) => String(path)))
+          },
+        }),
+      ).toBe(0)
+      expect(lookups).toEqual([
+        `Bearer ${SETUP_ACCESS}-opencode`,
+        `Bearer ${SETUP_ACCESS}-pi`,
+      ])
+    })
+    expect(calls).toEqual([
+      'signInLocal:opencode',
+      'exchange:opencode',
+      'signInLocal:pi',
+      'exchange:pi',
+    ])
+    expect(committed.size).toBe(2)
+    expect(writes.hits).toEqual([])
+    expect(f.plan.paths.journal).not.toBe(pi.paths.journal)
+    for (const plan of [f.plan, pi]) {
+      expect(await setupBytes(plan)).toEqual(committed.get(plan.host)!)
+      expect(await readNativeMigrationJournal(plan.paths)).toMatchObject({
+        host: plan.host,
+        version: 4,
+        phase: 'retired',
+      })
+      const pool = await createNativePoolStore({
+        paths: plan.paths,
+        quota: nativeQuotaCodec,
+      }).read()
+      expect(pool.status).toBe('ready')
+      if (pool.status !== 'ready')
+        throw new Error('Fixture login pool is not ready')
+      expect(pool.rows).toHaveLength(1)
+      expect(pool.rows[0]?.credentialEpoch).toBe(1)
+      expect(await readNativeEnrollmentMode(plan.host, f.env)).toBe('local')
+    }
+    expect(f.screen()).not.toContain(CLAUDE_POOL_LOGIN_STEP)
+  },
+)
+
 lifetimes.test(
   'default shared process fence prints a failing inspection refusal exactly once',
   async () => {
@@ -2455,3 +2900,395 @@ for (const mode of ['local', 'claustrum'] as const) {
     },
   )
 }
+
+lifetimes.test(
+  'verified vault generation 2 succeeds without any OpenCode data-directory I/O',
+  async () => {
+    const f = await callbackFixture({
+      opencode: true,
+      pi: false,
+      claustrum: true,
+    })
+    await writeSetupJson(f.plan.hostAuthPath, { anthropic: SETUP_HOST_LOGIN })
+    const before = await readFile(f.plan.hostAuthPath, 'utf8')
+    await fsPromises.chmod(f.plan.hostAuthPath, 0)
+    const data = watchDataDirectory(dirname(f.plan.hostAuthPath))
+    try {
+      expect(
+        await runSetupCommand(['--yes', '--claustrum', '--opencode=2'], {
+          ...f.io,
+          vaultActivate: (host, options, preflight) =>
+            completeNativeVaultActivation(
+              host,
+              { ...options, discover: async () => verifiedSetupInventory() },
+              preflight,
+            ),
+        }),
+      ).toBe(0)
+      expect(data.hits).toEqual([])
+      expect(data.accesses).toEqual([])
+    } finally {
+      data.restore()
+      await fsPromises.chmod(f.plan.hostAuthPath, 0o600)
+    }
+    expect(await readFile(f.plan.hostAuthPath, 'utf8')).toBe(before)
+    expect(await readNativeEnrollmentMode('opencode', f.env)).toBe('claustrum')
+    expect(await readNativeMigrationJournal(f.plan.paths)).toBeUndefined()
+  },
+)
+
+lifetimes.test(
+  'vault primary-unverified refuses without changing the OpenCode host auth bytes',
+  async () => {
+    const f = await callbackFixture({
+      opencode: true,
+      pi: false,
+      claustrum: true,
+    })
+    await writeSetupJson(f.plan.hostAuthPath, {
+      anthropic: SETUP_HOST_LOGIN,
+      unrelated: { type: 'api', key: 'fixture-key' },
+    })
+    const before = await setupBytes(f.plan)
+    let refusal: unknown
+    expect(
+      await runSetupCommand(['--yes', '--claustrum', '--opencode=1'], {
+        ...f.io,
+        vaultActivate: async (host, options, preflight) => {
+          try {
+            return await completeNativeVaultActivation(
+              host,
+              {
+                ...options,
+                discover: async () => ({
+                  view: 'fixture',
+                  skipped: [],
+                  credentials: [],
+                }),
+              },
+              preflight,
+            )
+          } catch (error) {
+            refusal = error
+            throw error
+          }
+        },
+      }),
+    ).toBe(1)
+    expect(refusal).toMatchObject({
+      name: 'NativeVaultActivationError',
+      code: 'primary-unverified',
+    })
+    expect(f.screen()).toContain(
+      'The vault has no verified default Claude account.',
+    )
+    expect(await setupBytes(f.plan)).toEqual(before)
+    expect(
+      existsSync(join(dirname(f.plan.legacyConfigPath), 'opencode.jsonc')),
+    ).toBe(false)
+  },
+)
+
+for (const failure of [
+  'missing-stash',
+  'consent-required',
+  'connection-file',
+] as const) {
+  lifetimes.test(
+    `first vault preflight refuses Pi ${failure} before enrollment or OpenCode effects`,
+    async () => {
+      const f = await callbackFixture({
+        opencode: true,
+        pi: true,
+        claustrum: true,
+      })
+      const pi = await resolveNativeSetupPaths('pi', f.env)
+      if (failure === 'missing-stash') {
+        const slot = nativePiAuthSlotPaths({
+          env: f.env,
+          authPath: pi.hostAuthPath,
+        })
+        await writeSetupJson(pi.hostAuthPath, {
+          anthropic: { type: 'api_key', key: slot.placeholderKey },
+        })
+      } else if (failure === 'consent-required') {
+        await writeSetupJson(pi.hostAuthPath, { anthropic: SETUP_HOST_LOGIN })
+      } else {
+        f.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
+          f.env.HOME!,
+          'different-pi-connection',
+        )
+      }
+      const before = await settleSetupSiblings([
+        setupBytes(f.plan),
+        setupBytes(pi),
+      ])
+      let connects = 0
+      let proposals = 0
+      const effects: Array<readonly string[]> = []
+      expect(
+        await runSetupCommand(['--yes', '--claustrum', '--opencode=both'], {
+          ...f.io,
+          env: { ...f.io.env, ...f.env },
+          runner: {
+            run: async (_file, args) => {
+              if (!args.includes('--version')) effects.push(args)
+              return { exitCode: 0, stdout: '1.0.0', stderr: '' }
+            },
+          },
+          connect: async (input) => {
+            connects++
+            const client = await f.io.connect!(input)
+            return {
+              ...client,
+              enrollPropose: async (proposal) => {
+                proposals++
+                return client.enrollPropose(proposal)
+              },
+            }
+          },
+        }),
+      ).toBe(1)
+      // The shared setup runner probes Claustrum availability before callbacks; refusal prevents subsequent host-enrollment connections.
+      expect(connects).toBe(1)
+      expect(proposals).toBe(0)
+      expect(effects).toEqual([])
+      expect(f.screen()).toContain(
+        {
+          'missing-stash': 'missing-stash',
+          'consent-required':
+            'Pi has stored Anthropic authentication. Rerun with --remove-pi-auth',
+          'connection-file':
+            'Selected hosts use different vault connection files.',
+        }[failure],
+      )
+      expect(
+        await settleSetupSiblings([setupBytes(f.plan), setupBytes(pi)]),
+      ).toEqual(before)
+      for (const host of ['opencode', 'pi'] as const) {
+        const enrollment = getHostClaustrumEnrollmentPaths(host, f.env)
+        expect(existsSync(enrollment.tokenPath)).toBe(false)
+        expect(existsSync(enrollment.statePath)).toBe(false)
+      }
+      expect(
+        existsSync(join(dirname(f.plan.legacyConfigPath), 'opencode.jsonc')),
+      ).toBe(false)
+    },
+  )
+}
+
+for (const change of ['slot', 'stash', 'enrollment'] as const) {
+  lifetimes.test(
+    `vault migrate refuses an external Pi ${change} change after beforeRegister without further provider writes`,
+    async () => {
+      const f = await callbackFixture({
+        opencode: true,
+        pi: true,
+        claustrum: true,
+      })
+      const pi = await resolveNativeSetupPaths('pi', f.env)
+      await writeSetupJson(pi.hostAuthPath, { anthropic: SETUP_HOST_LOGIN })
+      const slot = nativePiAuthSlotPaths({
+        env: f.env,
+        authPath: getPiAuthPath(f.env),
+      })
+      let changed: Awaited<ReturnType<typeof setupBytes>>[] | undefined
+      let stashBytes: string | undefined
+      expect(
+        await runSetupCommand(
+          ['--yes', '--claustrum', '--remove-pi-auth', '--opencode=both'],
+          {
+            ...f.io,
+            vaultActivate: (host, options, preflight) =>
+              completeNativeVaultActivation(
+                host,
+                {
+                  ...options,
+                  discover: async () => verifiedSetupInventory(),
+                },
+                preflight,
+              ),
+            runner: {
+              run: async (_file, args) => {
+                expect(args).not.toContain('--remove-pi-auth')
+                if (args[0] === 'install') {
+                  expect(
+                    JSON.parse(await readFile(pi.hostAuthPath, 'utf8'))
+                      .anthropic.key,
+                  ).toBe(slot.placeholderKey)
+                  if (change === 'slot')
+                    await writeSetupJson(pi.hostAuthPath, {
+                      anthropic: {
+                        type: 'api_key',
+                        key: 'external-replacement',
+                      },
+                    })
+                  else if (change === 'stash')
+                    await writeFile(
+                      slot.stashPath,
+                      `${await readFile(slot.stashPath, 'utf8')}\n`,
+                    )
+                  else {
+                    const enrollment = getHostClaustrumEnrollmentPaths(
+                      'pi',
+                      f.env,
+                    )
+                    await rm(enrollment.tokenPath)
+                    await rm(enrollment.statePath)
+                  }
+                  changed = await settleSetupSiblings([
+                    setupBytes(f.plan),
+                    setupBytes(pi),
+                  ])
+                  stashBytes = await readFile(slot.stashPath, 'utf8')
+                }
+                return { exitCode: 0, stdout: '1.0.0', stderr: '' }
+              },
+            },
+          },
+        ),
+      ).toBe(1)
+      expect(changed).toBeDefined()
+      expect(f.screen()).toContain(
+        'Setup inputs changed. Rerun setup with all hosts stopped.',
+      )
+      expect(
+        await settleSetupSiblings([setupBytes(f.plan), setupBytes(pi)]),
+      ).toEqual(changed!)
+      expect(await readFile(slot.stashPath, 'utf8')).toBe(stashBytes!)
+    },
+  )
+}
+
+for (const mode of ['local', 'claustrum'] as const) {
+  lifetimes.test(
+    `${mode} setup records the authoritative enrollment mode at default enrollment paths`,
+    async () => {
+      const f = await callbackFixture({
+        opencode: true,
+        pi: true,
+        claustrum: true,
+      })
+      delete f.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
+      delete f.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
+      delete f.io.env!.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
+      delete f.io.env!.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
+      expect(
+        await runSetupCommand(
+          [
+            '--yes',
+            '--opencode=both',
+            ...(mode === 'claustrum' ? ['--claustrum'] : []),
+          ],
+          {
+            ...f.io,
+            env: { ...f.io.env, ...f.env },
+            vaultActivate: (host, options, preflight) =>
+              completeNativeVaultActivation(
+                host,
+                {
+                  ...options,
+                  discover: async () => verifiedSetupInventory(),
+                },
+                preflight,
+              ),
+          },
+        ),
+      ).toBe(0)
+      expect(f.screen()).toContain(
+        `Configured CortexKit Anthropic Auth for opencode, pi (${mode}).`,
+      )
+      for (const host of ['opencode', 'pi'] as const)
+        expect(await readNativeEnrollmentMode(host, f.env)).toBe(mode)
+    },
+  )
+}
+
+lifetimes.test(
+  'OpenCode-only vault setup never compares an unselected Pi connection file',
+  async () => {
+    const f = await callbackFixture({
+      opencode: true,
+      pi: false,
+      claustrum: true,
+    })
+    f.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
+      f.env.HOME!,
+      'unselected-pi-connection',
+    )
+    const connections: string[] = []
+    expect(
+      await runSetupCommand(['--yes', '--claustrum', '--opencode=both'], {
+        ...f.io,
+        env: { ...f.io.env, ...f.env },
+        connect: async (input) => {
+          connections.push(input.connectionFile!)
+          return f.io.connect!(input)
+        },
+        vaultActivate: (host, options, preflight) =>
+          completeNativeVaultActivation(
+            host,
+            {
+              ...options,
+              discover: async () => verifiedSetupInventory(),
+            },
+            preflight,
+          ),
+      }),
+    ).toBe(0)
+    expect(connections).toEqual(
+      Array(2).fill(f.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE),
+    )
+    expect(await readNativeEnrollmentMode('opencode', f.env)).toBe('claustrum')
+    expect(await readNativeEnrollmentMode('pi', f.env)).toBe('local')
+  },
+)
+
+lifetimes.test(
+  'OpenCode both refuses a canonical Pi alias in first beforeSignIn before either owner writes',
+  async () => {
+    const f = await callbackFixture({
+      opencode: true,
+      pi: true,
+      claustrum: false,
+    })
+    const alias = join(f.env.HOME!, 'pi-alias')
+    await mkdir(dirname(f.plan.legacyConfigPath), { recursive: true })
+    await fsPromises.symlink(dirname(f.plan.legacyConfigPath), alias, 'dir')
+    f.env.PI_ANTHROPIC_AUTH_FILE = join(
+      alias,
+      basename(f.plan.legacyConfigPath),
+    )
+    const pi = await resolveNativeSetupPaths('pi', f.env)
+    const before = await settleSetupSiblings([
+      setupBytes(f.plan),
+      setupBytes(pi),
+    ])
+    let exchanges = 0
+    const registrations: Array<readonly string[]> = []
+    expect(
+      await runSetupCommand(['--yes', '--login', '--opencode=both'], {
+        ...f.io,
+        env: { ...f.io.env, ...f.env },
+        localLogin: async () => {
+          exchanges++
+          throw new Error('Must not exchange before alias validation')
+        },
+        runner: {
+          run: async (_file, args) => {
+            if (!args.includes('--version')) registrations.push(args)
+            return { exitCode: 0, stdout: '1.0.0', stderr: '' }
+          },
+        },
+      }),
+    ).toBe(1)
+    expect(exchanges).toBe(0)
+    expect(registrations).toEqual([])
+    expect(
+      await settleSetupSiblings([setupBytes(f.plan), setupBytes(pi)]),
+    ).toEqual(before)
+    expect(
+      existsSync(join(dirname(f.plan.legacyConfigPath), 'opencode.jsonc')),
+    ).toBe(false)
+  },
+)

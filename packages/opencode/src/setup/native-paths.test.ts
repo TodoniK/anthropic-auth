@@ -1,12 +1,14 @@
 import { expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import {
   requireDisjointNativeSetupPaths,
   resolveNativeSetupPaths,
 } from './native-paths.ts'
+import { getPiAuthPath } from './paths.ts'
 
 async function fixture(body: (root: string) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), 'native-setup-paths-'))
@@ -65,5 +67,53 @@ test('an explicit routing override remains same-path and shared legacy state ref
     await expect(
       requireDisjointNativeSetupPaths([opencode, pi]),
     ).rejects.toThrow('overlap')
+  })
+})
+
+test('Pi SDK tilde and file-URL auth paths participate in cross-host alias checks', async () => {
+  await fixture(async (root) => {
+    const sdkDirectory = join(root, 'data', 'opencode')
+    for (const configured of [
+      '~/data/opencode',
+      pathToFileURL(sdkDirectory).href,
+    ]) {
+      const env = {
+        HOME: root,
+        OPENCODE_CONFIG_DIR: join(root, 'config'),
+        XDG_DATA_HOME: join(root, 'data'),
+        PI_CODING_AGENT_DIR: configured,
+        PI_AGENT_DIR: join(root, 'not-the-sdk-slot'),
+      }
+      const opencode = await resolveNativeSetupPaths('opencode', env)
+      const pi = await resolveNativeSetupPaths('pi', env)
+      expect(getPiAuthPath(env)).toBe(join(sdkDirectory, 'auth.json'))
+      expect(pi.hostAuthPath).toBe(opencode.hostAuthPath)
+      await expect(
+        requireDisjointNativeSetupPaths([opencode, pi]),
+      ).rejects.toThrow('overlap')
+    }
+  })
+})
+
+test('canonical aliases between selected native pool owners refuse even when spelling differs', async () => {
+  await fixture(async (root) => {
+    const config = join(root, 'config')
+    const alias = join(root, 'pi-alias')
+    await mkdir(config)
+    await symlink(config, alias, 'dir')
+    const env = {
+      HOME: root,
+      OPENCODE_CONFIG_DIR: config,
+      XDG_DATA_HOME: join(root, 'data'),
+      PI_AGENT_DIR: alias,
+    }
+    const opencode = await resolveNativeSetupPaths('opencode', env)
+    const pi = await resolveNativeSetupPaths('pi', env)
+    await expect(
+      requireDisjointNativeSetupPaths([opencode, pi]),
+    ).rejects.toThrow('overlap')
+    await expect(
+      requireDisjointNativeSetupPaths([opencode]),
+    ).resolves.toBeUndefined()
   })
 })
