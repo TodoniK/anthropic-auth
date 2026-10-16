@@ -2,6 +2,18 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 2.0.2
+
+### Fixes
+
+- OpenCode 1 and OpenCode 2 local serving now read the session-routing file that the 2.0 setup migration fills, the same file Pi uses. Before, they read the old file name, so after upgrading each existing conversation picked an account again and rebuilt its prompt cache. Pins saved at the old name since upgrading are merged in once on the first routed request, never replacing a newer pin; a damaged or unreadable old file is skipped with one warning. OpenCode 2 also honors `OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE`. Vault mode was not affected.
+- Map tool names in Claude's responses back using only the tools that request declared (#286). A guessed short name such as `mcp_Search` is mapped to a declared tool only when exactly one declared tool matches; it no longer defaults to an AFT tool or rewrites a correctly called tool named `search`. A name that cannot be mapped back without risk of selecting a different declared tool stops the response with a fixed, non-retryable error. Tool arguments are never changed, and outgoing tool names are unchanged.
+
+### Compatibility
+
+- Support Pi 1.x (tested with 1.1) alongside Pi 0.86, and build the OpenCode sidebar for OpenTUI 0.6.
+- Move to `@cortexkit/common-auth` 0.17.0.
+
 ## 2.0.1
 
 ### Fixes
