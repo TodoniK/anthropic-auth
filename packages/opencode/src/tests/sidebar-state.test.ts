@@ -409,7 +409,7 @@ describe('formatFallbackModelLabel', () => {
 })
 
 describe('getCollapsedQuotaSummary', () => {
-  test('collapsed quota summary ignores credits binding marker and fallback advice', () => {
+  test('collapsed quota summary shares credit wording but omits binding marker and fallback advice', () => {
     expect(
       getCollapsedQuotaSummary({
         five_hour: { usedPercent: 78, remainingPercent: 22 },
@@ -422,11 +422,13 @@ describe('getCollapsedQuotaSummary', () => {
         bindingWindow: 'five_hour',
         fallbackAdvised: true,
       }).text,
-    ).toBe('5h: 78% 7d: 40%')
+    ).toBe('5h 22% left · 7d 60% left · credits spent')
   })
 
   test('formats both active-account quota windows', () => {
-    expect(getCollapsedQuotaSummary(quota(13)).text).toBe('5h: 13% 7d: 13%')
+    expect(getCollapsedQuotaSummary(quota(13)).text).toBe(
+      '5h 87% left · 7d 87% left',
+    )
   })
 
   test('formats different 5h and 7d percentages', () => {
@@ -435,15 +437,15 @@ describe('getCollapsedQuotaSummary', () => {
         five_hour: { usedPercent: 13.4, remainingPercent: 86.6 },
         seven_day: { usedPercent: 7.2, remainingPercent: 92.8 },
       }).text,
-    ).toBe('5h: 13% 7d: 7%')
+    ).toBe('5h 87% left · 7d 93% left')
   })
 
-  test('uses a dash for a missing collapsed quota window', () => {
+  test('omits an unreported collapsed quota window', () => {
     expect(
       getCollapsedQuotaSummary({
         five_hour: { usedPercent: 13, remainingPercent: 87 },
       }).text,
-    ).toBe('5h: 13% 7d: —')
+    ).toBe('5h 87% left')
   })
 
   test('formats scoped model quota windows in collapsed quota text', () => {
@@ -461,7 +463,7 @@ describe('getCollapsedQuotaSummary', () => {
           },
         ],
       }).text,
-    ).toBe('5h: 13% 7d: 7% Fa: 42%')
+    ).toBe('5h 87% left · 7d 93% left · Fable only 58% left')
   })
 
   test('returns no collapsed quota text when no windows are available', () => {
@@ -481,13 +483,13 @@ describe('getCollapsedQuotaSummary', () => {
         },
       ],
     })
-    expect(summary.text).toBe('Fa: 100%')
-    expect(summary.text).not.toContain('5h:')
-    expect(summary.text).not.toContain('7d:')
+    expect(summary.text).toBe('Fable only 0% left')
+    expect(summary.text).not.toContain('5h')
+    expect(summary.text).not.toContain('7d')
     expect(summary.text).not.toContain('—')
   })
 
-  test('preserves partial-dash primary segment alongside scoped windows', () => {
+  test('omits unreported primary windows alongside scoped windows', () => {
     const summary = getCollapsedQuotaSummary({
       five_hour: { usedPercent: 23, remainingPercent: 77 },
       scoped: [
@@ -500,7 +502,27 @@ describe('getCollapsedQuotaSummary', () => {
         },
       ],
     })
-    expect(summary.text).toBe('5h: 23% 7d: — Fa: 42%')
+    expect(summary.text).toBe('5h 77% left · Fable only 58% left')
+  })
+
+  test('keeps reading times through normalization and shows stale age in collapsed text', () => {
+    const now = Date.parse('2026-04-28T12:00:00Z')
+    const checkedAt = now - 2 * 86400000
+    const normalized = normalizeSidebarState({
+      main: {
+        quota: {
+          checkedAt,
+          five_hour: { usedPercent: 60, remainingPercent: 40, checkedAt },
+          scoped: [],
+        },
+      },
+    })
+    expect(normalized.main.quota?.checkedAt).toBe(checkedAt)
+    expect(normalized.main.quota?.five_hour?.checkedAt).toBe(checkedAt)
+    expect(normalized.main.quota?.scoped).toEqual([])
+    expect(getCollapsedQuotaSummary(normalized.main.quota, now).text).toBe(
+      '5h 40% left · checked 2d ago',
+    )
   })
 })
 

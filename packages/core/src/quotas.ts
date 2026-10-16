@@ -1,20 +1,100 @@
+import {
+  ALL_SCOPE,
+  formatQuota,
+  type ProjectedLimit,
+  type ProjectedQuota,
+  quotaTextParts,
+  quotaWindowParts,
+} from '@cortexkit/common-auth/quota'
 import type {
   AccountQuotaWindow,
   AccountScopedQuotaWindow,
   AccountStorage,
   OAuthAccount,
   OAuthQuotaSnapshot,
-  QuotaMoney,
-  QuotaWindowName,
 } from './accounts.ts'
 import { isOAuthAccount } from './accounts.ts'
 import { formatOAuthAccountTier } from './oauth-profile.ts'
 
 export const CLAUDE_QUOTAS_COMMAND_NAME = 'claude-quota'
 
-const WINDOW_LABELS: Record<QuotaWindowName, string> = {
-  five_hour: '5h',
-  seven_day: '1w',
+export type { QuotaWindowPart } from '@cortexkit/common-auth/quota'
+export { formatQuota, quotaTextParts, quotaWindowParts }
+
+type DisplayWindow = Omit<AccountQuotaWindow, 'checkedAt'> & {
+  checkedAt?: number
+}
+
+/** Sidebar files written by older versions may not retain reading times. */
+export type QuotaDisplaySnapshot = Pick<
+  OAuthQuotaSnapshot,
+  'checkedAt' | 'extraUsage' | 'bindingWindow'
+> & {
+  five_hour?: DisplayWindow
+  seven_day?: DisplayWindow
+  scoped?: (Omit<AccountScopedQuotaWindow, 'checkedAt'> & DisplayWindow)[]
+}
+
+/** Adapt every reported window without projecting away other model families. */
+export function quotaDisplayProjection(
+  snapshot: QuotaDisplaySnapshot | null | undefined,
+  now: number,
+): ProjectedQuota | undefined {
+  if (!snapshot) return undefined
+  const limits: ProjectedLimit[] = []
+  const add = (
+    window: DisplayWindow | undefined,
+    scope: string,
+    label: string,
+    windowMinutes: number,
+  ) => {
+    if (!window) return
+    limits.push({
+      scope,
+      label,
+      kind: 'reading',
+      windowMinutes,
+      usedPercent: window.usedPercent,
+      remainingPercent: window.remainingPercent,
+      resetsAt: window.resetsAt,
+      // Without either reading timestamp, a legacy sidebar cannot establish an age.
+      checkedAt: window.checkedAt ?? snapshot.checkedAt ?? now,
+    })
+  }
+  add(snapshot.five_hour, ALL_SCOPE, 'five_hour', 300)
+  add(snapshot.seven_day, ALL_SCOPE, 'seven_day', 10080)
+  for (const window of snapshot.scoped ?? []) {
+    add(window, window.modelId ?? window.modelName, window.title, 10080)
+  }
+  const checkedAt =
+    snapshot.checkedAt ??
+    (limits.length ? Math.min(...limits.map((limit) => limit.checkedAt)) : now)
+  const extra = snapshot.extraUsage
+  return {
+    scope: ALL_SCOPE,
+    limits,
+    checkedAt,
+    ...(extra && {
+      budget: {
+        checkedAt,
+        reached: extra.exhausted,
+        // Older snapshots have monetary totals but no utilization percentage.
+        remainingPercent:
+          extra.utilizationPercent !== undefined
+            ? 100 - extra.utilizationPercent
+            : extra.limit.amountMinor > 0
+              ? 100 * (1 - extra.used.amountMinor / extra.limit.amountMinor)
+              : undefined,
+      },
+    }),
+  }
+}
+
+function quotaBindingName(snapshot: QuotaDisplaySnapshot | null | undefined) {
+  const binding = snapshot?.bindingWindow
+  if (binding === 'five_hour') return '5h'
+  if (binding === 'seven_day') return '7d'
+  return snapshot?.scoped?.find((window) => window.id === binding)?.title
 }
 
 export type QuotaAccountSummary = {
@@ -27,10 +107,6 @@ export type QuotaAccountSummary = {
   tierLabel?: string
 }
 
-function formatPercent(value: number) {
-  return `${Math.round(value * 10) / 10}%`
-}
-
 function formatAge(checkedAt: number, now: number) {
   const elapsedMs = Math.max(0, now - checkedAt)
   const minutes = Math.floor(elapsedMs / 60_000)
@@ -41,63 +117,6 @@ function formatAge(checkedAt: number, now: number) {
   const remainder = minutes % 60
   if (remainder === 0) return `${hours}h ago`
   return `${hours}h ${remainder}m ago`
-}
-
-function formatResetDuration(resetsAt: string, now: number) {
-  const resetTime = Date.parse(resetsAt)
-  if (!Number.isFinite(resetTime)) return resetsAt
-
-  const remainingMs = resetTime - now
-  if (remainingMs <= 0) return 'now'
-
-  const totalMinutes = Math.max(1, Math.ceil(remainingMs / 60_000))
-  if (totalMinutes < 60) return `in ${totalMinutes}m`
-
-  const hours = Math.floor(totalMinutes / 60)
-  const minutes = totalMinutes % 60
-  if (minutes === 0) return `in ${hours}h`
-  return `in ${hours}h ${minutes}m`
-}
-
-function formatReset(resetsAt: string | undefined, now: number) {
-  if (!resetsAt) return ''
-  return `, resets ${formatResetDuration(resetsAt, now)}`
-}
-
-function formatWindow(
-  key: QuotaWindowName,
-  window: AccountQuotaWindow | undefined,
-  now: number,
-  bindingWindow?: string,
-) {
-  if (!window) return `  - ${WINDOW_LABELS[key]}: unknown`
-  const line = [
-    `  - ${WINDOW_LABELS[key]}: ${formatPercent(window.remainingPercent)} remaining`,
-    ` (${formatPercent(window.usedPercent)} used`,
-    `${formatReset(window.resetsAt, now)}, checked ${formatAge(window.checkedAt, now)})`,
-  ].join('')
-  return bindingWindow === key ? `${line} •` : line
-}
-
-export function formatQuotaMoney(money: QuotaMoney) {
-  try {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: money.currency,
-      minimumFractionDigits: money.exponent,
-      maximumFractionDigits: money.exponent,
-    }).format(money.amountMinor / 10 ** money.exponent)
-  } catch {
-    return `${money.amountMinor} ${money.currency}`
-  }
-}
-
-function formatScopedWindow(window: AccountScopedQuotaWindow, now: number) {
-  return [
-    `  - ${window.title}: ${formatPercent(window.remainingPercent)} remaining`,
-    ` (${formatPercent(window.usedPercent)} used`,
-    `${formatReset(window.resetsAt, now)}, checked ${formatAge(window.checkedAt, now)})`,
-  ].join('')
 }
 
 function accountName(account: OAuthAccount) {
@@ -161,36 +180,16 @@ export function buildClaudeQuotaSummary(input: {
     if (account.error) {
       lines.push(`  - Error: ${account.error}`)
     }
-    lines.push(
-      formatWindow(
-        'five_hour',
-        account.quota?.five_hour,
-        now,
-        account.quota?.bindingWindow,
-      ),
-    )
-    lines.push(
-      formatWindow(
-        'seven_day',
-        account.quota?.seven_day,
-        now,
-        account.quota?.bindingWindow,
-      ),
-    )
-    for (const window of account.quota?.scoped ?? []) {
-      const line = formatScopedWindow(window, now)
-      lines.push(
-        account.quota?.bindingWindow === window.id ? `${line} •` : line,
-      )
+    const quota = quotaDisplayProjection(account.quota, now)
+    const parts = quotaTextParts(quota, { now })
+    const windows = quotaWindowParts(quota, { now }).windows
+    const bindingName = quotaBindingName(account.quota)
+    for (const [index, part] of parts.entries()) {
+      const binding =
+        bindingName !== undefined && windows[index]?.name === bindingName
+      lines.push(`  - ${part}${binding ? ' •' : ''}`)
     }
-    const extraUsage = account.quota?.extraUsage
-    if (extraUsage) {
-      const used = formatQuotaMoney(extraUsage.used)
-      const limit = formatQuotaMoney(extraUsage.limit)
-      lines.push(
-        `  - credits ${used}/${limit}${extraUsage.exhausted ? ' · exhausted' : ''}`,
-      )
-    }
+    if (!parts.length) lines.push(`  - ${formatQuota(quota, { now })}`)
     if (account.quota?.fallbackAdvised === true) {
       lines.push('  - → fallback advised')
     }

@@ -251,6 +251,30 @@ describe('native diagnostics persistence', () => {
     }
   })
 
+  test('quota status uses shared wording and reports stale checked age', async () => {
+    const now = Date.now()
+    await saveNativePiFixture(
+      {
+        version: 1,
+        accounts: [],
+        quota: {
+          mainQuota: {
+            five_hour: {
+              usedPercent: 60,
+              remainingPercent: 40,
+              checkedAt: now - 2 * 24 * 60 * 60_000,
+            },
+          },
+        },
+      },
+      storagePath,
+    )
+
+    const text = await controller().backend.readStatus('quota', {})
+    expect(text).toContain('5h 40% left')
+    expect(text).toContain('checked 2d ago')
+  })
+
   test('logging status shows current level without mutating', async () => {
     await controller().execute({
       action: 'logging-level',

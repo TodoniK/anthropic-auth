@@ -3,7 +3,11 @@
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { formatQuotaMoney } from '@cortexkit/anthropic-auth-core'
+import {
+  type QuotaWindowPart,
+  quotaDisplayProjection,
+  quotaWindowParts,
+} from '@cortexkit/anthropic-auth-core'
 import type {
   TuiPlugin,
   TuiPluginApi,
@@ -25,7 +29,6 @@ import {
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
   formatPrimeAccountValue,
-  formatScopedQuotaLabel,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   getSidebarState,
@@ -232,7 +235,7 @@ function CollapsedRow(props: {
   )
 }
 
-// Quota window row: muted label left, tone-colored bar + percentage right,
+// Quota window row: muted label left, tone-colored bar + shared figure right,
 // with an optional muted reset suffix. When pacing data is present, the bar
 // gains a pace segment and an off-pace window adds a muted subline with the
 // reserve/deficit delta and the projected runout.
@@ -240,12 +243,13 @@ function QuotaRow(props: {
   theme: ThemeCurrent
   appearance: AppearancePrefs
   label: string
-  window: { usedPercent: number; resetsAt?: string } | undefined
+  part: QuotaWindowPart | undefined
+  usedPercent: number | undefined
   pacing: QuotaPacing | null
   binding?: boolean
 }) {
-  const used = () => props.window?.usedPercent ?? 0
-  const reset = () => formatResetIn(props.window?.resetsAt)
+  const used = () => props.usedPercent ?? 0
+  const reset = () => props.part?.resetIn
   const paceLine = () => {
     const pacing = props.pacing
     if (!pacing || pacing.state === 'on-pace') return null
@@ -257,7 +261,7 @@ function QuotaRow(props: {
   }
   return (
     <Show
-      when={props.window}
+      when={props.part}
       fallback={
         <box width='100%' flexDirection='row'>
           <text fg={props.theme.textMuted}>{props.label.padEnd(3)}</text>
@@ -265,8 +269,8 @@ function QuotaRow(props: {
         </box>
       }
     >
-      {/* Left group (label · bar · pct) stays left-aligned in fixed columns so
-          bars and percentages line up across rows; the reset time is pushed to
+      {/* Left group (label · bar · figure) stays left-aligned in fixed columns so
+          bars and figures line up across rows; the reset time is pushed to
           the right edge so reset times align in their own right column. */}
       <box width='100%' flexDirection='row' justifyContent='space-between'>
         <box flexDirection='row'>
@@ -281,7 +285,7 @@ function QuotaRow(props: {
           <text
             fg={toneColor(props.theme, usageTone(used(), props.appearance))}
           >
-            {` ${String(Math.round(used())).padStart(3)}%${props.binding ? ' •' : ''}`}
+            {` ${props.part?.figure}${props.binding ? ' •' : ''}`}
           </text>
         </box>
         <Show when={reset()}>
@@ -347,6 +351,12 @@ function AccountBlock(props: {
     props.pacingEnabled && !props.quotaDated && window
       ? computeQuotaPacing(window, windowMs, Date.now())
       : null
+  const parts = () => {
+    const now = Date.now()
+    return quotaWindowParts(quotaDisplayProjection(props.quota, now), { now })
+  }
+  const partFor = (name: string) =>
+    parts().windows.find((part) => part.name === name)
   return (
     <box width='100%' flexDirection='column' marginTop={props.marginTop ?? 0}>
       <box width='100%' flexDirection='row' justifyContent='space-between'>
@@ -368,7 +378,8 @@ function AccountBlock(props: {
           theme={props.theme}
           appearance={props.appearance}
           label='5h'
-          window={props.quota?.five_hour}
+          part={partFor('5h')}
+          usedPercent={props.quota?.five_hour?.usedPercent}
           pacing={pacingFor(props.quota?.five_hour, FIVE_HOUR_MS)}
           binding={props.quota?.bindingWindow === 'five_hour'}
         />
@@ -376,7 +387,8 @@ function AccountBlock(props: {
           theme={props.theme}
           appearance={props.appearance}
           label='7d'
-          window={props.quota?.seven_day}
+          part={partFor('7d')}
+          usedPercent={props.quota?.seven_day?.usedPercent}
           pacing={pacingFor(props.quota?.seven_day, SEVEN_DAY_MS)}
           binding={props.quota?.bindingWindow === 'seven_day'}
         />
@@ -385,29 +397,33 @@ function AccountBlock(props: {
             <QuotaRow
               theme={props.theme}
               appearance={props.appearance}
-              label={formatScopedQuotaLabel(window.title)}
-              window={window}
+              label={partFor(window.title)?.name ?? window.title}
+              part={partFor(window.title)}
+              usedPercent={window.usedPercent}
               pacing={pacingFor(window, SEVEN_DAY_MS)}
               binding={props.quota?.bindingWindow === window.id}
             />
           )}
         </For>
-        <Show when={props.quota?.extraUsage}>
-          {(extraUsage: () => NonNullable<AccountQuota['extraUsage']>) => (
+        <Show when={partFor('credits')}>
+          {(budget: () => QuotaWindowPart) => (
             <text
               fg={toneColor(
                 props.theme,
-                extraUsage().severity === 'critical'
+                props.quota?.extraUsage?.severity === 'critical'
                   ? 'err'
-                  : extraUsage().severity === 'warning' ||
-                      extraUsage().exhausted
+                  : props.quota?.extraUsage?.severity === 'warning' ||
+                      props.quota?.extraUsage?.exhausted
                     ? 'warn'
                     : 'muted',
               )}
             >
-              {`credits ${formatQuotaMoney(extraUsage().used)}/${formatQuotaMoney(extraUsage().limit)}${extraUsage().exhausted ? ' · exhausted' : ''}`}
+              {budget().figure}
             </text>
           )}
+        </Show>
+        <Show when={parts().age}>
+          <text fg={props.theme.textMuted}>{parts().age}</text>
         </Show>
         <Show when={props.quota?.fallbackAdvised === true}>
           <text fg={props.theme.textMuted}>{'→ fallback advised'}</text>
@@ -416,8 +432,6 @@ function AccountBlock(props: {
     </box>
   )
 }
-
-export { formatQuotaMoney }
 
 // --- Quota dialog content ---------------------------------------------------
 

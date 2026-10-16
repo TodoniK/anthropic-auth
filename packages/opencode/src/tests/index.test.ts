@@ -10094,7 +10094,7 @@ describe('auth.loader', () => {
           {
             type: 'text',
             ignored: true,
-            text: expect.stringContaining('5h: 75% remaining'),
+            text: expect.stringContaining('5h 75% left'),
           },
         ],
       },
@@ -10212,12 +10212,12 @@ describe('auth.loader', () => {
     // payload, not the earlier headless notice sent before the refresh.
     const currentMenu = await openClaudeMenu(plugin, 'session-1')
     const text = JSON.stringify(currentMenu)
-    expect(refreshed.text).toContain('5h: 75% remaining')
+    expect(refreshed.text).toContain('5h 75% left')
     expect(text).toContain('## Claude Quotas')
     expect(text).toContain('### OpenCode anthropic (main)')
     expect(text).toContain('### fallback personal (fallback)')
-    expect(text).toContain('5h: 75% remaining')
-    expect(text).toContain('1w: 50% remaining')
+    expect(text).toContain('5h 75% left')
+    expect(text).toContain('7d 50% left')
   })
 
   test('/claude-quota bounds stalled profile hydration without hiding quota output', async () => {
@@ -10304,7 +10304,7 @@ describe('auth.loader', () => {
     const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
       ?.body.parts[0]?.text as string
     expect(text).toContain('## Claude Quotas')
-    expect(text).toContain('5h: 75% remaining')
+    expect(text).toContain('5h 75% left')
     expect(text).not.toContain('Max 20x')
   }, 5_000)
 

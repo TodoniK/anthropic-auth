@@ -2,6 +2,7 @@ export interface QuotaWindow {
   usedPercent: number
   remainingPercent: number
   resetsAt?: string
+  checkedAt?: number
 }
 
 export interface ScopedQuotaWindow extends QuotaWindow {
@@ -12,6 +13,7 @@ export interface ScopedQuotaWindow extends QuotaWindow {
 }
 
 export interface AccountQuota {
+  checkedAt?: number
   five_hour?: QuotaWindow
   seven_day?: QuotaWindow
   scoped?: ScopedQuotaWindow[]
@@ -125,7 +127,11 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { PrimeUsageCounters } from '@cortexkit/anthropic-auth-core'
-import { logger } from '@cortexkit/anthropic-auth-core'
+import {
+  formatQuota,
+  logger,
+  quotaDisplayProjection,
+} from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
 const DEFAULT_STATE_DIR = join(tmpdir(), 'opencode-anthropic-auth')
@@ -234,12 +240,14 @@ function normalizeQuotaWindow(value: unknown): QuotaWindow | undefined {
     usedPercent,
     remainingPercent,
     resetsAt: typeof value.resetsAt === 'string' ? value.resetsAt : undefined,
+    ...(isFiniteNumber(value.checkedAt) && { checkedAt: value.checkedAt }),
   }
 }
 
 function normalizeAccountQuota(value: unknown): AccountQuota | null {
   if (!isRecord(value)) return null
   const quota: AccountQuota = {}
+  if (isFiniteNumber(value.checkedAt)) quota.checkedAt = value.checkedAt
   const fiveHour = normalizeQuotaWindow(value.five_hour)
   const sevenDay = normalizeQuotaWindow(value.seven_day)
   if (fiveHour) quota.five_hour = fiveHour
@@ -837,11 +845,6 @@ export function resolveActiveAccount(state: SidebarState): {
   }
 }
 
-export function formatScopedQuotaLabel(title: string) {
-  const label = title.replace(/\s+only$/i, '').trim()
-  return /^fable$/i.test(label) ? 'Fa' : label
-}
-
 /**
  * Pretty label for a recoverable-refusal source model (Fable 5/5.1 or Opus 5).
  * Falls back to the raw id for unrecognized ids so the sidebar never goes
@@ -927,7 +930,10 @@ export function getFableRecoverySummary(
   return `Opus 4.8 · ${recovery.remaining} left`
 }
 
-export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
+export function getCollapsedQuotaSummary(
+  quota: AccountQuota | null,
+  now = Date.now(),
+): {
   fiveHourUsedPercent: number | null
   sevenDayUsedPercent: number | null
   scopedUsedPercents: number[]
@@ -940,7 +946,8 @@ export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
   if (
     fiveHourUsedPercent == null &&
     sevenDayUsedPercent == null &&
-    scoped.length === 0
+    scoped.length === 0 &&
+    !quota?.extraUsage
   ) {
     return {
       fiveHourUsedPercent,
@@ -950,23 +957,14 @@ export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
     }
   }
 
-  const scopedSegments = scoped.map(
-    (window) =>
-      `${formatScopedQuotaLabel(window.title)}: ${Math.round(window.usedPercent)}%`,
-  )
-  const primarySegments =
-    fiveHourUsedPercent == null && sevenDayUsedPercent == null
-      ? []
-      : [
-          `5h: ${fiveHourUsedPercent == null ? '—' : `${Math.round(fiveHourUsedPercent)}%`}`,
-          `7d: ${sevenDayUsedPercent == null ? '—' : `${Math.round(sevenDayUsedPercent)}%`}`,
-        ]
-
   return {
     fiveHourUsedPercent,
     sevenDayUsedPercent,
     scopedUsedPercents,
-    text: [...primarySegments, ...scopedSegments].join(' '),
+    text: formatQuota(quotaDisplayProjection(quota, now), {
+      now,
+      form: 'compact',
+    }),
   }
 }
 

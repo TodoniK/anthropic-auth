@@ -9,7 +9,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 
 describe('quota summaries', () => {
-  test('malformed money metadata falls back without throwing', () => {
+  test('credit wording uses percentages rather than currency formatting', () => {
     const summary = buildClaudeQuotaSummary({
       accounts: [
         {
@@ -26,7 +26,7 @@ describe('quota summaries', () => {
       ],
     })
 
-    expect(summary).toContain('credits 10035 ZZZZ/10000 ZZZZ')
+    expect(summary).toContain('credits 0% left')
   })
 
   test('claude quota shows Team tier exhausted credits binding marker and fallback advice', () => {
@@ -62,9 +62,8 @@ describe('quota summaries', () => {
     })
 
     expect(summary).toContain('Team · Max 5x')
-    expect(summary).toContain('credits $100.35/$100.00 · exhausted')
-    expect(summary).toContain('5h:')
-    expect(summary).toContain('•')
+    expect(summary).toContain('credits spent')
+    expect(summary).toContain('5h 22% left •')
     expect(summary).toContain('→ fallback advised')
   })
 
@@ -138,13 +137,10 @@ describe('quota summaries', () => {
     expect(summary).toContain('## Claude Quotas')
     expect(summary).toContain('### OpenCode anthropic (main)')
     expect(summary).toContain('Last token refresh: 2m ago')
-    expect(summary).toContain(
-      '5h: 75% remaining (25% used, resets in 1h 15m, checked just now)',
-    )
-    expect(summary).toContain('1w: 50% remaining (50% used, checked 1m ago)')
-    expect(summary).toContain(
-      'Fable only: 95% remaining (5% used, checked just now)',
-    )
+    expect(summary).toContain('5h 75% left, resets 1h')
+    expect(summary).toContain('7d 50% left')
+    expect(summary).toContain('Fable only 95% left')
+    expect(summary).not.toContain('checked')
   })
 
   test('formats reset timestamps as relative durations', () => {
@@ -173,8 +169,9 @@ describe('quota summaries', () => {
       ],
     })
 
-    expect(summary).toContain('5h: 100% remaining (0% used, resets in 10m')
-    expect(summary).toContain('1w: 100% remaining (0% used, resets not-a-date')
+    expect(summary).toContain('5h 100% left, resets 9m')
+    expect(summary).toContain('7d 100% left')
+    expect(summary).not.toContain('not-a-date')
   })
 
   test('builds fallback summaries from sidecar storage', () => {

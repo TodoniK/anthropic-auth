@@ -259,7 +259,7 @@ async function runPackedHostRuntimeProbe(
   )
   const probe = `
 import { createTestRenderer } from "@opentui/core/testing";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { render } from "@opentui/solid";
@@ -371,16 +371,23 @@ const testSetup = await createTestRenderer({
 });
 let renderFailure;
 let frame = testSetup.captureCharFrame();
+let quotaFrame = "";
 let settleSidebarFrame;
 const sidebarFrame = new Promise((resolve) => { settleSidebarFrame = resolve; });
+let settleQuotaFrame;
+const quotaSidebarFrame = new Promise((resolve) => { settleQuotaFrame = resolve; });
 const observeFrame = () => {
   try {
     const captured = testSetup.captureCharFrame();
     if (captured.includes(sidebarRouteMarker) && captured.includes("Waiting for quota")) {
       settleSidebarFrame({ frame: captured });
     }
+    if (captured.includes("40% left") && captured.includes("checked 2d ago")) {
+      settleQuotaFrame({ frame: captured });
+    }
   } catch (error) {
     settleSidebarFrame({ error });
+    settleQuotaFrame({ error });
   }
 };
 testSetup.renderer.on("frame", observeFrame);
@@ -397,12 +404,28 @@ try {
     const captured = await sidebarFrame;
     if ("error" in captured) throw captured.error;
     frame = captured.frame;
+    const now = Date.now();
+    await writeFile(process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE, JSON.stringify({
+      main: { quota: {
+        five_hour: {
+          usedPercent: 60, remainingPercent: 40,
+          checkedAt: now - 2 * 86400000,
+          resetsAt: new Date(now + 4 * 86400000).toISOString(),
+        },
+        scoped: [],
+      } },
+      fallbacks: [], route: sidebarRouteMarker, lastUpdated: now,
+    }));
+    const quotaCaptured = await quotaSidebarFrame;
+    if ("error" in quotaCaptured) throw quotaCaptured.error;
+    quotaFrame = quotaCaptured.frame;
   } catch (error) {
     renderFailure = error;
   }
 } finally {
   testSetup.renderer.off("frame", observeFrame);
   settleSidebarFrame({ cancelled: true });
+  settleQuotaFrame({ cancelled: true });
   // destroy() can defer teardown until an active frame finishes.
   testSetup.renderer.destroy();
   await rendererDestroyed;
@@ -437,10 +460,13 @@ if (renderFailure) throw renderFailure;
 if (!frame.includes(sidebarRouteMarker) || !frame.includes("Waiting for quota")) {
   throw new Error("headless renderer output did not contain the expected sidebar nodes: " + frame);
 }
+if (!quotaFrame.includes("40% left") || !quotaFrame.includes("checked 2d ago") || !quotaFrame.includes("4d")) {
+  throw new Error("packed sidebar quota figure, reset or reading age was absent: " + quotaFrame);
+}
 if (eventSubscriptions !== 2) {
   throw new Error("sidebar did not subscribe to both host events");
 }
-console.log("real host renderer captured the packed sidebar route and quota nodes");
+console.log("real host renderer captured the packed sidebar route, empty quota, 40% left, 4d reset and checked 2d ago");
 process.exit(0);
 `
 
