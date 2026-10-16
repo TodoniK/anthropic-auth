@@ -1,14 +1,20 @@
-import { expect } from 'bun:test'
+import { expect, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
+import * as fs from 'node:fs/promises'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  __setLogTestSink,
+  acquireRefreshFileLock,
   createNativeAccountRuntime,
   custodyTombstoneOAuth,
+  getLogLevel,
   getStickyRoutingStatePath,
+  type LogTestRecord,
   resetClaudeCodeIdentityCachesForTest,
   runNativeMigration,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import { createOpencodeClient, type Provider } from '@opencode-ai/sdk'
 import { $ } from 'bun'
@@ -391,3 +397,83 @@ tests.test(
     expect(await readFile(legacy, 'utf8')).toBe(poison)
   },
 )
+
+for (const failure of ['malformed', 'unreadable', 'locked'] as const) {
+  tests.test(
+    `local routing serves destination pins after ${failure} legacy recovery fails`,
+    async () => {
+      for (const open of [oc1, oc2]) {
+        const f = await fixture()
+        try {
+          const legacy = getStickyRoutingStatePath(f.paths.legacyConfig)
+          const bytes =
+            failure === 'malformed'
+              ? '{synthetic-private-incomplete-json'
+              : routing({ [session1]: 'main' })
+          await writeFile(legacy, bytes)
+          const send = await open(f)
+          const records: LogTestRecord[] = []
+          const previousLevel = getLogLevel()
+          setLogLevel('warn')
+          __setLogTestSink((record) => records.push(record))
+          f.cleanups.push(() => {
+            __setLogTestSink(null)
+            setLogLevel(previousLevel)
+          })
+          let deniedReads = 0
+          let restoreRead = () => {}
+          if (failure === 'unreadable') {
+            // Inject EACCES so the file stays unreadable even in root-run test jobs.
+            const originalRead = fs.readFile
+            const read = spyOn(fs, 'readFile').mockImplementation(((
+              ...args: Parameters<typeof fs.readFile>
+            ) => {
+              if (args[0] === legacy) {
+                deniedReads++
+                return Promise.reject(
+                  Object.assign(new Error('synthetic-private-read-error'), {
+                    code: 'EACCES',
+                  }),
+                )
+              }
+              return originalRead(...args)
+            }) as typeof fs.readFile)
+            restoreRead = () => read.mockRestore()
+            f.cleanups.push(restoreRead)
+          }
+          if (failure === 'locked') {
+            const lock = await acquireRefreshFileLock({
+              path: f.journal.routingPaths.destination,
+              name: 'write',
+              ttlMs: 60_000,
+              renew: true,
+            })
+            if (!lock)
+              throw new Error('Fixture could not hold the routing lock')
+            f.cleanups.push(() => lock.release())
+          }
+          expect(await send(session1)).toContain('sk-ant-oat01-secondary')
+          expect(await send(session1)).toContain('sk-ant-oat01-secondary')
+          expect(
+            records.filter(
+              (record) =>
+                record.channel === 'sticky-routing' && record.level === 'warn',
+            ),
+          ).toEqual([
+            {
+              level: 'warn',
+              channel: 'sticky-routing',
+              message: 'local pin recovery unavailable',
+              payload: { reason: 'recovery-failed' },
+            },
+          ])
+          if (failure === 'unreadable') expect(deniedReads).toBe(1)
+          restoreRead()
+          expect(await readFile(legacy, 'utf8')).toBe(bytes)
+        } finally {
+          await f.close()
+        }
+      }
+    },
+  )
+}

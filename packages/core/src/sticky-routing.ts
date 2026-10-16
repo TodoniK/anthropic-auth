@@ -610,7 +610,7 @@ export class StickySessionRouter {
     this.loaded = true
   }
 
-  private async acquireLock() {
+  private async acquireLock(wait = true) {
     await mkdir(dirname(this.options.path), { recursive: true, mode: 0o700 })
     const deadline = this.now() + STICKY_ROUTING_LOCK_WAIT_MS
     while (true) {
@@ -621,7 +621,7 @@ export class StickySessionRouter {
         renew: true,
       })
       if (lock) return lock
-      if (this.now() >= deadline) {
+      if (!wait || this.now() >= deadline) {
         throw new Error('Timed out acquiring sticky routing state lock')
       }
       await new Promise((resolve) =>
@@ -636,14 +636,21 @@ export class StickySessionRouter {
     const key = JSON.stringify([this.options.path, source])
     let recovery = localRecoveries.get(key)
     if (!recovery) {
-      recovery = this.fillLocalPins(source)
+      // Recovery is bookkeeping, not a prerequisite for using destination pins.
+      // Remember failures as completed attempts so later requests do no recovery I/O.
+      recovery = this.fillLocalPins(source).catch(() => {
+        logger.warn('sticky-routing', 'local pin recovery unavailable', {
+          reason: 'recovery-failed',
+        })
+      })
       localRecoveries.set(key, recovery)
     }
     await recovery
   }
 
   private async fillLocalPins(source: string) {
-    const lock = await this.acquireLock()
+    // Do not make a request wait for another writer just to recover old pins.
+    const lock = await this.acquireLock(false)
     try {
       let legacy: StickyRouteState | undefined
       try {
