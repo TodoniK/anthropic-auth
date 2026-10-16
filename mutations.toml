@@ -239,7 +239,7 @@ broad_id = "{name}"
 id = "native-activation-before-401-refresh"
 guards = "A revoked host activation must not trigger a credential refresh."
 file = "packages/opencode/src/index.ts"
-old = '''              requireNativeActivation(await hostGetAuth())
+old = '''              await requireCurrentNativeActivation(separateLocalLogin)
               init?.signal?.throwIfAborted()
               const current = await authorizeOAuth('''
 new = '''              init?.signal?.throwIfAborted()
@@ -260,7 +260,7 @@ guards = "Activation revocation during physical credential authorization must pr
 file = "packages/opencode/src/index.ts"
 old = '''                oauthAccountId === 'main' ? 'last-main' : 'serve',
               )
-              requireNativeActivation(await hostGetAuth())
+              await requireCurrentNativeActivation(separateLocalLogin)
               init?.signal?.throwIfAborted()'''
 new = '''                oauthAccountId === 'main' ? 'last-main' : 'serve',
               )

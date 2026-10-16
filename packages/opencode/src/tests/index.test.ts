@@ -13358,7 +13358,7 @@ describe('auth.loader', () => {
       bindMainQuotaToAccount(
         createFallbackStorage({
           accounts: [],
-          routing: { mode: 'sticky-balanced' },
+          routing: { mode: 'fallback-first' },
           quota: {
             enabled: true,
             checkIntervalMinutes: 5,
@@ -13382,8 +13382,45 @@ describe('auth.loader', () => {
       paths: pool.paths,
       quota: nativeQuotaCodec,
     })
-    let initialBootstrapDone = false
     let rotated = false
+    let usableAuthorizations = 0
+    const factory = Core.createNativeAccountRuntime
+    const factorySpy = spyOn(
+      Core,
+      'createNativeAccountRuntime',
+    ).mockImplementation((options) => {
+      const runtime = factory(options)
+      const authorize = runtime.authorizeLocal.bind(runtime)
+      runtime.authorizeLocal = async (...args) => {
+        const authorization = await authorize(...args)
+        if (authorization.status === 'usable' && ++usableAuthorizations === 2) {
+          rotated = true
+          const settings = await store.readSettings()
+          if (
+            settings.status !== 'ready' ||
+            typeof settings.settings.mainAccountId !== 'string'
+          )
+            throw new Error('Expected primary row')
+          // The request reads its credential, then chooses a route before sending.
+          // Rotate after both steps have authorized the old pool token. The next
+          // authorizeLocal call is the last credential check before dispatch.
+          // Its /api/claude_cli/bootstrap mock below replaces the Anthropic auth
+          // slot with an OpenAI placeholder, which must prevent the model send.
+          // Keep host-auth reads passive so extra reads cannot move this revocation.
+          await store.rotate(settings.settings.mainAccountId, {
+            type: 'oauth',
+            access: successorAccess,
+            refresh: login.refresh,
+            expires: login.expires + 1000,
+          })
+        }
+        return authorization
+      }
+      return runtime
+    })
+    bodyLifetime().deferCleanup(() => {
+      factorySpy.mockRestore()
+    })
     const bootstraps: Array<string | null> = []
     const modelAuthorizations: Array<string | null> = []
     let tokenCalls = 0
@@ -13393,8 +13430,7 @@ describe('auth.loader', () => {
         const bearer = new Headers(init?.headers).get('authorization')
         if (url.includes('/api/claude_cli/bootstrap')) {
           bootstraps.push(bearer)
-          if (bearer === `Bearer ${login.access}`) initialBootstrapDone = true
-          else if (bearer === `Bearer ${successorAccess}`) {
+          if (bearer === `Bearer ${successorAccess}`) {
             const authFile = JSON.parse(
               await readFile(pool.hostAuthPath, 'utf8'),
             )
@@ -13406,7 +13442,8 @@ describe('auth.loader', () => {
             await writeFile(pool.hostAuthPath, JSON.stringify(authFile), {
               mode: 0o600,
             })
-          } else throw new Error('Unexpected bootstrap credential')
+          } else if (bearer !== `Bearer ${login.access}`)
+            throw new Error('Unexpected bootstrap credential')
           return Response.json({
             oauth_account: { account_uuid: syntheticMainAccountUuid },
           })
@@ -13419,27 +13456,7 @@ describe('auth.loader', () => {
     )
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(
-      async () => {
-        if (initialBootstrapDone && !rotated) {
-          rotated = true
-          const settings = await store.readSettings()
-          if (
-            settings.status !== 'ready' ||
-            typeof settings.settings.mainAccountId !== 'string'
-          )
-            throw new Error('Expected primary row')
-          // Simulate another process rotating the pool token after initial
-          // validation. The new token's bootstrap mock then replaces OpenCode's
-          // activation slot before that authorization returns.
-          await store.rotate(settings.settings.mainAccountId, {
-            type: 'oauth',
-            access: successorAccess,
-            refresh: login.refresh,
-            expires: login.expires + 1000,
-          })
-        }
-        return { type: 'oauth', ...login }
-      },
+      async () => ({ type: 'oauth', ...login }),
       { models: {} },
     )
     let refusal: unknown
