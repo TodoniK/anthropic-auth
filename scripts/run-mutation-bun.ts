@@ -46,9 +46,10 @@ export function testEnvironment(
     'PI_CODING_AGENT_DIR',
   ])
     env[key] = sandbox
+  // Let state derive from each fixture's explicit config, not one shared file.
+  // Tests that need an explicit state override can still set their own.
   for (const key of [
     'OPENCODE_ANTHROPIC_AUTH_FILE',
-    'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
     'OPENCODE_ANTHROPIC_AUTH_LOG_FILE',
     'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
     'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',

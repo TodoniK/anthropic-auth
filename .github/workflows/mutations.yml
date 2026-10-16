@@ -32,8 +32,10 @@ jobs:
         with:
           minimum_release_age: 0s
       - run: bun install --frozen-lockfile
-      - name: Build shared Core for test preloads
-        run: bun run --cwd packages/core build
+      - name: Build Core and packed OpenCode exports for preparation tests
+        run: |
+          bun run --cwd packages/core build
+          bun run --cwd packages/opencode build
       - name: Install pinned mutation runner
         shell: bash
         run: |

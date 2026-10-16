@@ -1190,6 +1190,88 @@ test('refuses a failure shifted between repeated Bun cases at the same source lo
 })
 
 const filesystemTests = createTestLifetimeSuite()
+
+function sandboxedPackageTests(
+  sandbox: string,
+  packageRoot: string,
+  file: string,
+  names: string[],
+): Transcript {
+  const env = testEnvironment(sandbox, process.env)
+  delete env.GITHUB_ACTIONS
+  const child = Bun.spawnSync(
+    [
+      process.execPath,
+      'test',
+      '--no-orphans',
+      '--config',
+      './bunfig.toml',
+      file,
+      '--test-name-pattern',
+      names.map(exactPattern).join('|'),
+    ],
+    {
+      cwd: resolve(import.meta.dir, '../..', packageRoot),
+      env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 5_000,
+    },
+  )
+  return {
+    stdout: child.stdout.toString(),
+    stderr: child.stderr.toString(),
+    exitCode: child.exitCode,
+    signal: child.signalCode ?? null,
+  }
+}
+
+filesystemTests.test(
+  'wrapper defaults keep successive native config fixtures on independent journals',
+  async () => {
+    const sandbox = await createMutationSandbox()
+    filesystemTests.deferCleanup(() =>
+      rm(sandbox, { recursive: true, force: true }),
+    )
+    const names = [
+      'authorizeLocal joins a held first-identity write and serves the intended fallback once it commits',
+      'a healthy companion authorizes during the held write without waiting on it',
+    ]
+    const transcript = sandboxedPackageTests(
+      sandbox,
+      'packages/core',
+      './src/tests/native-transient-account.test.ts',
+      names,
+    )
+    expect(transcript.exitCode, transcript.stderr).toBe(0)
+    expect(
+      parseExecution(undefined, transcript).events.map((event) => event.name),
+    ).toEqual(names)
+  },
+)
+
+filesystemTests.test(
+  'wrapper log defaults are rebased by the real OpenCode preload before Core imports',
+  async () => {
+    const sandbox = await createMutationSandbox()
+    filesystemTests.deferCleanup(() =>
+      rm(sandbox, { recursive: true, force: true }),
+    )
+    const names = [
+      'feature-path overrides deleted by a test cannot resolve outside the preload sandbox',
+    ]
+    const transcript = sandboxedPackageTests(
+      sandbox,
+      'packages/opencode',
+      './src/tests/host-isolation.test.ts',
+      names,
+    )
+    expect(transcript.exitCode, transcript.stderr).toBe(0)
+    expect(
+      parseExecution(undefined, transcript).events.map((event) => event.name),
+    ).toEqual(names)
+  },
+)
 filesystemTests.test(
   'credential sandbox has a private directory under system temporary storage',
   async () => {

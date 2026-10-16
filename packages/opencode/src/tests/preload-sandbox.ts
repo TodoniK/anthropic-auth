@@ -23,6 +23,7 @@ const safetyPaths = {
   HOME: testDir,
   TMPDIR: testDir,
   OPENCODE_ANTHROPIC_AUTH_FILE: join(testDir, 'anthropic-auth.json'),
+  OPENCODE_ANTHROPIC_AUTH_LOG_FILE: join(testDir, 'auth.log'),
   OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
     testDir,
     'opencode-enrollment.json',

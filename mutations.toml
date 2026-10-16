@@ -1,6 +1,7 @@
 # Commands select exact expect_red tests; --broad runs the full owning package.
 prebuild = [
   { name = "core-current-source", command = ["bun", "run", "--cwd", "packages/core", "build"] },
+  { name = "opencode-current-source", command = ["bun", "run", "--cwd", "packages/opencode", "build"] },
 ]
 
 [[control]]

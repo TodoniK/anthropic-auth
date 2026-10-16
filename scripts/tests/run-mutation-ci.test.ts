@@ -159,7 +159,56 @@ test('workflow installs the public pinned runner without write permissions or se
   expect(text).not.toContain('secrets.')
 })
 
+test('catalogue prebuilds current Core then packed OpenCode exports for command replays', () => {
+  const catalogue = Bun.TOML.parse(
+    readFileSync(new URL('../../mutations.toml', import.meta.url), 'utf8'),
+  )
+  // Command prebuilds run after mutation application and again after restoration;
+  // a workflow-only build would leave clean or stale exports in packed hosts.
+  expect(catalogue).toHaveProperty('prebuild', [
+    {
+      name: 'core-current-source',
+      command: ['bun', 'run', '--cwd', 'packages/core', 'build'],
+    },
+    {
+      name: 'opencode-current-source',
+      command: ['bun', 'run', '--cwd', 'packages/opencode', 'build'],
+    },
+  ])
+})
+
 const lifetimes = createTestLifetimeSuite()
+
+lifetimes.test(
+  'mutation preparation packs every advertised OpenCode import and type export',
+  async () => {
+    const root = await mkdtemp(
+      resolve(process.env.TMPDIR ?? '/tmp', 'mutation-pack-'),
+    )
+    lifetimes.deferCleanup(() => rm(root, { recursive: true, force: true }))
+    const packageRoot = resolve(import.meta.dir, '../../packages/opencode')
+    const manifest = await Bun.file(resolve(packageRoot, 'package.json')).json()
+    const archive = resolve(root, 'opencode.tgz')
+    const packed = Bun.spawnSync(
+      [process.execPath, 'pm', 'pack', '--filename', archive],
+      { cwd: packageRoot, stdout: 'pipe', stderr: 'pipe' },
+    )
+    expect(packed.exitCode, packed.stderr.toString()).toBe(0)
+    for (const entry of Object.values(manifest.exports)) {
+      for (const target of Object.values(entry as Record<string, string>)) {
+        const extracted = Bun.spawnSync(
+          ['tar', '-xOf', archive, `package/${target.replace(/^\.\//, '')}`],
+          { stdout: 'pipe', stderr: 'pipe' },
+        )
+        expect(extracted.exitCode, `${target}: ${extracted.stderr}`).toBe(0)
+        expect(extracted.stdout).toEqual(
+          Buffer.from(await Bun.file(resolve(packageRoot, target)).bytes()),
+        )
+        expect(extracted.stdout.byteLength).toBeGreaterThan(0)
+      }
+    }
+  },
+)
 
 async function ciFixture() {
   await mkdir(resolve(import.meta.dir, '../../tmp'), { recursive: true })
