@@ -5,6 +5,7 @@ import {
   canonicalPath,
   getStickyRoutingStatePath,
   type NativePoolPaths,
+  resolveLocalRoutingDestination,
   resolveNativePoolPaths,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -62,9 +63,7 @@ export async function resolveNativeSetupPaths(
     routingSourcePath: resolve(
       routingOverride || getStickyRoutingStatePath(legacyConfigPath),
     ),
-    routingDestinationPath: resolve(
-      routingOverride || getStickyRoutingStatePath(paths.config),
-    ),
+    routingDestinationPath: resolveLocalRoutingDestination(host, paths, env),
   }
 }
 
@@ -74,7 +73,8 @@ export async function requireDisjointNativeSetupPaths(
 ): Promise<void> {
   const owners = new Map<string, HarnessKind>()
   for (const plan of plans) {
-    for (const path of [
+    const ownPaths = new Set<string>()
+    for (const [index, path] of [
       plan.paths.legacyConfig,
       plan.paths.legacyState,
       plan.paths.config,
@@ -85,14 +85,23 @@ export async function requireDisjointNativeSetupPaths(
       plan.hostAuthPath,
       plan.routingSourcePath,
       plan.routingDestinationPath,
-    ]) {
+    ].entries()) {
       const canonical = await canonicalPath(path)
+      if (
+        ownPaths.has(canonical) &&
+        !(
+          index === 9 &&
+          canonical === (await canonicalPath(plan.routingSourcePath))
+        )
+      )
+        throw new Error('Native setup storage paths overlap')
       const owner = owners.get(canonical)
       if (owner !== undefined && owner !== plan.host)
         throw new Error(
           'Native setup storage paths overlap between selected hosts',
         )
       owners.set(canonical, plan.host)
+      ownPaths.add(canonical)
     }
   }
 }

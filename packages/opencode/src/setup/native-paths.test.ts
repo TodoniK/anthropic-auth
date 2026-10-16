@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
@@ -34,7 +34,12 @@ test('selected host paths use injected configuration, data and Pi overrides with
       join(root, 'data', 'opencode', 'auth.json'),
     )
     expect(pi.legacyConfigPath).toBe(join(root, 'pi', 'anthropic-auth.json'))
-    expect(pi.hostAuthPath).toBe(join(root, 'pi', 'auth.json'))
+    expect(pi.hostAuthPath).toBe(join(homedir(), '.pi', 'agent', 'auth.json'))
+    const sdkPi = await resolveNativeSetupPaths('pi', {
+      ...env,
+      PI_CODING_AGENT_DIR: join(root, 'sdk-pi'),
+    })
+    expect(sdkPi.hostAuthPath).toBe(join(root, 'sdk-pi', 'auth.json'))
     expect(opencode.routingSourcePath).not.toBe(opencode.routingDestinationPath)
     expect(process.env.OPENCODE_CONFIG_DIR).toBe(before)
     await expect(

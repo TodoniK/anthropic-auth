@@ -1,12 +1,30 @@
+import { createHash } from 'node:crypto'
+import { lstat, mkdir, readFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import {
+  assertHostsStopped,
+  canonicalPath,
   createNativeAccountRuntime,
+  custodyTombstoneOAuth,
+  inspectNativeHostAuthEntry,
+  NativeMigrationError,
+  type NativeMigrationPreflight,
+  nativePoolHoldsAccountData,
+  prepareNativeMigration,
   readNativeEnrollmentMode,
+  readNativeMigrationJournal,
+  releaseNativeMigrationPreflight,
   requireNoSupervisedAuthContentSnapshot,
   runNativeMigration,
+  writeNativeHostAuth,
 } from '@cortexkit/anthropic-auth-core'
 import { type NativeSetupPaths, resolveNativeSetupPaths } from './native-paths'
-import { assertHostsStopped } from './process-fence'
-import type { HarnessKind, ProcessFence } from './types'
+import {
+  type HarnessKind,
+  type ProcessFence,
+  SetupRefusal,
+  setupProcessInspectionMessage,
+} from './types'
 
 export interface NativeOfflineLogin {
   credential: {
@@ -24,6 +42,235 @@ export interface NativeLocalSetupOptions {
   paths?: NativeSetupPaths
   removePiAnthropicAuth: boolean
   login?: (host: HarnessKind) => Promise<NativeOfflineLogin>
+  preflight?: NativeMigrationPreflight
+  skipMigration?: boolean
+  beforeCommit?: () => Promise<void>
+}
+
+export const SEPARATE_HOST_LOGIN_NOTICE =
+  "OpenCode's separate Anthropic login is not used. Add that account through /claude Accounts if needed, or remove the separate login from OpenCode."
+
+export function nativeLocalProcessFence(
+  host: HarnessKind,
+  options: NativeLocalSetupOptions,
+) {
+  return async () => {
+    requireNoSupervisedAuthContentSnapshot(options.env)
+    try {
+      await assertHostsStopped(options.fence, options.env)
+    } catch (error) {
+      const message = setupProcessInspectionMessage(error)
+      if (message) throw new SetupRefusal(message)
+      throw error
+    }
+    if ((await readNativeEnrollmentMode(host, options.env)) !== 'local')
+      throw new SetupRefusal('Disconnect from the vault first.')
+  }
+}
+
+export async function nativeSetupFileFingerprint(
+  path: string,
+): Promise<string> {
+  try {
+    return createHash('sha256')
+      .update(await readFile(path))
+      .digest('hex')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent'
+    throw new NativeMigrationError('unsafe-source')
+  }
+}
+
+export async function inspectSetupHostAuth(host: HarnessKind, path: string) {
+  let data: unknown
+  try {
+    data = JSON.parse(await readFile(path, 'utf8'))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+      throw new NativeMigrationError('unsafe-source')
+  }
+  const entry = inspectNativeHostAuthEntry(host, data)
+  const auth = (
+    data as { anthropic?: { access?: string; refresh?: string } } | undefined
+  )?.anthropic
+  return {
+    ...entry,
+    realLogin: entry.kind === 'oauth' && Boolean(auth?.access && auth.refresh),
+  }
+}
+
+export interface NativeLocalPlan {
+  paths: NativeSetupPaths
+  generation2: boolean
+  action: 'migration' | 'skip' | 'empty-init' | 'reuse'
+  slot?: Awaited<ReturnType<typeof inspectSetupHostAuth>>
+  notice: boolean
+  preflight?: NativeMigrationPreflight
+  fingerprint: string
+  authorityPhase:
+    | NonNullable<
+        Awaited<ReturnType<typeof readNativeMigrationJournal>>
+      >['phase']
+    | 'absent'
+  poolPopulation: boolean | 'not-evaluated'
+}
+
+/** Hash pool, journal and routing bytes and the host's Anthropic entry, so a credential replacement cannot hide behind an unchanged account count. */
+export async function fingerprintNativeLocalPlan(
+  plan: NativeLocalPlan,
+  env: NodeJS.ProcessEnv,
+): Promise<string> {
+  const { paths } = plan
+  const entry = plan.generation2
+    ? undefined
+    : await inspectSetupHostAuth(paths.host, paths.hostAuthPath)
+  const files = await Promise.all(
+    [
+      paths.paths.config,
+      paths.paths.state,
+      paths.paths.runtime,
+      paths.paths.roster,
+      paths.paths.journal,
+      paths.routingDestinationPath,
+    ].map(nativeSetupFileFingerprint),
+  )
+  return JSON.stringify([
+    await readNativeEnrollmentMode(paths.host, env),
+    entry?.digest,
+    ...files,
+  ])
+}
+
+/** Record journal status, the host's Anthropic entry and whether setup will import, skip import or initialize a new pool, without writing. */
+export async function planNativeLocalSetup(
+  host: HarnessKind,
+  options: NativeLocalSetupOptions,
+  generation2: boolean,
+): Promise<NativeLocalPlan> {
+  const paths =
+    options.paths ?? (await resolveNativeSetupPaths(host, options.env))
+  const processFence = nativeLocalProcessFence(host, options)
+  await processFence()
+  const journal = await readNativeMigrationJournal(paths.paths)
+  if (journal && journal.host !== host)
+    throw new NativeMigrationError('invalid-source')
+  const completed =
+    journal?.phase === 'committed' || journal?.phase === 'retired'
+  if (
+    journal &&
+    journal.kind !== 'empty-init' &&
+    (journal.hostAuthPath !== (await canonicalPath(paths.hostAuthPath)) ||
+      journal.routingPaths.source !==
+        (await canonicalPath(paths.routingSourcePath)) ||
+      journal.routingPaths.destination !==
+        (await canonicalPath(paths.routingDestinationPath)))
+  )
+    throw new NativeMigrationError('invalid-source')
+  const plan: NativeLocalPlan = {
+    paths,
+    generation2,
+    action: 'migration',
+    notice: false,
+    fingerprint: '',
+    authorityPhase: journal?.phase ?? 'absent',
+    poolPopulation: 'not-evaluated',
+  }
+  if (generation2) {
+    if (journal && !completed) throw new NativeMigrationError('invalid-source')
+    plan.action = journal ? 'reuse' : 'empty-init'
+    if (!journal) {
+      const destinations = [
+        paths.paths.config,
+        paths.paths.state,
+        paths.paths.runtime,
+        paths.paths.roster,
+      ]
+      if (!options.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE)
+        destinations.push(paths.routingDestinationPath)
+      for (const path of destinations) {
+        try {
+          await lstat(path)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+          throw new NativeMigrationError('unsafe-source')
+        }
+        throw new NativeMigrationError('invalid-source')
+      }
+    }
+  } else {
+    plan.slot = await inspectSetupHostAuth(host, paths.hostAuthPath)
+    plan.poolPopulation =
+      journal?.kind === 'empty-init'
+        ? await nativePoolHoldsAccountData({ paths: paths.paths })
+        : 'not-evaluated'
+    const populated = plan.poolPopulation === true
+    if (
+      host === 'opencode' &&
+      (populated ||
+        (completed &&
+          journal?.kind !== 'empty-init' &&
+          plan.slot.kind === 'oauth'))
+    ) {
+      plan.action = 'skip'
+      plan.notice = plan.slot.realLogin
+    } else {
+      plan.preflight = await prepareNativeMigration({
+        ...paths,
+        env: options.env,
+        processFence,
+        removePiAnthropicAuth: options.removePiAnthropicAuth,
+      })
+    }
+  }
+  plan.fingerprint = await fingerprintNativeLocalPlan(plan, options.env)
+  return plan
+}
+
+export async function revalidateNativeLocalPlan(
+  plan: NativeLocalPlan,
+  options: NativeLocalSetupOptions,
+): Promise<void> {
+  await nativeLocalProcessFence(plan.paths.host, options)()
+  const current = await planNativeLocalSetup(
+    plan.paths.host,
+    { ...options, paths: plan.paths },
+    plan.generation2,
+  )
+  try {
+    if (
+      current.fingerprint !== plan.fingerprint ||
+      current.action !== plan.action
+    )
+      throw new SetupRefusal(
+        'Setup inputs changed. Rerun setup with all hosts stopped.',
+      )
+  } finally {
+    if (current.preflight) releaseNativeMigrationPreflight(current.preflight)
+  }
+}
+
+export async function installAbsentNativePlaceholder(
+  plan: Pick<NativeLocalPlan, 'paths' | 'slot'>,
+  options: NativeLocalSetupOptions,
+): Promise<void> {
+  if (plan.paths.host !== 'opencode' || plan.slot?.kind !== 'absent') return
+  const processFence = nativeLocalProcessFence('opencode', options)
+  await processFence()
+  await mkdir(dirname(plan.paths.hostAuthPath), {
+    recursive: true,
+    mode: 0o700,
+  })
+  await writeNativeHostAuth({
+    host: 'opencode',
+    authPath: plan.paths.hostAuthPath,
+    sourceDigest: 'absent',
+    expectedDigest: inspectNativeHostAuthEntry('opencode', {
+      anthropic: custodyTombstoneOAuth('anthropic'),
+    }).digest,
+    env: options.env,
+    removePiAnthropicAuth: false,
+    processFence,
+  })
 }
 
 /** Transfer local credentials while hosts are stopped, before telling the user to restart. */
@@ -32,12 +279,7 @@ export async function migrateNativeLocalForHost(
   options: NativeLocalSetupOptions,
 ): Promise<void> {
   const env = { ...options.env }
-  const processFence = async () => {
-    requireNoSupervisedAuthContentSnapshot(env)
-    await assertHostsStopped(options.fence)
-    if ((await readNativeEnrollmentMode(host, env)) !== 'local')
-      throw new Error('Disconnect from the vault first.')
-  }
+  const processFence = nativeLocalProcessFence(host, { ...options, env })
   await processFence()
   const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
   const login = await options.login?.(host)
@@ -49,18 +291,21 @@ export async function migrateNativeLocalForHost(
   )
     throw new Error('Claude sign-in did not establish an account UUID')
   await processFence()
-  await runNativeMigration({
-    paths: plan.paths,
-    legacyConfigPath: plan.legacyConfigPath,
-    legacyStatePath: plan.legacyStatePath,
-    host,
-    hostAuthPath: plan.hostAuthPath,
-    routingSourcePath: plan.routingSourcePath,
-    routingDestinationPath: plan.routingDestinationPath,
-    env,
-    processFence,
-    removePiAnthropicAuth: options.removePiAnthropicAuth,
-  })
+  await options.beforeCommit?.()
+  if (!options.skipMigration)
+    await runNativeMigration({
+      paths: plan.paths,
+      legacyConfigPath: plan.legacyConfigPath,
+      legacyStatePath: plan.legacyStatePath,
+      host,
+      hostAuthPath: plan.hostAuthPath,
+      routingSourcePath: plan.routingSourcePath,
+      routingDestinationPath: plan.routingDestinationPath,
+      env,
+      processFence,
+      removePiAnthropicAuth: options.removePiAnthropicAuth,
+      preflight: options.preflight,
+    })
   if (login) {
     const runtime = createNativeAccountRuntime({
       paths: plan.paths,
@@ -77,5 +322,15 @@ export async function migrateNativeLocalForHost(
     } finally {
       runtime.close()
     }
+  }
+  if (options.skipMigration) {
+    const slot = await inspectSetupHostAuth(host, plan.hostAuthPath)
+    await installAbsentNativePlaceholder(
+      {
+        paths: plan,
+        slot,
+      },
+      options,
+    )
   }
 }

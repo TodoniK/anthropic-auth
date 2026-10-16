@@ -230,3 +230,26 @@ test('a terminal enrollment is reset without proposing; only a later explicit se
     expect(calls.slice(0, 2)).toEqual(['propose', 'poll'])
   })
 })
+
+import { getHostClaustrumEnrollmentPaths } from '@cortexkit/anthropic-auth-core'
+import { hostEnrollmentPaths } from '@cortexkit/common-auth/claustrum'
+import {
+  NATIVE_VAULT_HOST_NAMES,
+  nativeVaultHostPaths,
+} from './native-enrollment.ts'
+
+for (const host of ['opencode', 'pi'] as const) {
+  for (const override of [undefined, '/fixture/private/enrollment.json']) {
+    test(`runner enrollment paths match Core for ${host} (${override ? 'override' : 'default'})`, () => {
+      const env = {
+        XDG_STATE_HOME: '/fixture/state',
+        [`${host.toUpperCase()}_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE`]:
+          override,
+      }
+      expect(NATIVE_VAULT_HOST_NAMES[host]).toBe(`anthropic-auth-${host}`)
+      expect(hostEnrollmentPaths(nativeVaultHostPaths(host, env))).toEqual(
+        getHostClaustrumEnrollmentPaths(host, env),
+      )
+    })
+  }
+}

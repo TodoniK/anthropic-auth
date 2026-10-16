@@ -1,41 +1,12 @@
 import { expect, test } from 'bun:test'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-
 import { runSetupCommand, type SetupCommandOptions } from './command.ts'
-import type { HarnessKind, SetupDetection } from './types.ts'
+import type { HarnessKind } from './types.ts'
 
-function detection(piLocalAuth = false): SetupDetection {
-  return {
-    opencode: {
-      kind: 'opencode',
-      installed: true,
-      version: '1.18.31',
-      configPath: '/synthetic/opencode.jsonc',
-      pluginInstalled: true,
-    },
-    pi: {
-      kind: 'pi',
-      installed: true,
-      version: '0.86.1',
-      configPath: '/synthetic/pi',
-      pluginInstalled: true,
-      hasLocalAuth: piLocalAuth,
-    },
-    claustrum: {
-      ckInstalled: true,
-      ckVersion: '0.20.8',
-      daemonRunning: true,
-      connectionPath: '/synthetic/subc-connection.json',
-    },
-  }
-}
-
-/**
- * Drive the real command with injected detection, process fence, runner and
- * per-host activation. Host config writes land in a private synthetic home.
- */
+/** Run the real shared callbacks with fixture executables and a fixture vault. */
 async function run(
   argv: string[],
   input: {
@@ -47,6 +18,13 @@ async function run(
   try {
     const env: NodeJS.ProcessEnv = {
       HOME: root,
+      PATH: join(root, 'bin'),
+      XDG_STATE_HOME: join(root, 'state'),
+      OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+        root,
+        'connection',
+      ),
+      PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(root, 'connection'),
       XDG_CONFIG_HOME: join(root, '.config'),
       XDG_DATA_HOME: join(root, '.local', 'share'),
       PI_CODING_AGENT_DIR: join(root, '.pi', 'agent'),
@@ -56,15 +34,67 @@ async function run(
       join(root, '.config', 'opencode', 'opencode.jsonc'),
       '{\n  "plugin": []\n}\n',
     )
+    if (input.piLocalAuth) {
+      await mkdir(env.PI_CODING_AGENT_DIR!, { recursive: true })
+      await writeFile(
+        join(env.PI_CODING_AGENT_DIR!, 'auth.json'),
+        JSON.stringify({
+          anthropic: {
+            type: 'oauth',
+            access: 'fixture-access',
+            refresh: 'fixture-refresh',
+            expires: 1,
+          },
+        }),
+      )
+    }
     const activations: Array<{ host: HarnessKind; consent: boolean }> = []
     const options: SetupCommandOptions = {
       env,
+      migrateLocal: async () => {},
       fence: { listRunningHosts: async () => [] },
       runner: {
         run: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
       },
-      detect: async () => detection(input.piLocalAuth),
-      activate: async (host, options) => {
+      fs: {
+        exists: (path) =>
+          path === env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE ||
+          existsSync(path),
+        isDirectory: (path) => {
+          try {
+            return statSync(path).isDirectory()
+          } catch {
+            return false
+          }
+        },
+        isFile: (path) =>
+          ['opencode', 'pi', 'ck'].some(
+            (name) => path === join(root, 'bin', name),
+          ),
+        isExecutable: (path) =>
+          ['opencode', 'pi', 'ck'].some(
+            (name) => path === join(root, 'bin', name),
+          ),
+        readText: (path) => readFileSync(path, 'utf8'),
+        realpath: realpathSync,
+      },
+      connect: async () => {
+        let name = ''
+        return {
+          close() {},
+          enrollPropose: async (input) => {
+            name = input.name
+            return { requestId: 'fixture-request' }
+          },
+          enrollPoll: async () => ({
+            status: 'approved',
+            name,
+            token: 'c'.repeat(64),
+            tokenGeneration: 1,
+          }),
+        }
+      },
+      vaultActivate: async (host, options) => {
         activations.push({ host, consent: options.removePiAnthropicAuth })
         if (host === input.fail) throw new Error('synthetic activation refusal')
         return 'committed'

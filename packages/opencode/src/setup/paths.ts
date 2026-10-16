@@ -53,13 +53,14 @@ export function getPiAgentDir(
 export function getPiAuthPath(env: NodeJS.ProcessEnv = process.env): string {
   // Match Pi's SDK directory rule, not the extension's optional storage override.
   const configured = env.PI_CODING_AGENT_DIR
-  let agentDir = configured || join(homedir(), '.pi', 'agent')
-  if (agentDir === '~') agentDir = homedir()
+  const home = getHostHome(env)
+  let agentDir = configured || join(home, '.pi', 'agent')
+  if (agentDir === '~') agentDir = home
   else if (
     agentDir.startsWith('~/') ||
     (process.platform === 'win32' && agentDir.startsWith('~\\'))
   )
-    agentDir = join(homedir(), agentDir.slice(2))
+    agentDir = join(home, agentDir.slice(2))
   if (agentDir.startsWith('file://')) agentDir = fileURLToPath(agentDir)
   return join(agentDir, 'auth.json')
 }

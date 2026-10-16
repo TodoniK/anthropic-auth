@@ -1,26 +1,34 @@
 import { readFile } from 'node:fs/promises'
 import {
+  assertHostsStopped,
   createNativeAccountRuntime,
   discoverNativeVaultInventory,
   inspectNativeHostAuthEntry,
   type NativeCustodyActivationHooks,
   type NativeCustodyInventory,
   NativePiAuthSlotError,
+  nativePiAuthSlotPaths,
   openNativePiAuthSlot,
   readNativeEnrollmentMode,
   requireNoSupervisedAuthContentSnapshot,
 } from '@cortexkit/anthropic-auth-core'
-
 import {
   enrollNativeVaultForHost,
+  grantNativeVaultForHost,
   type NativeVaultEnrollmentOptions,
 } from './native-enrollment.ts'
+import { nativeSetupFileFingerprint } from './native-local.ts'
 import {
   type NativeSetupPaths,
   resolveNativeSetupPaths,
 } from './native-paths.ts'
-import { assertHostsStopped } from './process-fence.ts'
-import type { CommandRunner, HarnessKind, ProcessFence } from './types.ts'
+import {
+  type CommandRunner,
+  type HarnessKind,
+  type ProcessFence,
+  SetupRefusal,
+  setupProcessInspectionMessage,
+} from './types.ts'
 
 export class NativeVaultActivationError extends Error {
   constructor(
@@ -76,26 +84,61 @@ async function readHostAuth(path: string): Promise<unknown> {
   }
 }
 
-/**
- * Enroll this stopped host, discover its verified default vault account and
- * leave the host auth slot untouched. Local credentials, migration journal,
- * account metadata and routing assignments are not inputs to this operation.
- */
-export async function activateNativeVaultForHost(
+export interface NativeVaultPreflight {
+  priorMode: 'local' | 'claustrum'
+  fingerprint: string
+}
+
+export async function fingerprintNativeVaultInputs(
   host: HarnessKind,
   options: NativeVaultActivationOptions,
-): Promise<'committed' | 'already-vault'> {
-  const env = { ...options.env }
-  // Checked before every write below: OPENCODE_AUTH_CONTENT (an auth snapshot
-  // a supervising OpenCode passes down) must be unset, and no host may run.
-  const processFence = async () => {
-    try {
-      requireNoSupervisedAuthContentSnapshot(env)
-    } catch {
-      throw new NativeVaultActivationError('auth-content-refused')
-    }
-    await assertHostsStopped(options.fence)
+): Promise<string> {
+  if (host === 'opencode') return 'opencode'
+  const plan =
+    options.paths ?? (await resolveNativeSetupPaths(host, options.env))
+  const entry = inspectNativeHostAuthEntry(
+    host,
+    await readHostAuth(plan.hostAuthPath),
+  )
+  const slot = openNativePiAuthSlot({
+    env: options.env,
+    authPath: plan.hostAuthPath,
+  })
+  const { stashPath } = nativePiAuthSlotPaths({
+    env: options.env,
+    authPath: plan.hostAuthPath,
+  })
+  return JSON.stringify([
+    entry.digest,
+    await slot.inspect(),
+    await nativeSetupFileFingerprint(stashPath),
+  ])
+}
+
+async function vaultProcessFence(
+  options: NativeVaultActivationOptions,
+): Promise<void> {
+  try {
+    requireNoSupervisedAuthContentSnapshot(options.env)
+  } catch {
+    throw new NativeVaultActivationError('auth-content-refused')
   }
+  try {
+    await assertHostsStopped(options.fence, options.env)
+  } catch (error) {
+    const message = setupProcessInspectionMessage(error)
+    if (message) throw new SetupRefusal(message)
+    throw error
+  }
+}
+
+/** Validate vault inputs before the runner enrolls any selected host. */
+export async function preflightNativeVaultForHost(
+  host: HarnessKind,
+  options: NativeVaultActivationOptions,
+): Promise<NativeVaultPreflight> {
+  const env = { ...options.env }
+  const processFence = () => vaultProcessFence({ ...options, env })
   await processFence()
   const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
   if (host === 'pi') {
@@ -116,12 +159,32 @@ export async function activateNativeVaultForHost(
     )
       throw new NativeVaultActivationError('consent-required')
   }
-  const priorMode = await readNativeEnrollmentMode(host, env)
-  await enrollNativeVaultForHost(host, {
+  return {
+    priorMode: await readNativeEnrollmentMode(host, env),
+    fingerprint: await fingerprintNativeVaultInputs(host, { ...options, env }),
+  }
+}
+
+/** Grant native-account read access and require a vault-backed default Claude account with an account identity before moving Pi's login aside. */
+export async function completeNativeVaultActivation(
+  host: HarnessKind,
+  options: NativeVaultActivationOptions,
+  preflight: NativeVaultPreflight,
+): Promise<'committed' | 'already-vault'> {
+  const env = { ...options.env }
+  const processFence = () => vaultProcessFence({ ...options, env })
+  await processFence()
+  const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
+  if (
+    (await fingerprintNativeVaultInputs(host, options)) !==
+    preflight.fingerprint
+  )
+    throw new NativeVaultActivationError('host-auth-invalid')
+  await grantNativeVaultForHost(host, {
     env,
     runner: options.runner,
     processFence,
-    ...options.enrollment,
+    ckBinary: options.enrollment?.ckBinary,
   })
   const discover =
     options.discover ??
@@ -160,8 +223,25 @@ export async function activateNativeVaultForHost(
         env,
         authPath: plan.hostAuthPath,
       }).enterVault()
-    return priorMode === 'claustrum' ? 'already-vault' : 'committed'
+    return preflight.priorMode === 'claustrum' ? 'already-vault' : 'committed'
   } finally {
     runtime.close()
   }
+}
+
+/** Outside runSetup, check inputs, enroll the host, then grant and activate vault access. runSetup owns enrollment and calls preflight and completion separately. */
+export async function activateNativeVaultForHost(
+  host: HarnessKind,
+  options: NativeVaultActivationOptions,
+): Promise<'committed' | 'already-vault'> {
+  const operation = { ...options, env: { ...options.env } }
+  const preflight = await preflightNativeVaultForHost(host, operation)
+  await enrollNativeVaultForHost(host, {
+    env: operation.env,
+    runner: operation.runner,
+    processFence: () => vaultProcessFence(operation),
+    ...operation.enrollment,
+    grantPermissions: false,
+  })
+  return completeNativeVaultActivation(host, operation, preflight)
 }

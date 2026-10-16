@@ -14,7 +14,11 @@ export type {
   SetupResult,
 } from '@cortexkit/common-auth/setup'
 // Host adapters use the bundled runner without adding a runtime dependency.
-export { runSetup } from '@cortexkit/common-auth/setup'
+export {
+  assertHostsStopped,
+  createProcessFence,
+  runSetup,
+} from '@cortexkit/common-auth/setup'
 export * from './accounts.ts'
 export * from './auth.ts'
 export * from './cache1h.ts'

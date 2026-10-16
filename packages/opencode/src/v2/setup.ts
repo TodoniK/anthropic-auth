@@ -21,6 +21,7 @@ import type { Plugin } from '@opencode/plugin'
 import type { Registration } from '@opencode/plugin/promise/registration'
 import {
   CLAUDE_POOL_LOGIN_METHOD_ID,
+  CLAUDE_POOL_LOGIN_METHOD_LABEL,
   CLAUDE_VAULT_ACTIVATION_METHOD_ID,
 } from './activation'
 import { installNativeAnthropic } from './install'
@@ -111,7 +112,7 @@ export function claudeLoginMethods(
       method: {
         id: CLAUDE_POOL_LOGIN_METHOD_ID,
         type: 'oauth',
-        label: 'Claude Pro / Max (native account pool)',
+        label: CLAUDE_POOL_LOGIN_METHOD_LABEL,
       },
       async authorize() {
         ensureActive()

@@ -354,9 +354,31 @@ test('combined local-login and vault flags refuse before detection or any file c
   expect(
     await runSetupCommand(['--yes', '--login', '--claustrum'], {
       env: f.options.env,
-      detect: async () => {
-        detections++
-        throw new Error('Detection must not run')
+      fs: {
+        exists() {
+          detections++
+          throw new Error('Detection must not run')
+        },
+        isDirectory() {
+          detections++
+          throw new Error('Detection must not run')
+        },
+        isFile() {
+          detections++
+          throw new Error('Detection must not run')
+        },
+        isExecutable() {
+          detections++
+          throw new Error('Detection must not run')
+        },
+        readText() {
+          detections++
+          throw new Error('Detection must not run')
+        },
+        realpath() {
+          detections++
+          throw new Error('Detection must not run')
+        },
       },
     }),
   ).toBe(1)

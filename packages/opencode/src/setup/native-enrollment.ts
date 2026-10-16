@@ -1,4 +1,7 @@
+import { dirname } from 'node:path'
 import {
+  CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+  CLAUSTRUM_PI_ENROLLMENT_NAME,
   getHostClaustrumEnrollmentPaths,
   resolveClaustrumConnectionPath,
 } from '@cortexkit/anthropic-auth-core'
@@ -13,6 +16,32 @@ import {
 
 import type { CommandRunner, HarnessKind } from './types.ts'
 
+export const NATIVE_VAULT_HOST_NAMES = {
+  opencode: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+  pi: CLAUSTRUM_PI_ENROLLMENT_NAME,
+} as const
+
+/** Convert the token file resolved by getHostClaustrumEnrollmentPaths into runSetup's path inputs; the runner derives the matching state file itself. */
+export function nativeVaultHostPaths(
+  host: HarnessKind,
+  env: NodeJS.ProcessEnv,
+) {
+  const { tokenPath } = getHostClaustrumEnrollmentPaths(host, env)
+  return { stateDir: dirname(tokenPath), host, override: tokenPath }
+}
+
+export function nativeVaultConnectionFile(
+  host: HarnessKind,
+  env: NodeJS.ProcessEnv,
+): string {
+  return resolveClaustrumConnectionPath(
+    host === 'pi' ? env.PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE : undefined,
+    host === 'pi'
+      ? { ...env, OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: undefined }
+      : env,
+  )
+}
+
 export interface NativeVaultEnrollmentOptions {
   env: NodeJS.ProcessEnv
   runner: CommandRunner
@@ -26,6 +55,8 @@ export interface NativeVaultEnrollmentOptions {
   client?: ClaustrumEnrollmentClient
   ckBinary?: string
   connectionFile?: string
+  /** Defaults to granting native-account read access after enrollment. False leaves that grant to completeNativeVaultActivation, avoiding a duplicate grant. */
+  grantPermissions?: boolean
 }
 
 export class NativeVaultEnrollmentError extends Error {
@@ -52,7 +83,7 @@ export async function enrollNativeVaultForHost(
 ): Promise<void> {
   const env = { ...options.env }
   const paths = options.paths ?? getHostClaustrumEnrollmentPaths(host, env)
-  const name = `anthropic-auth-${host}`
+  const name = NATIVE_VAULT_HOST_NAMES[host]
   const processFence = options.processFence
   const runner = options.runner
   const ck = options.ckBinary ?? 'ck'
@@ -71,18 +102,8 @@ export async function enrollNativeVaultForHost(
     ) {
       if (!client) {
         ownedClient = await connectClaustrumEnrollmentClient({
-          connectionFile: resolveClaustrumConnectionPath(
-            options.connectionFile ??
-              (host === 'pi'
-                ? env.PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
-                : undefined),
-            host === 'pi'
-              ? {
-                  ...env,
-                  OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: undefined,
-                }
-              : env,
-          ),
+          connectionFile:
+            options.connectionFile ?? nativeVaultConnectionFile(host, env),
         })
         client = ownedClient
       }
@@ -139,25 +160,8 @@ export async function enrollNativeVaultForHost(
     }
     if (status.state !== 'approved')
       throw new NativeVaultEnrollmentError('enrollment-refused')
-    await processFence()
-    const grant = await runner.run(
-      ck,
-      [
-        'auth',
-        'grant',
-        '--principal',
-        `enrolled:${name}`,
-        '--selector-kind',
-        'category',
-        '--selector',
-        'anthropic-native',
-        '--operation',
-        'read',
-      ],
-      { env },
-    )
-    if (grant.exitCode !== 0)
-      throw new NativeVaultEnrollmentError('permission-refused')
+    if (options.grantPermissions !== false)
+      await grantNativeVaultForHost(host, options)
   } catch (error) {
     if (error instanceof NativeVaultEnrollmentError) throw error
     // Never propagate a daemon, runner or fence exception that could contain a
@@ -165,5 +169,38 @@ export async function enrollNativeVaultForHost(
     throw new NativeVaultEnrollmentError('enrollment-refused')
   } finally {
     ownedClient?.close()
+  }
+}
+
+/** Grant this OpenCode or Pi principal read access to the vault's anthropic-native category; enrollment alone grants no provider access. */
+export async function grantNativeVaultForHost(
+  host: HarnessKind,
+  options: Pick<
+    NativeVaultEnrollmentOptions,
+    'env' | 'runner' | 'processFence' | 'ckBinary'
+  >,
+): Promise<void> {
+  try {
+    await options.processFence()
+    const grant = await options.runner.run(
+      options.ckBinary ?? 'ck',
+      [
+        'auth',
+        'grant',
+        '--principal',
+        `enrolled:${NATIVE_VAULT_HOST_NAMES[host]}`,
+        '--selector-kind',
+        'category',
+        '--selector',
+        'anthropic-native',
+        '--operation',
+        'read',
+      ],
+      { env: options.env },
+    )
+    if (grant.exitCode !== 0)
+      throw new NativeVaultEnrollmentError('permission-refused')
+  } catch {
+    throw new NativeVaultEnrollmentError('permission-refused')
   }
 }
