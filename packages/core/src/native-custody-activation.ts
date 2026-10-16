@@ -48,6 +48,7 @@ import {
   advanceNativeCustodyActivation,
   type NativeCustodyActivationPlan,
   type NativeCustodyActivationRoster,
+  type NativeLegacyMigrationJournal,
   type NativeMigrationJournal,
   readNativeMigrationJournal,
   recordNativeCustodyActivation,
@@ -57,6 +58,7 @@ import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
 
 export type NativeCustodyActivationErrorCode =
   | 'migration-required'
+  | 'invalid-journal'
   | 'invalid-state'
   | 'primary-missing'
   | 'primary-mismatch'
@@ -436,7 +438,7 @@ function expectedHostAuth(
 
 async function preparePlan(
   options: NativeCustodyActivationOptions,
-  journal: NativeMigrationJournal,
+  journal: NativeLegacyMigrationJournal,
   store: ReturnType<typeof createNativePoolStore>,
 ): Promise<NativeCustodyActivationPlan> {
   const { paths } = options
@@ -744,6 +746,7 @@ export async function runNativeCustodyActivation(
         await fence()
         let journal = await readNativeMigrationJournal(paths)
         if (!journal) return refuse('migration-required')
+        if (journal.kind === 'empty-init') refuse('invalid-journal')
         if (journal.host !== input.host || journal.phase !== 'retired')
           refuse('invalid-state')
         const hostAuthPath = journal.hostAuthPath

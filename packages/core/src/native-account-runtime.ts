@@ -90,7 +90,10 @@ import {
   type NativeLocalPoolBinding,
   nativeLocalPoolBindingMatches,
 } from './pool-binding.ts'
-import type { NativePoolPaths } from './pool-paths.ts'
+import {
+  type NativePoolPaths,
+  resolveLocalRoutingDestination,
+} from './pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
 import type { QuotaRequestDispatch } from './quota-manager.ts'
 import type { RelayConfig } from './relay.ts'
@@ -387,7 +390,16 @@ export function createNativeAccountRuntime(
     let mode = await readNativeEnrollmentMode(options.host, env)
     if (mode === 'local') {
       // Reuse the authority read rather than opening the journal again for routing.
-      localRouting = (await requireNativePoolAuthority(paths)).routingPaths
+      const journal = await requireNativePoolAuthority(paths)
+      const destination = resolveLocalRoutingDestination(
+        options.host,
+        paths,
+        env,
+      )
+      localRouting =
+        journal.kind === 'empty-init'
+          ? { source: destination, destination }
+          : journal.routingPaths
       // Enrollment can land while the local journal is being read.
       mode = await readNativeEnrollmentMode(options.host, env)
     }

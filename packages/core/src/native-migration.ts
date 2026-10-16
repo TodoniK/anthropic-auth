@@ -51,7 +51,11 @@ import {
 } from './native-runtime.ts'
 import {
   advanceNativeMigration,
+  beginNativeEmptyInit,
   beginNativeMigration,
+  NativeAuthorityError,
+  type NativeEmptyInitJournal,
+  type NativeLegacyMigrationJournal,
   type NativeMigrationJournal,
   readNativeMigrationJournal,
   recordNativeMigrationExpectations,
@@ -59,6 +63,7 @@ import {
 import {
   canonicalPath,
   type NativePoolPaths,
+  resolveLocalRoutingDestination,
   resolveNativePoolPaths,
 } from './pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
@@ -146,7 +151,7 @@ interface Captured {
   auth: NativeMigrationSourceSnapshot
   projection?: NativeMigrationProjection
   seedInput?: NativeRosterSeedInput
-  journal?: NativeMigrationJournal
+  journal?: NativeLegacyMigrationJournal
   hostAuthPath: string
   routingSourcePath: string
   routingDestinationPath: string
@@ -178,6 +183,99 @@ async function absent(path: string): Promise<boolean> {
       return true
     return refuse('unsafe-source')
   }
+}
+
+export interface NativeEmptyInitOptions {
+  paths: NativePoolPaths
+  routingDestinationPath: string
+  processFence: () => Promise<void>
+  env: NodeJS.ProcessEnv
+}
+
+export interface NativeEmptyInitHooks
+  extends Pick<NativeMigrationHooks, 'onStep'> {
+  lockOptions?: { ttlMs: number; timeoutMs: number }
+}
+
+/** Establish local authority for a new OpenCode pool without reading legacy credentials. */
+export async function publishNativeEmptyInit(
+  input: NativeEmptyInitOptions,
+  hooks: NativeEmptyInitHooks = {},
+): Promise<NativeEmptyInitJournal> {
+  const paths = { ...input.paths }
+  const env = { ...input.env }
+  const routingDestinationPath = input.routingDestinationPath
+  const processFence = input.processFence
+  // Even lock acquisition may read local files; enrollment wins before any read.
+  await processFence()
+  requireNoSupervisedAuthContentSnapshot(env)
+  return withLock(
+    paths.journal,
+    {
+      name: 'native-migration',
+      ttlMs: 30_000,
+      timeoutMs: 15_000,
+      ...hooks.lockOptions,
+      renew: true,
+    },
+    async (lease) => {
+      await processFence()
+      const checkDestinations = async () => {
+        await processFence()
+        try {
+          await lease.assertOwned()
+        } catch {
+          refuse('ownership-lost')
+        }
+        for (const path of [
+          paths.config,
+          paths.state,
+          paths.runtime,
+          paths.roster,
+        ])
+          if (!(await absent(path))) refuse()
+        if (
+          !env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE &&
+          !(await absent(routingDestinationPath))
+        )
+          refuse()
+        const resolved = await resolveNativePoolPaths(
+          paths.legacyConfig,
+          paths.legacyState,
+        )
+        for (const key of Object.keys(resolved) as Array<keyof NativePoolPaths>)
+          if (paths[key] !== resolved[key]) refuse()
+        if (
+          !isAbsolute(routingDestinationPath) ||
+          /\p{Cc}/u.test(routingDestinationPath)
+        )
+          refuse()
+        const routing = await canonicalPath(routingDestinationPath)
+        const all = [
+          paths.legacyConfig,
+          paths.legacyState,
+          paths.config,
+          paths.state,
+          paths.runtime,
+          paths.roster,
+          paths.journal,
+        ]
+        if (new Set(all).size !== all.length || all.includes(routing)) refuse()
+        const expectedRouting = resolveLocalRoutingDestination(
+          'opencode',
+          paths,
+          env,
+        )
+        if (routing !== (await canonicalPath(expectedRouting))) refuse()
+      }
+      return beginNativeEmptyInit(paths, {
+        lockOptions: hooks.lockOptions,
+        assertOwned: checkDestinations,
+        onWriteStep: async (step) =>
+          hooks.onStep?.(`${step}:journal:committed`),
+      })
+    },
+  )
 }
 
 /** Preflight is read-only so setup can validate all selected hosts before any begin. */
@@ -215,6 +313,8 @@ async function capture(input: NativeMigrationOptions): Promise<Captured> {
   ])
     if (!isAbsolute(path) || /\p{Cc}/u.test(path)) refuse()
   const journal = await readNativeMigrationJournal(input.paths)
+  if (journal?.kind === 'empty-init')
+    throw new NativeAuthorityError('journal-conflict')
   const auth = await readNativeMigrationSource('hostAuth', input.hostAuthPath)
   owned(auth)
   const entry = inspectNativeHostAuthEntry(input.host, auth.data)
@@ -539,10 +639,10 @@ async function checkPaths(
 
 async function retire(
   input: NativeMigrationOptions,
-  journal: NativeMigrationJournal,
+  journal: NativeLegacyMigrationJournal,
   assertOwned: () => Promise<void>,
   hooks: NativeMigrationHooks,
-): Promise<NativeMigrationJournal> {
+): Promise<NativeLegacyMigrationJournal> {
   const sources = [
     {
       role: 'config' as const,
@@ -624,7 +724,7 @@ async function repair(
 export async function runNativeMigration(
   input: NativeMigrationOptions,
   hooks: NativeMigrationHooks = {},
-): Promise<NativeMigrationJournal> {
+): Promise<NativeLegacyMigrationJournal> {
   const paths = { ...input.paths }
   const operation = { ...input, paths, env: { ...input.env } }
   try {
@@ -678,7 +778,9 @@ export async function runNativeMigration(
             value: NativeMigrationJournal,
           ) => {
             await step(
-              value.phase === 'verified' && value.preparedProof
+              value.kind !== 'empty-init' &&
+                value.phase === 'verified' &&
+                value.preparedProof
                 ? `${write}:proof`
                 : `${write}:journal:${value.phase}`,
             )

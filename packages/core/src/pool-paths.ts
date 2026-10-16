@@ -3,6 +3,7 @@ import { realpath } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 
 import { getAccountStatePath, getAccountStoragePath } from './accounts.ts'
+import { getStickyRoutingStatePath } from './sticky-routing.ts'
 
 export interface NativePoolPaths {
   legacyConfig: string
@@ -13,6 +14,20 @@ export interface NativePoolPaths {
   journal: string
   roster: string
   storageId: string
+}
+
+/** Local hosts share the native pool's routing file unless explicitly overridden. */
+export function resolveLocalRoutingDestination(
+  host: 'opencode' | 'pi',
+  paths: NativePoolPaths,
+  env: NodeJS.ProcessEnv,
+): string {
+  return (
+    (host === 'opencode'
+      ? env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE
+      : env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE) ||
+    getStickyRoutingStatePath(paths.config)
+  )
 }
 
 /**

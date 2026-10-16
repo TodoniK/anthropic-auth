@@ -116,6 +116,8 @@ export type {
 } from './native-menu-model.ts'
 export { getNativeMenuModel } from './native-menu-model.ts'
 export type {
+  NativeEmptyInitHooks,
+  NativeEmptyInitOptions,
   NativeMigrationCustody,
   NativeMigrationHooks,
   NativeMigrationOptions,
@@ -124,6 +126,7 @@ export type {
 export {
   NativeMigrationError,
   prepareNativeMigration,
+  publishNativeEmptyInit,
   releaseNativeMigrationPreflight,
   runNativeMigration,
 } from './native-migration.ts'
@@ -209,7 +212,11 @@ export {
 } from './native-vault-runtime.ts'
 export * from './oauth-profile.ts'
 export * from './pkce.ts'
-export type { NativeMigrationJournal } from './pool-authority.ts'
+export type {
+  NativeEmptyInitJournal,
+  NativeLegacyMigrationJournal,
+  NativeMigrationJournal,
+} from './pool-authority.ts'
 export {
   nativeMigrationAuthorityPhase,
   readNativeMigrationJournal,

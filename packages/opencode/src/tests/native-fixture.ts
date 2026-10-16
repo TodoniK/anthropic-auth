@@ -5,7 +5,7 @@ import {
   discoverNativeVaultInventory,
   getStickyRoutingStatePath,
   type NativeCustodyClient,
-  type NativeMigrationJournal,
+  type NativeLegacyMigrationJournal,
   type NativePoolPaths,
   publishNativeVaultRosterSeed,
   publishNativeVaultRuntimeSeed,
@@ -75,7 +75,7 @@ export interface NativeOpencodeFixture {
   /** Canonical pool paths, as resolveNativePoolPaths returns them. */
   paths: NativePoolPaths
   /** Journal returned by runNativeMigration; always phase 'retired'. */
-  journal: NativeMigrationJournal
+  journal: NativeLegacyMigrationJournal
   hostAuthPath: string
   routingSourcePath: string
   routingDestinationPath: string

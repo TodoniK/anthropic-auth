@@ -10,12 +10,24 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readVaultRoster } from '@cortexkit/common-auth/claustrum'
-import { lockPathFor, writeJsonAtomic } from '@cortexkit/common-auth/fs'
+import {
+  mutateVaultRoster,
+  readVaultRoster,
+} from '@cortexkit/common-auth/claustrum'
+import {
+  LockContentionError,
+  lockPathFor,
+  withLock,
+  writeJsonAtomic,
+} from '@cortexkit/common-auth/fs'
+import type { ProviderAccountUuid } from '../claude-code.ts'
+import { createNativeAccountRuntime } from '../native-account-runtime.ts'
 import type { NativeCustodyInventory } from '../native-custody.ts'
 import {
+  NativeMigrationError,
   type NativeMigrationOptions,
   prepareNativeMigration,
+  publishNativeEmptyInit,
   runNativeMigration,
 } from '../native-migration.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
@@ -25,14 +37,18 @@ import {
 } from '../native-roster-seed.ts'
 import { readNativeRuntime, updateNativeRuntime } from '../native-runtime.ts'
 import {
+  NativeAuthorityError,
   readNativeMigrationJournal,
   requireNativePoolAuthority,
 } from '../pool-authority.ts'
-import { resolveNativePoolPaths } from '../pool-paths.ts'
+import {
+  resolveLocalRoutingDestination,
+  resolveNativePoolPaths,
+} from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
-const { test, deferCleanup } = createTestLifetimeSuite()
+const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
 const oauth = {
   type: 'oauth' as const,
   access: 'synthetic-access-main',
@@ -137,6 +153,449 @@ async function expireChildLocks(root: string) {
     await writeFile(path, JSON.stringify({ ...value, expiresAt: 0 }))
   }
 }
+
+async function emptyFixture() {
+  const f = await fixture()
+  f.input.routingDestinationPath = resolveLocalRoutingDestination(
+    'opencode',
+    f.paths,
+    {},
+  )
+  return f
+}
+
+async function fileBytes(f: Awaited<ReturnType<typeof fixture>>) {
+  return Promise.all(
+    [
+      f.paths.config,
+      f.paths.state,
+      f.paths.runtime,
+      f.paths.roster,
+      f.paths.journal,
+      f.paths.legacyConfig,
+      f.paths.legacyState,
+      f.input.hostAuthPath,
+      f.input.routingSourcePath,
+      f.input.routingDestinationPath,
+    ].map(async (path) => {
+      try {
+        return await readFile(path, 'utf8')
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          'code' in error &&
+          error.code === 'ENOENT'
+        )
+          return null
+        throw error
+      }
+    }),
+  )
+}
+
+async function expectRefusal(
+  work: Promise<unknown>,
+  type: typeof NativeMigrationError | typeof NativeAuthorityError,
+  code: string,
+) {
+  const error = await work.catch((error) => error)
+  expect(error).toBeInstanceOf(type)
+  expect(
+    error instanceof Error && 'code' in error ? error.code : undefined,
+  ).toBe(code)
+}
+
+test('empty-init publishes only authority and repeats byte-identically after native writes', async () => {
+  const f = await emptyFixture()
+  const before = await fileBytes(f)
+  const journal = await publishNativeEmptyInit(f.input)
+  expect(journal).toEqual({
+    version: 5,
+    kind: 'empty-init',
+    storageId: f.paths.storageId,
+    host: 'opencode',
+    phase: 'committed',
+  })
+  const published = await fileBytes(f)
+  expect(published.map((value, index) => (index === 4 ? null : value))).toEqual(
+    before,
+  )
+  expect((await stat(f.paths.journal)).mode & 0o777).toBe(0o600)
+  const runtime = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    vault: { env: {} },
+    local: {
+      resolveIdentity: async () => ({
+        deviceId: 'synthetic-device',
+        sessionId: 'synthetic-session',
+        accountUuid:
+          '00000000-0000-4000-8000-000000000001' as ProviderAccountUuid,
+      }),
+    },
+  })
+  deferCleanup(() => runtime.close())
+  expect((await runtime.read()).mode).toBe('local')
+  await runtime.loginOAuth({
+    routeId: 'main',
+    credential: {
+      ...oauth,
+      access: 'sk-ant-oat01-synthetic-empty-init',
+      expires: Date.now() + 3_600_000,
+    },
+  })
+  await writeFile(f.input.routingDestinationPath, 'native pins', {
+    mode: 0o600,
+  })
+  const populated = await fileBytes(f)
+  let writes = 0
+  expect(
+    await publishNativeEmptyInit(f.input, {
+      onStep: async () => {
+        writes++
+      },
+    }),
+  ).toEqual(journal)
+  expect(writes).toBe(0)
+  expect(await fileBytes(f)).toEqual(populated)
+})
+
+test('empty-init waits on each existing journal lease and times out without writes', async () => {
+  for (const name of ['native-migration', 'migration-journal']) {
+    const f = await emptyFixture()
+    const before = await fileBytes(f)
+    const ready = gate()
+    const release = gate()
+    const holder = withLock(
+      f.paths.journal,
+      { name, ttlMs: 30_000, timeoutMs: 100, renew: true },
+      async () => {
+        ready.open()
+        await release.wait
+      },
+    )
+    trackDetached(holder)
+    try {
+      await ready.wait
+      const error = await publishNativeEmptyInit(f.input, {
+        lockOptions: { ttlMs: 30_000, timeoutMs: 30 },
+      }).catch((error) => error)
+      expect(error).toBeInstanceOf(LockContentionError)
+      expect(error.details).toEqual({
+        target: f.paths.journal,
+        name,
+        timeoutMs: 30,
+      })
+      expect(await fileBytes(f)).toEqual(before)
+    } finally {
+      release.open()
+      await Promise.allSettled([holder])
+    }
+  }
+})
+
+test('empty-init takes no pool locks and never enters the roster mutation', async () => {
+  const f = await emptyFixture()
+  const release = gate()
+  const locks = [
+    [f.paths.config, 'pool-config'],
+    [f.paths.state, 'pool-state'],
+    [f.paths.runtime, 'native-runtime'],
+  ] as const
+  const ready = locks.map(() => gate())
+  const holders = locks.map(([path, name], index) =>
+    withLock(
+      path,
+      { name, ttlMs: 30_000, timeoutMs: 100, renew: true },
+      async () => {
+        ready[index]!.open()
+        await release.wait
+      },
+    ),
+  )
+  const rosterReady = gate()
+  holders.push(
+    mutateVaultRoster(f.paths.roster, async () => {
+      rosterReady.open()
+      await release.wait
+      return { result: undefined }
+    }),
+  )
+  for (const holder of holders) trackDetached(holder)
+  try {
+    await Promise.all(ready.map((item) => item.wait))
+    await rosterReady.wait
+    await publishNativeEmptyInit(f.input, {
+      lockOptions: { ttlMs: 30_000, timeoutMs: 30 },
+    })
+    expect(await readNativeMigrationJournal(f.paths)).toMatchObject({
+      kind: 'empty-init',
+    })
+    await expect(stat(f.paths.roster)).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally {
+    release.open()
+    await Promise.allSettled(holders)
+  }
+})
+
+test('empty-init lost lease before rename leaves no journal, native file or POSIX temp', async () => {
+  const f = await emptyFixture()
+  const before = await fileBytes(f)
+  await expectRefusal(
+    publishNativeEmptyInit(f.input, {
+      onStep: async (step) => {
+        if (step !== 'before-write:journal:committed') return
+        const path = lockPathFor(f.paths.journal, 'native-migration')
+        const lease = JSON.parse(await readFile(path, 'utf8'))
+        await writeFile(
+          path,
+          JSON.stringify({ ...lease, ownerId: 'other-owner' }),
+        )
+      },
+    }),
+    NativeMigrationError,
+    'ownership-lost',
+  )
+  expect(await fileBytes(f)).toEqual(before)
+  if (process.platform !== 'win32')
+    expect(
+      (await readdir(f.root)).filter((name) => name.endsWith('.tmp')),
+    ).toEqual([])
+})
+
+test('empty-init enrollment fence precedes reads and repeats before rename', async () => {
+  const f = await emptyFixture()
+  const before = await fileBytes(f)
+  const vault = new Error('Disconnect from the vault first.')
+  await expect(
+    publishNativeEmptyInit({
+      ...f.input,
+      processFence: async () => {
+        throw vault
+      },
+    }),
+  ).rejects.toBe(vault)
+  expect(await fileBytes(f)).toEqual(before)
+  let enrolled = false
+  await expect(
+    publishNativeEmptyInit(
+      {
+        ...f.input,
+        processFence: async () => {
+          if (enrolled) throw vault
+        },
+      },
+      {
+        onStep: async (step) => {
+          if (step === 'before-write:journal:committed') {
+            enrolled = true
+            const path = lockPathFor(f.paths.journal, 'native-migration')
+            const lease = JSON.parse(await readFile(path, 'utf8'))
+            await writeFile(
+              path,
+              JSON.stringify({ ...lease, ownerId: 'other-owner' }),
+            )
+          }
+        },
+      },
+    ),
+  ).rejects.toBe(vault)
+  expect(await fileBytes(f)).toEqual(before)
+  await writeFile(f.paths.journal, '{bad', { mode: 0o600 })
+  await expect(
+    publishNativeEmptyInit({
+      ...f.input,
+      processFence: async () => {
+        throw vault
+      },
+    }),
+  ).rejects.toBe(vault)
+  expect(await readFile(f.paths.journal, 'utf8')).toBe('{bad')
+})
+
+test('empty-init refuses existing destinations including a file created before rename', async () => {
+  for (const key of [
+    'config',
+    'state',
+    'runtime',
+    'roster',
+    'routing',
+  ] as const) {
+    for (const late of [false, true]) {
+      const f = await emptyFixture()
+      const path =
+        key === 'routing' ? f.input.routingDestinationPath : f.paths[key]
+      if (!late)
+        await writeFile(path, 'pre-existing native bytes', { mode: 0o600 })
+      const before = await fileBytes(f)
+      await expectRefusal(
+        publishNativeEmptyInit(f.input, {
+          onStep: async (step) => {
+            if (late && step === 'before-write:journal:committed')
+              await writeFile(path, 'external native bytes', { mode: 0o600 })
+          },
+        }),
+        NativeMigrationError,
+        'invalid-source',
+      )
+      expect(await readFile(path, 'utf8')).toBe(
+        late ? 'external native bytes' : 'pre-existing native bytes',
+      )
+      const expected = [...before]
+      if (late)
+        expected[
+          key === 'routing'
+            ? 9
+            : ['config', 'state', 'runtime', 'roster'].indexOf(key)
+        ] = 'external native bytes'
+      expect(await fileBytes(f)).toEqual(expected)
+      expect(await readNativeMigrationJournal(f.paths)).toBeUndefined()
+    }
+  }
+})
+
+test('empty-init refuses unsafe destination stats and canonical aliases without writes', async () => {
+  const f = await emptyFixture()
+  const before = await fileBytes(f)
+  const blocker = join(f.root, 'not-a-directory')
+  await writeFile(blocker, 'blocker')
+  await expectRefusal(
+    publishNativeEmptyInit({
+      ...f.input,
+      paths: { ...f.paths, config: join(blocker, 'child') },
+    }),
+    NativeMigrationError,
+    'unsafe-source',
+  )
+  await expectRefusal(
+    publishNativeEmptyInit({
+      ...f.input,
+      routingDestinationPath: f.paths.legacyConfig,
+      env: { OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE: f.paths.legacyConfig },
+    }),
+    NativeMigrationError,
+    'invalid-source',
+  )
+  expect(await fileBytes(f)).toEqual(before)
+})
+
+test('empty-init preserves overridden and legacy-derived routing files', async () => {
+  for (const override of [false, true]) {
+    const f = await emptyFixture()
+    const legacy = resolveLocalRoutingDestination(
+      'opencode',
+      { ...f.paths, config: f.paths.legacyConfig },
+      {},
+    )
+    const shared = join(f.root, 'shared-routing.json')
+    await writeFile(legacy, 'legacy pins', { mode: 0o600 })
+    if (override) {
+      f.input.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE = shared
+      f.input.routingDestinationPath = shared
+      await writeFile(shared, 'shared pins', { mode: 0o600 })
+    }
+    await publishNativeEmptyInit(f.input)
+    expect(await readFile(legacy, 'utf8')).toBe('legacy pins')
+    if (override) expect(await readFile(shared, 'utf8')).toBe('shared pins')
+    const runtime = createNativeAccountRuntime({
+      paths: f.paths,
+      host: 'opencode',
+      vault: { env: f.input.env },
+    })
+    deferCleanup(() => runtime.close())
+    expect((await runtime.read()).routingPath).toBe(
+      f.input.routingDestinationPath,
+    )
+  }
+})
+
+test('empty-init publication conflicts on every differing journal key and on legacy journals', async () => {
+  const f = await emptyFixture()
+  const journal = await publishNativeEmptyInit(f.input)
+  for (const value of [
+    { ...journal, version: 4 },
+    { ...journal, kind: 'legacy-import' },
+    { ...journal, host: 'pi' },
+    { ...journal, storageId: '0'.repeat(64) },
+    { ...journal, phase: 'retired' },
+    { ...journal, extra: true },
+  ]) {
+    const bytes = JSON.stringify(value)
+    await writeFile(f.paths.journal, bytes)
+    const before = await fileBytes(f)
+    await expectRefusal(
+      publishNativeEmptyInit(f.input),
+      NativeAuthorityError,
+      'journal-conflict',
+    )
+    expect(await fileBytes(f)).toEqual(before)
+  }
+  const g = await fixture()
+  await runNativeMigration(g.input)
+  const before = await fileBytes(g)
+  await expectRefusal(
+    publishNativeEmptyInit(g.input),
+    NativeAuthorityError,
+    'journal-conflict',
+  )
+  expect(await fileBytes(g)).toEqual(before)
+})
+
+test('empty-init interruption before rename publishes on one new run; after rename retry is a no-op', async () => {
+  for (const step of [
+    'before-write:journal:committed',
+    'after-write:journal:committed',
+  ]) {
+    const f = await emptyFixture()
+    const before = await fileBytes(f)
+    await expect(
+      publishNativeEmptyInit(f.input, {
+        onStep: async (current) => {
+          if (current === step) throw new Error('synthetic interruption')
+        },
+      }),
+    ).rejects.toThrow('synthetic interruption')
+    const crashed = await fileBytes(f)
+    if (step.startsWith('before')) expect(crashed).toEqual(before)
+    else
+      expect(await readNativeMigrationJournal(f.paths)).toMatchObject({
+        kind: 'empty-init',
+        phase: 'committed',
+      })
+    await publishNativeEmptyInit(f.input)
+    const published = await fileBytes(f)
+    if (step.startsWith('after')) expect(published).toEqual(crashed)
+    await publishNativeEmptyInit(f.input, {
+      onStep: async () => {
+        throw new Error('must not write')
+      },
+    })
+    expect(await fileBytes(f)).toEqual(published)
+  }
+})
+
+test('offline migration refuses empty-init before source reads or retirement and preserves committed bytes', async () => {
+  const f = await emptyFixture()
+  await publishNativeEmptyInit(f.input)
+  await writeFile(f.input.hostAuthPath, '{invalid host auth')
+  const before = await fileBytes(f)
+  let writes = 0
+  await expectRefusal(
+    runNativeMigration(f.input, {
+      onStep: async () => {
+        writes++
+      },
+    }),
+    NativeAuthorityError,
+    'journal-conflict',
+  )
+  expect(writes).toBe(0)
+  expect(await fileBytes(f)).toEqual(before)
+  expect(await readNativeMigrationJournal(f.paths)).toMatchObject({
+    kind: 'empty-init',
+    phase: 'committed',
+  })
+})
 
 test('offline transaction imports actual source, commits and retires in the same invocation', async () => {
   const { input, paths, store } = await fixture('opencode', oauth, true)
@@ -417,7 +876,10 @@ test('fresh all-absent install reaches retired without fabricating a credential'
   )
   expect((await runNativeMigration(input)).phase).toBe('retired')
   expect(await store.read()).toMatchObject({ status: 'ready', rows: [] })
-  expect((await readNativeMigrationJournal(paths))?.sources).toEqual({
+  const journal = await readNativeMigrationJournal(paths)
+  if (journal?.kind === 'empty-init')
+    throw new Error('expected legacy migration')
+  expect(journal?.sources).toEqual({
     config: null,
     state: null,
     routing: null,

@@ -5,11 +5,14 @@ import { join } from 'node:path'
 import {
   createNativeAccountRuntime,
   getClaudeCodeIdentityForVerifiedAccount,
+  getStickyRoutingStatePath,
+  resolveLocalRoutingDestination,
   resolveNativePoolPaths,
   runNativeMigration,
 } from '@cortexkit/anthropic-auth-core'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
-import { closePiNativeRuntime } from '../native.ts'
+import { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
+import { closePiNativeRuntime, PiNativeRuntime } from '../native.ts'
 import { streamCortexKitAnthropic } from '../stream.ts'
 import {
   fixtureAccountIdentity,
@@ -68,6 +71,79 @@ afterEach(async () => {
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   await rm(directory, { recursive: true, force: true })
 })
+
+test('Pi empty-init routing uses the construction-time override or native derived path; missing authority refuses', () =>
+  trackPiTestBody(
+    (async () => {
+      const lifetime = new TestLifetime()
+      try {
+        await lifetime.runBody(async () => {
+          const root = await mkdtemp(join(tmpdir(), 'pi-empty-init-routing-'))
+          const original = process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE
+          const originalState = process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE
+          const runtimes: PiNativeRuntime[] = []
+          lifetime.deferCleanup(async () => {
+            await Promise.allSettled(runtimes.map((runtime) => runtime.close()))
+            if (original === undefined)
+              delete process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE
+            else process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE = original
+            if (originalState === undefined)
+              delete process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE
+            else process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = originalState
+            await rm(root, { recursive: true, force: true })
+          })
+          for (const override of [
+            undefined,
+            join(root, 'override-routing.json'),
+          ]) {
+            if (override === undefined)
+              delete process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE
+            else process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE = override
+            process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = join(
+              root,
+              override ? 'override-state.json' : 'derived-state.json',
+            )
+            const env = { ...process.env }
+            const paths = await resolveNativePoolPaths(
+              join(root, override ? 'override.json' : 'derived.json'),
+            )
+            await writeFile(
+              paths.journal,
+              JSON.stringify({
+                version: 5,
+                kind: 'empty-init',
+                storageId: paths.storageId,
+                host: 'opencode',
+                phase: 'committed',
+              }),
+              { mode: 0o600 },
+            )
+            const runtime = new PiNativeRuntime(paths.legacyConfig, {
+              vaultPoll: { intervalMs: 0 },
+            })
+            runtimes.push(runtime)
+            process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE = join(
+              root,
+              'changed-after-construction.json',
+            )
+            expect(await runtime.routingStorage()).toEqual({
+              path: override ?? getStickyRoutingStatePath(paths.config),
+            })
+            expect(await runtime.routingPath()).toBe(
+              resolveLocalRoutingDestination('pi', paths, env),
+            )
+            await rm(paths.journal)
+            await expect(runtime.routingStorage()).rejects.toMatchObject({
+              name: 'NativeAuthorityError',
+              code: 'migration-required',
+            })
+          }
+        })
+      } finally {
+        await lifetime.finish()
+      }
+    })(),
+  ))
 
 test('native Pi serving ignores host and legacy OAuth material after committed migration', () =>
   trackPiTestBody(

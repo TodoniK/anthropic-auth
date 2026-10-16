@@ -43,6 +43,7 @@ export interface NativeMigrationInput {
    * keeps native serving blocked until the separate vault activation commits.
    */
   activation?: 'requested'
+  nativeSettingsDigest?: string
 }
 
 export interface NativeMigrationExpectations {
@@ -111,8 +112,7 @@ export type NativeCustodyActivation =
   | { kind: 'requested' }
   | NativeCustodyActivationPlan
 
-export interface NativeMigrationJournal {
-  version: 4
+interface NativeMigrationRecord {
   storageId: string
   host: 'opencode' | 'pi'
   phase: NativeMigrationPhase
@@ -128,6 +128,24 @@ export interface NativeMigrationJournal {
    */
   activation: NativeCustodyActivation | null
 }
+
+export type NativeLegacyMigrationJournal = NativeMigrationRecord &
+  (
+    | { version: 4; kind?: never }
+    | { version: 5; kind: 'legacy-import'; nativeSettingsDigest: string }
+  )
+
+export interface NativeEmptyInitJournal {
+  version: 5
+  kind: 'empty-init'
+  storageId: string
+  host: 'opencode'
+  phase: 'committed'
+}
+
+export type NativeMigrationJournal =
+  | NativeLegacyMigrationJournal
+  | NativeEmptyInitJournal
 
 export class NativeAuthorityError extends Error {
   constructor(
@@ -401,23 +419,56 @@ function decodeJournal(
   storageId: string,
 ): NativeMigrationJournal {
   const value = captureJournalJson(input)
+  if (!isRecord(value) || value.storageId !== storageId)
+    throw new NativeAuthorityError('invalid-journal')
+  if (value.version === 5 && value.kind === 'empty-init') {
+    if (
+      !hasKeys(value, ['version', 'kind', 'storageId', 'host', 'phase']) ||
+      value.host !== 'opencode' ||
+      value.phase !== 'committed'
+    )
+      throw new NativeAuthorityError('invalid-journal')
+    return {
+      version: 5,
+      kind: 'empty-init',
+      storageId,
+      host: value.host,
+      phase: value.phase,
+    }
+  }
+  const legacyKeys = [
+    'version',
+    'storageId',
+    'host',
+    'phase',
+    'sources',
+    'routingPaths',
+    'hostAuthPath',
+    'expectedHostAuth',
+    'expectedRouting',
+    'preparedProof',
+    'activation',
+  ]
+  const format =
+    value.version === 4
+      ? { version: 4 as const }
+      : value.version === 5 &&
+          value.kind === 'legacy-import' &&
+          isDigest(value.nativeSettingsDigest)
+        ? {
+            version: 5 as const,
+            kind: 'legacy-import' as const,
+            nativeSettingsDigest: value.nativeSettingsDigest,
+          }
+        : undefined
   if (
-    !isRecord(value) ||
-    !hasKeys(value, [
-      'version',
-      'storageId',
-      'host',
-      'phase',
-      'sources',
-      'routingPaths',
-      'hostAuthPath',
-      'expectedHostAuth',
-      'expectedRouting',
-      'preparedProof',
-      'activation',
-    ]) ||
-    value.version !== 4 ||
-    value.storageId !== storageId ||
+    !format ||
+    !hasKeys(
+      value,
+      value.version === 4
+        ? legacyKeys
+        : [...legacyKeys, 'kind', 'nativeSettingsDigest'],
+    ) ||
     (value.host !== 'opencode' && value.host !== 'pi') ||
     !isPhase(value.phase) ||
     !isSources(value.sources) ||
@@ -446,7 +497,7 @@ function decodeJournal(
     throw new NativeAuthorityError('invalid-journal')
   }
   return {
-    version: 4,
+    ...format,
     storageId,
     host: value.host,
     phase: value.phase,
@@ -495,6 +546,7 @@ export function nativeMigrationAuthorityPhase(
   journal: NativeMigrationJournal | undefined,
 ): 'committed' | 'retired' | undefined {
   if (!journal) return undefined
+  if (journal.kind === 'empty-init') return 'committed'
   if (journal.phase !== 'committed' && journal.phase !== 'retired')
     return undefined
   if (
@@ -543,14 +595,16 @@ async function writeJournal(
   // Hooks observe a detached immutable value, not the object the controller will
   // use for its next phase. A hook cannot alter the proof being published.
   const snapshot = decodeJournal(journal, paths.storageId)
-  if (snapshot.preparedProof) {
-    for (const row of snapshot.preparedProof.rows) Object.freeze(row)
-    Object.freeze(snapshot.preparedProof.rows)
-    Object.freeze(snapshot.preparedProof)
+  if (snapshot.kind !== 'empty-init') {
+    if (snapshot.preparedProof) {
+      for (const row of snapshot.preparedProof.rows) Object.freeze(row)
+      Object.freeze(snapshot.preparedProof.rows)
+      Object.freeze(snapshot.preparedProof)
+    }
+    Object.freeze(snapshot.sources)
+    Object.freeze(snapshot.routingPaths)
+    deepFreeze(snapshot.activation)
   }
-  Object.freeze(snapshot.sources)
-  Object.freeze(snapshot.routingPaths)
-  deepFreeze(snapshot.activation)
   Object.freeze(snapshot)
   await writeJsonAtomic(paths.journal, snapshot, {
     beforeRename: async () => {
@@ -567,7 +621,7 @@ export async function beginNativeMigration(
   paths: NativePoolPaths,
   input: NativeMigrationInput,
   hooks: JournalHooks = {},
-): Promise<NativeMigrationJournal> {
+): Promise<NativeLegacyMigrationJournal> {
   try {
     requireNativeMigrationDataObject(input)
   } catch {
@@ -575,7 +629,13 @@ export async function beginNativeMigration(
   }
   const initial = decodeJournal(
     {
-      version: 4,
+      ...(input.nativeSettingsDigest === undefined
+        ? { version: 4 }
+        : {
+            version: 5,
+            kind: 'legacy-import',
+            nativeSettingsDigest: input.nativeSettingsDigest,
+          }),
       storageId: paths.storageId,
       host: input.host,
       phase: 'building',
@@ -594,6 +654,8 @@ export async function beginNativeMigration(
     },
     paths.storageId,
   )
+  if (initial.kind === 'empty-init')
+    throw new NativeAuthorityError('invalid-journal')
   return withLock(
     paths.journal,
     {
@@ -607,6 +669,11 @@ export async function beginNativeMigration(
       const current = await readNativeMigrationJournal(paths)
       if (current) {
         if (
+          current.kind === 'empty-init' ||
+          current.version !== initial.version ||
+          (current.version === 5 &&
+            initial.version === 5 &&
+            current.nativeSettingsDigest !== initial.nativeSettingsDigest) ||
           current.host !== initial.host ||
           current.sources.config !== initial.sources.config ||
           current.sources.state !== initial.sources.state ||
@@ -633,7 +700,7 @@ export async function recordNativeMigrationExpectations(
   paths: NativePoolPaths,
   expectations: NativeMigrationExpectations,
   hooks: JournalHooks = {},
-): Promise<NativeMigrationJournal> {
+): Promise<NativeLegacyMigrationJournal> {
   const captured = captureJournalJson(expectations)
   if (
     !isRecord(captured) ||
@@ -664,6 +731,7 @@ export async function recordNativeMigrationExpectations(
       const current = await readNativeMigrationJournal(paths)
       if (!current) throw new NativeAuthorityError('migration-required')
       if (
+        current.kind === 'empty-init' ||
         current.phase !== 'verified' ||
         (current.sources.routing === null) !== (expectedRouting === null)
       ) {
@@ -703,7 +771,7 @@ export async function advanceNativeMigration(
   expected: NativeMigrationPhase,
   next: NativeMigrationPhase,
   hooks: JournalHooks = {},
-): Promise<NativeMigrationJournal> {
+): Promise<NativeLegacyMigrationJournal> {
   if (
     !isPhase(expected) ||
     !isPhase(next) ||
@@ -722,6 +790,8 @@ export async function advanceNativeMigration(
     async (lock) => {
       const current = await readNativeMigrationJournal(paths)
       if (!current) throw new NativeAuthorityError('migration-required')
+      if (current.kind === 'empty-init')
+        throw new NativeAuthorityError('journal-conflict')
       if (current.phase === next) return current
       if (current.phase !== expected)
         throw new NativeAuthorityError('journal-conflict')
@@ -757,7 +827,7 @@ export async function recordNativeCustodyActivation(
   paths: NativePoolPaths,
   plan: NativeCustodyActivationPlan,
   hooks: JournalHooks = {},
-): Promise<NativeMigrationJournal> {
+): Promise<NativeLegacyMigrationJournal> {
   const captured = captureJournalJson(plan)
   if (!isRecord(captured) || captured.phase !== 'prepared')
     throw new NativeAuthorityError('journal-conflict')
@@ -767,7 +837,7 @@ export async function recordNativeCustodyActivation(
   return withLock(paths.journal, journalLock(hooks), async (lock) => {
     const current = await readNativeMigrationJournal(paths)
     if (!current) throw new NativeAuthorityError('migration-required')
-    if (current.phase !== 'retired')
+    if (current.kind === 'empty-init' || current.phase !== 'retired')
       throw new NativeAuthorityError('journal-conflict')
     if (current.activation?.kind === 'activation') {
       if (
@@ -789,7 +859,7 @@ export async function advanceNativeCustodyActivation(
   expected: NativeCustodyActivationPhase,
   next: NativeCustodyActivationPhase,
   hooks: JournalHooks = {},
-): Promise<NativeMigrationJournal> {
+): Promise<NativeLegacyMigrationJournal> {
   if (
     ACTIVATION_PHASES.indexOf(next) !==
       ACTIVATION_PHASES.indexOf(expected) + 1 ||
@@ -799,6 +869,8 @@ export async function advanceNativeCustodyActivation(
   return withLock(paths.journal, journalLock(hooks), async (lock) => {
     const current = await readNativeMigrationJournal(paths)
     if (!current) throw new NativeAuthorityError('migration-required')
+    if (current.kind === 'empty-init')
+      throw new NativeAuthorityError('journal-conflict')
     const activation = current.activation
     if (activation?.kind !== 'activation')
       throw new NativeAuthorityError('journal-conflict')
@@ -808,5 +880,39 @@ export async function advanceNativeCustodyActivation(
     const updated = { ...current, activation: { ...activation, phase: next } }
     await writeJournal(paths, updated, () => lock.assertOwned(), hooks)
     return updated
+  })
+}
+
+/** Publish local authority without inventing migration inputs or creating a pool. */
+export async function beginNativeEmptyInit(
+  paths: NativePoolPaths,
+  hooks: JournalHooks = {},
+): Promise<NativeEmptyInitJournal> {
+  return withLock(paths.journal, journalLock(hooks), async (lock) => {
+    let current: NativeMigrationJournal | undefined
+    try {
+      current = await readNativeMigrationJournal(paths)
+    } catch (error) {
+      if (
+        error instanceof NativeAuthorityError &&
+        error.code === 'invalid-journal'
+      )
+        throw new NativeAuthorityError('journal-conflict')
+      throw error
+    }
+    if (current) {
+      if (current.kind === 'empty-init') return current
+      throw new NativeAuthorityError('journal-conflict')
+    }
+    const initial: NativeEmptyInitJournal = {
+      version: 5,
+      kind: 'empty-init',
+      storageId: paths.storageId,
+      host: 'opencode',
+      phase: 'committed',
+    }
+    await hooks.assertOwned?.()
+    await writeJournal(paths, initial, () => lock.assertOwned(), hooks)
+    return initial
   })
 }

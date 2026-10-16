@@ -20,6 +20,7 @@ import { lockPathFor, withLock } from '@cortexkit/common-auth/fs'
 import { custodyTombstoneOAuth } from '../claustrum.ts'
 import type { NativeCustodyInventory } from '../native-custody.ts'
 import {
+  NativeCustodyActivationError,
   type NativeCustodyActivationHooks,
   type NativeCustodyActivationOptions,
   runNativeCustodyActivation,
@@ -44,6 +45,46 @@ import { createNativePoolStore } from '../pool-store.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup } = createTestLifetimeSuite()
+
+test('custody activation refuses empty-init as invalid-journal without changing files', async () => {
+  const f = await fixture()
+  await writeFile(
+    f.paths.journal,
+    JSON.stringify({
+      version: 5,
+      kind: 'empty-init',
+      storageId: f.paths.storageId,
+      host: 'opencode',
+      phase: 'committed',
+    }),
+    { mode: 0o600 },
+  )
+  const paths = [
+    f.paths.journal,
+    f.paths.config,
+    f.paths.state,
+    f.paths.runtime,
+    f.paths.roster,
+    f.migration.hostAuthPath,
+    f.migration.routingDestinationPath,
+  ]
+  const capture = () =>
+    Promise.all(
+      paths.map((path) =>
+        readFile(path, 'utf8').catch((error) => {
+          if (error.code === 'ENOENT') return null
+          throw error
+        }),
+      ),
+    )
+  const before = await capture()
+  const error = await runNativeCustodyActivation(f.options).catch(
+    (error) => error,
+  )
+  expect(error).toBeInstanceOf(NativeCustodyActivationError)
+  expect(error.code).toBe('invalid-journal')
+  expect(await capture()).toEqual(before)
+})
 
 const MAIN_IDENTITY = 'account-main-uuid'
 const WORK_IDENTITY = 'account-work-uuid'
@@ -272,7 +313,9 @@ async function expectPending(paths: NativePoolPaths): Promise<void> {
 async function expectVault(f: Fixture): Promise<void> {
   await requireNativePoolAuthority(f.paths)
   const journal = await readNativeMigrationJournal(f.paths)
-  expect(journal?.activation).toMatchObject({ phase: 'committed' })
+  expect(journal?.kind !== 'empty-init' && journal?.activation).toMatchObject({
+    phase: 'committed',
+  })
   expect(nativeMigrationAuthorityPhase(journal)).toBe('retired')
   const rows = await f.store.read()
   expect(rows).toMatchObject({ status: 'ready' })
@@ -721,7 +764,8 @@ test('environment, process and consent fences refuse before any write', async ()
       }),
     ).rejects.toMatchObject({ code: 'process-fence-refused' })
     const journal = await readNativeMigrationJournal(h.paths)
-    if (journal?.activation) await expectPending(h.paths)
+    if (journal?.kind !== 'empty-init' && journal?.activation)
+      await expectPending(h.paths)
     expect((await runNativeCustodyActivation(h.options)).status).toBe(
       'committed',
     )
@@ -757,7 +801,8 @@ test('an interruption at every boundary leaves serving refused and resumes to th
     const journal = await readNativeMigrationJournal(f.paths)
     // Until the journal records the activation plan, local authority and
     // credential files remain unchanged.
-    if (journal?.activation === null) await requireNativePoolAuthority(f.paths)
+    if (journal?.kind !== 'empty-init' && journal?.activation === null)
+      await requireNativePoolAuthority(f.paths)
     else await expectPending(f.paths)
     expect((await runNativeCustodyActivation(f.options)).status, point).toBe(
       'committed',
@@ -1137,7 +1182,9 @@ test('loss or drift between the mode rename and the authority rename leaves the 
       () => take(f),
     )
     expect(
-      (await readNativeMigrationJournal(f.paths))?.activation,
+      await readNativeMigrationJournal(f.paths).then((journal) =>
+        journal?.kind !== 'empty-init' ? journal?.activation : undefined,
+      ),
       name,
     ).toMatchObject({ phase: 'published' })
     expect(outcome, name).toMatchObject({ code: 'ownership-lost' })

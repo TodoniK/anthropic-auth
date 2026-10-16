@@ -24,6 +24,7 @@ import {
   readNativeAccountsForRequest,
   readNativeMigrationJournal,
   resolveClaustrumConnectionPath,
+  resolveLocalRoutingDestination,
   resolveNativePoolPaths,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -138,6 +139,7 @@ export interface PiVaultPollOptions {
 export class PiNativeRuntime {
   private readonly paths: Promise<NativePoolPaths>
   private readonly initialization: Promise<NativeAccountRuntime>
+  private readonly env: NodeJS.ProcessEnv
   private vaultWatch: NativeVaultWatch | undefined
   private closed = false
   private closing: Promise<void> | undefined
@@ -151,6 +153,7 @@ export class PiNativeRuntime {
     } = {},
   ) {
     const env = { ...process.env }
+    this.env = env
     const poll = options.vaultPoll ?? { intervalMs: PI_VAULT_POLL_INTERVAL_MS }
     const identity = getPiClaustrumConnectionOptions(storagePath).identity
     this.paths = resolveNativePoolPaths(storagePath)
@@ -211,12 +214,13 @@ export class PiNativeRuntime {
     }
     // Keep local session-to-account assignments at the exact file destination
     // recorded by migration; guessing a new path would lose those assignments.
-    const journal = await readNativeMigrationJournal(await this.paths)
-    if (
-      !journal ||
-      !nativeMigrationAuthorityPhase(journal) ||
-      !journal.routingPaths.destination
-    )
+    const paths = await this.paths
+    const journal = await readNativeMigrationJournal(paths)
+    if (!journal || !nativeMigrationAuthorityPhase(journal))
+      throw new Error('Pi native routing requires committed offline migration')
+    if (journal.kind === 'empty-init')
+      return { path: resolveLocalRoutingDestination('pi', paths, this.env) }
+    if (!journal.routingPaths.destination)
       throw new Error('Pi native routing requires committed offline migration')
     return { path: journal.routingPaths.destination }
   }

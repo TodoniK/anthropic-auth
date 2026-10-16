@@ -16,7 +16,9 @@ import { inspectNativeHostAuthEntry } from '../native-host-auth.ts'
 import {
   advanceNativeCustodyActivation,
   advanceNativeMigration,
+  beginNativeEmptyInit,
   beginNativeMigration,
+  NativeAuthorityError,
   type NativeCustodyActivationPlan,
   type NativeMigrationInput,
   type NativeMigrationPhase,
@@ -69,6 +71,146 @@ async function fixture() {
     join(root, 'anthropic-auth-state.json'),
   )
 }
+
+async function readLegacyJournal(paths: NativePoolPaths) {
+  const journal = await readNativeMigrationJournal(paths)
+  if (journal?.kind === 'empty-init')
+    throw new Error('expected legacy migration')
+  return journal
+}
+
+test('v4 and v5 legacy imports retain exactly their wire keys through every phase', async () => {
+  const keys = [
+    'version',
+    'storageId',
+    'host',
+    'phase',
+    'sources',
+    'routingPaths',
+    'hostAuthPath',
+    'expectedHostAuth',
+    'expectedRouting',
+    'preparedProof',
+    'activation',
+  ]
+  for (const version of [4, 5]) {
+    const paths = await fixture()
+    const input = {
+      ...captureInput(paths),
+      ...(version === 5 ? { nativeSettingsDigest: '9'.repeat(64) } : {}),
+    }
+    await beginNativeMigration(paths, input)
+    const assertWire = async (phase: string) => {
+      const raw = JSON.parse(await readFile(paths.journal, 'utf8'))
+      const decoded = await readNativeMigrationJournal(paths)
+      expect(decoded).toEqual(raw)
+      expect(raw.phase).toBe(phase)
+      expect(raw.version).toBe(version)
+      expect(Object.keys(raw).sort()).toEqual(
+        (version === 4
+          ? keys
+          : [...keys, 'kind', 'nativeSettingsDigest']
+        ).toSorted(),
+      )
+      if (version === 5)
+        expect(raw).toMatchObject({
+          kind: 'legacy-import',
+          nativeSettingsDigest: input.nativeSettingsDigest,
+        })
+      else expect('kind' in raw).toBe(false)
+    }
+    await assertWire('building')
+    const bytes = await readFile(paths.journal, 'utf8')
+    await beginNativeMigration(paths, input)
+    expect(await readFile(paths.journal, 'utf8')).toBe(bytes)
+    if (version === 5) {
+      await expect(
+        beginNativeMigration(paths, {
+          ...input,
+          nativeSettingsDigest: '8'.repeat(64),
+        }),
+      ).rejects.toBeInstanceOf(NativeAuthorityError)
+      await expect(
+        beginNativeMigration(paths, {
+          ...input,
+          nativeSettingsDigest: '8'.repeat(64),
+        }),
+      ).rejects.toMatchObject({ code: 'journal-conflict' })
+      expect(await readFile(paths.journal, 'utf8')).toBe(bytes)
+    }
+    await advanceNativeMigration(paths, 'building', 'verified')
+    await assertWire('verified')
+    await recordNativeMigrationExpectations(paths, expectations)
+    await assertWire('verified')
+    for (const [from, to] of [
+      ['verified', 'activation-installed'],
+      ['activation-installed', 'committed'],
+      ['committed', 'retired'],
+    ] as const) {
+      await advanceNativeMigration(paths, from, to)
+      await assertWire(to)
+    }
+  }
+})
+
+test('v5 never falls back to the v4 decoder when kind or digest is invalid', async () => {
+  const paths = await fixture()
+  await beginNativeMigration(paths, captureInput(paths))
+  const v4 = JSON.parse(await readFile(paths.journal, 'utf8'))
+  for (const value of [
+    { ...v4, version: 5 },
+    { ...v4, version: 5, kind: 'unknown' },
+    { ...v4, version: 5, kind: 'legacy-import' },
+    ...[null, 'absent', '', 'x'.repeat(64)].map((nativeSettingsDigest) => ({
+      ...v4,
+      version: 5,
+      kind: 'legacy-import',
+      nativeSettingsDigest,
+    })),
+    { ...v4, kind: 'legacy-import' },
+  ]) {
+    const bytes = JSON.stringify(value)
+    await writeFile(paths.journal, bytes)
+    const error = await readNativeMigrationJournal(paths).catch(
+      (error) => error,
+    )
+    expect(error).toBeInstanceOf(NativeAuthorityError)
+    expect(error.code).toBe('invalid-journal')
+    expect(await readFile(paths.journal, 'utf8')).toBe(bytes)
+  }
+})
+
+test('empty-init is exact committed authority and cannot be consumed by migration mutators', async () => {
+  const paths = await fixture()
+  const journal = await beginNativeEmptyInit(paths)
+  expect(journal).toEqual({
+    version: 5,
+    kind: 'empty-init',
+    storageId: paths.storageId,
+    host: 'opencode',
+    phase: 'committed',
+  })
+  expect(await readNativeMigrationJournal(paths)).toEqual(journal)
+  expect(await requireNativePoolAuthority(paths)).toEqual(journal)
+  expect(nativeMigrationAuthorityPhase(journal)).toBe('committed')
+  const bytes = await readFile(paths.journal, 'utf8')
+  const operations = [
+    () => beginNativeMigration(paths, captureInput(paths)),
+    () =>
+      beginNativeMigration(paths, {
+        ...captureInput(paths),
+        nativeSettingsDigest: 'a'.repeat(64),
+      }),
+    () => recordNativeMigrationExpectations(paths, expectations),
+    () => advanceNativeMigration(paths, 'committed', 'retired'),
+  ]
+  for (const operation of operations) {
+    const error = await operation().catch((error) => error)
+    expect(error).toBeInstanceOf(NativeAuthorityError)
+    expect(error.code).toBe('journal-conflict')
+    expect(await readFile(paths.journal, 'utf8')).toBe(bytes)
+  }
+})
 
 test('a readable empty pool without a committed journal cannot authorize dispatch', async () => {
   const paths = await fixture()
@@ -237,9 +379,7 @@ test('concurrent starts publish one journal without rewriting its baselines', as
   )
   expect(writes).toBe(1)
   expect(journals.every((journal) => journal.phase === 'building')).toBe(true)
-  expect((await readNativeMigrationJournal(paths))?.sources).toEqual(
-    input.sources,
-  )
+  expect((await readLegacyJournal(paths))?.sources).toEqual(input.sources)
 })
 
 test('v4 persists eleven fields including an initially absent prepared proof and activation', async () => {
@@ -508,7 +648,7 @@ test('native canonical leaf spellings retain their exact path bytes', async () =
   input.hostAuthPath = join(dirname(paths.config), 'host\\auth.json')
   const journal = await beginNativeMigration(paths, input)
   expect(journal.hostAuthPath).toBe(input.hostAuthPath)
-  expect((await readNativeMigrationJournal(paths))?.hostAuthPath).toBe(
+  expect((await readLegacyJournal(paths))?.hostAuthPath).toBe(
     input.hostAuthPath,
   )
 })
@@ -1170,7 +1310,7 @@ test('older v3 native journals fail closed unchanged', async () => {
 test('a requested vault activation keeps a retired migration unauthorized', async () => {
   const paths = await fixture()
   await retiredJournal(paths, 'requested')
-  const journal = await readNativeMigrationJournal(paths)
+  const journal = await readLegacyJournal(paths)
   expect(journal?.phase).toBe('retired')
   expect(journal?.activation).toEqual({ kind: 'requested' })
   expect(nativeMigrationAuthorityPhase(journal)).toBeUndefined()
@@ -1215,7 +1355,7 @@ test('activation phases block authority until committed and only move forward', 
   ).rejects.toMatchObject({ code: 'journal-conflict' })
   await advanceNativeCustodyActivation(paths, 'published', 'committed')
   await requireNativePoolAuthority(paths)
-  const committed = await readNativeMigrationJournal(paths)
+  const committed = await readLegacyJournal(paths)
   expect(nativeMigrationAuthorityPhase(committed)).toBe('retired')
   expect(committed?.activation).toMatchObject({ phase: 'committed' })
   // The completed migration history is kept, never reset.
