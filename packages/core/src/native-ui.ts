@@ -82,6 +82,8 @@ export interface NativeUiOptions {
   readonly readAccounts?: () => Promise<
     import('./native-account-view.ts').NativeAccountSnapshot
   >
+  /** Re-read the separate host-login notice on each local Accounts render. */
+  readonly readSeparateHostLoginNotice?: () => Promise<boolean>
   /**
    * Disconnects this host from the vault; while enrolled, this is the host's
    * only enrollment action. Before ending the enrollment, the callback
@@ -417,6 +419,16 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
     const sections = []
     for (const group of offered.groups) {
       const lines: string[] = []
+      if (group.id === 'Accounts' && custody === 'local') {
+        try {
+          if ((await options.readSeparateHostLoginNotice?.()) === true)
+            lines.push(
+              "OpenCode's separate Anthropic login is not used. Add that account through /claude Accounts if needed, or remove the separate login from OpenCode.",
+            )
+        } catch {
+          // Notice failures must not expose errors that could contain secrets.
+        }
+      }
       if (group.id === 'Accounts' && custody !== 'local')
         lines.push(
           custody === 'claustrum'

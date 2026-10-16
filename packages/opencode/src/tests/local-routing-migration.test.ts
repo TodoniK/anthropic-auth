@@ -12,7 +12,10 @@ import {
   getLogLevel,
   getStickyRoutingStatePath,
   type LogTestRecord,
+  type ProviderAccountUuid,
+  publishNativeEmptyInit,
   resetClaudeCodeIdentityCachesForTest,
+  resolveLocalRoutingDestination,
   runNativeMigration,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
@@ -237,7 +240,12 @@ async function fixture(override = false) {
   return { root, paths, journal, sent, offlineFetch, cleanups, close }
 }
 
-async function oc1(f: Awaited<ReturnType<typeof fixture>>) {
+type HostFixture = Pick<
+  Awaited<ReturnType<typeof fixture>>,
+  'root' | 'paths' | 'sent' | 'offlineFetch' | 'cleanups'
+>
+
+async function oc1(f: HostFixture) {
   const creation = AnthropicAuthPlugin(
     {
       client: createOpencodeClient({
@@ -286,7 +294,7 @@ async function oc1(f: Awaited<ReturnType<typeof fixture>>) {
   }
 }
 
-async function oc2(f: Awaited<ReturnType<typeof fixture>>) {
+async function oc2(f: HostFixture) {
   const runtime = createNativeAccountRuntime({
     paths: f.paths,
     host: 'opencode',
@@ -318,6 +326,164 @@ async function oc2(f: Awaited<ReturnType<typeof fixture>>) {
     tests.trackDetached(work)
     return work
   }
+}
+
+async function emptyFixture(override: boolean): Promise<HostFixture> {
+  const root = await mkdtemp(join(tmpdir(), 'oc-empty-routing-'))
+  const savedEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
+  const savedFetch = globalThis.fetch
+  const cleanups: HostFixture['cleanups'] = []
+  tests.deferCleanup(async () => {
+    const results = await Promise.allSettled(
+      cleanups.map((cleanup) => Promise.resolve().then(cleanup)),
+    )
+    globalThis.fetch = savedFetch
+    for (const [key, value] of savedEnv) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    resetClaudeCodeIdentityCachesForTest()
+    await rm(root, { recursive: true, force: true })
+    for (const result of results)
+      if (result.status === 'rejected') throw result.reason
+  })
+  for (const key of envKeys) delete process.env[key]
+  Object.assign(process.env, {
+    HOME: root,
+    XDG_CONFIG_HOME: join(root, 'config'),
+    XDG_DATA_HOME: join(root, 'data'),
+    CLAUDE_CONFIG_DIR: join(root, 'claude'),
+    OPENCODE_ANTHROPIC_AUTH_FILE: join(root, 'legacy.json'),
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+      root,
+      'enrollment.json',
+    ),
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+      root,
+      'connection.json',
+    ),
+    OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE: join(root, 'sidebar.json'),
+    OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR: join(root, 'cachekeep'),
+    OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR: join(root, 'quota-feed'),
+    OPENCODE_ANTHROPIC_AUTH_RPC_DIR: join(root, 'rpc'),
+    OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION: '1',
+  })
+  if (override)
+    process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE = join(
+      root,
+      'override.json',
+    )
+  resetClaudeCodeIdentityCachesForTest()
+  const { paths, routingDestinationPath } = await resolveNativeSetupPaths(
+    'opencode',
+    process.env,
+  )
+  const destination = override
+    ? process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE!
+    : getStickyRoutingStatePath(paths.config)
+  expect(resolveLocalRoutingDestination('opencode', paths, process.env)).toBe(
+    destination,
+  )
+  expect(routingDestinationPath).toBe(destination)
+  await publishNativeEmptyInit({
+    paths,
+    routingDestinationPath,
+    env: { ...process.env },
+    processFence: async () => {},
+  })
+  const runtime = createNativeAccountRuntime({
+    paths,
+    host: 'opencode',
+    local: {
+      resolveIdentity: async (access) => ({
+        deviceId: 'synthetic-device',
+        sessionId: 'synthetic-session',
+        accountUuid: (access.includes('secondary')
+          ? '22222222-2222-4222-8222-222222222222'
+          : '11111111-1111-4111-8111-111111111111') as ProviderAccountUuid,
+      }),
+    },
+  })
+  cleanups.push(() => runtime.close())
+  for (const [routeId, name] of [
+    ['main', 'primary'],
+    ['secondary', 'secondary'],
+  ] as const)
+    await runtime.loginOAuth({
+      routeId,
+      credential: {
+        access: `sk-ant-oat01-${name}`,
+        refresh: `synthetic-${name}-refresh`,
+        expires: Date.now() + 28_800_000,
+      },
+    })
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    refresh: { enabled: false },
+    quota: { enabled: false },
+    routing: { mode: 'sticky-balanced' },
+  }))
+  await writeFile(destination, routing({ [session1]: 'secondary' }))
+  const sent: string[] = []
+  const offlineFetch: typeof fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      const auth =
+        new Headers(
+          init?.headers ??
+            (input instanceof Request ? input.headers : undefined),
+        ).get('authorization') ?? ''
+      if (url.includes('/api/claude_cli/bootstrap'))
+        return Response.json({
+          oauth_account: {
+            account_uuid: auth.includes('secondary')
+              ? '22222222-2222-4222-8222-222222222222'
+              : '11111111-1111-4111-8111-111111111111',
+          },
+        })
+      if (!url.includes('/v1/messages'))
+        throw new Error('Unexpected empty-init network request')
+      expect(new Headers(init?.headers).get('x-api-key')).toBeNull()
+      sent.push(auth)
+      return Response.json({
+        id: 'synthetic-message',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      })
+    },
+    { preconnect: savedFetch.preconnect },
+  )
+  globalThis.fetch = offlineFetch
+  return { root, paths, sent, offlineFetch, cleanups }
+}
+
+for (const [host, open] of [
+  ['OC1', oc1],
+  ['OC2', oc2],
+] as const) {
+  for (const override of [false, true])
+    tests.test(
+      `${host} empty-init routing reads and writes the ${override ? 'override' : 'derived'} destination`,
+      async () => {
+        const f = await emptyFixture(override)
+        const send = await open(f)
+        expect(await send(session1)).toContain('sk-ant-oat01-secondary')
+        await send(session2)
+        const destination = resolveLocalRoutingDestination(
+          'opencode',
+          f.paths,
+          process.env,
+        )
+        const persisted = JSON.parse(await readFile(destination, 'utf8'))
+        expect(persisted.assignments[hash(session1)].accountId).toBe(
+          'secondary',
+        )
+        expect(persisted.assignments[hash(session2)]).toBeDefined()
+      },
+    )
 }
 
 for (const [host, open] of [

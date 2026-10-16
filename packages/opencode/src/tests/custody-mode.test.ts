@@ -44,3 +44,38 @@ test('activation and roster cannot bypass the committed migration journal', () =
     expect(() => reconcileCustodyStartup(input)).toThrow('MIGRATION_REQUIRED')
   }
 })
+
+test('separate local login requires servable native OAuth and completed authority for every fallback', () => {
+  for (const authority of ['committed', 'retired'] as const) {
+    for (const fallbacks of ['R', 'T', 'M'] as const) {
+      const input = { mode: 'L', main: 'R', evidence: 'V', fallbacks } as const
+      expect(
+        reconcileCustodyStartup({
+          ...input,
+          authority,
+          localOAuthServable: true,
+        }).verdict,
+      ).toBe('LOCAL_SERVE')
+      for (const localOAuthServable of [false, undefined])
+        expect(() =>
+          reconcileCustodyStartup({ ...input, authority, localOAuthServable }),
+        ).toThrow('FAIL_CLOSED')
+      expect(() =>
+        reconcileCustodyStartup({ ...input, localOAuthServable: true }),
+      ).toThrow('MIGRATION_REQUIRED')
+      for (const patch of [
+        { mode: 'C' },
+        { main: 'X' },
+        { evidence: 'N' },
+      ] as const)
+        expect(() =>
+          reconcileCustodyStartup({
+            ...input,
+            authority,
+            localOAuthServable: true,
+            ...patch,
+          }),
+        ).toThrow('FAIL_CLOSED')
+    }
+  }
+})

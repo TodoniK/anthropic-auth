@@ -23,7 +23,10 @@ import {
   type LogTestRecord,
   type NativeCustodyClient,
   PrimeManager,
+  type ProviderAccountUuid,
+  publishNativeEmptyInit,
   resetClaudeCodeIdentityCachesForTest,
+  resolveLocalRoutingDestination,
   resolveNativePoolPaths,
   runNativeMigration,
   StickySessionRouter,
@@ -33,11 +36,15 @@ import {
 import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
 import { createOpencodeClient, type Provider } from '@opencode-ai/sdk'
 import { $ } from 'bun'
-import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
+import {
+  nativeQuotaCodec,
+  toNativeQuotaMap,
+} from '../../../core/src/native-quota-codec.ts'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { MockRelayServer } from '../../../e2e-tests/src/mock-relay.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
+import { drainNotifications } from '../rpc/notifications.ts'
 import { COMMAND_MODAL_NAMES } from '../rpc/protocol.ts'
 
 type PluginHooks = Awaited<ReturnType<typeof AnthropicAuthPlugin>>
@@ -368,6 +375,203 @@ test('ordinary OpenCode API auth stays passthrough even without native migration
   ).toEqual({})
   expect(network).not.toHaveBeenCalled()
   expect(await readFile(configPath, 'utf8')).toBe(legacyBytes)
+})
+
+const inertActivationError =
+  'Native OAuth requires inert OpenCode activation; run offline setup'
+const separateHostLogin = {
+  type: 'oauth' as const,
+  access: 'synthetic-host-access-canary',
+  refresh: 'synthetic-host-refresh-canary',
+  expires: 0,
+}
+
+async function emptyAdmissionPool(servable: boolean) {
+  const paths = await resolveNativePoolPaths(
+    configPath,
+    process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE,
+  )
+  await publishNativeEmptyInit({
+    paths,
+    routingDestinationPath: resolveLocalRoutingDestination(
+      'opencode',
+      paths,
+      process.env,
+    ),
+    env: { ...process.env },
+    processFence: async () => {},
+  })
+  if (servable) {
+    const runtime = createNativeAccountRuntime({
+      paths,
+      host: 'opencode',
+      local: {
+        resolveIdentity: async () => ({
+          accountUuid:
+            '11111111-1111-4111-8111-111111111111' as ProviderAccountUuid,
+          deviceId: 'synthetic-device',
+          sessionId: 'synthetic-session',
+        }),
+      },
+    })
+    try {
+      await runtime.loginOAuth({
+        routeId: 'main',
+        credential: {
+          access: 'sk-ant-oat01-native-only',
+          refresh: 'synthetic-native-refresh',
+          expires: Date.now() + 28_800_000,
+        },
+      })
+      await runtime.updateSettings((settings) => ({
+        ...settings,
+        refresh: { enabled: false },
+        quota: { enabled: false },
+      }))
+    } finally {
+      runtime.close()
+    }
+  }
+  return paths
+}
+
+async function refusedAdmission(auth = separateHostLogin) {
+  const plugin = await createPlugin()
+  const options = await load(plugin, async () => auth)
+  return requestFetch(options)('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+  })
+}
+
+test('separate OC1 login preserves migration-required without a journal', async () => {
+  await expect(refusedAdmission()).rejects.toMatchObject({
+    name: 'NativeAuthorityError',
+    code: 'migration-required',
+  })
+  expect(network).not.toHaveBeenCalled()
+})
+
+test('separate OC1 login preserves migration-incomplete for a building journal', async () => {
+  const f = await migrateServingFixture('local')
+  const journal = JSON.parse(await readFile(f.paths.journal, 'utf8'))
+  await writeFile(
+    f.paths.journal,
+    JSON.stringify({
+      ...journal,
+      phase: 'building',
+      expectedHostAuth: 'unprepared',
+      expectedRouting: 'unprepared',
+      preparedProof: null,
+    }),
+    { mode: 0o600 },
+  )
+  await expect(refusedAdmission()).rejects.toMatchObject({
+    name: 'NativeAuthorityError',
+    code: 'migration-incomplete',
+  })
+  expect(f.records).toHaveLength(0)
+})
+
+test('separate OC1 login with committed empty pool refuses before custody', async () => {
+  await emptyAdmissionPool(false)
+  await expect(refusedAdmission()).rejects.toThrow(inertActivationError)
+  expect(network).not.toHaveBeenCalled()
+})
+
+for (const kind of ['orphan', 'quota-only'] as const) {
+  test(`separate OC1 login with ${kind} metadata refuses before custody`, async () => {
+    const paths = await emptyAdmissionPool(false)
+    if (kind === 'orphan') {
+      await writeFile(
+        paths.runtime,
+        JSON.stringify({
+          version: 1,
+          storageId: paths.storageId,
+          accounts: {
+            orphan: {
+              binding: {
+                kind: 'local',
+                storageId: paths.storageId,
+                rowId: 'orphan',
+                credentialEpoch: 1,
+              },
+              lastUsed: 1,
+            },
+          },
+        }),
+        { mode: 0o600 },
+      )
+    } else {
+      const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+      await store.updateSettings((settings) => ({
+        ...settings,
+        quota: { enabled: false },
+      }))
+      const config = JSON.parse(await readFile(paths.config, 'utf8'))
+      config.commonAuthPool = {
+        schemaVersion: 1,
+        rows: {
+          orphan: {
+            quota: toNativeQuotaMap({
+              checkedAt: 1,
+              five_hour: {
+                usedPercent: 10,
+                remainingPercent: 90,
+                checkedAt: 1,
+              },
+            }),
+          },
+        },
+      }
+      await writeFile(paths.config, JSON.stringify(config), { mode: 0o600 })
+      const read = await store.read()
+      if (read.status !== 'ready')
+        throw new Error('Expected readable quota-only pool')
+      expect(read.rows).toEqual([])
+    }
+    await expect(refusedAdmission()).rejects.toThrow(inertActivationError)
+    expect(network).not.toHaveBeenCalled()
+  })
+}
+
+test('incomplete OC1 OAuth records refuse before custody even with servable native OAuth', async () => {
+  await emptyAdmissionPool(true)
+  for (const auth of [
+    { ...separateHostLogin, access: '' },
+    { ...separateHostLogin, refresh: '' },
+  ])
+    await expect(refusedAdmission(auth)).rejects.toThrow(inertActivationError)
+  expect(network).not.toHaveBeenCalled()
+})
+
+test('OC1 Accounts rechecks the separate host login on every render and hides X records', async () => {
+  await emptyAdmissionPool(true)
+  let auth = { ...separateHostLogin }
+  const plugin = await createPlugin()
+  await load(plugin, async () => auth)
+  const sessionID = 'separate-login-notice-session'
+  async function render() {
+    drainNotifications(0, sessionID)
+    await expect(
+      plugin['command.execute.before']!(
+        { command: 'claude', arguments: '', sessionID },
+        { parts: [] },
+      ),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    const notification = drainNotifications(0, sessionID).at(-1)
+    if (notification?.type !== 'open-menu')
+      throw new Error('Expected native menu')
+    return notification.payload.menu.sections
+      .flatMap((section) => section.lines)
+      .filter((line) => line.startsWith("OpenCode's separate Anthropic login"))
+  }
+  expect(await render()).toHaveLength(1)
+  expect(await render()).toHaveLength(1)
+  auth = custodyTombstoneOAuth('anthropic')
+  expect(await render()).toHaveLength(0)
+  auth = { ...separateHostLogin, access: '' }
+  expect(await render()).toHaveLength(0)
 })
 
 test('single claude registration removes owned aliases and preserves foreign commands', async () => {
@@ -725,6 +929,69 @@ test('real offline local migration serves only positively admitted pool OAuth, n
     expect(JSON.stringify(snapshot.policyStorage)).not.toContain('sk-ant-oat01')
   } finally {
     runtime.close()
+  }
+})
+
+test('separate OC1 login serves only native pool credentials and refreshes without host tokens', async () => {
+  const f = await migrateServingFixture('local')
+  const runtime = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    local: {
+      resolveIdentity: async () => ({
+        accountUuid: mainIdentity as ProviderAccountUuid,
+        deviceId: 'synthetic-device',
+        sessionId: 'synthetic-session',
+      }),
+    },
+  })
+  try {
+    await runtime.loginOAuth({
+      routeId: 'main',
+      credential: {
+        access: 'sk-ant-oat01-native-expired',
+        refresh: 'synthetic-primary-refresh',
+        expires: 0,
+      },
+    })
+  } finally {
+    runtime.close()
+  }
+  const logs: LogTestRecord[] = []
+  __setLogTestSink((record) => logs.push(record))
+  try {
+    const plugin = await createPlugin()
+    const options = await load(plugin, async () => separateHostLogin)
+    const response = await requestFetch(options)(
+      'https://api.anthropic.com/v1/messages',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 8,
+          messages: [{ role: 'user', content: 'native probe' }],
+        }),
+      },
+    )
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(
+      f.records
+        .filter((record) => record.url.includes('/v1/messages'))
+        .map((record) => record.authorization),
+    ).toEqual(['Bearer sk-ant-oat01-local-main-rotated'])
+    expect(
+      f.records.some(
+        (record) =>
+          record.url.includes('/oauth/token') &&
+          record.body.includes('synthetic-primary-refresh'),
+      ),
+    ).toBe(true)
+    const evidence = JSON.stringify({ records: f.records, logs })
+    expect(evidence).not.toContain(separateHostLogin.access)
+    expect(evidence).not.toContain(separateHostLogin.refresh)
+  } finally {
+    __setLogTestSink(null)
   }
 })
 

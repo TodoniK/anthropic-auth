@@ -37,9 +37,18 @@ export function reconcileCustodyStartup(input: {
   fallbacks: 'R' | 'T' | 'M'
   evidence: 'V' | 'N'
   authority?: 'committed' | 'retired'
+  localOAuthServable?: boolean
 }): { verdict: 'LOCAL_SERVE' | 'CLAUSTRUM_SERVE' } {
   if (input.authority !== 'committed' && input.authority !== 'retired') {
     throw new CustodyStateMismatchError('MIGRATION_REQUIRED', input)
+  }
+  if (
+    input.mode === 'L' &&
+    input.main === 'R' &&
+    input.evidence === 'V' &&
+    input.localOAuthServable === true
+  ) {
+    return { verdict: 'LOCAL_SERVE' }
   }
   if (
     input.mode === 'L' &&

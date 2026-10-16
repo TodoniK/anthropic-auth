@@ -171,6 +171,86 @@ function setup(
 }
 
 describe('native UI contract', () => {
+  test('separate host login notice is read once per local render and is never selectable', async () => {
+    let separateLogin = true
+    let reads = 0
+    const menu = createNativeUi({
+      host: 'opencode',
+      interactive: true,
+      readMode: localCustody,
+      disconnectVault: unusedDisconnect,
+      dispatch: async () => ({ ok: true, text: '' }),
+      readStatus: async () => 'public status',
+      readSeparateHostLoginNotice: async () => {
+        reads++
+        return separateLogin
+      },
+    })
+    const notice =
+      "OpenCode's separate Anthropic login is not used. Add that account through /claude Accounts if needed, or remove the separate login from OpenCode."
+    for (let render = 1; render <= 2; render++) {
+      const { menu: model } = await menu.open(invocation)
+      expect(reads).toBe(render)
+      expect(
+        model.sections
+          .flatMap((section) => section.lines)
+          .filter((line) => line === notice),
+      ).toHaveLength(1)
+      expect(
+        JSON.stringify(
+          model.sections.flatMap((section) => [
+            ...section.items,
+            ...section.actions,
+          ]),
+        ),
+      ).not.toContain(notice)
+    }
+    separateLogin = false
+    expect(JSON.stringify(await menu.open(invocation))).not.toContain(notice)
+    expect(reads).toBe(3)
+  })
+
+  test('notice reader failures and non-boolean values stay silent and non-local custody never reads it', async () => {
+    for (const mode of ['local', 'claustrum', undefined] as const) {
+      for (const value of [
+        false,
+        'true',
+        1,
+        undefined,
+        new Error('synthetic-private-error'),
+      ]) {
+        let reads = 0
+        const options = {
+          host: 'opencode',
+          interactive: false,
+          readMode: async () => mode,
+          disconnectVault: unusedDisconnect,
+          dispatch: async () => ({ ok: true, text: '' }),
+          readStatus: async () => '',
+          readSeparateHostLoginNotice: async () => {
+            reads++
+            if (value instanceof Error) throw value
+            return value
+          },
+        }
+        const menu: CommandMenu = Reflect.apply(createNativeUi, undefined, [
+          options,
+        ])
+        const rendered = JSON.stringify(await menu.open(invocation))
+        expect(reads).toBe(mode === 'local' ? 1 : 0)
+        expect(rendered).not.toContain('separate Anthropic login')
+        expect(rendered).not.toContain('synthetic-private-error')
+      }
+    }
+  })
+
+  test('hosts without the optional reader show no separate login notice', async () => {
+    for (const host of ['opencode', 'pi'] as const)
+      expect(
+        JSON.stringify(await setup(host).menu.open(invocation)),
+      ).not.toContain('separate Anthropic login')
+  })
+
   for (const host of ['opencode', 'pi'] as const) {
     test(`${host} shared vault menu names reauth accounts and the replacement command`, async () => {
       let state = 'needs_reauth'

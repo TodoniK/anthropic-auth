@@ -189,6 +189,7 @@ import {
   setFastModeEnabled,
   setLogLevel,
   shouldFallbackStatus,
+  snapshotHasServableLocalOAuth,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
   TrailingAssistantHistoryError,
@@ -3103,6 +3104,16 @@ const anthropicAuthPlugin = async (
   // OpenCode's auth file itself.
   let latestHostGetAuth: (() => Promise<unknown>) | null = null
 
+  function isRealHostLogin(value: unknown): boolean {
+    return (
+      value !== null &&
+      typeof value === 'object' &&
+      mainCustodyDimension(
+        value as Parameters<typeof mainCustodyDimension>[0],
+      ) === 'R'
+    )
+  }
+
   /** The native placeholder, field for field; a look-alike is a different login. */
   function isExactNativePlaceholder(auth: unknown) {
     const placeholder = custodyTombstoneOAuth('anthropic')
@@ -5509,6 +5520,20 @@ const anthropicAuthPlugin = async (
           dispatch: dispatchNative,
           readStatus: readNativeStatus,
           readAccounts: () => nativeAccounts.read(),
+          readSeparateHostLoginNotice: async () => {
+            if ((await readNativeEnrollmentMode('opencode')) !== 'local')
+              return false
+            const snapshot = await nativeAccounts.read()
+            const phase = nativeMigrationAuthorityPhase(
+              await readNativeMigrationJournal(nativePaths),
+            )
+            return (
+              snapshot.mode === 'local' &&
+              (phase === 'committed' || phase === 'retired') &&
+              snapshotHasServableLocalOAuth(snapshot) &&
+              isRealHostLogin(await latestHostGetAuth?.())
+            )
+          },
           interactive,
         }),
       }
@@ -5921,11 +5946,29 @@ const anthropicAuthPlugin = async (
           profilePublications.add(hydration)
           void hydration.then(() => profilePublications.delete(hydration))
         }
-        function requireNativeActivation(currentActivation: unknown) {
-          if (!isCustodyTombstoneOAuth(currentActivation, 'anthropic'))
+        function requireNativeActivation(
+          currentActivation: unknown,
+          separateLocalLogin = false,
+        ) {
+          if (
+            !isCustodyTombstoneOAuth(currentActivation, 'anthropic') &&
+            !(separateLocalLogin && isRealHostLogin(currentActivation))
+          )
             throw new Error(
               'Native OAuth requires inert OpenCode activation; run offline setup',
             )
+        }
+        async function requireCurrentNativeActivation(
+          separateLocalLogin: boolean,
+        ) {
+          // Native authorization checks pool authority and the selected account
+          // before dispatch. This fence only rechecks the host slot and custody;
+          // the separate local login never supplies credential material.
+          requireNativeActivation(
+            await hostGetAuth(),
+            separateLocalLogin &&
+              (await readNativeEnrollmentMode('opencode')) === 'local',
+          )
         }
         const getAuth = async (
           modelId?: string,
@@ -5961,7 +6004,20 @@ const anthropicAuthPlugin = async (
             nativeAccounts,
             signal,
           )
-          requireNativeActivation(currentActivation)
+          const authority =
+            mode === 'claustrum'
+              ? 'committed'
+              : nativeMigrationAuthorityPhase(
+                  await readNativeMigrationJournal(nativePaths),
+                )
+          const localOAuthServable =
+            snapshotHasServableLocalOAuth(primarySnapshot)
+          requireNativeActivation(
+            currentActivation,
+            mode === 'local' &&
+              (authority === 'committed' || authority === 'retired') &&
+              localOAuthServable,
+          )
           if (
             mode === 'claustrum' &&
             !primarySnapshot.accounts.some(
@@ -5981,12 +6037,8 @@ const anthropicAuthPlugin = async (
               main: mainCustodyDimension(currentActivation),
               fallbacks: mode === 'claustrum' ? 'T' : dimensions.fallbacks,
               evidence: 'V',
-              authority:
-                mode === 'claustrum'
-                  ? 'committed'
-                  : nativeMigrationAuthorityPhase(
-                      await readNativeMigrationJournal(nativePaths),
-                    ),
+              authority,
+              localOAuthServable,
             })
             custodyStartupMismatchVerdict = undefined
           } catch (error) {
@@ -6190,10 +6242,9 @@ const anthropicAuthPlugin = async (
             modelId?: string,
             signal?: AbortSignal,
           ) {
-            // A provider's 401 cannot authorize refresh after OpenCode's
-            // native activation marker is removed or changed. Recheck the
-            // host auth slot before and after awaiting the credentials.
-            requireNativeActivation(await hostGetAuth())
+            const separateLocalLogin = isRealHostLogin(await hostGetAuth())
+            // Recheck host admission before and after awaiting native credentials.
+            await requireCurrentNativeActivation(separateLocalLogin)
             signal?.throwIfAborted()
             const credential = await authorizeOAuth(
               'main',
@@ -6202,7 +6253,7 @@ const anthropicAuthPlugin = async (
               modelId,
               'refresh',
             )
-            requireNativeActivation(await hostGetAuth())
+            await requireCurrentNativeActivation(separateLocalLogin)
             signal?.throwIfAborted()
             return credential.accessToken
           }
@@ -6720,6 +6771,9 @@ const anthropicAuthPlugin = async (
             scopedAttempt?: NativeCustodyReceipt,
           ) {
             assertNotCustodyTombstone(accessToken, 'anthropic')
+            // A request admitted with the placeholder cannot switch to a
+            // separate login while native authorization or refresh is waiting.
+            const separateLocalLogin = isRealHostLogin(await hostGetAuth())
             const start = nowMs()
             let requestStorage = currentStorage
             const getRequestStorage = async () => {
@@ -6996,9 +7050,8 @@ const anthropicAuthPlugin = async (
             const requestAuthority = nativeAuthorization
             let retryFromVault: NativeCustodyReceipt | undefined
             const authorizePhysical = async (rejectedAccessToken?: string) => {
-              // Every direct or relay attempt still needs the native host
-              // activation, including retries after an upstream 401.
-              requireNativeActivation(await hostGetAuth())
+              // Every physical attempt rechecks host admission, including retries.
+              await requireCurrentNativeActivation(separateLocalLogin)
               init?.signal?.throwIfAborted()
               const current = await authorizeOAuth(
                 oauthAccountId,
@@ -7007,7 +7060,7 @@ const anthropicAuthPlugin = async (
                 modelForIdentity,
                 oauthAccountId === 'main' ? 'last-main' : 'serve',
               )
-              requireNativeActivation(await hostGetAuth())
+              await requireCurrentNativeActivation(separateLocalLogin)
               init?.signal?.throwIfAborted()
               if (
                 current.accountIdentity !== requestAuthority.accountIdentity ||
