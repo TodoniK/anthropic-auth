@@ -2023,11 +2023,10 @@ const anthropicAuthPlugin = async (
       ? new QuotaHeaderFeedRegistry()
       : null
   // Profiles fetched by this plugin instance, keyed by route and account
-  // identity. A profile request that reached the network is not repeated in
-  // this boot: a failed request stays failed, and a fetched profile is reused
-  // until it goes stale, even if saving it is slow or fails. Attempts refused
-  // before any request (missing native authority, unavailable route) leave no
-  // entry, so a later display can try again.
+  // identity. A failed network request is not repeated for that account this
+  // boot, and a fetched profile is reused until it goes stale, even if saving
+  // it is slow or fails. Expired pending attempts and pre-request refusals
+  // can retry.
   interface ProfileHydration {
     /** Settles when the profile response arrives or the attempt fails, never on the save. */
     fetched: Promise<void>
@@ -2038,11 +2037,19 @@ const anthropicAuthPlugin = async (
     deadline?: AbortSignal
     /** True once the profile response arrived or the attempt failed. */
     settled?: boolean
+    /** A dispatched request rejected; suppress repeats for that account this boot. */
+    failed?: boolean
+    /** Storage row and login epoch; identity discovery and token refresh leave these unchanged. */
+    lineage?: string
     profile?: OAuthAccountProfile
     persistence?: 'pending' | 'saved' | 'refused' | 'failed'
     isCurrent?: () => Promise<boolean>
   }
   const profileHydrations = new Map<string, ProfileHydration>()
+  // A completed fresh check prevents repeat requests for the same account,
+  // even when a new login invalidates the credentials used by that check.
+  // Keep this suppression separate from the attempt's displayable profile.
+  const checkedProfiles = new Map<string, OAuthAccountProfile>()
   // Saving a fetched profile continues after the display has used it. Dispose
   // aborts unfinished profile requests and waits for these saves, so an
   // instance never leaves a metadata write running after it is torn down.
@@ -2052,6 +2059,32 @@ const anthropicAuthPlugin = async (
 
   function profileHydrationKey(id: string, accountIdentity?: string) {
     return JSON.stringify([id, accountIdentity ?? null])
+  }
+
+  function profileHydrationLineage(account: NativeAccountView) {
+    const binding = account.binding
+    if (account.source !== 'local' || !binding) return undefined
+    return JSON.stringify([
+      binding.storageId,
+      binding.rowId,
+      binding.credentialEpoch,
+    ])
+  }
+
+  function canIdentifyProfileHydration(
+    hydration: ProfileHydration,
+    account: NativeAccountView,
+  ) {
+    // Learning an identity leaves the storage row and login epoch unchanged;
+    // a replacement login changes the epoch. Only a matching row and epoch
+    // link an initially unidentified request to the now-identified account.
+    // Vault routes already have an identity before requesting a profile.
+    return (
+      hydration.lineage !== undefined &&
+      hydration.lineage === profileHydrationLineage(account) &&
+      (!hydration.profile ||
+        hydration.profile.accountIdentity === account.accountIdentity)
+    )
   }
 
   /** A fetched tier requires current credentials; a storage failure alone does not hide it. */
@@ -2087,6 +2120,7 @@ const anthropicAuthPlugin = async (
     )
     const hydration: ProfileHydration = {
       fetched: Promise.resolve(),
+      lineage: profileHydrationLineage(account),
       ...(signal && { deadline: signal }),
     }
     hydration.fetched = nativeAccounts
@@ -2101,6 +2135,11 @@ const anthropicAuthPlugin = async (
       .then(
         ({ profile, persisted, isCurrent }) => {
           hydration.settled = true
+          if (profile.accountIdentity !== undefined)
+            checkedProfiles.set(
+              profileHydrationKey(account.id, profile.accountIdentity),
+              profile,
+            )
           // Keep a profile only for the account it was read for. A route
           // whose identity was not yet known accepts the identity this read
           // reports; the display checks it against the route again later.
@@ -2151,6 +2190,7 @@ const anthropicAuthPlugin = async (
         },
         (error: unknown) => {
           hydration.settled = true
+          hydration.failed = requested
           logger.debug('quota', 'failed to hydrate account profile', {
             account: account.id,
             error: error instanceof Error ? error.message : String(error),
@@ -2222,22 +2262,32 @@ const anthropicAuthPlugin = async (
         continue
       const key = profileHydrationKey(account.id, account.accountIdentity)
       let hydration = profileHydrations.get(key)
+      if (
+        hydration &&
+        account.accountIdentity === undefined &&
+        (hydration.lineage === undefined ||
+          hydration.lineage !== profileHydrationLineage(account))
+      )
+        hydration = undefined
       if (!hydration && account.accountIdentity !== undefined) {
         // A profile attempt for a route whose account was not yet known
         // first authorizes the route, and that records the account identity.
         // A display that starts while such an attempt is still in flight
-        // therefore sees the route as identified. Join the in-flight attempt
-        // instead of sending a second profile request for the same route; the
-        // check after the wait still requires the fetched profile to name
-        // this account before it is filed or shown.
+        // therefore sees the route as identified. Join only if the same
+        // storage row and login epoch remain, not just the same route ID.
         const earlier = profileHydrations.get(profileHydrationKey(account.id))
-        if (earlier && !earlier.settled) {
+        if (earlier && canIdentifyProfileHydration(earlier, account)) {
           hydration = earlier
           unidentified.set(account.id, earlier)
         }
       }
+      if (hydration?.failed) continue
+      if (!hydration && oauthProfileIsFresh(checkedProfiles.get(key), now))
+        continue
       if (
         !hydration ||
+        (!hydration.profile &&
+          (hydration.deadline?.aborted || hydration.settled)) ||
         (hydration.profile && !oauthProfileIsFresh(hydration.profile, now))
       ) {
         if (signal?.aborted || profileHydrationShutdown.signal.aborted) continue
@@ -2267,8 +2317,7 @@ const anthropicAuthPlugin = async (
         earlier &&
         account.accountIdentity !== undefined &&
         !profileHydrations.has(key) &&
-        (!earlier.profile ||
-          earlier.profile.accountIdentity === account.accountIdentity)
+        canIdentifyProfileHydration(earlier, account)
       )
         profileHydrations.set(key, earlier)
       if (storedProfileIsFresh(account, later)) continue
