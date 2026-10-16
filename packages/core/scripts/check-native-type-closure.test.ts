@@ -110,7 +110,7 @@ test('rejects unsupported published producer versions before copying declaration
     producer,
     'package.json',
     JSON.stringify({
-      version: '0.9.0',
+      version: '0.17.1',
       exports: { './store': { types: './dist/store.d.ts' } },
     }),
   )
@@ -124,7 +124,7 @@ test('rejects unsupported published producer versions before copying declaration
   )
 
   await expect(closeNativeTypeDeclarations(dist, producer)).rejects.toThrow(
-    'Expected published common-auth 0.16.0, got 0.9.0',
+    'Expected published common-auth 0.17.0, got 0.17.1',
   )
   expect(await readdir(dist)).not.toContain('internal-types')
 })
@@ -137,7 +137,7 @@ test('copies the complete published relative declaration graph including cycles 
     producer,
     'package.json',
     JSON.stringify({
-      version: '0.16.0',
+      version: '0.17.0',
       exports: { './store': { types: './dist/store/index.d.ts' } },
     }),
   )
@@ -249,14 +249,17 @@ test('Core bundles published preferences but keeps jsonc-parser and private-file
   ).toBe(false)
 })
 
-test('Core bundle imports subc-client externally without inlining its implementation', async () => {
+test('Core bundle keeps runtime clients and private-files external', async () => {
   const root = await fixture()
   const outfile = join(root, 'core.js')
   await bundleCore({ entrypoint: join(core, 'src/index.ts'), outfile })
   const source = await readFile(outfile, 'utf8')
-  expect(
-    moduleReferences(source, false).map((edge) => edge.specifier),
-  ).toContain('@cortexkit/subc-client')
+  const specifiers = moduleReferences(source, false).map(
+    (edge) => edge.specifier,
+  )
+  expect(specifiers).toContain('@cortexkit/claustrum-client')
+  expect(specifiers).toContain('@cortexkit/subc-client')
+  expect(specifiers).toContain('@cortexkit/private-files')
   expect(source).not.toMatch(/\/\/ .*node_modules\/.*subc-client\/dist\//)
 })
 
@@ -270,6 +273,9 @@ test('packed Core types and Node runtime work in a fresh consumer without common
   const manifest = JSON.parse(
     await readFile(join(core, 'package.json'), 'utf8'),
   )
+  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.17.0')
+  expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe('0.9.0')
+  expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.16.0')
   expect(manifest.dependencies['jsonc-parser']).toBe('^3.3.1')
   expect(manifest.dependencies['@cortexkit/private-files']).toBe('0.2.1')
   expect(manifest.dependencies['@cortexkit/common-auth']).toBeUndefined()
@@ -319,6 +325,17 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     ),
   )
   expect(privateFilesManifest.version).toBe('0.2.1')
+  const claustrumManifests = allInstalled.filter((path) =>
+    /(?:^|\/)@cortexkit\/claustrum-client\/package\.json$/.test(path),
+  )
+  expect(claustrumManifests).toHaveLength(1)
+  const claustrumManifest = JSON.parse(
+    await readFile(
+      join(consumer, 'node_modules', claustrumManifests[0]!),
+      'utf8',
+    ),
+  )
+  expect(claustrumManifest.version).toBe('0.9.0')
   const subcManifests = allInstalled.filter((path) =>
     /(?:^|\/)@cortexkit\/subc-client\/package\.json$/.test(path),
   )
@@ -334,7 +351,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     `Packed consumer subc-client copies: ${JSON.stringify(subcCopies)}`,
   )
   expect(subcCopies).toHaveLength(1)
-  expect(Bun.semver.satisfies(subcCopies[0]!.version, '^0.16.0')).toBe(true)
+  expect(subcCopies[0]!.version).toBe('0.16.1')
   const coreSubc = Bun.resolveSync('@cortexkit/subc-client', installed)
   const claustrumEntry = Bun.resolveSync(
     '@cortexkit/claustrum-client',
@@ -350,7 +367,9 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     await readFile(join(installed, 'dist/index.js'), 'utf8'),
     false,
   ).map((edge) => edge.specifier)
+  expect(runtimeImports).toContain('@cortexkit/claustrum-client')
   expect(runtimeImports).toContain('@cortexkit/subc-client')
+  expect(runtimeImports).toContain('@cortexkit/private-files')
   console.log(
     'Packed consumer Core and claustrum-client share the same subc-client entrypoint',
   )
