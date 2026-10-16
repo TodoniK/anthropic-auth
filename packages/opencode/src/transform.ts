@@ -18,6 +18,7 @@ import {
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
+  createSseFramer,
   FAST_MODE_BETA,
   hasThinkingBindingControls,
   isClaudeFableOrMythos5Model,
@@ -34,8 +35,10 @@ import {
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
+  parseSseFrame,
   REQUIRED_BETAS,
   remapRequestBodyModel,
+  SseFrameTooLargeError,
   selectClaudeCodeBetas,
   signRequestBody,
   stripBillingLineageFromBody,
@@ -47,6 +50,13 @@ import {
   TrailingAssistantHistoryError,
   usesMidConversationOutputConfig,
 } from '@cortexkit/anthropic-auth-core'
+import {
+  applyEdits,
+  type Edit,
+  type Node,
+  type ParseError,
+  parseTree,
+} from 'jsonc-parser'
 import {
   applyCacheDiagnosticsOptIn,
   CACHE_DIAGNOSTICS_BETA,
@@ -124,10 +134,10 @@ function responseToolNames(tools: unknown): ToolNameMap {
     }
     add(wireNames, prefixName(name), name)
   }
-  // Names emitted by prefixName outrank inferred suffixes. The original tool
-  // definitions take final precedence so a real host tool is never redirected.
-  for (const [wire, name] of wireNames) aliases.set(wire, name)
+  // Anthropic sees the emitted wire names, so they outrank original host
+  // spellings as well as inferred suffixes, including ambiguous wire names.
   for (const name of names) aliases.set(name, name)
+  for (const [wire, name] of wireNames) aliases.set(wire, name)
   return aliases
 }
 
@@ -279,56 +289,164 @@ export function stripToolPrefix(
   text: string,
   toolNameMap?: ToolNameMap,
 ): string {
-  return text.replace(/"name"\s*:\s*"([^"]+)"/g, (match, name: string) => {
-    const realName = toolNameMap?.get(name)
-    return realName && realName !== name
-      ? `"name": ${JSON.stringify(realName)}`
-      : match
-  })
+  return applyEdits(text, toolNameEdits(text, toolNameMap, false))
 }
 
-function splitToolPrefixRewriteBuffer(
-  buffer: string,
-  toolNameMap: ToolNameMap | undefined,
-  flush = false,
-) {
-  if (flush) return { ready: stripToolPrefix(buffer, toolNameMap), pending: '' }
-
-  let keepFrom = buffer.length
-  const marker = '"name"'
-  const lastName = buffer.lastIndexOf(marker)
-  const completeName =
-    lastName === -1
-      ? null
-      : /^"name"\s*:\s*"[^"]*"/.exec(buffer.slice(lastName))
-  // A value's closing quote cannot also start a partial property marker.
-  const partialMarkerStart = Math.max(
-    0,
-    buffer.length - marker.length + 1,
-    completeName ? lastName + completeName[0].length : 0,
+function jsonMember(node: Node | undefined, key: string): Node | undefined {
+  if (node?.type !== 'object') return undefined
+  const matches = node.children?.filter(
+    (property) => property.children?.[0]?.value === key,
   )
-  for (let index = partialMarkerStart; index < buffer.length; index++) {
-    if (marker.startsWith(buffer.slice(index))) {
-      keepFrom = Math.min(keepFrom, index)
-      break
+  // Duplicate keys make a provider field ambiguous; leave it for the host.
+  return matches?.length === 1 ? matches[0]?.children?.[1] : undefined
+}
+
+function toolNameEdits(
+  text: string,
+  toolNameMap: ToolNameMap | undefined,
+  event: boolean,
+): Edit[] {
+  if (!toolNameMap?.size) return []
+  const bom = text.charCodeAt(0) === 0xfeff ? 1 : 0
+  const errors: ParseError[] = []
+  let root: Node | undefined
+  try {
+    root = parseTree(text.slice(bom), errors, {
+      disallowComments: true,
+      allowTrailingComma: false,
+    })
+  } catch {
+    return []
+  }
+  if (errors.length || root?.type !== 'object') return []
+  if (
+    (root.children?.filter(
+      (property) => property.children?.[0]?.value === 'type',
+    ).length ?? 0) > 1
+  )
+    return []
+  const type = jsonMember(root, 'type')?.value
+  let blocks: Node[]
+  if (event) {
+    if (type !== 'content_block_start') return []
+    const block = jsonMember(root, 'content_block')
+    blocks = block ? [block] : []
+  } else {
+    if (type !== undefined && type !== 'message') return []
+    const content = jsonMember(root, 'content')
+    blocks = content?.type === 'array' ? (content.children ?? []) : []
+  }
+  const edits: Edit[] = []
+  for (const block of blocks) {
+    if (jsonMember(block, 'type')?.value !== 'tool_use') continue
+    const name = jsonMember(block, 'name')
+    if (name?.type !== 'string') continue
+    const realName = toolNameMap.get(name.value)
+    if (realName && realName !== name.value) {
+      edits.push({
+        offset: bom + name.offset,
+        length: name.length,
+        content: JSON.stringify(realName),
+      })
     }
   }
+  return edits
+}
 
-  if (lastName !== -1) {
-    const tail = buffer.slice(lastName)
-    if (/^"name"\s*(?::\s*(?:"[^"]*)?)?$/.test(tail)) {
-      keepFrom = Math.min(keepFrom, lastName)
-    }
+function rewriteToolNameFrame(frame: string, toolNameMap: ToolNameMap): string {
+  const bom = frame.charCodeAt(0) === 0xfeff ? 1 : 0
+  const event = parseSseFrame(frame.slice(bom))
+  if (event.event !== undefined && event.event !== 'content_block_start')
+    return frame
+  if (event.data === undefined) return frame
+  const edits = toolNameEdits(event.data, toolNameMap, true)
+  if (!edits.length) return frame
+  // SSE joins data lines with newlines. Map JSON token offsets back to their
+  // original lines so comments, IDs, whitespace and line endings stay intact.
+  const spans: { dataOffset: number; frameOffset: number; length: number }[] =
+    []
+  let dataOffset = 0
+  for (const line of frame.slice(bom).matchAll(/([^\r\n]*)(?:\r\n|\r|\n|$)/g)) {
+    const value = /^data(?:: ?(.*))?$/.exec(line[1] ?? '')
+    if (!value) continue
+    const length = value[1]?.length ?? 0
+    spans.push({
+      dataOffset,
+      frameOffset: bom + (line.index ?? 0) + value[0].length - length,
+      length,
+    })
+    dataOffset += length + 1
   }
-
-  if (keepFrom < buffer.length) {
-    return {
-      ready: stripToolPrefix(buffer.slice(0, keepFrom), toolNameMap),
-      pending: buffer.slice(keepFrom),
-    }
+  const frameEdits: Edit[] = []
+  for (const edit of edits) {
+    const span = spans.find(
+      (span) =>
+        edit.offset >= span.dataOffset &&
+        edit.offset + edit.length <= span.dataOffset + span.length,
+    )
+    if (!span) return frame
+    frameEdits.push({
+      ...edit,
+      offset: span.frameOffset + edit.offset - span.dataOffset,
+    })
   }
+  return applyEdits(frame, frameEdits)
+}
 
-  return { ready: stripToolPrefix(buffer, toolNameMap), pending: '' }
+function createToolNameRewriter(
+  toolNameMap: ToolNameMap | undefined,
+  jsonMode: boolean,
+) {
+  const encoder = new TextEncoder()
+  const decoder = new TextDecoder('utf-8', { ignoreBOM: true })
+  const framer = createSseFramer({
+    maxFrameBytes: NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+  })
+  let pending = ''
+  let pendingBytes = 0
+  let disabled = !toolNameMap?.size
+  return {
+    pendingLength: () => pending.length,
+    push(text: string, flush = false): string {
+      if (disabled || !toolNameMap) return text
+      const combined = pending + text
+      if (jsonMode) {
+        pendingBytes += encoder.encode(text).byteLength
+        if (pendingBytes > NON_STREAMING_DIAGNOSTICS_MAX_BYTES) {
+          // Oversized documents pass through unchanged rather than retaining
+          // an unbounded response or guessing at incomplete JSON structure.
+          disabled = true
+          pending = ''
+          return combined
+        }
+        pending = flush ? '' : combined
+        return flush ? stripToolPrefix(combined, toolNameMap) : ''
+      }
+      let frames: Uint8Array[]
+      try {
+        frames = framer.push(encoder.encode(text))
+      } catch (error) {
+        if (!(error instanceof SseFrameTooLargeError)) throw error
+        // The framer drops an oversized frame on failure. Our bounded copy
+        // preserves it and any earlier frames from this chunk byte for byte.
+        disabled = true
+        pending = ''
+        return combined
+      }
+      const decoded = frames.map((frame) => decoder.decode(frame))
+      pending = combined.slice(
+        decoded.reduce((length, frame) => length + frame.length, 0),
+      )
+      if (flush) {
+        const tail = framer.finish()
+        if (tail) decoded.push(decoder.decode(tail))
+        pending = ''
+      }
+      return decoded
+        .map((frame) => rewriteToolNameFrame(frame, toolNameMap))
+        .join('')
+    },
+  }
 }
 
 /**
@@ -2118,10 +2236,12 @@ export function createStrippedStream(
   if (!response.body) return response
 
   const reader = response.body.getReader()
-  const decoder = new TextDecoder()
+  const decoder = new TextDecoder('utf-8', { ignoreBOM: true })
   const encoder = new TextEncoder()
   const jsonMode = options.responseMode === 'json'
-  let pending = ''
+  const toolNames = createToolNameRewriter(options.toolNameMap, jsonMode)
+  let decodeAtStart = true
+  let preamble = ''
   let chunkCount = 0
   let pullCount = 0
   let inputBytes = 0
@@ -2219,7 +2339,7 @@ export function createStrippedStream(
     pulls: pullCount,
     inputBytes,
     outputBytes,
-    pendingChars: pending.length,
+    pendingChars: toolNames.pendingLength(),
     sseErrorPending: sseErrors.pending.length,
     sseFinishPending: sseFinish?.pending.length ?? 0,
     sseFinishDisabled: sseFinish?.disabled ?? false,
@@ -2324,14 +2444,11 @@ export function createStrippedStream(
               await cancelReader(retryableStreamError)
               throw retryableStreamError
             }
-            const flushed = splitToolPrefixRewriteBuffer(
-              `${pending}${laneStartRewritten}`,
-              options.toolNameMap,
-              true,
-            )
+            const flushed = toolNames.push(laneStartRewritten, true)
             rewriteMs += rewriteNowMs() - rewriteStart
-            if (flushed.ready) {
-              const encoded = encoder.encode(flushed.ready)
+            if (flushed || preamble) {
+              const encoded = encoder.encode(preamble + flushed)
+              preamble = ''
               outputBytes += encoded.byteLength
               controller.enqueue(encoded)
             }
@@ -2348,7 +2465,16 @@ export function createStrippedStream(
 
           chunkCount++
           inputBytes += value.byteLength
-          const decoded = decoder.decode(value, { stream: true })
+          let decoded = decoder.decode(value, { stream: true })
+          if (decodeAtStart && decoded) {
+            decodeAtStart = false
+            if (decoded.charCodeAt(0) === 0xfeff) {
+              // Observers keep the decoder's former BOM-free view; only the
+              // returned bytes retain the provider's original BOM.
+              preamble = decoded[0] ?? ''
+              decoded = decoded.slice(1)
+            }
+          }
           if (jsonMode) {
             const decodedBytes = value.byteLength
             if (
@@ -2406,15 +2532,11 @@ export function createStrippedStream(
             releaseReader()
             throw retryableStreamError
           }
-          const text = pending + laneStartRewritten
-          const rewritten = splitToolPrefixRewriteBuffer(
-            text,
-            options.toolNameMap,
-          )
+          const rewritten = toolNames.push(laneStartRewritten)
           rewriteMs += rewriteNowMs() - rewriteStart
-          pending = rewritten.pending
-          if (rewritten.ready) {
-            const encoded = encoder.encode(rewritten.ready)
+          if (rewritten) {
+            const encoded = encoder.encode(preamble + rewritten)
+            preamble = ''
             outputBytes += encoded.byteLength
             controller.enqueue(encoded)
           }
@@ -2431,7 +2553,7 @@ export function createStrippedStream(
               lastChunkBytes: value.byteLength,
             })
           }
-          if (rewritten.ready) return
+          if (rewritten) return
         } catch (error) {
           // Only the stage is logged: the error text can repeat provider output.
           logProgress('stream_tool_prefix_error')

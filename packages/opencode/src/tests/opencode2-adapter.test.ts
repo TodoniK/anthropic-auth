@@ -987,7 +987,7 @@ describe('OpenCode 2 native Anthropic adapter: responses', () => {
     expect(quotaReads).toHaveLength(1)
     expect(quotaReads[0]?.context.provenance).toBe(vault)
     expect(quotaReads[0]?.context.status).toBe(200)
-    expect(text).toContain('"name": "bash"')
+    expect(text).toContain('"name":"bash"')
     expect(text).not.toContain('mcp_Bash')
     expect((response as Response).headers.get('request-id')).toBe(
       'req_011CTestUpstream000000001',

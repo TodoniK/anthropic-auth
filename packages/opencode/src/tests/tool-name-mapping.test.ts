@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   createStrippedStream,
+  NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
   rewriteRequestBody,
   stripToolPrefix,
   type ToolNameMap,
@@ -79,6 +80,87 @@ async function restore(
 }
 
 describe('request-bound response tool names', () => {
+  test('restores the exact forced wire name before an original host alias', async () => {
+    const request = await prepare(['search', 'mcp_Search'])
+    expect(
+      request.body.tools.map((tool: { name: string }) => tool.name),
+    ).toEqual(['mcp_Search', 'mcp_Mcp_Search'])
+    expect(request.body.tool_choice).toEqual({
+      type: 'tool',
+      name: 'mcp_Search',
+    })
+    const response = createStrippedStream(
+      Response.json({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'synthetic',
+            name: request.body.tool_choice.name,
+            input: {},
+          },
+        ],
+      }),
+      { responseMode: 'json', toolNameMap: request.toolNameMap },
+    )
+    expect(await response.json()).toEqual({
+      content: [
+        { type: 'tool_use', id: 'synthetic', name: 'search', input: {} },
+      ],
+    })
+  })
+
+  test('preserves tool arguments and unrelated JSON name fields', async () => {
+    const request = await prepare(['create_file'])
+    const input = {
+      name: 'file',
+      nested: { name: 'File' },
+      items: [{ name: 'mcp_Create_file' }],
+      text: '{"name":"mcp_Create_file"}',
+      canonical: { name: 'create_file' },
+    }
+    const response = createStrippedStream(
+      Response.json({
+        name: 'mcp_Create_file',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'mcp_Create_file',
+            name: 'mcp_Create_file',
+            input,
+          },
+          { type: 'text', name: 'mcp_Create_file', text: 'mcp_Create_file' },
+        ],
+        metadata: { content: [{ type: 'tool_use', name: 'mcp_Create_file' }] },
+      }),
+      { responseMode: 'json', toolNameMap: request.toolNameMap },
+    )
+    expect(await response.json()).toEqual({
+      name: 'mcp_Create_file',
+      content: [
+        { type: 'tool_use', id: 'mcp_Create_file', name: 'create_file', input },
+        { type: 'text', name: 'mcp_Create_file', text: 'mcp_Create_file' },
+      ],
+      metadata: { content: [{ type: 'tool_use', name: 'mcp_Create_file' }] },
+    })
+  })
+
+  test('retains ordinary read wire round trips', async () => {
+    const request = await prepare(['read'])
+    const response = createStrippedStream(
+      Response.json({
+        content: [{ type: 'tool_use', name: 'mcp_Read', input: {} }],
+      }),
+      { responseMode: 'json', toolNameMap: request.toolNameMap },
+    )
+    expect(await response.json()).toEqual({
+      content: [{ type: 'tool_use', name: 'read', input: {} }],
+    })
+    expect(await restore(request, ['mcp_Read', 'read'])).toEqual([
+      'read',
+      'read',
+    ])
+  })
+
   test('exact host and wire names beat competing namespace suffixes', async () => {
     const names = ['search', 'move', 'delete', 'import']
     const request = await prepare([
@@ -231,11 +313,11 @@ describe('request-bound response tool names', () => {
     ])
   })
 
-  test('does not redirect a real host name that is also another tools wire name', async () => {
+  test('gives exact emitted names precedence over original host aliases in SSE', async () => {
     const request = await prepare(['search', 'mcp_Search', 'aft_search'])
     expect(
       await restore(request, ['mcp_Search', 'mcp_Mcp_Search', 'search']),
-    ).toEqual(['mcp_Search', 'mcp_Search', 'search'])
+    ).toEqual(['search', 'mcp_Search', 'search'])
   })
 
   test('leaves a colliding capitalized wire name unresolved without losing exact host names', async () => {
@@ -288,4 +370,177 @@ describe('request-bound response tool names', () => {
       ],
     })
   })
+
+  test.each(['\n', '\r\n', '\r'])(
+    'patches only SSE tool names with every-byte %j splitting',
+    async (ending) => {
+      const request = await prepare(['create_file'])
+      const data = [
+        '{"type":"content_block_start", "name":"File",',
+        '"content_block":{"input":{"name":"file","nested":{"name":"File"},"items":[{"name":"mcp_Create_file"}],"text":"{\\"name\\":\\"file\\"}"},',
+        '"name"  :  "mcp_Create_file", "type":"tool_use", "id":"mcp_Create_file"}}',
+      ]
+      const frame =
+        '\ufeff: début 🧪\n' +
+        'id: mcp_Create_file\n' +
+        'event: content_block_start\n' +
+        data.map((line) => `data: ${line}\n`).join('') +
+        '\n'
+      const text = frame.replaceAll('\n', ending)
+      const expected = text.replace(
+        '"name"  :  "mcp_Create_file"',
+        '"name"  :  "create_file"',
+      )
+      const bytes = new TextEncoder().encode(text)
+      const response = createStrippedStream(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              for (const byte of bytes) controller.enqueue(Uint8Array.of(byte))
+              controller.close()
+            },
+          }),
+        ),
+        { toolNameMap: request.toolNameMap },
+      )
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(
+        new TextEncoder().encode(expected),
+      )
+    },
+  )
+
+  test('preserves JSON bytes outside tool-name values with every-byte splitting', async () => {
+    const request = await prepare(['create_file'])
+    const text =
+      '{ "type":"message", "content" : [{"name" : "mcp_Create_file", "input":{"name":"File","items":[{"name":"file"}]},"type":"tool_use"}], "name":"mcp_Create_file" }'
+    const bytes = new TextEncoder().encode(text)
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const byte of bytes) controller.enqueue(Uint8Array.of(byte))
+            controller.close()
+          },
+        }),
+      ),
+      { responseMode: 'json', toolNameMap: request.toolNameMap },
+    )
+    expect(await response.text()).toBe(
+      text.replace('"name" : "mcp_Create_file"', '"name" : "create_file"'),
+    )
+  })
+
+  test('keeps canonical, unknown, malformed and non-tool SSE frames byte-identical', async () => {
+    const request = await prepare(['create_file'])
+    const frames = [
+      'event: content_block_start\ndata: {"type":"content_block_start","content_block":{"type":"tool_use","name":"create_file","input":{"name":"file"}}}\n\n',
+      'event: future\ndata: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_Create_file"}}\n\n',
+      'event: error\ndata: {"type":"error","name":"file","content_block":{"type":"tool_use","name":"mcp_Create_file"}}\n\n',
+      'data: {"type":"future","name":"mcp_Create_file","content_block":{"type":"tool_use","name":"mcp_Create_file"}}\n\n',
+      'data: {"type":"content_block_start","type":"error","content_block":{"type":"tool_use","name":"mcp_Create_file"}}\n\n',
+      'data: {"type":"content_block_start","content_block":{"type":"text","name":"mcp_Create_file","text":"file"}}\n\n',
+      'data: {"type":"content_block_delta","delta":{"name":"File","partial_json":"{\\"name\\":\\"file\\"}"}}\n\n',
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_Absent","input":{"name":"file"}}}\n\n',
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"file","name":"mcp_Create_file"}}\n\n',
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_Create_file"}\n\n',
+    ].join('')
+    const bytes = new TextEncoder().encode(frames)
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (let offset = 0; offset < bytes.length; offset += 3)
+              controller.enqueue(bytes.slice(offset, offset + 3))
+            controller.close()
+          },
+        }),
+      ),
+      { toolNameMap: request.toolNameMap },
+    )
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes)
+  })
+
+  test('keeps canonical and unknown JSON documents byte-identical', async () => {
+    const request = await prepare(['create_file'])
+    for (const text of [
+      '{"content":[{"type":"tool_use","name":"create_file","input":{"name":"file"}}]}',
+      '{"type":"error","content":[{"type":"tool_use","name":"mcp_Create_file"}]}',
+      '{"type":"future","content":[{"type":"tool_use","name":"mcp_Create_file"}]}',
+      '{"type":"message","type":"error","content":[{"type":"tool_use","name":"mcp_Create_file"}]}',
+      '{"metadata":{"content":[{"type":"tool_use","name":"mcp_Create_file"}]},"name":"File"}',
+      '{"content":[{"type":"text","name":"mcp_Create_file"},{"type":"tool_use","name":"unknown"}]}',
+      '{"content":[{"type":"tool_use","name":"mcp_Create_file"}],',
+    ]) {
+      expect(
+        await createStrippedStream(new Response(text), {
+          responseMode: 'json',
+          toolNameMap: request.toolNameMap,
+        }).text(),
+      ).toBe(text)
+    }
+  })
+
+  test('preserves initial BOM bytes without changing response observers', async () => {
+    const request = await prepare(['read'])
+    const message = { type: 'message', id: 'msg_observed', content: [] }
+    for (const mode of ['json', 'sse']) {
+      const text =
+        '\ufeff' +
+        (mode === 'json'
+          ? JSON.stringify(message)
+          : `data: ${JSON.stringify({ type: 'message_start', message })}\n\n`)
+      const seen: Record<string, unknown>[] = []
+      const response = createStrippedStream(new Response(text), {
+        toolNameMap: request.toolNameMap,
+        ...(mode === 'json' ? { responseMode: 'json' } : {}),
+        onMessageResponse: (value) => seen.push(value),
+        onMessageStart: (value) => seen.push(value),
+      })
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(
+        new TextEncoder().encode(text),
+      )
+      expect(seen).toEqual([message])
+    }
+  })
+
+  test.each(['json', 'sse'] as const)(
+    'passes oversized %s through unchanged without losing later bytes',
+    async (mode) => {
+      const request = await prepare(['create_file'])
+      const large = JSON.stringify({
+        type: 'message',
+        content: [
+          {
+            type: 'tool_use',
+            name: 'mcp_Create_file',
+            input: {
+              name: 'file',
+              text: 'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES),
+            },
+          },
+        ],
+      })
+      const text =
+        mode === 'json'
+          ? large
+          : `data: ${large}\n\ndata: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_Create_file"}}\n\n`
+      const bytes = new TextEncoder().encode(text)
+      const response = createStrippedStream(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              for (let offset = 0; offset < bytes.length; offset += 1024 * 1024)
+                controller.enqueue(bytes.slice(offset, offset + 1024 * 1024))
+              controller.close()
+            },
+          }),
+        ),
+        {
+          toolNameMap: request.toolNameMap,
+          ...(mode === 'json' ? { responseMode: 'json' } : {}),
+        },
+      )
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes)
+    },
+  )
 })

@@ -13040,7 +13040,7 @@ describe('auth.loader', () => {
       start(controller) {
         controller.enqueue(
           encoder.encode(
-            'data: {"content_block":{"type":"tool_use","name":"mcp_bash"}}\n\n',
+            'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_bash"}}\n\n',
           ),
         )
         controller.close()
@@ -13070,6 +13070,7 @@ describe('auth.loader', () => {
       {
         method: 'POST',
         body: JSON.stringify({
+          stream: true,
           tools: [
             { name: 'bash', input_schema: { type: 'object', properties: {} } },
           ],
@@ -13078,7 +13079,7 @@ describe('auth.loader', () => {
     )
 
     const text = await response.text()
-    expect(text).toContain('"name": "bash"')
+    expect(text).toContain('"name":"bash"')
     expect(text).not.toContain('mcp_bash')
   })
 

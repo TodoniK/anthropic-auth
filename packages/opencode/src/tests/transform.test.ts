@@ -978,47 +978,48 @@ describe('stripToolPrefix', () => {
     )
   })
   const stripDeclared = (text: string) => stripToolPrefix(text, map)
+  const document = (...names: string[]) =>
+    JSON.stringify({
+      content: names.map((name) => ({ type: 'tool_use', name })),
+    })
 
   test('strips mcp_ prefix from tool names', () => {
-    const text = '{"name": "mcp_read_file"}'
-    expect(stripDeclared(text)).toBe('{"name": "read_file"}')
+    const text = document('mcp_read_file')
+    expect(stripDeclared(text)).toBe(document('read_file'))
   })
 
   test('strips multiple prefixed names', () => {
-    const text = '{"name": "mcp_tool_a"} and {"name": "mcp_tool_b"}'
+    const text = document('mcp_tool_a', 'mcp_tool_b')
     const result = stripDeclared(text)
-    expect(result).toContain('"name": "tool_a"')
-    expect(result).toContain('"name": "tool_b"')
+    expect(result).toBe(document('tool_a', 'tool_b'))
   })
 
   test('does not strip names without mcp_ prefix', () => {
-    const text = '{"name": "regular_tool"}'
+    const text = document('regular_tool')
     expect(stripDeclared(text)).toBe(text)
   })
 
   test('canonicalizes Claude-dropped AFT namespace for prefixed tool names', () => {
-    expect(stripDeclared('{"name": "mcp_Safety"}')).toBe(
-      '{"name": "aft_safety"}',
-    )
-    expect(stripDeclared('{"name": "mcp_Outline"}')).toBe(
-      '{"name": "aft_outline"}',
-    )
+    expect(stripDeclared(document('mcp_Safety'))).toBe(document('aft_safety'))
+    expect(stripDeclared(document('mcp_Outline'))).toBe(document('aft_outline'))
   })
 
   test('canonicalizes raw AFT suffix tool names', () => {
-    expect(stripDeclared('{"name": "safety"}')).toBe('{"name": "aft_safety"}')
-    expect(stripDeclared('{"name": "outline"}')).toBe('{"name": "aft_outline"}')
+    expect(stripDeclared(document('safety'))).toBe(document('aft_safety'))
+    expect(stripDeclared(document('outline'))).toBe(document('aft_outline'))
   })
 
   test('preserves existing AFT names after stripping mcp prefix', () => {
-    expect(stripDeclared('{"name": "mcp_Aft_safety"}')).toBe(
-      '{"name": "aft_safety"}',
+    expect(stripDeclared(document('mcp_Aft_safety'))).toBe(
+      document('aft_safety'),
     )
   })
 
   test('handles whitespace variations in JSON', () => {
-    const text = '{"name"  :  "mcp_tool"}'
-    expect(stripDeclared(text)).toBe('{"name": "tool"}')
+    const text = '{"content":[{"type":"tool_use","name"  :  "mcp_tool"}]}'
+    expect(stripDeclared(text)).toBe(
+      '{"content":[{"type":"tool_use","name"  :  "tool"}]}',
+    )
   })
 })
 
@@ -1775,8 +1776,8 @@ describe('createStrippedStream', () => {
     })
 
     const text = await stripped.text()
-    expect(text).toContain('"name": "bash"')
-    expect(text).toContain('"name": "read"')
+    expect(text).toContain('"name":"bash"')
+    expect(text).toContain('"name":"read"')
     expect(text).not.toContain('mcp_bash')
     expect(text).not.toContain('mcp_read')
   })
@@ -1803,7 +1804,7 @@ describe('createStrippedStream', () => {
     )
 
     const text = await stripped.text()
-    expect(text).toContain('"name": "read"')
+    expect(text).toContain('"name":"read"')
     expect(text).not.toContain('mcp_Read')
   })
 
