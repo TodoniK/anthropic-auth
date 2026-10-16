@@ -29,6 +29,7 @@ import {
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
   formatPrimeAccountValue,
+  formatQuotaRowLabel,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   getSidebarState,
@@ -264,7 +265,9 @@ function QuotaRow(props: {
       when={props.part}
       fallback={
         <box width='100%' flexDirection='row'>
-          <text fg={props.theme.textMuted}>{props.label.padEnd(3)}</text>
+          <text
+            fg={props.theme.textMuted}
+          >{`${formatQuotaRowLabel(props.label)} `}</text>
           <text fg={props.theme.textMuted}>{'\u2014'}</text>
         </box>
       }
@@ -274,7 +277,9 @@ function QuotaRow(props: {
           the right edge so reset times align in their own right column. */}
       <box width='100%' flexDirection='row' justifyContent='space-between'>
         <box flexDirection='row'>
-          <text fg={props.theme.textMuted}>{props.label.padEnd(3)}</text>
+          <text
+            fg={props.theme.textMuted}
+          >{`${formatQuotaRowLabel(props.label)} `}</text>
           <For each={quotaBarSegments(used(), props.appearance, props.pacing)}>
             {(segment) => (
               <text fg={toneColor(props.theme, segment.tone)}>
@@ -294,7 +299,7 @@ function QuotaRow(props: {
       </box>
       <Show when={paceLine()}>
         <box width='100%' flexDirection='row'>
-          <text fg={props.theme.textMuted}>{'   '}</text>
+          <text fg={props.theme.textMuted}>{formatQuotaRowLabel('', 11)}</text>
           <text
             fg={toneColor(
               props.theme,

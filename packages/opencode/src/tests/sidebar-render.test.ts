@@ -14,30 +14,10 @@ afterEach(async () => {
   fixture = undefined
 })
 
-test('compiled sidebar renders the shared quota figure reset and stale reading age offline', async () => {
+async function renderSidebar(state: unknown, wanted: string[]) {
   fixture = await mkdtemp(join(tmpdir(), 'anthropic-quota-render-'))
   const stateFile = join(fixture, 'sidebar.json')
-  const now = Date.now()
-  await writeFile(
-    stateFile,
-    JSON.stringify({
-      main: {
-        quota: {
-          five_hour: {
-            usedPercent: 60,
-            remainingPercent: 40,
-            checkedAt: now - 2 * 86400000,
-            resetsAt: new Date(now + 4 * 86400000).toISOString(),
-          },
-          scoped: [],
-        },
-      },
-      fallbacks: [],
-      activeId: 'main',
-      route: 'main',
-      lastUpdated: now,
-    }),
-  )
+  await writeFile(stateFile, JSON.stringify(state))
   // Render the compiled sidebar with installed OpenTUI libraries, without a package install.
   const probe = `
 import { createTestRenderer } from '@opentui/core/testing';
@@ -61,12 +41,12 @@ const sidebar = registered.find((value) => value.slots?.sidebar_content)?.slots.
 if (!sidebar) throw new Error('sidebar slot was not registered');
 let destroyed;
 const teardown = new Promise((resolve) => { destroyed = resolve; });
-const setup = await createTestRenderer({ width: 80, height: 24, onDestroy() { destroyed(); } });
+const setup = await createTestRenderer({ width: 42, height: 32, onDestroy() { destroyed(); } });
 let settle;
 const frame = new Promise((resolve) => { settle = resolve; });
 const observe = () => {
   const text = setup.captureCharFrame();
-  if (text.includes('40% left') && text.includes('checked 2d ago')) settle(text);
+  if (${JSON.stringify(wanted)}.every((part) => text.includes(part))) settle(text);
 };
 setup.renderer.on('frame', observe);
 try {
@@ -102,8 +82,100 @@ process.exit(0);
     child.exited,
   ])
   expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
+  return stdout
+}
+
+test('compiled sidebar renders the shared quota figure reset and stale reading age offline', async () => {
+  const now = Date.now()
+  const stdout = await renderSidebar(
+    {
+      main: {
+        quota: {
+          five_hour: {
+            usedPercent: 60,
+            remainingPercent: 40,
+            checkedAt: now - 2 * 86400000,
+            resetsAt: new Date(now + 4 * 86400000).toISOString(),
+          },
+          scoped: [],
+        },
+      },
+      fallbacks: [],
+      activeId: 'main',
+      route: 'main',
+      lastUpdated: now,
+    },
+    ['40% left', 'checked 2d ago'],
+  )
   expect(stdout).toContain('40% left')
   expect(stdout).toContain('4d')
   expect(stdout).toContain('checked 2d ago')
   expect(stdout).not.toContain('Fable')
+})
+
+test('42-column sidebar renders full scoped names credits and stale fallback rows in aligned columns', async () => {
+  const now = Date.now()
+  const window = (used: number, checkedAt = now, resetMinutes?: number) => ({
+    usedPercent: used,
+    remainingPercent: 100 - used,
+    checkedAt,
+    ...(resetMinutes === undefined
+      ? {}
+      : {
+          resetsAt: new Date(now + resetMinutes * 60_000).toISOString(),
+        }),
+  })
+  const stdout = await renderSidebar(
+    {
+      main: {
+        quota: {
+          five_hour: window(62, now, 149),
+          seven_day: window(41, now, 3 * 1440 + 23 * 60),
+          scoped: [
+            {
+              id: 'fable',
+              title: 'Fable only',
+              modelName: 'Fable',
+              ...window(78),
+            },
+          ],
+          extraUsage: {
+            used: { amountMinor: 1250, currency: 'USD', exponent: 2 },
+            limit: { amountMinor: 5000, currency: 'USD', exponent: 2 },
+            exhausted: false,
+          },
+        },
+      },
+      fallbacks: [
+        {
+          id: 'work',
+          label: 'work',
+          enabled: true,
+          needsReauth: false,
+          quota: {
+            five_hour: window(8, now - 30 * 3_600_000),
+            seven_day: window(93, now - 30 * 3_600_000),
+          },
+        },
+      ],
+      activeId: 'main',
+      route: 'main',
+      lastUpdated: now,
+    },
+    ['Fable only', 'credits 75% left', 'work', 'checked 1d ago'],
+  )
+  expect(stdout).toContain('38% left')
+  expect(stdout).toContain('59% left')
+  expect(stdout).toContain('Fable only ████████░░ 22% left')
+  expect(stdout).toContain('credits 75% left')
+  expect(stdout).toContain('92% left')
+  expect(stdout).toContain('7% left')
+  expect(stdout).toContain('checked 1d ago')
+  const rows = stdout
+    .split('\n')
+    .filter((line) => /38% left|59% left|22% left|92% left|7% left/.test(line))
+  expect(rows).toHaveLength(5)
+  expect(new Set(rows.map((line) => line.search(/[█░▓▒]/)))).toEqual(
+    new Set([12]),
+  )
 })

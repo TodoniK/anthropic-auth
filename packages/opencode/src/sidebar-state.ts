@@ -930,6 +930,20 @@ export function getFableRecoverySummary(
   return `Opus 4.8 · ${recovery.remaining} left`
 }
 
+/** Keep full shared names when they fit; truncate only to preserve row columns. */
+export function formatQuotaRowLabel(name: string, width = 10): string {
+  let label = name
+  if (Bun.stringWidth(label) > width) {
+    label = ''
+    for (const character of name) {
+      if (Bun.stringWidth(label + character) > width - 1) break
+      label += character
+    }
+    label += '…'
+  }
+  return label + ' '.repeat(Math.max(0, width - Bun.stringWidth(label)))
+}
+
 export function getCollapsedQuotaSummary(
   quota: AccountQuota | null,
   now = Date.now(),

@@ -23,6 +23,7 @@ import {
   formatPrimeAccountValue,
   formatPrimeCost,
   formatPrimeTime,
+  formatQuotaRowLabel,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   getSidebarState,
@@ -405,6 +406,25 @@ describe('formatFallbackModelLabel', () => {
 
   test('defaults to Fable 5 when the id is missing', () => {
     expect(formatFallbackModelLabel(undefined)).toBe('Fable 5')
+  })
+})
+
+describe('formatQuotaRowLabel', () => {
+  test('keeps full shared names and pads short window names to the same column', () => {
+    expect(formatQuotaRowLabel('Fable only')).toBe('Fable only')
+    expect(formatQuotaRowLabel('5h')).toBe('5h        ')
+    expect(formatQuotaRowLabel('7d')).toBe('7d        ')
+  })
+
+  test('cuts long names with a trailing ellipsis instead of an abbreviation', () => {
+    expect(formatQuotaRowLabel('Fable weekly only')).toBe('Fable wee…')
+    expect(formatQuotaRowLabel('Fable only', 7)).toBe('Fable …')
+  })
+
+  test('measures terminal cells rather than splitting wide model names', () => {
+    const label = formatQuotaRowLabel('模型模型模型 only')
+    expect(label).toBe('模型模型… ')
+    expect(Bun.stringWidth(label)).toBe(10)
   })
 })
 
