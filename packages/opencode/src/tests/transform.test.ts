@@ -49,7 +49,7 @@ import {
 } from '../transform'
 
 async function toolMapFor(...names: string[]): Promise<ToolNameMap> {
-  let map: ToolNameMap = new Map()
+  let map: ToolNameMap | undefined
   await rewriteRequestBody(
     JSON.stringify({ tools: names.map((name) => ({ name })) }),
     {
@@ -58,6 +58,7 @@ async function toolMapFor(...names: string[]): Promise<ToolNameMap> {
       },
     },
   )
+  if (!map) throw new Error('Request did not produce a tool-name map')
   return map
 }
 

@@ -283,10 +283,12 @@ import {
 } from './sidebar-state.ts'
 import {
   addFastModeBetaHeader,
+  cancelUnsafeToolNameResponse,
   createStrippedStream,
   extractLatestHybridMessageCacheAnchor,
   isInsecure,
   mergeHeaders,
+  normalizeToolNameResponseError,
   prepareFableCacheWarmSource,
   rewriteRequestBody,
   rewriteUrl,
@@ -6340,7 +6342,17 @@ const anthropicAuthPlugin = async (
             // Only the stream's first frame may drop a leading byte-order mark.
             let streamStart = true
             while (!decided && bytes < 65_536) {
-              const { done, value } = await reader.read()
+              const { done, value } = await reader
+                .read()
+                .catch(async (caught: unknown) => {
+                  const error = normalizeToolNameResponseError(
+                    caught,
+                    cacheDiagnosticsResponses.get(response)?.toolNameMap,
+                  )
+                  if (error !== caught)
+                    await cancelUnsafeToolNameResponse(reader, error)
+                  throw error
+                })
               if (done) break
               chunks.push(value)
               bytes += value.byteLength

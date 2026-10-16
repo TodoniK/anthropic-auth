@@ -29,7 +29,10 @@ import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import type { TestGate } from '../../../core/src/tests/test-lifetime.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
-import { createStrippedStream } from '../transform.ts'
+import {
+  createStrippedStream,
+  NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
+} from '../transform.ts'
 
 // Provider errors can repeat the credential a send used. These tests drive the
 // OpenCode 1 plugin's own request handler with synthetic accounts and check
@@ -497,6 +500,7 @@ async function sendNative(
   plugin: PluginHooks,
   sessionId: string,
   toolNames?: string[],
+  streaming = true,
 ) {
   const loader = plugin.auth?.loader
   if (!loader) throw new Error('Plugin did not install its auth loader')
@@ -518,7 +522,7 @@ async function sendNative(
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
         max_tokens: 16,
-        stream: true,
+        stream: streaming,
         ...(toolNames
           ? {
               tools: toolNames.map((name) => ({
@@ -609,6 +613,68 @@ for (const ending of ['LF', 'CRLF'] as const) {
 }
 
 for (const relay of [false, true]) {
+  for (const streaming of [false, true]) {
+    for (const kind of ['ambiguous', 'overflow', 'parse']) {
+      test(`OC1 ${relay ? 'HTTP relay' : 'direct'} ${streaming ? 'SSE' : 'JSON'} ${kind} mapping refusal is terminal and never reroutes`, async () => {
+        const { owner, client, state } = await vaultFixture(
+          relay ? { fallbackToDirect: false } : undefined,
+        )
+        let sends = 0
+        owner.network.current = async () => {
+          sends++
+          const block = {
+            type: 'tool_use',
+            name: 'mcp_Search',
+            input: {
+              text: 'private provider prose',
+              ...(kind === 'overflow'
+                ? { query: 'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES) }
+                : {}),
+            },
+          }
+          const text =
+            kind === 'parse'
+              ? streaming
+                ? 'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_Search"}\n\n'
+                : '{"type":"message","content":[{"type":"tool_use","name":"mcp_Search"}],'
+              : streaming
+                ? sse({ type: 'content_block_start', content_block: block })
+                : JSON.stringify({ type: 'message', content: [block] })
+          return new Response(text, {
+            headers: {
+              'content-type': streaming
+                ? 'text/event-stream'
+                : 'application/json',
+              'request-id': 'req_synthetic_mapping',
+            },
+          })
+        }
+        const plugin = await createPlugin(owner, client)
+        const response = await sendNative(
+          owner,
+          plugin,
+          'oc1-terminal-mapping',
+          kind === 'ambiguous'
+            ? ['search', 'Search', 'mcp_Search']
+            : ['search', 'mcp_Search'],
+          streaming,
+        )
+        const failure: unknown = await response
+          .text()
+          .catch((error: unknown) => error)
+        expect(failure).toMatchObject({
+          name: 'UnsafeToolNameResponseError',
+          message: 'Response tool-name mapping could not be validated safely',
+        })
+        expect(failure).not.toHaveProperty('code')
+        expect(failure).toMatchObject({ retryable: false, isRetryable: false })
+        expect(failure).not.toHaveProperty('providerErrorType')
+        expect(sends).toBe(1)
+        expect(state.reports).toEqual([])
+      })
+    }
+  }
+
   test(`OC1 ${relay ? 'HTTP relay' : 'direct'} binds tool names to each concurrent request`, async () => {
     const { owner, client } = await vaultFixture(
       relay ? { fallbackToDirect: false } : undefined,
@@ -684,6 +750,55 @@ for (const relay of [false, true]) {
     expect(sentNames).toContainEqual(['mcp_Ctx_search', 'mcp_Bash'])
   })
 }
+
+test('OC1 pre-wrapper overflow inspection stays a terminal mapping refusal', async () => {
+  const { owner } = await localFixture(true)
+  let sends = 0
+  owner.network.current = async (url) => {
+    if (url.includes('/api/oauth/usage')) {
+      const window = {
+        utilization: 0,
+        resets_at: new Date(Date.now() + 3_600_000).toISOString(),
+      }
+      return Response.json({ five_hour: window, seven_day: window })
+    }
+    sends++
+    expect(url).not.toStartWith('https://paid.invalid')
+    expect(url).toContain('/v1/messages')
+    return eventStream(
+      sse({
+        type: 'content_block_start',
+        content_block: {
+          type: 'tool_use',
+          name: 'mcp_Search',
+          input: { query: 'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES) },
+        },
+      }),
+    )
+  }
+  const plugin = await createPlugin(owner)
+  let responseReturned = false
+  const failure: unknown = await sendNative(
+    owner,
+    plugin,
+    'oc1-pre-wrapper-refusal',
+    ['search', 'mcp_Search'],
+  )
+    .then((response) => {
+      responseReturned = true
+      return response.text()
+    })
+    .catch((error: unknown) => error)
+  expect(failure).toMatchObject({
+    name: 'UnsafeToolNameResponseError',
+    message: 'Response tool-name mapping could not be validated safely',
+    retryable: false,
+    isRetryable: false,
+  })
+  expect(failure).not.toHaveProperty('code')
+  expect(responseReturned).toBe(false)
+  expect(sends).toBe(1)
+})
 
 test('OC1 thrown transport error omits the credential it was sent with', async () => {
   const { owner, client } = await vaultFixture()

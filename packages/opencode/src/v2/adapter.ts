@@ -1130,6 +1130,12 @@ export function createNativeAnthropicAdapter<Q, P>(
         createStrippedStream(safe, {
           ...options,
           toolNameMap: responseToolNameMaps.get(data),
+          // Unsafe response names depend on this request's tool declarations,
+          // not the Anthropic account. Changing accounts must not bypass refusal.
+          onToolNameRefusal: () => {
+            localRefusals.set(data, 'response_tool_names')
+            release(data)
+          },
           laneStartOAuthServed: true,
           ...(json ? { responseMode: 'json' as const } : {}),
         }),
@@ -1145,7 +1151,8 @@ export function createNativeAnthropicAdapter<Q, P>(
     },
     async limitFromResponse({ status, headers, body, attempt }) {
       const data = attempt.data
-      if (!data) return undefined
+      if (!data || localRefusals.get(data) === 'response_tool_names')
+        return undefined
       if (!fromUpstream(headers, data))
         return source.limitFromRelayFailure?.({
           ...contextOf(attempt, data),
@@ -1168,6 +1175,11 @@ export function createNativeAnthropicAdapter<Q, P>(
       })
     },
     inspectEvent({ data: payload, event, attempt }) {
+      if (
+        attempt.data &&
+        localRefusals.get(attempt.data) === 'response_tool_names'
+      )
+        return undefined
       const parsed = parseJson(payload)
       if (!isRecord(parsed)) return undefined
       const type = typeof parsed.type === 'string' ? parsed.type : event

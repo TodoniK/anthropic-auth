@@ -28,6 +28,7 @@ import {
 } from '../server-fallback'
 import {
   hasPinnedFirstUserTextForTest,
+  NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
   resetPinnedFirstUserTextsForTest,
 } from '../transform'
 import {
@@ -848,6 +849,125 @@ describe('OpenCode 2 native Anthropic adapter: refusals', () => {
 })
 
 describe('OpenCode 2 native Anthropic adapter: responses', () => {
+  for (const streaming of [false, true]) {
+    for (const kind of ['ambiguous', 'overflow', 'parse']) {
+      test(`${streaming ? 'SSE' : 'JSON'} ${kind} mapping refusal stays fixed and never becomes an account limit`, async () => {
+        let classified = 0
+        const { source } = makeSource({
+          limitFromHostError: () => {
+            classified++
+            return undefined
+          },
+          limitFromResponse: () => {
+            classified++
+            return undefined
+          },
+          limitFromStreamError: () => {
+            classified++
+            return undefined
+          },
+        })
+        const native = createNativeAnthropicAdapter({ source })
+        const host = new Host(native.adapter)
+        const payload = sonnetPayload()
+        payload.tools = (
+          kind === 'ambiguous'
+            ? ['search', 'Search', 'mcp_Search']
+            : ['search', 'mcp_Search']
+        ).map((name) => ({
+          ...payload.tools[0]!,
+          name,
+        }))
+        payload.stream = streaming
+        const { attempt, final } = await host.run(
+          scopeOf(),
+          hostRequest(payload),
+        )
+        const block = {
+          type: 'tool_use',
+          name: 'mcp_Search',
+          input: {
+            text: 'private provider prose',
+            ...(kind === 'overflow'
+              ? { query: 'x'.repeat(NON_STREAMING_DIAGNOSTICS_MAX_BYTES) }
+              : {}),
+          },
+        }
+        const text =
+          kind === 'parse'
+            ? streaming
+              ? 'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_Search"}\n\n'
+              : '{"type":"message","content":[{"type":"tool_use","name":"mcp_Search"}],'
+            : streaming
+              ? sse('content_block_start', {
+                  type: 'content_block_start',
+                  content_block: block,
+                })
+              : JSON.stringify({ type: 'message', content: [block] })
+        const upstream = new Response(text, {
+          headers: {
+            'content-type': streaming
+              ? 'text/event-stream'
+              : 'application/json',
+          },
+        })
+        const response = await native.adapter.rewriteResponse?.({
+          ...attempt,
+          request: final,
+          response: upstream,
+          attempt,
+        })
+        const failure: unknown = await (response as Response)
+          .text()
+          .catch((error: unknown) => error)
+        expect(failure).toMatchObject({
+          name: 'UnsafeToolNameResponseError',
+          message: 'Response tool-name mapping could not be validated safely',
+        })
+        expect(failure).not.toHaveProperty('code')
+        expect(failure).toMatchObject({ retryable: false, isRetryable: false })
+        expect(failure).not.toHaveProperty('providerErrorType')
+        expect(
+          native.adapter.limitFromError?.(
+            { type: 'provider_error', message: 'private host error prose' },
+            attempt,
+          ),
+        ).toBeUndefined()
+        let bodyReads = 0
+        expect(
+          await native.adapter.limitFromResponse?.({
+            status: 200,
+            headers: (response as Response).headers,
+            body: async () => {
+              bodyReads++
+              return 'private provider prose'
+            },
+            attempt,
+          }),
+        ).toBeUndefined()
+        expect(
+          native.adapter.inspectEvent?.({
+            ...attempt,
+            transport: 'http',
+            event: 'error',
+            data: JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'rate_limit_error',
+                message: 'private provider prose',
+              },
+            }),
+            attempt,
+          }),
+        ).toBeUndefined()
+        expect(bodyReads).toBe(0)
+        expect(classified).toBe(0)
+        expect(host.sent).toHaveLength(1)
+        native.dispose()
+      })
+    }
+  }
+
   test('never redirects declared host tools to AFT aliases', async () => {
     const { source } = makeSource()
     const native = createNativeAnthropicAdapter({ source })

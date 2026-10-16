@@ -76,9 +76,8 @@ import {
 
 export const NON_STREAMING_DIAGNOSTICS_MAX_BYTES = 8 * 1024 * 1024
 /**
- * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
- * Claude Code uses PascalCase tool names (e.g. mcp_Bash, mcp_Read);
- * lowercase names (mcp_bash, mcp_read) are flagged as non-Claude-Code clients.
+ * This plugin prefixes names with mcp_ and uppercases their first character.
+ * Tool definitions, outgoing history and response reverse maps must agree.
  */
 function prefixName(name: string): string {
   return `${TOOL_PREFIX}${name.charAt(0).toUpperCase()}${name.slice(1)}`
@@ -96,7 +95,60 @@ function unprefixName(name: string): string {
 }
 
 /** Request-local response spellings; null marks a spelling shared by multiple tools. */
-export type ToolNameMap = ReadonlyMap<string, string | null>
+export type ToolNameMap = ReadonlyMap<string, string | null> & {
+  readonly declaredHostNames: ReadonlySet<string>
+  readonly hazardousWireNames: ReadonlySet<string>
+}
+
+class UnsafeToolNameResponseError extends Error {
+  readonly retryable = false
+  readonly isRetryable = false
+
+  constructor() {
+    super('Response tool-name mapping could not be validated safely')
+    this.name = 'UnsafeToolNameResponseError'
+  }
+}
+
+function requireSafePassthrough(toolNameMap: ToolNameMap | undefined): void {
+  if (toolNameMap?.hazardousWireNames.size)
+    throw new UnsafeToolNameResponseError()
+}
+
+export function normalizeToolNameResponseError(
+  error: unknown,
+  toolNameMap?: ToolNameMap,
+): unknown {
+  // A provider-error reader may hit its SSE frame limit before names can be
+  // restored. If sent names also identify different host tools, exposing an
+  // unmapped response would let the host select the wrong tool.
+  return error instanceof SseFrameTooLargeError &&
+    toolNameMap?.hazardousWireNames.size
+    ? new UnsafeToolNameResponseError()
+    : error
+}
+
+export async function cancelUnsafeToolNameResponse(
+  reader: {
+    cancel(reason?: unknown): Promise<void>
+    readonly closed: Promise<void>
+    releaseLock(): void
+  },
+  error: unknown,
+): Promise<void> {
+  try {
+    // Source cancellation hooks may never settle; observe their rejection
+    // immediately, but join only the logically closed reader.
+    void reader.cancel(error).catch(() => {})
+  } catch {}
+  try {
+    await Promise.allSettled([reader.closed])
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {}
+  }
+}
 
 function responseToolNames(tools: unknown): ToolNameMap {
   const names = new Set<string>()
@@ -138,7 +190,12 @@ function responseToolNames(tools: unknown): ToolNameMap {
   // spellings as well as inferred suffixes, including ambiguous wire names.
   for (const name of names) aliases.set(name, name)
   for (const [wire, name] of wireNames) aliases.set(wire, name)
-  return aliases
+  return Object.assign(aliases, {
+    declaredHostNames: names,
+    hazardousWireNames: new Set(
+      [...wireNames.keys()].filter((wire) => names.has(wire)),
+    ),
+  })
 }
 
 export type FetchInput = string | URL | Request
@@ -297,14 +354,15 @@ function jsonMember(node: Node | undefined, key: string): Node | undefined {
   const matches = node.children?.filter(
     (property) => property.children?.[0]?.value === key,
   )
-  // Duplicate keys make a provider field ambiguous; leave it for the host.
-  return matches?.length === 1 ? matches[0]?.children?.[1] : undefined
+  // The host uses JSON.parse, so only the last property with this key routes a call.
+  return matches?.at(-1)?.children?.[1]
 }
 
 function toolNameEdits(
   text: string,
   toolNameMap: ToolNameMap | undefined,
   event: boolean,
+  routeAllowed = true,
 ): Edit[] {
   if (!toolNameMap?.size) return []
   const bom = text.charCodeAt(0) === 0xfeff ? 1 : 0
@@ -316,23 +374,21 @@ function toolNameEdits(
       allowTrailingComma: false,
     })
   } catch {
+    requireSafePassthrough(toolNameMap)
     return []
   }
-  if (errors.length || root?.type !== 'object') return []
-  if (
-    (root.children?.filter(
-      (property) => property.children?.[0]?.value === 'type',
-    ).length ?? 0) > 1
-  )
+  if (errors.length || root?.type !== 'object') {
+    requireSafePassthrough(toolNameMap)
     return []
+  }
   const type = jsonMember(root, 'type')?.value
   let blocks: Node[]
   if (event) {
-    if (type !== 'content_block_start') return []
+    routeAllowed &&= type === 'content_block_start'
     const block = jsonMember(root, 'content_block')
     blocks = block ? [block] : []
   } else {
-    if (type !== undefined && type !== 'message') return []
+    routeAllowed &&= type === undefined || type === 'message'
     const content = jsonMember(root, 'content')
     blocks = content?.type === 'array' ? (content.children ?? []) : []
   }
@@ -342,6 +398,13 @@ function toolNameEdits(
     const name = jsonMember(block, 'name')
     if (name?.type !== 'string') continue
     const realName = toolNameMap.get(name.value)
+    if (
+      toolNameMap.hazardousWireNames.has(name.value) &&
+      (!routeAllowed || realName === null)
+    ) {
+      throw new UnsafeToolNameResponseError()
+    }
+    if (!routeAllowed) continue
     if (realName && realName !== name.value) {
       edits.push({
         offset: bom + name.offset,
@@ -356,10 +419,13 @@ function toolNameEdits(
 function rewriteToolNameFrame(frame: string, toolNameMap: ToolNameMap): string {
   const bom = frame.charCodeAt(0) === 0xfeff ? 1 : 0
   const event = parseSseFrame(frame.slice(bom))
-  if (event.event !== undefined && event.event !== 'content_block_start')
-    return frame
   if (event.data === undefined) return frame
-  const edits = toolNameEdits(event.data, toolNameMap, true)
+  const edits = toolNameEdits(
+    event.data,
+    toolNameMap,
+    true,
+    event.event === undefined || event.event === 'content_block_start',
+  )
   if (!edits.length) return frame
   // SSE joins data lines with newlines. Map JSON token offsets back to their
   // original lines so comments, IDs, whitespace and line endings stay intact.
@@ -384,7 +450,10 @@ function rewriteToolNameFrame(frame: string, toolNameMap: ToolNameMap): string {
         edit.offset >= span.dataOffset &&
         edit.offset + edit.length <= span.dataOffset + span.length,
     )
-    if (!span) return frame
+    if (!span) {
+      requireSafePassthrough(toolNameMap)
+      return frame
+    }
     frameEdits.push({
       ...edit,
       offset: span.frameOffset + edit.offset - span.dataOffset,
@@ -413,10 +482,11 @@ function createToolNameRewriter(
       if (jsonMode) {
         pendingBytes += encoder.encode(text).byteLength
         if (pendingBytes > NON_STREAMING_DIAGNOSTICS_MAX_BYTES) {
-          // Oversized documents pass through unchanged rather than retaining
-          // an unbounded response or guessing at incomplete JSON structure.
+          // Bound retained data. Passthrough is safe only when an unrewritten
+          // wire name cannot select a different declared host tool.
           disabled = true
           pending = ''
+          requireSafePassthrough(toolNameMap)
           return combined
         }
         pending = flush ? '' : combined
@@ -427,10 +497,11 @@ function createToolNameRewriter(
         frames = framer.push(encoder.encode(text))
       } catch (error) {
         if (!(error instanceof SseFrameTooLargeError)) throw error
-        // The framer drops an oversized frame on failure. Our bounded copy
-        // preserves it and any earlier frames from this chunk byte for byte.
+        // The framer drops an oversized frame on failure. Keep its original
+        // bytes only when passthrough cannot invoke another declared tool.
         disabled = true
         pending = ''
+        requireSafePassthrough(toolNameMap)
         return combined
       }
       const decoded = frames.map((frame) => decoder.decode(frame))
@@ -2212,6 +2283,7 @@ export function createStrippedStream(
   response: Response,
   options: {
     toolNameMap?: ToolNameMap
+    onToolNameRefusal?: () => void
     perf?: RewritePerfCallback
     onContentFilter?: (context?: {
       completedToolUse: boolean
@@ -2554,10 +2626,20 @@ export function createStrippedStream(
             })
           }
           if (rewritten) return
-        } catch (error) {
+        } catch (caught) {
+          const error = normalizeToolNameResponseError(
+            caught,
+            options.toolNameMap,
+          )
           // Only the stage is logged: the error text can repeat provider output.
           logProgress('stream_tool_prefix_error')
-          releaseReader()
+          if (error instanceof UnsafeToolNameResponseError) {
+            await cancelUnsafeToolNameResponse(reader, error)
+            readerReleased = true
+            observe(options.onToolNameRefusal)
+          } else {
+            releaseReader()
+          }
           throw error
         }
       }
