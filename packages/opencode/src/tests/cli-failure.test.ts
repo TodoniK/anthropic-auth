@@ -14,6 +14,9 @@ import {
   createProviderErrorRedactor,
   NativeMigrationError,
   NativePiAuthSlotError,
+  runSetup,
+  type SetupIO,
+  type SetupPlugin,
 } from '@cortexkit/anthropic-auth-core'
 import { NativeAccountReadError } from '../../../core/src/native-account-view.ts'
 import { NativeCustodyError } from '../../../core/src/native-custody.ts'
@@ -47,6 +50,91 @@ const OPAQUE = 'OPAQUE-cli-synthetic-Kp3Nw8Ty5Qa2Lz'
 const JWT =
   'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMtY2xpIn0.c3ludGhldGljLWNsaS1zaWduYXR1cmU'
 const SK = 'sk-ant-synthetic9876543210fedcbaCLI'
+
+async function runnerFailure(
+  argv: string[],
+  options: {
+    ambiguous?: boolean
+    processes?: string
+    inspectionFails?: boolean
+  } = {},
+) {
+  const lines: string[] = []
+  const unexpectedCallback = async () => {
+    throw new Error('Runner failure fixture reached a setup callback')
+  }
+  const plugin: SetupPlugin = {
+    packages: { opencode: 'fixture-opencode', pi: 'fixture-pi' },
+    version: '1.0.0',
+    displayName: 'Fixture',
+    slashCommand: '/fixture',
+    vault: {
+      connectionFile: '/fixture/connection.json',
+      hosts: {
+        opencode: {
+          name: 'fixture-opencode',
+          paths: { stateDir: '/fixture/state', host: 'opencode' },
+        },
+        pi: {
+          name: 'fixture-pi',
+          paths: { stateDir: '/fixture/state', host: 'pi' },
+        },
+      },
+    },
+    signInLocal: unexpectedCallback,
+    migrate: unexpectedCallback,
+  }
+  const io: SetupIO = {
+    home: '/fixture',
+    cwd: '/fixture',
+    platform: 'linux',
+    env: {
+      HOME: '/fixture',
+      XDG_CONFIG_HOME: '/fixture/config',
+      PATH: options.ambiguous ? '/fixture/bin' : '',
+    },
+    terminal: {
+      input: {
+        isTTY: false,
+        setRawMode() {},
+        resume() {},
+        pause() {},
+        on() {},
+        removeListener() {},
+      },
+      output: {
+        write: (text) => {
+          lines.push(text)
+        },
+      },
+    },
+    fs: {
+      exists: () => false,
+      isDirectory: (path) => path === '/fixture/config/opencode',
+      isFile: () => false,
+      isExecutable: (path) =>
+        options.ambiguous === true &&
+        (path === '/fixture/bin/opencode' || path === '/fixture/bin/opencode2'),
+      readText: () => '{"name":"opencode-ai","version":"1.18.18"}',
+      realpath: (path) => path,
+    },
+    runner: {
+      run: async (file) => ({
+        exitCode: options.inspectionFails ? 1 : 0,
+        stdout:
+          file === 'ps' ? (options.processes ?? '1 /sbin/init\n') : '1.18.18',
+        stderr: '',
+        durationMs: 1,
+      }),
+    },
+  }
+  try {
+    await runSetup(plugin, argv, io)
+  } catch (error) {
+    return { error, output: lines.join('') }
+  }
+  throw new Error('Expected the shared runner to reject setup')
+}
 
 /**
  * Seeded pseudo-random text. The checks below look for any 16-character piece
@@ -106,7 +194,6 @@ test('fixed remedies and validated closed codes are admitted word for word', () 
       { pid: 77, command: '/bin/pi --x' },
       { pid: 78, command: '/usr/bin/LiteCode' },
     ]),
-    new ProcessInspectionError(),
     new NativeVaultActivationError('auth-content-refused'),
     new NativeVaultEnrollmentError('approval-refused'),
     new NativeMigrationError('primary-unverified'),
@@ -131,6 +218,65 @@ test('fixed remedies and validated closed codes are admitted word for word', () 
     expect(knownFailureMessage(error)).toBe(error.message)
 })
 
+test('shared runner plain errors retain their exact display messages', async () => {
+  const cases = [
+    {
+      argv: ['--unknown-fixture'],
+      message: 'Unknown setup argument: --unknown-fixture',
+    },
+    {
+      argv: ['--claustrum', '--no-claustrum'],
+      message: '--claustrum and --no-claustrum cannot be used together.',
+    },
+    { argv: [], message: 'Setup requires a TTY or --yes.' },
+    {
+      argv: ['--yes'],
+      ambiguous: true,
+      message:
+        'Multiple OpenCode generations found. Choose --opencode=1|2|both before running noninteractive setup.',
+    },
+    {
+      argv: ['--yes', '--claustrum'],
+      message:
+        'Claustrum is not available. Start ck or use --no-claustrum for local sign-in.',
+    },
+  ]
+  for (const { argv, message, ...options } of cases) {
+    const { error, output } = await runnerFailure(argv, options)
+    expect(knownFailureMessage(error)).toBe(message)
+    expect(await reportThrownFailure('cli-setup', error, {})).toBe(message)
+    expect(output).not.toContain(message)
+  }
+})
+
+test('shared runner fence errors display only rebuilt host names and PIDs', async () => {
+  const { error, output } = await runnerFailure(['--yes'], {
+    processes: `77 /private/host-canary/opencode --token=${SK}\n78 /usr/bin/pi --secret=${OPAQUE}\n`,
+  })
+  const expected =
+    'OpenCode or Pi processes are currently running:\n' +
+    '  - PID 77: opencode\n  - PID 78: pi\n\n' +
+    'Please quit all OpenCode, LiteCode, and Pi processes before running setup.'
+  expect(knownFailureMessage(error)).toBe(expected)
+  expect(await reportThrownFailure('cli-setup', error, {})).toBe(expected)
+  expect(output).not.toContain(expected)
+  expect(output).not.toContain('/private/host-canary')
+  expect(output).not.toContain(SK)
+  expect(output).not.toContain(OPAQUE)
+})
+
+test('shared runner inspection errors suppress an already printed refusal by own name', async () => {
+  const { error, output } = await runnerFailure(['--yes'], {
+    inspectionFails: true,
+  })
+  const refusal =
+    'Process inspection failed; setup cannot prove hosts are stopped.'
+  expect(output.split(refusal)).toHaveLength(2)
+  expect(knownFailureMessage(error)).toBe('')
+  expect(await reportThrownFailure('cli-setup', error, {})).toBe('')
+  expect(knownFailureMessage(new ProcessInspectionError())).toBe('')
+})
+
 test('forged, mutated, look-alike, proxy and accessor errors are not admitted', () => {
   const touched: string[] = []
   const closed = new NativeVaultActivationError('primary-conflict')
@@ -144,7 +290,7 @@ test('forged, mutated, look-alike, proxy and accessor errors are not admitted', 
       return Reflect.getOwnPropertyDescriptor(target, key)
     },
   })
-  const accessor = new ProcessInspectionError()
+  const accessor = new Error()
   Object.defineProperty(accessor, 'message', {
     get() {
       touched.push('message getter')
@@ -179,6 +325,18 @@ test('forged, mutated, look-alike, proxy and accessor errors are not admitted', 
   const named = Object.assign(new Error(`Native vault setup: ${SK}`), {
     name: 'NativeVaultEnrollmentError',
   })
+  const inheritedName = Object.create(
+    { name: 'ProcessInspectionError' },
+    {
+      message: { value: OPAQUE },
+    },
+  )
+  const accessorName = Object.defineProperty(new Error(OPAQUE), 'name', {
+    get() {
+      touched.push('name getter')
+      return 'ProcessInspectionError'
+    },
+  })
   for (const value of [
     proxy,
     accessor,
@@ -189,6 +347,8 @@ test('forged, mutated, look-alike, proxy and accessor errors are not admitted', 
     forgedStatus,
     prefixed,
     named,
+    inheritedName,
+    accessorName,
     'Disconnect from the vault first.',
     null,
     undefined,
@@ -196,6 +356,21 @@ test('forged, mutated, look-alike, proxy and accessor errors are not admitted', 
   ])
     expect(knownFailureMessage(value)).toBeUndefined()
   expect(touched).toEqual([])
+})
+
+test('unknown setup failures keep thrown paths and stacks off screen', async () => {
+  const root = await stateRoot()
+  const uniquePath = '/private/setup-path-canary-52f50b15/credentials.json'
+  const error = new Error(`Cannot migrate ${uniquePath}`)
+  error.stack = `Error: ${error.message}\n    at migrate (${uniquePath}:17:9)`
+  expect(knownFailureMessage(error)).toBeUndefined()
+  const screen = await reportThrownFailure('cli-setup', error, {
+    XDG_STATE_HOME: root,
+  })
+  expect(screen).toStartWith('Setup failed (cli-setup/unexpected-error).')
+  expect(screen).not.toContain(uniquePath)
+  expect(screen).not.toContain(error.stack)
+  expect(screen).not.toContain('at migrate')
 })
 
 test('known secrets include short submitted and secret-named environment values', () => {

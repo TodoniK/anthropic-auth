@@ -5,6 +5,10 @@ import { join } from 'node:path'
 import type { authorize, exchange } from '@cortexkit/anthropic-auth-core'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { addApiRoute, login, relaySetup } from '../cli.ts'
+import {
+  CLAUDE_POOL_LOGIN_METHOD_LABEL,
+  CLAUDE_POOL_LOGIN_STEP,
+} from '../v2/activation.ts'
 
 const envKeys = [
   'OPENCODE_ANTHROPIC_AUTH_FILE',
@@ -52,6 +56,18 @@ const exchangeImpl = mock(
 const network = mock(async (): Promise<Response> => {
   throw new Error('Unexpected external request in native CLI refusal test')
 })
+
+lifetimes.test(
+  'OC2 pool login instructions use the registered method label',
+  () => {
+    expect(CLAUDE_POOL_LOGIN_METHOD_LABEL).toBe(
+      'Claude Pro / Max (native account pool)',
+    )
+    expect(CLAUDE_POOL_LOGIN_STEP).toBe(
+      'In OpenCode, sign in to Anthropic with "Claude Pro / Max (native account pool)".',
+    )
+  },
+)
 
 async function setupBody() {
   const savedFetch = globalThis.fetch

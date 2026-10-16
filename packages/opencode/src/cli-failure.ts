@@ -1,15 +1,15 @@
 /**
  * Setup and CLI failures can contain credential echoes from child processes
- * or remote responses. Only fixed remedies and verified lists of running
- * OpenCode or Pi processes appear directly on screen. Other failures show a
- * fixed step label, failure code and private diagnostic file path. Details
- * are bounded and scrubbed by the shared authentication library using known
- * credentials and Bearer, JWT and `sk-` token patterns.
+ * or remote responses. Only recognized setup argument errors, fixed remedies
+ * and verified lists of running OpenCode or Pi processes appear on screen.
+ * Other failures show a fixed step label, failure code and private diagnostic
+ * file path. Details are bounded and scrubbed by the shared authentication
+ * library using known credentials and Bearer, JWT and `sk-` token patterns.
  *
  * Thrown values, credential lists and environments are read only through own
  * data properties: getters, iterators, `toJSON`, `toString` and proxy traps are
- * never run. A message is trusted only when it equals one of the fixed texts
- * below; the error's class, prototype or `name` never decides it.
+ * never run. An own name of ProcessInspectionError suppresses duplicate output:
+ * the shared setup runner prints its process-inspection refusal before rethrowing.
  */
 import { randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
@@ -28,10 +28,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { NativeVaultActivationError } from './setup/native-activation.ts'
 import { NativeVaultEnrollmentError } from './setup/native-enrollment.ts'
-import {
-  ProcessFenceViolationError,
-  ProcessInspectionError,
-} from './setup/process-fence.ts'
+import { ProcessFenceViolationError } from './setup/process-fence.ts'
 
 const STAGE_LABELS = {
   'setup-activation': 'Vault custody setup',
@@ -132,7 +129,6 @@ const CUSTODY_CODES = everyCode<NativeCustodyErrorCode>()([
  * of displaying unchecked text.
  */
 const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
-  new ProcessInspectionError().message,
   ...ACTIVATION_CODES.map(
     (code) => new NativeVaultActivationError(code).message,
   ),
@@ -154,6 +150,10 @@ const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
   'Cloudflare API token is required',
   'Cloudflare account ID is required',
   'Relay Worker URL is required',
+  '--claustrum and --no-claustrum cannot be used together.',
+  'Setup requires a TTY or --yes.',
+  'Multiple OpenCode generations found. Choose --opencode=1|2|both before running noninteractive setup.',
+  'Claustrum is not available. Start ck or use --no-claustrum for local sign-in.',
   // Offline local setup refuses an unverified account identity.
   'Claude sign-in did not establish an account UUID',
   // Each selected host needs separate storage.
@@ -269,18 +269,21 @@ function closedFenceHosts(
 }
 
 /**
- * The text to show for a known failure, or undefined when the thrown value is
- * not one. A message counts only when it equals a text in CLOSED_MESSAGES,
- * equals "OAuth metadata read failed: <status>" for its own integer HTTP
- * `status`, or equals what `new ProcessFenceViolationError(activeHosts)`
- * produces from its own validated `activeHosts`.
+ * Returns display text, '' when the runner already printed its process-inspection
+ * refusal, or undefined to fall through to reportThrownFailure. Runner errors
+ * cross a bundle boundary, so only own data properties classify them.
+ * Display text must be a fixed remedy, the runner's unknown-argument message,
+ * an OAuth metadata error matching its own integer HTTP status (100–599), or
+ * a running-host list rebuilt from validated own host names and PIDs.
  */
 export function knownFailureMessage(error: unknown): string | undefined {
   try {
     if (!isInspectable(error)) return undefined
+    if (ownData(error, 'name') === 'ProcessInspectionError') return ''
     const message = ownData(error, 'message')
     if (typeof message !== 'string') return undefined
     if (CLOSED_MESSAGES.has(message)) return message
+    if (message.startsWith('Unknown setup argument: ')) return message
     const status = ownData(error, 'status')
     if (
       typeof status === 'number' &&
@@ -291,8 +294,10 @@ export function knownFailureMessage(error: unknown): string | undefined {
     )
       return message
     const hosts = closedFenceHosts(ownData(error, 'activeHosts'))
-    if (hosts && message === new ProcessFenceViolationError(hosts).message)
-      return message
+    if (hosts) {
+      const rebuilt = new ProcessFenceViolationError(hosts).message
+      if (message === rebuilt) return rebuilt
+    }
   } catch {
     // Unreadable values are treated as unknown.
   }
