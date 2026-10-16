@@ -852,8 +852,22 @@ describe('OpenCode scoped custody serving', () => {
       ...dumps.map((name) => join(dumpDir, name)),
     ])
       expect(written).toContain(path)
+    // Background bookkeeping can still be holding a lock when the scan runs;
+    // a lock file that is released between listing and reading held no
+    // persistent data. Any other file that disappears still fails the test.
     const serialized = (
-      await Promise.all(written.map((path) => readFile(path, 'utf8')))
+      await Promise.all(
+        written.map((path) =>
+          readFile(path, 'utf8').catch((error: unknown) => {
+            if (
+              path.endsWith('.lock') &&
+              (error as NodeJS.ErrnoException).code === 'ENOENT'
+            )
+              return ''
+            throw error
+          }),
+        ),
+      )
     ).join('\n')
     expect(serialized).not.toContain('scoped-access-oauth:anthropic')
     expect(serialized).not.toContain('aa'.repeat(32))
