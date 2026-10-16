@@ -460,13 +460,13 @@ if (renderFailure) throw renderFailure;
 if (!frame.includes(sidebarRouteMarker) || !frame.includes("Waiting for quota")) {
   throw new Error("headless renderer output did not contain the expected sidebar nodes: " + frame);
 }
-if (!quotaFrame.includes("40% left") || !quotaFrame.includes("checked 2d ago") || !quotaFrame.includes("4d")) {
+if (!quotaFrame.includes("40% left") || !quotaFrame.includes("checked 2d ago") || !quotaFrame.includes("3d23h")) {
   throw new Error("packed sidebar quota figure, reset or reading age was absent: " + quotaFrame);
 }
 if (eventSubscriptions !== 2) {
   throw new Error("sidebar did not subscribe to both host events");
 }
-console.log("real host renderer captured the packed sidebar route, empty quota, 40% left, 4d reset and checked 2d ago");
+console.log("real host renderer captured the packed sidebar route, empty quota, 40% left, 3d23h reset and checked 2d ago");
 process.exit(0);
 `
 

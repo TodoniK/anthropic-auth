@@ -108,7 +108,7 @@ test('compiled sidebar renders the shared quota figure reset and stale reading a
     ['40% left', 'checked 2d ago'],
   )
   expect(stdout).toContain('40% left')
-  expect(stdout).toContain('4d')
+  expect(stdout).toContain('3d23h')
   expect(stdout).toContain('checked 2d ago')
   expect(stdout).not.toContain('Fable')
 })
@@ -162,7 +162,7 @@ test('42-column sidebar renders full scoped names credits and stale fallback row
       route: 'main',
       lastUpdated: now,
     },
-    ['Fable only', 'credits 75% left', 'work', 'checked 1d ago'],
+    ['Fable only', 'credits 75% left', 'work', 'checked 1d6h ago'],
   )
   expect(stdout).toContain('38% left')
   expect(stdout).toContain('59% left')
@@ -170,7 +170,7 @@ test('42-column sidebar renders full scoped names credits and stale fallback row
   expect(stdout).toContain('credits 75% left')
   expect(stdout).toContain('92% left')
   expect(stdout).toContain('7% left')
-  expect(stdout).toContain('checked 1d ago')
+  expect(stdout).toContain('checked 1d6h ago')
   const rows = stdout
     .split('\n')
     .filter((line) => /38% left|59% left|22% left|92% left|7% left/.test(line))

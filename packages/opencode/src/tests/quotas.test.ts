@@ -137,7 +137,7 @@ describe('quota summaries', () => {
     expect(summary).toContain('## Claude Quotas')
     expect(summary).toContain('### OpenCode anthropic (main)')
     expect(summary).toContain('Last token refresh: 2m ago')
-    expect(summary).toContain('5h 75% left, resets 1h')
+    expect(summary).toContain('5h 75% left, resets 1h15m')
     expect(summary).toContain('7d 50% left')
     expect(summary).toContain('Fable only 95% left')
     expect(summary).not.toContain('checked')
