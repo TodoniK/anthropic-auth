@@ -15,6 +15,7 @@ import {
   readNativeMigrationSource,
   requireUnchangedNativeMigrationSource,
 } from './migration-source.ts'
+import type { NativeAccountSnapshot } from './native-account-view.ts'
 import type { NativeCustodyInventory } from './native-custody.ts'
 import {
   inspectNativeHostAuthEntry,
@@ -28,6 +29,7 @@ import {
   captureNativeMigrationPreparedProof,
   NativeMigrationProofError,
   nativeMigrationCanonicalJson,
+  nativeMigrationDigest,
   requireNativeMigrationPreparedProof,
 } from './native-migration-proof.ts'
 import {
@@ -53,7 +55,6 @@ import {
   advanceNativeMigration,
   beginNativeEmptyInit,
   beginNativeMigration,
-  NativeAuthorityError,
   type NativeEmptyInitJournal,
   type NativeLegacyMigrationJournal,
   type NativeMigrationJournal,
@@ -78,6 +79,9 @@ export class NativeMigrationError extends Error {
       | 'primary-unverified'
       | 'migration-busy'
       | 'ownership-lost'
+      | 'pool-populated'
+      | 'host-login-present'
+      | 'settings-changed'
       | 'retirement-refused',
   ) {
     super(
@@ -151,13 +155,64 @@ interface Captured {
   auth: NativeMigrationSourceSnapshot
   projection?: NativeMigrationProjection
   seedInput?: NativeRosterSeedInput
-  journal?: NativeLegacyMigrationJournal
+  journal?: NativeMigrationJournal
+  routingDestination?: NativeMigrationSourceSnapshot
   hostAuthPath: string
   routingSourcePath: string
   routingDestinationPath: string
 }
 
 const preflights = new WeakMap<NativeMigrationPreflight, Captured>()
+
+/** Session pins and preferences do not establish account ownership. */
+export async function nativePoolHoldsAccountData({
+  paths,
+}: {
+  paths: NativePoolPaths
+}): Promise<boolean> {
+  const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+  const [pool, config, state, runtime] = await Promise.all([
+    store.read(),
+    readNativeMigrationSource('config', paths.config),
+    readNativeMigrationSource('state', paths.state),
+    readNativeRuntime(paths.runtime, paths.storageId),
+  ])
+  if (pool.status !== 'ready') refuse()
+  for (const snapshot of [config, state]) owned(snapshot)
+  const entries = (value: unknown): number => {
+    if (value === undefined) return 0
+    if (!value || typeof value !== 'object' || Array.isArray(value)) refuse()
+    return Object.keys(value).length
+  }
+  const configRows = config.data?.commonAuthPool
+  if (
+    configRows !== undefined &&
+    (!configRows || typeof configRows !== 'object' || Array.isArray(configRows))
+  )
+    refuse()
+  const count =
+    entries(configRows && 'rows' in configRows ? configRows.rows : undefined) +
+    entries(state.data?.accounts)
+  return (
+    pool.rows.length > 0 ||
+    count > 0 ||
+    (runtime.status === 'ready' &&
+      Object.keys(runtime.state.accounts).length > 0)
+  )
+}
+
+/** Only enabled local OAuth rows can authorize local OAuth serving. */
+export function snapshotHasServableLocalOAuth(
+  snapshot: Pick<NativeAccountSnapshot, 'accounts'>,
+): boolean {
+  return snapshot.accounts.some(
+    (account) =>
+      account.source === 'local' &&
+      account.type === 'oauth' &&
+      account.enabled &&
+      account.state !== 'unsupported-access',
+  )
+}
 
 function refuse(
   code: ConstructorParameters<
@@ -297,7 +352,10 @@ export function releaseNativeMigrationPreflight(
   preflights.delete(token)
 }
 
-async function capture(input: NativeMigrationOptions): Promise<Captured> {
+async function capture(
+  input: NativeMigrationOptions,
+  checkPool = false,
+): Promise<Captured> {
   requireNoSupervisedAuthContentSnapshot(input.env)
   await input.processFence()
   const resolved = await resolveNativePoolPaths(
@@ -312,9 +370,19 @@ async function capture(input: NativeMigrationOptions): Promise<Captured> {
     input.routingDestinationPath,
   ])
     if (!isAbsolute(path) || /\p{Cc}/u.test(path)) refuse()
-  const journal = await readNativeMigrationJournal(input.paths)
-  if (journal?.kind === 'empty-init')
-    throw new NativeAuthorityError('journal-conflict')
+  const current = await readNativeMigrationJournal(input.paths)
+  const emptyInit = current?.kind === 'empty-init'
+  const journal = current?.kind === 'empty-init' ? undefined : current
+  if (emptyInit) {
+    if (
+      current.host !== input.host ||
+      input.routingDestinationPath !==
+        resolveLocalRoutingDestination(input.host, input.paths, input.env)
+    )
+      refuse()
+    if (checkPool && (await nativePoolHoldsAccountData({ paths: input.paths })))
+      refuse('pool-populated')
+  }
   const auth = await readNativeMigrationSource('hostAuth', input.hostAuthPath)
   owned(auth)
   const entry = inspectNativeHostAuthEntry(input.host, auth.data)
@@ -379,7 +447,7 @@ async function capture(input: NativeMigrationOptions): Promise<Captured> {
       routingDestinationPath,
     }
   }
-  if (!journal) {
+  if (!current) {
     for (const path of [
       input.paths.config,
       input.paths.state,
@@ -405,6 +473,11 @@ async function capture(input: NativeMigrationOptions): Promise<Captured> {
     'routing',
     input.routingSourcePath,
   )
+  const routingDestination =
+    emptyInit || journal?.kind === 'legacy-import'
+      ? await readNativeMigrationSource('routing', input.routingDestinationPath)
+      : undefined
+  if (routingDestination) owned(routingDestination)
   for (const source of [config, state, routing]) owned(source)
   if (
     (await canonicalPath(config.path)) !== input.paths.legacyConfig ||
@@ -498,7 +571,8 @@ async function capture(input: NativeMigrationOptions): Promise<Captured> {
     state,
     routing,
     auth,
-    journal,
+    journal: current,
+    routingDestination,
     projection,
     seedInput,
     hostAuthPath,
@@ -591,13 +665,53 @@ async function heldPool<T>(
 }
 
 function routingBytes(captured: Captured): string | undefined {
-  if (!captured.routing.data) return undefined
+  const native = captured.routingDestination?.data
+  let nativeAssignments: object = {}
+  if (native) {
+    const nativeMap = new Map<string, string>()
+    if (!native.assignments || typeof native.assignments !== 'object') refuse()
+    nativeAssignments = native.assignments
+    for (const assignment of Object.values(native.assignments)) {
+      if (
+        !assignment ||
+        typeof assignment !== 'object' ||
+        !('accountId' in assignment) ||
+        typeof assignment.accountId !== 'string'
+      )
+        refuse()
+      nativeMap.set(assignment.accountId, assignment.accountId)
+    }
+    migrateStickyRoutingState(
+      {
+        version: native.version,
+        updatedAt: native.updatedAt,
+        assignments: native.assignments,
+      },
+      nativeMap,
+    )
+  }
+  if (!captured.routing.data)
+    return native ? `${JSON.stringify(native, null, 2)}\n` : undefined
   if (!captured.projection) refuse()
   const map = new Map(
     captured.projection.accounts.map((account) => [account.id, account.id]),
   )
   map.set('main', captured.projection.mainRouteId)
-  return migrateStickyRoutingState(captured.routing.data, map)
+  const imported = migrateStickyRoutingState(captured.routing.data, map)
+  if (!native) return imported
+  // Native session affinity wins; a legacy import fills only missing sessions.
+  const legacy = JSON.parse(imported)
+  return `${JSON.stringify(
+    {
+      ...native,
+      assignments: {
+        ...legacy.assignments,
+        ...nativeAssignments,
+      },
+    },
+    null,
+    2,
+  )}\n`
 }
 function bytesDigest(bytes: string | undefined): string | null {
   return bytes === undefined
@@ -744,7 +858,7 @@ export async function runNativeMigration(
             refuse('ownership-lost')
           }
         }
-        const captured = await capture(operation)
+        const captured = await capture(operation, true)
         if (operation.preflight) {
           const previous = preflights.get(operation.preflight)
           if (
@@ -754,6 +868,8 @@ export async function runNativeMigration(
             previous.config.digest !== captured.config.digest ||
             previous.state.digest !== captured.state.digest ||
             previous.routing.digest !== captured.routing.digest ||
+            previous.routingDestination?.digest !==
+              captured.routingDestination?.digest ||
             inspectNativeHostAuthEntry(operation.host, previous.auth.data)
               .digest !==
               inspectNativeHostAuthEntry(operation.host, captured.auth.data)
@@ -764,7 +880,40 @@ export async function runNativeMigration(
           )
             refuse()
         }
-        let journal = captured.journal
+        const emptyInit = captured.journal?.kind === 'empty-init'
+        let journal =
+          captured.journal?.kind === 'empty-init' ? undefined : captured.journal
+        const store = createNativePoolStore({
+          paths,
+          quota: nativeQuotaCodec,
+          onLockStep: hooks.store?.onLockStep,
+          onStep: async (write, info) => {
+            await hooks.store?.onStep?.(write, info)
+            await step(`${write}:store:${info.operation}`)
+            if (write.startsWith('before-')) {
+              await checkLegacy(captured)
+              await operation.processFence()
+              await assertMigration()
+            }
+          },
+        })
+        const settingsDigest = async () => {
+          const settings = await store.readSettings()
+          if (settings.status !== 'ready') refuse('settings-changed')
+          return nativeMigrationDigest(settings.settings)
+        }
+        const nativeSettingsDigest = emptyInit
+          ? await settingsDigest()
+          : journal?.kind === 'legacy-import' &&
+              journal.phase !== 'committed' &&
+              journal.phase !== 'retired'
+            ? journal.nativeSettingsDigest
+            : undefined
+        if (
+          nativeSettingsDigest !== undefined &&
+          (await settingsDigest()) !== nativeSettingsDigest
+        )
+          refuse('settings-changed')
         const step = async (label: string) => hooks.onStep?.(label)
         const journalHooks = {
           assertOwned: async () => {
@@ -772,6 +921,12 @@ export async function runNativeMigration(
             await checkLegacy(captured)
             await operation.processFence()
             await assertMigration()
+            if (
+              emptyInit &&
+              !journal &&
+              (await nativePoolHoldsAccountData({ paths }))
+            )
+              refuse('pool-populated')
           },
           onWriteStep: async (
             write: 'before-write' | 'after-write',
@@ -786,9 +941,15 @@ export async function runNativeMigration(
             )
           },
         }
-        // Once a switch to vault custody is requested or prepared, the
-        // activation controller owns the host auth file. Restoring the ordinary host activation marker
-        // could delete a credential that controller must refuse to adopt.
+        if (
+          operation.host === 'opencode' &&
+          (journal?.phase === 'committed' || journal?.phase === 'retired') &&
+          inspectNativeHostAuthEntry('opencode', captured.auth.data).kind ===
+            'oauth'
+        )
+          refuse('host-login-present')
+        // A pending vault switch leaves host auth under the activation controller's authority.
+        // Repairing the local placeholder could delete a credential it must refuse to adopt.
         if (journal?.phase === 'retired') {
           if (journal.activation === null)
             await repair(operation, assertMigration, hooks)
@@ -806,6 +967,9 @@ export async function runNativeMigration(
             paths,
             {
               host: operation.host,
+              ...(nativeSettingsDigest === undefined
+                ? {}
+                : { nativeSettingsDigest }),
               sources: {
                 config: captured.config.digest,
                 state: captured.state.digest,
@@ -827,20 +991,6 @@ export async function runNativeMigration(
             journalHooks,
           )
         }
-        const store = createNativePoolStore({
-          paths,
-          quota: nativeQuotaCodec,
-          onLockStep: hooks.store?.onLockStep,
-          onStep: async (write, info) => {
-            await hooks.store?.onStep?.(write, info)
-            await step(`${write}:store:${info.operation}`)
-            if (write.startsWith('before-')) {
-              await checkLegacy(captured)
-              await operation.processFence()
-              await assertMigration()
-            }
-          },
-        })
         let bytes: string | undefined
         let seed: NativeVaultRosterSeed | undefined
         if (journal.phase === 'building') {
@@ -921,8 +1071,10 @@ export async function runNativeMigration(
               .filter((account) => account.credential)
               .map((account) => account.id),
           )
-          await beforeMutator()
-          await store.updateSettings(() => projection.settings)
+          if (journal.kind !== 'legacy-import') {
+            await beforeMutator()
+            await store.updateSettings(() => projection.settings)
+          }
           if (captured.seedInput) {
             await beforeMutator()
             await step('before:roster')
@@ -1018,8 +1170,11 @@ export async function runNativeMigration(
               const importedSettings = await store.readSettings()
               if (
                 importedSettings.status !== 'ready' ||
-                nativeMigrationCanonicalJson(importedSettings.settings) !==
-                  nativeMigrationCanonicalJson(captured.projection.settings)
+                (journal.kind === 'legacy-import'
+                  ? nativeMigrationDigest(importedSettings.settings) !==
+                    journal.nativeSettingsDigest
+                  : nativeMigrationCanonicalJson(importedSettings.settings) !==
+                    nativeMigrationCanonicalJson(captured.projection.settings))
               )
                 refuse()
               if (captured.seedInput && !seed) {
@@ -1112,10 +1267,13 @@ export async function runNativeMigration(
                 if (destination.digest !== authoritative.expectedRouting) {
                   if (
                     authoritative.phase !== 'verified' ||
-                    (captured.routingSourcePath !==
-                    captured.routingDestinationPath
-                      ? destination.digest !== null
-                      : destination.digest !== authoritative.sources.routing)
+                    (authoritative.kind === 'legacy-import'
+                      ? destination.digest !==
+                        captured.routingDestination?.digest
+                      : captured.routingSourcePath !==
+                          captured.routingDestinationPath
+                        ? destination.digest !== null
+                        : destination.digest !== authoritative.sources.routing)
                   )
                     refuse()
                   await requireUnchangedNativeMigrationSource(captured.routing)

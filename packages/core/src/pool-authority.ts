@@ -491,7 +491,8 @@ function decodeJournal(
     unprepared !== (preparedProof === null) ||
     (value.phase === 'building' && !unprepared) ||
     (value.phase !== 'building' && value.phase !== 'verified' && unprepared) ||
-    (!unprepared &&
+    (format.version === 4 &&
+      !unprepared &&
       (value.sources.routing === null) !== (value.expectedRouting === null))
   ) {
     throw new NativeAuthorityError('invalid-journal')
@@ -667,9 +668,14 @@ export async function beginNativeMigration(
     },
     async (lock) => {
       const current = await readNativeMigrationJournal(paths)
+      if (current?.kind === 'empty-init') {
+        if (current.host !== initial.host)
+          throw new NativeAuthorityError('journal-conflict')
+        await writeJournal(paths, initial, () => lock.assertOwned(), hooks)
+        return initial
+      }
       if (current) {
         if (
-          current.kind === 'empty-init' ||
           current.version !== initial.version ||
           (current.version === 5 &&
             initial.version === 5 &&
@@ -733,7 +739,8 @@ export async function recordNativeMigrationExpectations(
       if (
         current.kind === 'empty-init' ||
         current.phase !== 'verified' ||
-        (current.sources.routing === null) !== (expectedRouting === null)
+        (current.version === 4 &&
+          (current.sources.routing === null) !== (expectedRouting === null))
       ) {
         throw new NativeAuthorityError('journal-conflict')
       }

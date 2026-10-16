@@ -21,15 +21,20 @@ import {
   writeJsonAtomic,
 } from '@cortexkit/common-auth/fs'
 import type { ProviderAccountUuid } from '../claude-code.ts'
+import { custodyTombstoneOAuth } from '../claustrum.ts'
 import { createNativeAccountRuntime } from '../native-account-runtime.ts'
+import type { NativeAccountView } from '../native-account-view.ts'
 import type { NativeCustodyInventory } from '../native-custody.ts'
 import {
   NativeMigrationError,
   type NativeMigrationOptions,
+  nativePoolHoldsAccountData,
   prepareNativeMigration,
   publishNativeEmptyInit,
   runNativeMigration,
+  snapshotHasServableLocalOAuth,
 } from '../native-migration.ts'
+import { nativeMigrationDigest } from '../native-migration-proof.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import {
   buildNativeVaultRosterSeed,
@@ -46,6 +51,7 @@ import {
   resolveNativePoolPaths,
 } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
+import { tokenFingerprint } from '../token-fingerprint.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
@@ -164,7 +170,9 @@ async function emptyFixture() {
   return f
 }
 
-async function fileBytes(f: Awaited<ReturnType<typeof fixture>>) {
+async function fileBytes(
+  f: Pick<Awaited<ReturnType<typeof fixture>>, 'input' | 'paths'>,
+) {
   return Promise.all(
     [
       f.paths.config,
@@ -574,26 +582,495 @@ test('empty-init interruption before rename publishes on one new run; after rena
   }
 })
 
-test('offline migration refuses empty-init before source reads or retirement and preserves committed bytes', async () => {
+test('empty-init imports later OC1 accounts and metadata, preserves preferences and gap-fills pins', async () => {
   const f = await emptyFixture()
   await publishNativeEmptyInit(f.input)
-  await writeFile(f.input.hostAuthPath, '{invalid host auth')
-  const before = await fileBytes(f)
-  let writes = 0
+  await f.store.updateSettings(() => ({
+    costZeroing: { enabled: true },
+    routingMode: 'sticky',
+    customPreference: { exact: [1, false] },
+  }))
+  const settings = await f.store.readSettings()
+  const pin = (accountId: string) => ({
+    accountId,
+    family: 'general',
+    assignedAt: 1,
+    lastSeenAt: 2,
+    initialInputBytes: 3,
+    quotaCheckedAt: 0,
+  })
+  const nativePin = pin('native-route')
+  await writeFile(
+    f.input.routingDestinationPath,
+    JSON.stringify({
+      version: 1,
+      updatedAt: 20,
+      assignments: { A: nativePin },
+    }),
+    { mode: 0o600 },
+  )
+  await writeFile(
+    f.input.routingSourcePath,
+    JSON.stringify({
+      version: 1,
+      updatedAt: 10,
+      assignments: { A: pin('main'), B: pin('fallback-route') },
+    }),
+    { mode: 0o600 },
+  )
+  const config = JSON.parse(await readFile(f.paths.legacyConfig, 'utf8'))
+  config.accounts[0].anthropicAccountUuid = 'fixture-uuid'
+  await writeFile(f.paths.legacyConfig, JSON.stringify(config))
+  const state = JSON.parse(await readFile(f.paths.legacyState, 'utf8'))
+  state.accounts['fallback-route'] = {
+    ...state.accounts['fallback-route'],
+    profile: {
+      tier: 'max',
+      orgType: 'claude_max',
+      checkedAt: 10,
+      providerAccountUuid: 'fixture-uuid',
+    },
+    profileToken: tokenFingerprint('synthetic-access-fallback'),
+    quotaToken: tokenFingerprint('synthetic-access-fallback'),
+    quota: { accountIdentity: 'fixture-uuid', scoped: [] },
+    prime: { count: 2, inputTokens: 3, outputTokens: 4, since: 1 },
+  }
+  await writeFile(f.paths.legacyState, JSON.stringify(state))
+  let building = false
+  const journal = await runNativeMigration(f.input, {
+    onStep: async (step) => {
+      if (step === 'after-write:journal:building') {
+        building = true
+        expect(await readNativeMigrationJournal(f.paths)).toMatchObject({
+          version: 5,
+          kind: 'legacy-import',
+          phase: 'building',
+          nativeSettingsDigest: nativeMigrationDigest(
+            settings.status === 'ready' ? settings.settings : {},
+          ),
+        })
+        expect(await f.store.read()).toMatchObject({ rows: [] })
+      }
+    },
+  })
+  expect(building).toBe(true)
+  expect(journal).toMatchObject({
+    version: 5,
+    kind: 'legacy-import',
+    phase: 'retired',
+  })
+  expect(await f.store.readSettings()).toEqual(settings)
+  expect(await f.store.read()).toMatchObject({
+    rows: [
+      { id: 'primary-route' },
+      { id: 'fallback-route', quota: { anthropic: { scoped: [] } } },
+    ],
+  })
+  expect(
+    await readNativeRuntime(f.paths.runtime, f.paths.storageId),
+  ).toMatchObject({
+    state: {
+      accounts: {
+        'fallback-route': {
+          profile: { providerAccountUuid: 'fixture-uuid' },
+          prime: { count: 2 },
+        },
+      },
+    },
+  })
+  expect(
+    JSON.parse(await readFile(f.input.routingDestinationPath, 'utf8'))
+      .assignments,
+  ).toEqual({ A: nativePin, B: pin('fallback-route') })
+  await expect(stat(f.paths.legacyState)).rejects.toMatchObject({
+    code: 'ENOENT',
+  })
+})
+
+test('direct migration refuses populated empty-init before any write for every host slot', async () => {
+  for (const slot of [
+    undefined,
+    { type: 'api', key: 'synthetic-api' },
+    custodyTombstoneOAuth('anthropic'),
+    oauth,
+  ]) {
+    const f = await emptyFixture()
+    await publishNativeEmptyInit(f.input)
+    await f.store.add({
+      id: 'native',
+      credential: { ...oauth, refresh: 'native-refresh' },
+    })
+    if (slot === undefined) await rm(f.input.hostAuthPath)
+    else
+      await writeFile(f.input.hostAuthPath, JSON.stringify({ anthropic: slot }))
+    const before = await fileBytes(f)
+    await expectRefusal(
+      runNativeMigration(f.input, {
+        onStep: async () => {
+          throw new Error(
+            'capture must refuse before a journal write is attempted',
+          )
+        },
+      }),
+      NativeMigrationError,
+      'pool-populated',
+    )
+    expect(await fileBytes(f)).toEqual(before)
+  }
+})
+
+test('empty-init building owner check catches account data created after capture', async () => {
+  const f = await emptyFixture()
+  await publishNativeEmptyInit(f.input)
+  const journal = await readFile(f.paths.journal, 'utf8')
   await expectRefusal(
     runNativeMigration(f.input, {
-      onStep: async () => {
-        writes++
+      onStep: async (step) => {
+        if (step === 'before-write:journal:building')
+          await f.store.add({ id: 'concurrent', credential: oauth })
       },
     }),
+    NativeMigrationError,
+    'pool-populated',
+  )
+  expect(await readFile(f.paths.journal, 'utf8')).toBe(journal)
+  expect(await readFile(f.paths.legacyState, 'utf8')).toContain(
+    'synthetic-refresh-fallback',
+  )
+})
+
+test('empty-init imports every unpopulated host slot and absent sources install the placeholder', async () => {
+  for (const slot of [
+    undefined,
+    { type: 'api', key: 'synthetic-api' },
+    custodyTombstoneOAuth('anthropic'),
+    oauth,
+  ]) {
+    const f = await emptyFixture()
+    await publishNativeEmptyInit(f.input)
+    if (slot === undefined) await rm(f.input.hostAuthPath)
+    else
+      await writeFile(f.input.hostAuthPath, JSON.stringify({ anthropic: slot }))
+    await rm(f.paths.legacyConfig)
+    await rm(f.paths.legacyState)
+    const journal = await runNativeMigration(f.input)
+    expect(journal).toMatchObject({
+      version: 5,
+      kind: 'legacy-import',
+      phase: 'retired',
+    })
+    const auth = JSON.parse(
+      await readFile(f.input.hostAuthPath, 'utf8'),
+    ).anthropic
+    expect(auth).toEqual(
+      slot && slot.type === 'api' ? slot : custodyTombstoneOAuth('anthropic'),
+    )
+    if (slot !== oauth) expect(await f.store.read()).toMatchObject({ rows: [] })
+  }
+})
+
+test('v5 crash after account import resumes with exact settings or refuses changed settings without writes', async () => {
+  for (const changed of [false, true, 'non-ready'] as const) {
+    const f = await emptyFixture()
+    await publishNativeEmptyInit(f.input)
+    await f.store.updateSettings(() => ({ costZeroing: { enabled: true } }))
+    const settings = await f.store.readSettings()
+    await stopAt(f.input, 'after:add:primary-route')
+    expect(await readNativeMigrationJournal(f.paths)).toMatchObject({
+      kind: 'legacy-import',
+      phase: 'building',
+    })
+    if (changed === true)
+      await f.store.updateSettings(() => ({ costZeroing: { enabled: false } }))
+    if (changed === 'non-ready') {
+      const config = JSON.parse(await readFile(f.paths.config, 'utf8'))
+      config.commonAuthPool.schemaVersion = 999
+      await writeFile(f.paths.config, JSON.stringify(config))
+    }
+    const before = await fileBytes(f)
+    let writes = 0
+    if (changed) {
+      await expectRefusal(
+        runNativeMigration(f.input, {
+          onStep: async () => {
+            writes++
+          },
+        }),
+        NativeMigrationError,
+        'settings-changed',
+      )
+      expect(writes).toBe(0)
+      expect(await fileBytes(f)).toEqual(before)
+    } else {
+      expect((await runNativeMigration(f.input)).phase).toBe('retired')
+      expect(await f.store.readSettings()).toEqual(settings)
+    }
+  }
+})
+
+test('v5 verified and activation-installed resumes reject changed settings before any write', async () => {
+  for (const point of [
+    'after-write:journal:verified',
+    'after-write:journal:activation-installed',
+  ]) {
+    const f = await emptyFixture()
+    await publishNativeEmptyInit(f.input)
+    await stopAt(f.input, point)
+    await f.store.updateSettings(() => ({ costZeroing: { enabled: true } }))
+    const before = await fileBytes(f)
+    let writes = 0
+    await expectRefusal(
+      runNativeMigration(f.input, {
+        onStep: async () => {
+          writes++
+        },
+      }),
+      NativeMigrationError,
+      'settings-changed',
+    )
+    expect(writes).toBe(0)
+    expect(await fileBytes(f)).toEqual(before)
+  }
+})
+
+test('v5 routing resumes after preparation and rename, including native pins without a legacy routing source', async () => {
+  for (const point of ['after-write:proof', 'after:routing'])
+    for (const legacy of [false, true]) {
+      const f = await emptyFixture()
+      await publishNativeEmptyInit(f.input)
+      const pin = {
+        accountId: 'native-route',
+        family: 'general',
+        assignedAt: 1,
+        lastSeenAt: 2,
+        initialInputBytes: 3,
+        quotaCheckedAt: 0,
+      }
+      await writeFile(
+        f.input.routingDestinationPath,
+        JSON.stringify({
+          version: 1,
+          updatedAt: 20,
+          assignments: { A: pin },
+          vaultLegacySeed: 'complete',
+        }),
+        { mode: 0o600 },
+      )
+      if (legacy)
+        await writeFile(
+          f.input.routingSourcePath,
+          JSON.stringify({
+            version: 1,
+            updatedAt: 10,
+            assignments: { B: { ...pin, accountId: 'main' } },
+          }),
+          { mode: 0o600 },
+        )
+      await stopAt(f.input, point)
+      const journal = await runNativeMigration(f.input)
+      expect(journal).toMatchObject({
+        version: 5,
+        kind: 'legacy-import',
+        phase: 'retired',
+      })
+      const routing = JSON.parse(
+        await readFile(f.input.routingDestinationPath, 'utf8'),
+      )
+      expect(routing.assignments.A).toEqual(pin)
+      expect(routing.vaultLegacySeed).toBe('complete')
+      if (legacy)
+        expect(routing.assignments.B).toEqual({
+          ...pin,
+          accountId: 'primary-route',
+        })
+      else expect(Object.keys(routing.assignments)).toEqual(['A'])
+    }
+})
+
+test('crash after the first v5 building write blocks login and empty-init publication until resume', async () => {
+  const f = await emptyFixture()
+  await publishNativeEmptyInit(f.input)
+  await stopAt(f.input, 'after-write:journal:building')
+  const before = await fileBytes(f)
+  await expectRefusal(
+    publishNativeEmptyInit(f.input),
     NativeAuthorityError,
     'journal-conflict',
   )
-  expect(writes).toBe(0)
+  const runtime = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    vault: { env: {} },
+  })
+  deferCleanup(() => runtime.close())
+  await expectRefusal(
+    runtime.loginOAuth({
+      routeId: 'new',
+      credential: {
+        access: 'synthetic-access',
+        refresh: 'synthetic-refresh',
+        expires: 2000,
+      },
+      accountIdentity: '00000000-0000-0000-0000-000000000001',
+    }),
+    NativeAuthorityError,
+    'migration-incomplete',
+  )
   expect(await fileBytes(f)).toEqual(before)
-  expect(await readNativeMigrationJournal(f.paths)).toMatchObject({
-    kind: 'empty-init',
-    phase: 'committed',
+  expect((await runNativeMigration(f.input)).phase).toBe('retired')
+})
+
+test('pool populated predicate reads account maps and runtime, never routing or preferences', async () => {
+  const f = await emptyFixture()
+  expect(await nativePoolHoldsAccountData(f)).toBe(false)
+  await f.store.updateSettings(() => ({
+    routingMode: 'sticky',
+    costZeroing: { enabled: true },
+  }))
+  await writeFile(
+    f.input.routingDestinationPath,
+    '{malformed routing is not read',
+  )
+  await writeFile(f.input.routingSourcePath, '{legacy routing is not read')
+  expect(await nativePoolHoldsAccountData(f)).toBe(false)
+  await updateNativeRuntime(f.paths.runtime, f.paths.storageId, (state) => ({
+    ...state,
+    accounts: {
+      orphan: {
+        binding: {
+          kind: 'local',
+          storageId: f.paths.storageId,
+          rowId: 'orphan',
+          credentialEpoch: 1,
+        },
+        lastUsed: 1,
+      },
+    },
+  }))
+  expect(await f.store.read()).toMatchObject({ rows: [] })
+  expect(await nativePoolHoldsAccountData(f)).toBe(true)
+  await rm(f.paths.runtime)
+  await writeFile(
+    f.paths.state,
+    JSON.stringify({ version: 1, accounts: { orphan: { refresh: 'orphan' } } }),
+    { mode: 0o600 },
+  )
+  expect(await nativePoolHoldsAccountData(f)).toBe(true)
+  await rm(f.paths.state)
+  const config = JSON.parse(await readFile(f.paths.config, 'utf8'))
+  config.commonAuthPool = {
+    schemaVersion: 1,
+    rows: { orphan: { quota: { anthropic: { scoped: [] } } } },
+  }
+  await writeFile(f.paths.config, JSON.stringify(config))
+  expect(await nativePoolHoldsAccountData(f)).toBe(true)
+  for (const path of [f.paths.config, f.paths.state, f.paths.runtime]) {
+    await writeFile(path, '{invalid', { mode: 0o600 })
+    await expect(nativePoolHoldsAccountData(f)).rejects.toThrow()
+    await rm(path)
+  }
+})
+
+test('snapshot predicate accepts a new local OAuth login and rejects every non-servable row', async () => {
+  const f = await emptyFixture()
+  await publishNativeEmptyInit(f.input)
+  const runtime = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    local: {
+      resolveIdentity: async () => ({
+        deviceId: 'synthetic-device',
+        sessionId: 'synthetic-session',
+        accountUuid:
+          '00000000-0000-4000-8000-000000000001' as ProviderAccountUuid,
+      }),
+    },
+    vault: { env: {} },
+  })
+  deferCleanup(() => runtime.close())
+  await runtime.loginOAuth({
+    routeId: 'native',
+    credential: {
+      access: 'sk-ant-oat01-synthetic',
+      refresh: 'synthetic-refresh',
+      expires: Date.now() + 3_600_000,
+    },
+    accountIdentity: '00000000-0000-0000-0000-000000000001',
+  })
+  const snapshot = await runtime.read()
+  expect(snapshotHasServableLocalOAuth(snapshot)).toBe(true)
+  const row = snapshot.accounts[0]
+  if (!row) throw new Error('expected local row')
+  for (const patch of [
+    { type: 'api' },
+    { enabled: false },
+    { state: 'unsupported-access' },
+    { source: 'vault', state: 'active' },
+  ] satisfies Partial<NativeAccountView>[]) {
+    expect(
+      snapshotHasServableLocalOAuth({ accounts: [{ ...row, ...patch }] }),
+    ).toBe(false)
+  }
+  expect(snapshotHasServableLocalOAuth({ accounts: [] })).toBe(false)
+})
+
+test('completed v4 and v5 journals handle every OpenCode slot without reimport', async () => {
+  for (const version of [4, 5])
+    for (const phase of ['committed', 'retired'])
+      for (const slot of [
+        undefined,
+        { type: 'api', key: 'synthetic-api' },
+        custodyTombstoneOAuth('anthropic'),
+        oauth,
+      ]) {
+        const f = version === 5 ? await emptyFixture() : await fixture()
+        if (version === 5) await publishNativeEmptyInit(f.input)
+        await stopAt(f.input, `after-write:journal:${phase}`)
+        if (slot === undefined) await rm(f.input.hostAuthPath)
+        else
+          await writeFile(
+            f.input.hostAuthPath,
+            JSON.stringify({ anthropic: slot }),
+          )
+        const before = await fileBytes(f)
+        let writes = 0
+        if (slot === oauth) {
+          await expectRefusal(
+            runNativeMigration(f.input, {
+              onStep: async () => {
+                writes++
+              },
+            }),
+            NativeMigrationError,
+            'host-login-present',
+          )
+          expect(writes).toBe(0)
+          expect(await fileBytes(f)).toEqual(before)
+        } else {
+          expect((await runNativeMigration(f.input)).phase).toBe('retired')
+          expect(
+            JSON.parse(await readFile(f.input.hostAuthPath, 'utf8')).anthropic,
+          ).toEqual(slot ?? custodyTombstoneOAuth('anthropic'))
+        }
+      }
+})
+
+test('committed retirement repairs an absent host slot after legitimate serving writes', async () => {
+  const f = await fixture()
+  await stopAt(f.input, 'after-write:journal:committed')
+  await f.store.rotate('primary-route', {
+    ...oauth,
+    access: 'synthetic-serving-access',
+  })
+  const before = await readFile(f.paths.state, 'utf8')
+  await rm(f.input.hostAuthPath)
+  expect((await runNativeMigration(f.input)).phase).toBe('retired')
+  expect(await readFile(f.paths.state, 'utf8')).toBe(before)
+  expect(
+    JSON.parse(await readFile(f.input.hostAuthPath, 'utf8')).anthropic,
+  ).toEqual(custodyTombstoneOAuth('anthropic'))
+  await expect(stat(f.paths.legacyState)).rejects.toMatchObject({
+    code: 'ENOENT',
   })
 })
 
@@ -832,7 +1309,7 @@ test('lost migration and pool ownership fence physical host write and authority 
   }
 })
 
-test('committed retirement ignores prepared proof after legitimate serving writes and repairs host without importing', async () => {
+test('committed authority refuses a later host login before retirement or repair', async () => {
   const { input, paths, store } = await fixture()
   await stopAt(input, 'after-write:journal:committed')
   await store.rotate('primary-route', {
@@ -847,11 +1324,17 @@ test('committed retirement ignores prepared proof after legitimate serving write
       other: { key: 'synthetic-other' },
     }),
   )
-  expect((await runNativeMigration(input)).phase).toBe('retired')
-  expect(await readFile(paths.state, 'utf8')).toBe(before)
-  expect(await readFile(input.hostAuthPath, 'utf8')).not.toContain(
-    'synthetic-host-relogin',
+  // Commit follows placeholder installation, so an occupied OAuth slot is a later user login.
+  // Refusing it preserves both the new login and legacy sources awaiting retirement.
+  const bytes = await fileBytes({ input, paths })
+  await expectRefusal(
+    runNativeMigration(input),
+    NativeMigrationError,
+    'host-login-present',
   )
+  expect(await fileBytes({ input, paths })).toEqual(bytes)
+  expect(await readFile(paths.state, 'utf8')).toBe(before)
+  expect((await readNativeMigrationJournal(paths))?.phase).toBe('committed')
 })
 
 test('changed retirement source remains untouched and authority remains committed', async () => {
@@ -879,6 +1362,8 @@ test('fresh all-absent install reaches retired without fabricating a credential'
   const journal = await readNativeMigrationJournal(paths)
   if (journal?.kind === 'empty-init')
     throw new Error('expected legacy migration')
+  expect(journal?.version).toBe(4)
+  expect(journal && 'kind' in journal).toBe(false)
   expect(journal?.sources).toEqual({
     config: null,
     state: null,
@@ -984,7 +1469,11 @@ test('retired setup preserves serving-owned routing changes and imports no host 
       anthropic: { ...oauth, access: 'synthetic-unimported-login' },
     }),
   )
-  await runNativeMigration(input)
+  await expectRefusal(
+    runNativeMigration(input),
+    NativeMigrationError,
+    'host-login-present',
+  )
   expect(await readFile(input.routingDestinationPath, 'utf8')).toBe(routing)
   expect(
     await Promise.all(

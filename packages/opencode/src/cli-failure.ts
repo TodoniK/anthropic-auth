@@ -85,6 +85,9 @@ const MIGRATION_CODES = everyCode<NativeMigrationError['code']>()([
   'migration-busy',
   'ownership-lost',
   'retirement-refused',
+  'pool-populated',
+  'host-login-present',
+  'settings-changed',
 ])
 const PI_SLOT_CODES = everyCode<NativePiAuthSlotError['code']>()([
   'invalid-options',

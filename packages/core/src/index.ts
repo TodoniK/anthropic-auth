@@ -1,3 +1,20 @@
+export type {
+  CommandResult,
+  CommandRunner,
+  HostDetection,
+  OpenCodeGeneration,
+  ProcessFence,
+  SetupCallbackContext,
+  SetupDetection,
+  SetupEnvironment,
+  SetupFileSystem,
+  SetupHost,
+  SetupIO,
+  SetupPlugin,
+  SetupResult,
+} from '@cortexkit/common-auth/setup'
+// Host adapters use the bundled runner without adding a runtime dependency.
+export { runSetup } from '@cortexkit/common-auth/setup'
 export * from './accounts.ts'
 export * from './auth.ts'
 export * from './cache1h.ts'
@@ -70,6 +87,12 @@ export {
 } from './native-host-auth.ts'
 export { readNativeHostAuthKind } from './native-host-auth-read.ts'
 export type {
+  NativeHostAuthWriteHooks,
+  NativeHostAuthWriteInput,
+  NativeHostAuthWriteOutcome,
+} from './native-host-auth-write.ts'
+export { writeNativeHostAuth } from './native-host-auth-write.ts'
+export type {
   NativeLocalAttributedFailure,
   NativeLocalCredentialService,
   NativeLocalCredentialServiceOptions,
@@ -125,10 +148,12 @@ export type {
 } from './native-migration.ts'
 export {
   NativeMigrationError,
+  nativePoolHoldsAccountData,
   prepareNativeMigration,
   publishNativeEmptyInit,
   releaseNativeMigrationPreflight,
   runNativeMigration,
+  snapshotHasServableLocalOAuth,
 } from './native-migration.ts'
 export type {
   NativeCommittedMaterial,

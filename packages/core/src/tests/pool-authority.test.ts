@@ -180,7 +180,7 @@ test('v5 never falls back to the v4 decoder when kind or digest is invalid', asy
   }
 })
 
-test('empty-init is exact committed authority and cannot be consumed by migration mutators', async () => {
+test('empty-init is exact committed authority and refuses phase and expectation mutators', async () => {
   const paths = await fixture()
   const journal = await beginNativeEmptyInit(paths)
   expect(journal).toEqual({
@@ -195,12 +195,6 @@ test('empty-init is exact committed authority and cannot be consumed by migratio
   expect(nativeMigrationAuthorityPhase(journal)).toBe('committed')
   const bytes = await readFile(paths.journal, 'utf8')
   const operations = [
-    () => beginNativeMigration(paths, captureInput(paths)),
-    () =>
-      beginNativeMigration(paths, {
-        ...captureInput(paths),
-        nativeSettingsDigest: 'a'.repeat(64),
-      }),
     () => recordNativeMigrationExpectations(paths, expectations),
     () => advanceNativeMigration(paths, 'committed', 'retired'),
   ]
@@ -210,6 +204,59 @@ test('empty-init is exact committed authority and cannot be consumed by migratio
     expect(error.code).toBe('journal-conflict')
     expect(await readFile(paths.journal, 'utf8')).toBe(bytes)
   }
+})
+
+test('begin replaces matching empty-init with the requested v4 or v5 building record', async () => {
+  for (const digest of [undefined, 'a'.repeat(64)]) {
+    const paths = await fixture()
+    await beginNativeEmptyInit(paths)
+    const input = {
+      ...captureInput(paths),
+      ...(digest ? { nativeSettingsDigest: digest } : {}),
+    }
+    let writes = 0
+    const journal = await beginNativeMigration(paths, input, {
+      onWriteStep: async (step, value) => {
+        if (step !== 'before-write') return
+        writes++
+        expect(value).toMatchObject({
+          version: digest ? 5 : 4,
+          phase: 'building',
+        })
+        if (value.kind === 'legacy-import') {
+          if (digest === undefined) throw new Error('v5 requires a digest')
+          expect(value.nativeSettingsDigest).toBe(digest)
+        } else expect('nativeSettingsDigest' in value).toBe(false)
+      },
+    })
+    expect(writes).toBe(1)
+    expect(await readNativeMigrationJournal(paths)).toEqual(journal)
+    const bytes = await readFile(paths.journal, 'utf8')
+    expect(await beginNativeMigration(paths, input)).toEqual(journal)
+    expect(await readFile(paths.journal, 'utf8')).toBe(bytes)
+    for (const conflict of [
+      { ...input, host: 'pi' as const },
+      { ...input, hostAuthPath: join(dirname(paths.config), 'other.json') },
+      { ...input, sources: { ...input.sources, state: 'f'.repeat(64) } },
+      { ...input, nativeSettingsDigest: 'b'.repeat(64) },
+    ]) {
+      await expect(beginNativeMigration(paths, conflict)).rejects.toMatchObject(
+        { code: 'journal-conflict' },
+      )
+      expect(await readFile(paths.journal, 'utf8')).toBe(bytes)
+    }
+  }
+  const paths = await fixture()
+  await beginNativeEmptyInit(paths)
+  const bytes = await readFile(paths.journal, 'utf8')
+  await expect(
+    beginNativeMigration(paths, {
+      ...captureInput(paths),
+      host: 'pi',
+      nativeSettingsDigest: 'a'.repeat(64),
+    }),
+  ).rejects.toMatchObject({ code: 'journal-conflict' })
+  expect(await readFile(paths.journal, 'utf8')).toBe(bytes)
 })
 
 test('a readable empty pool without a committed journal cannot authorize dispatch', async () => {
