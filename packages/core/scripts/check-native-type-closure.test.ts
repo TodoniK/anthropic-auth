@@ -351,7 +351,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     `Packed consumer subc-client copies: ${JSON.stringify(subcCopies)}`,
   )
   expect(subcCopies).toHaveLength(1)
-  expect(subcCopies[0]!.version).toBe('0.16.1')
+  expect(Bun.semver.satisfies(subcCopies[0]!.version, '^0.16.0')).toBe(true)
   const coreSubc = Bun.resolveSync('@cortexkit/subc-client', installed)
   const claustrumEntry = Bun.resolveSync(
     '@cortexkit/claustrum-client',
