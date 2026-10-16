@@ -13069,7 +13069,11 @@ describe('auth.loader', () => {
       'https://api.anthropic.com/v1/messages',
       {
         method: 'POST',
-        body: '{}',
+        body: JSON.stringify({
+          tools: [
+            { name: 'bash', input_schema: { type: 'object', properties: {} } },
+          ],
+        }),
       },
     )
 

@@ -45,7 +45,21 @@ import {
   sanitizeSystemText,
   setOAuthHeaders,
   stripToolPrefix,
+  type ToolNameMap,
 } from '../transform'
+
+async function toolMapFor(...names: string[]): Promise<ToolNameMap> {
+  let map: ToolNameMap = new Map()
+  await rewriteRequestBody(
+    JSON.stringify({ tools: names.map((name) => ({ name })) }),
+    {
+      onToolNameMap: (value) => {
+        map = value
+      },
+    },
+  )
+  return map
+}
 
 const sse = (event: string, data: unknown) =>
   `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
@@ -952,48 +966,59 @@ describe('prefixToolNames', () => {
 })
 
 describe('stripToolPrefix', () => {
+  let map: ToolNameMap
+  beforeEach(async () => {
+    map = await toolMapFor(
+      'read_file',
+      'tool_a',
+      'tool_b',
+      'tool',
+      'aft_safety',
+      'aft_outline',
+    )
+  })
+  const stripDeclared = (text: string) => stripToolPrefix(text, map)
+
   test('strips mcp_ prefix from tool names', () => {
     const text = '{"name": "mcp_read_file"}'
-    expect(stripToolPrefix(text)).toBe('{"name": "read_file"}')
+    expect(stripDeclared(text)).toBe('{"name": "read_file"}')
   })
 
   test('strips multiple prefixed names', () => {
     const text = '{"name": "mcp_tool_a"} and {"name": "mcp_tool_b"}'
-    const result = stripToolPrefix(text)
+    const result = stripDeclared(text)
     expect(result).toContain('"name": "tool_a"')
     expect(result).toContain('"name": "tool_b"')
   })
 
   test('does not strip names without mcp_ prefix', () => {
     const text = '{"name": "regular_tool"}'
-    expect(stripToolPrefix(text)).toBe(text)
+    expect(stripDeclared(text)).toBe(text)
   })
 
   test('canonicalizes Claude-dropped AFT namespace for prefixed tool names', () => {
-    expect(stripToolPrefix('{"name": "mcp_Safety"}')).toBe(
+    expect(stripDeclared('{"name": "mcp_Safety"}')).toBe(
       '{"name": "aft_safety"}',
     )
-    expect(stripToolPrefix('{"name": "mcp_Outline"}')).toBe(
+    expect(stripDeclared('{"name": "mcp_Outline"}')).toBe(
       '{"name": "aft_outline"}',
     )
   })
 
   test('canonicalizes raw AFT suffix tool names', () => {
-    expect(stripToolPrefix('{"name": "safety"}')).toBe('{"name": "aft_safety"}')
-    expect(stripToolPrefix('{"name": "outline"}')).toBe(
-      '{"name": "aft_outline"}',
-    )
+    expect(stripDeclared('{"name": "safety"}')).toBe('{"name": "aft_safety"}')
+    expect(stripDeclared('{"name": "outline"}')).toBe('{"name": "aft_outline"}')
   })
 
   test('preserves existing AFT names after stripping mcp prefix', () => {
-    expect(stripToolPrefix('{"name": "mcp_Aft_safety"}')).toBe(
+    expect(stripDeclared('{"name": "mcp_Aft_safety"}')).toBe(
       '{"name": "aft_safety"}',
     )
   })
 
   test('handles whitespace variations in JSON', () => {
     const text = '{"name"  :  "mcp_tool"}'
-    expect(stripToolPrefix(text)).toBe('{"name": "tool"}')
+    expect(stripDeclared(text)).toBe('{"name": "tool"}')
   })
 })
 
@@ -1745,7 +1770,9 @@ describe('createStrippedStream', () => {
     })
 
     const original = new Response(stream, { status: 200 })
-    const stripped = createStrippedStream(original)
+    const stripped = createStrippedStream(original, {
+      toolNameMap: await toolMapFor('bash', 'read'),
+    })
 
     const text = await stripped.text()
     expect(text).toContain('"name": "bash"')
@@ -1770,7 +1797,10 @@ describe('createStrippedStream', () => {
       },
     })
 
-    const stripped = createStrippedStream(new Response(stream, { status: 200 }))
+    const stripped = createStrippedStream(
+      new Response(stream, { status: 200 }),
+      { toolNameMap: await toolMapFor('read') },
+    )
 
     const text = await stripped.text()
     expect(text).toContain('"name": "read"')

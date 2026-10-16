@@ -291,6 +291,7 @@ import {
   rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
+  type ToolNameMap,
 } from './transform.ts'
 
 /** Dump label for a physical send that failed before any response arrived. */
@@ -2919,6 +2920,8 @@ const anthropicAuthPlugin = async (
     streaming: boolean
     dumpWrite: Promise<void>
     messageStart?: Record<string, unknown>
+    // Response inspection copies this metadata when it replaces the Response.
+    toolNameMap?: ToolNameMap
   }
   const cacheDiagnosticsResponses = new WeakMap<
     Response,
@@ -6538,6 +6541,7 @@ const anthropicAuthPlugin = async (
             let body = await fetchBody(input, init)
             let streaming = false
             let dump: DumpHandle | null = null
+            let toolNameMap: ToolNameMap | undefined
 
             const originalBytes =
               typeof body === 'string' ? body.length : undefined
@@ -6553,6 +6557,9 @@ const anthropicAuthPlugin = async (
               })()
               try {
                 body = await rewriteRequestBody(body, {
+                  onToolNameMap: (map) => {
+                    toolNameMap = map
+                  },
                   cache1hEnabled: !subagentRequest && isCache1hEnabled(),
                   cache1hMode: getCache1hMode(),
                   fastModeEnabled: fastModeRequested,
@@ -6659,6 +6666,7 @@ const anthropicAuthPlugin = async (
             }
             attachCacheDiagnosticsResponse(response, {
               source: 'turn',
+              toolNameMap,
               accountId: account.id,
               synthetic: false,
               ...cacheDiagnosticsBetas,
@@ -6741,6 +6749,7 @@ const anthropicAuthPlugin = async (
             let streaming = false
             let directDump: DumpHandle | null = null
             let relayDump: DumpHandle | null = null
+            let toolNameMap: ToolNameMap | undefined
             let modelForIdentity: string | undefined
             if (body && typeof body === 'string') {
               const modelParseStart = nowMs()
@@ -6807,6 +6816,9 @@ const anthropicAuthPlugin = async (
                   : undefined
               try {
                 body = await rewriteRequestBody(body, {
+                  onToolNameMap: (map) => {
+                    toolNameMap = map
+                  },
                   cache1hEnabled: cacheEnabled,
                   cache1hMode: cacheMode,
                   fastModeEnabled: fastModeRequested,
@@ -7291,6 +7303,7 @@ const anthropicAuthPlugin = async (
             }
             attachCacheDiagnosticsResponse(response, {
               source: laneStartRequest ? 'start' : 'turn',
+              toolNameMap,
               accountId: oauthAccountId,
               synthetic: laneStartRequest,
               ...cacheDiagnosticsBetas,
@@ -8107,6 +8120,7 @@ const anthropicAuthPlugin = async (
                 const diagnosticsContext =
                   cacheDiagnosticsResponses.get(response)
                 return createStrippedStream(response, {
+                  toolNameMap: diagnosticsContext?.toolNameMap,
                   perf: (stage, data) => trace.mark(stage, data),
                   laneStart: laneStartRequest,
                   laneStartOAuthServed:

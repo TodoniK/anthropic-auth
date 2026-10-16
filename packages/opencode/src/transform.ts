@@ -85,27 +85,50 @@ function unprefixName(name: string): string {
   return `${name.charAt(0).toLowerCase()}${name.slice(1)}`
 }
 
-const AFT_SUFFIX_TOOL_NAMES = new Set([
-  'callgraph',
-  'conflicts',
-  'delete',
-  'import',
-  'inspect',
-  'move',
-  'navigate',
-  'outline',
-  'refactor',
-  'safety',
-  'search',
-  'transform',
-  'zoom',
-])
+/** Request-local response spellings; null marks a spelling shared by multiple tools. */
+export type ToolNameMap = ReadonlyMap<string, string | null>
 
-function canonicalizeAftToolName(name: string): string | null {
-  const normalized = unprefixName(name)
-  if (normalized.startsWith('aft_')) return normalized
-  if (AFT_SUFFIX_TOOL_NAMES.has(normalized)) return `aft_${normalized}`
-  return null
+function responseToolNames(tools: unknown): ToolNameMap {
+  const names = new Set<string>()
+  if (Array.isArray(tools)) {
+    for (const tool of tools) {
+      if (isRecord(tool) && typeof tool.name === 'string' && tool.name) {
+        names.add(tool.name)
+      }
+    }
+  }
+  const aliases = new Map<string, string | null>()
+  const add = (
+    map: Map<string, string | null>,
+    alias: string,
+    name: string,
+  ) => {
+    map.set(alias, map.has(alias) && map.get(alias) !== name ? null : name)
+  }
+  const wireNames = new Map<string, string | null>()
+  for (const name of names) {
+    // A guessed suffix like Search can mean aft_search only if no other
+    // declared tool, such as ctx_search, shares that suffix.
+    const parts = name.split('_')
+    for (let index = 0; index < parts.length; index++) {
+      const suffix = parts.slice(index).join('_')
+      if (!suffix) continue
+      for (const variant of new Set([
+        suffix,
+        unprefixName(suffix),
+        suffix.charAt(0).toUpperCase() + suffix.slice(1),
+      ])) {
+        add(aliases, variant, name)
+        add(aliases, `${TOOL_PREFIX}${variant}`, name)
+      }
+    }
+    add(wireNames, prefixName(name), name)
+  }
+  // Names emitted by prefixName outrank inferred suffixes. The original tool
+  // definitions take final precedence so a real host tool is never redirected.
+  for (const [wire, name] of wireNames) aliases.set(wire, name)
+  for (const name of names) aliases.set(name, name)
+  return aliases
 }
 
 export type FetchInput = string | URL | Request
@@ -249,28 +272,41 @@ export function prefixToolNames(parsed: Record<string, unknown>): string {
 }
 
 /**
- * Strip TOOL_PREFIX from tool names in streaming response text.
+ * Use the map supplied to onToolNameMap by rewriteRequestBody for this response's request.
+ * Unmatched or ambiguous names stay unchanged for the host to handle.
  */
-export function stripToolPrefix(text: string): string {
-  return text.replace(
-    /"name"\s*:\s*"(mcp_)?([^"]+)"/g,
-    (match, prefix: string | undefined, name: string) => {
-      if (prefix) {
-        return `"name": "${canonicalizeAftToolName(name) ?? unprefixName(name)}"`
-      }
-
-      const canonical = canonicalizeAftToolName(name)
-      return canonical ? `"name": "${canonical}"` : match
-    },
-  )
+export function stripToolPrefix(
+  text: string,
+  toolNameMap?: ToolNameMap,
+): string {
+  return text.replace(/"name"\s*:\s*"([^"]+)"/g, (match, name: string) => {
+    const realName = toolNameMap?.get(name)
+    return realName && realName !== name
+      ? `"name": ${JSON.stringify(realName)}`
+      : match
+  })
 }
 
-function splitToolPrefixRewriteBuffer(buffer: string, flush = false) {
-  if (flush) return { ready: stripToolPrefix(buffer), pending: '' }
+function splitToolPrefixRewriteBuffer(
+  buffer: string,
+  toolNameMap: ToolNameMap | undefined,
+  flush = false,
+) {
+  if (flush) return { ready: stripToolPrefix(buffer, toolNameMap), pending: '' }
 
   let keepFrom = buffer.length
   const marker = '"name"'
-  const partialMarkerStart = Math.max(0, buffer.length - marker.length + 1)
+  const lastName = buffer.lastIndexOf(marker)
+  const completeName =
+    lastName === -1
+      ? null
+      : /^"name"\s*:\s*"[^"]*"/.exec(buffer.slice(lastName))
+  // A value's closing quote cannot also start a partial property marker.
+  const partialMarkerStart = Math.max(
+    0,
+    buffer.length - marker.length + 1,
+    completeName ? lastName + completeName[0].length : 0,
+  )
   for (let index = partialMarkerStart; index < buffer.length; index++) {
     if (marker.startsWith(buffer.slice(index))) {
       keepFrom = Math.min(keepFrom, index)
@@ -278,7 +314,6 @@ function splitToolPrefixRewriteBuffer(buffer: string, flush = false) {
     }
   }
 
-  const lastName = buffer.lastIndexOf(marker)
   if (lastName !== -1) {
     const tail = buffer.slice(lastName)
     if (/^"name"\s*(?::\s*(?:"[^"]*)?)?$/.test(tail)) {
@@ -288,12 +323,12 @@ function splitToolPrefixRewriteBuffer(buffer: string, flush = false) {
 
   if (keepFrom < buffer.length) {
     return {
-      ready: stripToolPrefix(buffer.slice(0, keepFrom)),
+      ready: stripToolPrefix(buffer.slice(0, keepFrom), toolNameMap),
       pending: buffer.slice(keepFrom),
     }
   }
 
-  return { ready: stripToolPrefix(buffer), pending: '' }
+  return { ready: stripToolPrefix(buffer, toolNameMap), pending: '' }
 }
 
 /**
@@ -1330,6 +1365,7 @@ export async function rewriteRequestBody(
     laneStart?: boolean
     billingLineage?: BillingLineageFields
     cacheDiagnosticsPreviousMessageId?: string | null
+    onToolNameMap?: (map: ToolNameMap) => void
   } = {},
 ): Promise<string> {
   try {
@@ -1485,6 +1521,7 @@ export async function rewriteRequestBody(
 
     const prefixStart = rewriteNowMs()
     if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
+    const toolNameMap = responseToolNames(parsed.tools)
     const prefixed = prefixToolNames(parsed)
     options.perf?.('prefix_tools_stringify', {
       ms: rewriteRoundMs(rewriteNowMs() - prefixStart),
@@ -1499,6 +1536,7 @@ export async function rewriteRequestBody(
       outputBytes: signed.length,
     })
 
+    options.onToolNameMap?.(toolNameMap)
     return signed
   } catch (error) {
     if (
@@ -2055,6 +2093,7 @@ function sseDiagnosticStats(state: SseDiagnosticState) {
 export function createStrippedStream(
   response: Response,
   options: {
+    toolNameMap?: ToolNameMap
     perf?: RewritePerfCallback
     onContentFilter?: (context?: {
       completedToolUse: boolean
@@ -2287,6 +2326,7 @@ export function createStrippedStream(
             }
             const flushed = splitToolPrefixRewriteBuffer(
               `${pending}${laneStartRewritten}`,
+              options.toolNameMap,
               true,
             )
             rewriteMs += rewriteNowMs() - rewriteStart
@@ -2367,7 +2407,10 @@ export function createStrippedStream(
             throw retryableStreamError
           }
           const text = pending + laneStartRewritten
-          const rewritten = splitToolPrefixRewriteBuffer(text)
+          const rewritten = splitToolPrefixRewriteBuffer(
+            text,
+            options.toolNameMap,
+          )
           rewriteMs += rewriteNowMs() - rewriteStart
           pending = rewritten.pending
           if (rewritten.ready) {

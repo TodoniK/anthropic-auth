@@ -848,6 +848,90 @@ describe('OpenCode 2 native Anthropic adapter: refusals', () => {
 })
 
 describe('OpenCode 2 native Anthropic adapter: responses', () => {
+  test('never redirects declared host tools to AFT aliases', async () => {
+    const { source } = makeSource()
+    const native = createNativeAnthropicAdapter({ source })
+    const host = new Host(native.adapter)
+    const payload = sonnetPayload()
+    const names = ['search', 'move', 'delete', 'import']
+    payload.tools = names.flatMap((name) =>
+      [name, `aft_${name}`].map((name) => ({ ...payload.tools[0]!, name })),
+    )
+    const { attempt } = await host.run(scopeOf(), hostRequest(payload))
+    const wireNames = names.flatMap((name) => [
+      `mcp_${name[0]!.toUpperCase()}${name.slice(1)}`,
+      name,
+    ])
+    const upstream = wireNames
+      .map((name, index) =>
+        sse('content_block_start', {
+          type: 'content_block_start',
+          index,
+          content_block: {
+            type: 'tool_use',
+            id: `toolu_${index}`,
+            name,
+            input: {},
+          },
+        }),
+      )
+      .join('')
+    const response = await native.adapter.rewriteResponse?.({
+      ...attempt,
+      request: host.sent[0] as Request,
+      response: sseResponse(upstream),
+      attempt,
+    })
+    const text = await (response as Response).text()
+    const restored = text
+      .split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)).content_block.name)
+    expect(restored).toEqual(names.flatMap((name) => [name, name]))
+  })
+
+  test('keeps concurrent OAuth response bindings separate within one session', async () => {
+    const { source } = makeSource()
+    const native = createNativeAnthropicAdapter({ source })
+    const host = new Host(native.adapter)
+    const sends = await Promise.all(
+      ['aft_search', 'ctx_search', 'bash'].map(async (name) => {
+        const payload = sonnetPayload()
+        payload.tools = [{ ...payload.tools[0]!, name }]
+        return host.run(scopeOf(), hostRequest(payload))
+      }),
+    )
+    const names = await Promise.all(
+      sends.map(async ({ attempt, final }) => {
+        const response = await native.adapter.rewriteResponse?.({
+          ...attempt,
+          request: final,
+          response: sseResponse(
+            sse('content_block_start', {
+              type: 'content_block_start',
+              index: 0,
+              content_block: {
+                type: 'tool_use',
+                id: 'toolu_isolated',
+                name: 'mcp_Search',
+                input: {},
+              },
+            }),
+          ),
+          attempt,
+        })
+        const text = await (response as Response).text()
+        return JSON.parse(
+          text
+            .split('\n')
+            .find((line) => line.startsWith('data: '))!
+            .slice(6),
+        ).content_block.name
+      }),
+    )
+    expect(names).toEqual(['aft_search', 'ctx_search', 'mcp_Search'])
+  })
+
   test('maps tool names back, keeps upstream headers and reports observations with provenance', async () => {
     const starts: {
       message: Record<string, unknown>

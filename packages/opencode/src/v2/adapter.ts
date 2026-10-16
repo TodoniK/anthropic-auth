@@ -197,11 +197,12 @@ type RewriteBodyOptions = NonNullable<Parameters<typeof rewriteRequestBody>[1]>
  * lineage, effort plan, cache, fast mode, safety and diagnostics inputs. Two
  * options are left out because the adapter sets them: the Claude Code
  * identity, which the source returns with the credential, and the session id,
- * which is the host's own session id for the request.
+ * which is the host's own session id for the request. The tool-name callback
+ * is private to the adapter so response names stay bound to that send.
  */
 export type NativeAnthropicBodyOptions = Omit<
   RewriteBodyOptions,
-  'identity' | 'sessionId'
+  'identity' | 'sessionId' | 'onToolNameMap'
 >
 
 type StrippedStreamOptions = NonNullable<
@@ -627,6 +628,10 @@ export function createNativeAnthropicAdapter<Q, P>(
   // A relay's own failure is not a provider credential failure. Only a
   // provider request-id proves that its response came from Anthropic.
   const relayUpstream = new WeakMap<Data, boolean>()
+  const responseToolNameMaps = new WeakMap<
+    Data,
+    NonNullable<StrippedStreamOptions['toolNameMap']>
+  >()
   // Each sent request privately holds its own credentials, so errors about
   // it can be scrubbed after rewriteSend has dropped the pending credential:
   // a response scope for the one response the request gets, and a redactor
@@ -961,6 +966,7 @@ export function createNativeAnthropicAdapter<Q, P>(
             ...options,
             ...(identity ? { identity } : {}),
             sessionId: input.sessionID,
+            onToolNameMap: (map) => responseToolNameMaps.set(data, map),
           })
           const parsed = parseJson(body)
           finalBody = isRecord(parsed) ? parsed : null
@@ -1123,6 +1129,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         data,
         createStrippedStream(safe, {
           ...options,
+          toolNameMap: responseToolNameMaps.get(data),
           laneStartOAuthServed: true,
           ...(json ? { responseMode: 'json' as const } : {}),
         }),

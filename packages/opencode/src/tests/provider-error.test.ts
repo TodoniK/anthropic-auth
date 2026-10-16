@@ -496,6 +496,7 @@ async function sendNative(
   owner: BodyOwner,
   plugin: PluginHooks,
   sessionId: string,
+  toolNames?: string[],
 ) {
   const loader = plugin.auth?.loader
   if (!loader) throw new Error('Plugin did not install its auth loader')
@@ -518,6 +519,15 @@ async function sendNative(
         model: 'claude-sonnet-4-6',
         max_tokens: 16,
         stream: true,
+        ...(toolNames
+          ? {
+              tools: toolNames.map((name) => ({
+                name,
+                description: `Use ${name}`,
+                input_schema: { type: 'object', properties: {} },
+              })),
+            }
+          : {}),
         messages: [{ role: 'user', content: 'Synthetic provider error probe' }],
       }),
       signal: owner.controller.signal,
@@ -595,6 +605,83 @@ for (const ending of ['LF', 'CRLF'] as const) {
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(
       new TextEncoder().encode(body),
     )
+  })
+}
+
+for (const relay of [false, true]) {
+  test(`OC1 ${relay ? 'HTTP relay' : 'direct'} binds tool names to each concurrent request`, async () => {
+    const { owner, client } = await vaultFixture(
+      relay ? { fallbackToDirect: false } : undefined,
+    )
+    const sentNames: string[][] = []
+    owner.network.current = async (url, init) => {
+      expect(url.startsWith(RELAY_URL)).toBe(relay)
+      const physical = JSON.parse(String(init?.body))
+      const body = relay ? JSON.parse(physical.body) : physical
+      sentNames.push(body.tools.map((tool: { name: string }) => tool.name))
+      const events = ['mcp_Search', 'search', 'mcp_Bash']
+        .map((name, index) =>
+          sse({
+            type: 'content_block_start',
+            index,
+            content_block: {
+              type: 'tool_use',
+              id: `toolu_${index}`,
+              name,
+              input: {},
+            },
+          }),
+        )
+        .join('')
+      const bytes = new TextEncoder().encode(events)
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (let offset = 0; offset < bytes.length; offset += 5) {
+              controller.enqueue(bytes.slice(offset, offset + 5))
+            }
+            controller.close()
+          },
+        }),
+        {
+          headers: {
+            'content-type': 'text/event-stream',
+            'request-id': 'req_synthetic_mapping',
+          },
+        },
+      )
+    }
+    const plugin = await createPlugin(owner, client)
+    const names = await Promise.all(
+      [
+        ['search', 'aft_search', 'ctx_search', 'bash'],
+        ['ctx_search', 'bash'],
+      ].map(async (tools, index) => {
+        const response = await sendNative(
+          owner,
+          plugin,
+          `oc1-mapping-${index}`,
+          tools,
+        )
+        const text = await response.text()
+        return text
+          .split('\n')
+          .filter((line) => line.startsWith('data: '))
+          .map((line) => JSON.parse(line.slice(6)).content_block.name)
+      }),
+    )
+    expect(names).toEqual([
+      ['search', 'search', 'bash'],
+      ['ctx_search', 'ctx_search', 'bash'],
+    ])
+    expect(sentNames).toHaveLength(2)
+    expect(sentNames).toContainEqual([
+      'mcp_Search',
+      'mcp_Aft_search',
+      'mcp_Ctx_search',
+      'mcp_Bash',
+    ])
+    expect(sentNames).toContainEqual(['mcp_Ctx_search', 'mcp_Bash'])
   })
 }
 
