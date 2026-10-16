@@ -1,5 +1,6 @@
 import * as sqlite from 'bun:sqlite'
 import { describe, expect, spyOn } from 'bun:test'
+import { EventEmitter } from 'node:events'
 import * as fsSync from 'node:fs'
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import * as fsPromises from 'node:fs/promises'
@@ -14,7 +15,8 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { Writable } from 'node:stream'
+import { PassThrough, Writable } from 'node:stream'
+import * as core from '@cortexkit/anthropic-auth-core'
 import {
   createNativeAccountRuntime,
   createNativePoolStore,
@@ -31,6 +33,7 @@ import {
   runNativeMigration,
   type SetupIO,
 } from '@cortexkit/anthropic-auth-core'
+import { lockPathFor, withLock } from '@cortexkit/common-auth/fs'
 import type {
   AccountHeadersResult,
   RequestScope,
@@ -60,7 +63,11 @@ import {
 import { resolveNativeSetupPaths } from '../setup/native-paths.ts'
 import { getOpenCodeAuthPath, getPiAuthPath } from '../setup/paths.ts'
 import { ProcessFenceViolationError } from '../setup/process-fence.ts'
-import type { CommandRunner, ProcessFence } from '../setup/types.ts'
+import {
+  type CommandRunner,
+  type ProcessFence,
+  SetupRefusal,
+} from '../setup/types.ts'
 import { CLAUDE_POOL_LOGIN_STEP } from '../v2/activation.ts'
 import {
   createNativeAnthropicAdapter,
@@ -98,6 +105,76 @@ function createMockRunner(
       return { exitCode: 0, stdout: '', stderr: '' }
     },
   }
+}
+
+function observeSetupArguments() {
+  const original = core.runSetup
+  const calls: string[][] = []
+  const spy = spyOn(core, 'runSetup').mockImplementation((plugin, argv, io) => {
+    calls.push([...(argv ?? [])])
+    return original(plugin, argv, io)
+  })
+  lifetimes.deferCleanup(() => spy.mockRestore())
+  return calls
+}
+
+function ambiguousSetupIO(io: SetupIO): SetupIO {
+  const fs = io.fs!
+  const second = join(io.env!.HOME!, 'fixture-bin', 'opencode2')
+  return {
+    ...io,
+    fs: {
+      ...fs,
+      isFile: (path) => path === second || fs.isFile(path),
+      isExecutable: (path) => path === second || fs.isExecutable(path),
+    },
+  }
+}
+
+/** Supply keys only after each expected prompt is rendered, and cancel pending reads before teardown joins. */
+function scriptedSetupTerminal(
+  output: Writable,
+  script: Array<[string, string]>,
+) {
+  const input = Object.assign(new PassThrough(), {
+    isTTY: true,
+    isRaw: false,
+    setRawMode(raw: boolean) {
+      this.isRaw = raw
+      return this
+    },
+  })
+  const signals = new EventEmitter()
+  const remaining = [...script]
+  const prompts: string[] = []
+  const terminal = {
+    input,
+    signals,
+    output: Object.assign(
+      new Writable({
+        write(chunk, _encoding, done) {
+          output.write(chunk)
+          const next = remaining[0]
+          if (next && String(chunk).includes(next[0])) {
+            remaining.shift()
+            prompts.push(next[0])
+            queueMicrotask(() => input.write(next[1]))
+          }
+          done()
+        },
+      }),
+      { columns: 160 },
+    ),
+  }
+  const cancel = lifetimes.gate()
+  lifetimes.trackDetached(
+    cancel.wait.then(() => {
+      input.isTTY = false
+      signals.emit('SIGTERM')
+      input.destroy()
+    }),
+  )
+  return { terminal, prompts, remaining, close: cancel.open }
 }
 
 function detectionIO(
@@ -618,7 +695,12 @@ describe('setup failure diagnostics', () => {
         '  - PID 77: pi',
         'Please quit all OpenCode, LiteCode, and Pi processes before running setup.',
       ])
-        expect(screen).toContain(line)
+        expect(screen.split(line).length - 1).toBe(1)
+      expect(
+        screen.endsWith(
+          'Please quit all OpenCode, LiteCode, and Pi processes before running setup.\n',
+        ),
+      ).toBe(true)
       expectNoSecretFragments(screen)
       await expectNoDiagnostics(fixture)
     },
@@ -2033,6 +2115,11 @@ lifetimes.test(
       pi: true,
       claustrum: false,
     })
+    const pi = await resolveNativeSetupPaths('pi', f.env)
+    const before = await settleSetupSiblings([
+      setupBytes(f.plan),
+      setupBytes(pi),
+    ])
     expect(
       await runSetupCommand(['--yes', '--dry-run', '--opencode=2'], {
         ...f.io,
@@ -2046,6 +2133,19 @@ lifetimes.test(
     expect(f.screen()).toContain(
       'Dry run: no registrations, enrollment, sign-in or migration will be performed.',
     )
+    expect(f.screen()).toContain(
+      'OpenCode is running; setup will ask you to quit it.',
+    )
+    expect(f.screen()).toContain(
+      'Would migrate opencode using the plugin callback (provider-specific writes).',
+    )
+    expect(f.screen()).toContain(
+      'Would migrate pi using the plugin callback (provider-specific writes).',
+    )
+    expect(f.screen()).not.toContain(CLAUDE_POOL_LOGIN_STEP)
+    expect(
+      await settleSetupSiblings([setupBytes(f.plan), setupBytes(pi)]),
+    ).toEqual(before)
     expect(await readNativeMigrationJournal(f.plan.paths)).toBeUndefined()
     await expect(
       stat(join(dirname(f.plan.legacyConfigPath), 'opencode.jsonc')),
@@ -2848,8 +2948,10 @@ lifetimes.test(
       'Process inspection failed; setup cannot prove hosts are stopped.'
     expect(f.screen().split(message).length - 1).toBe(1)
     expect(f.screen()).toMatch(/ps: exit code 7 after \d+ ms\./)
+    expect(f.screen()).toMatch(/ps: exit code 7 after \d+ ms\.\n$/)
     expect(f.screen()).not.toContain(ECHO_SK)
     expect(f.screen()).not.toContain('Details were written')
+    await expectNoDiagnostics(f)
     expect(await readNativeMigrationJournal(f.plan.paths)).toBeUndefined()
   },
 )
@@ -3292,3 +3394,573 @@ lifetimes.test(
     ).toBe(false)
   },
 )
+
+describe('setup CLI boundary', () => {
+  lifetimes.test(
+    'consumes Pi consent, normalizes -y and forwards every other argument unchanged',
+    async () => {
+      const f = await callbackFixture()
+      const calls = observeSetupArguments()
+      const argv = [
+        '--remove-pi-auth',
+        '-y',
+        '--dry-run',
+        '--no-claustrum',
+        '--opencode=both',
+        '--login',
+        '--yes',
+        '--unknown=kept',
+        '--remove-pi-auth',
+      ]
+      const before = [...argv]
+      expect(await runSetupCommand(argv, f.io)).toBe(1)
+      expect(argv).toEqual(before)
+      expect(calls).toEqual([
+        [
+          '--yes',
+          '--dry-run',
+          '--no-claustrum',
+          '--opencode=both',
+          '--login',
+          '--yes',
+          '--unknown=kept',
+        ],
+      ])
+      expect(f.screen()).toBe('Unknown setup argument: --unknown=kept\n')
+      await expectNoDiagnostics(f)
+    },
+  )
+
+  for (const dry of [false, true]) {
+    for (const choice of ['--claustrum', '--opencode=2']) {
+      lifetimes.test(
+        `argument-level --login ${choice} refuses before runSetup (${dry ? 'dry' : 'real'})`,
+        async () => {
+          const f = await callbackFixture()
+          const calls = observeSetupArguments()
+          const before = await setupBytes(f.plan)
+          expect(
+            await runSetupCommand(
+              ['--yes', '--login', choice, ...(dry ? ['--dry-run'] : [])],
+              f.io,
+            ),
+          ).toBe(1)
+          expect(calls).toEqual([])
+          expect(f.screen()).toBe(
+            `${choice === '--claustrum' ? 'Local sign-in and vault setup are two separate choices. Use --login or --claustrum, not both.' : CLAUDE_POOL_LOGIN_STEP}\n`,
+          )
+          expect(await setupBytes(f.plan)).toEqual(before)
+          await expectNoDiagnostics(f)
+        },
+      )
+    }
+  }
+
+  for (const dry of [false, true]) {
+    lifetimes.test(
+      `detected generation 2 --login ${dry ? 'previews without the pool step' : 'refuses with the pool step once'}`,
+      async () => {
+        const f = await callbackFixture()
+        await writeSetupJson(join(f.env.HOME!, 'fixture-bin', 'package.json'), {
+          name: '@opencode/cli',
+          version: '2.0.21',
+        })
+        const before = await setupBytes(f.plan)
+        let exchanges = 0
+        expect(
+          await runSetupCommand(
+            ['--yes', '--login', ...(dry ? ['--dry-run'] : [])],
+            {
+              ...f.io,
+              runner: createMockRunner({
+                opencode: () => ({
+                  exitCode: 0,
+                  stdout: '2.0.21\n',
+                  stderr: '',
+                }),
+              }),
+              localLogin: async () => {
+                exchanges++
+                throw new Error('Must not exchange')
+              },
+            },
+          ),
+        ).toBe(dry ? 0 : 1)
+        expect(exchanges).toBe(0)
+        expect(await setupBytes(f.plan)).toEqual(before)
+        expect(f.screen().split(CLAUDE_POOL_LOGIN_STEP).length - 1).toBe(
+          dry ? 0 : 1,
+        )
+        if (dry)
+          expect(f.screen()).toContain('Would sign in locally for opencode.\n')
+        else
+          expect(f.screen().endsWith(`${CLAUDE_POOL_LOGIN_STEP}\n`)).toBe(true)
+        await expectNoDiagnostics(f)
+      },
+    )
+  }
+
+  for (const [label, argv, message] of [
+    [
+      'unknown argument',
+      ['--yes', '--unknown'],
+      'Unknown setup argument: --unknown',
+    ],
+    [
+      'conflicting vault flags',
+      ['--yes', '--claustrum', '--no-claustrum'],
+      '--claustrum and --no-claustrum cannot be used together.',
+    ],
+    ['noninteractive without --yes', [], 'Setup requires a TTY or --yes.'],
+    [
+      'unavailable Claustrum',
+      ['--yes', '--claustrum'],
+      'Claustrum is not available. Start ck or use --no-claustrum for local sign-in.',
+    ],
+  ] as const) {
+    lifetimes.test(
+      `runner plain error: ${label} prints once and exits 1`,
+      async () => {
+        const f = await callbackFixture()
+        const before = await setupBytes(f.plan)
+        expect(await runSetupCommand([...argv], f.io)).toBe(1)
+        expect(f.screen().split(message).length - 1).toBe(1)
+        expect(f.screen().endsWith(`${message}\n`)).toBe(true)
+        expect(await setupBytes(f.plan)).toEqual(before)
+        await expectNoDiagnostics(f)
+      },
+    )
+  }
+
+  lifetimes.test(
+    'a callback SetupRefusal prints exactly once without diagnostics',
+    async () => {
+      const f = await callbackFixture()
+      const message = 'Fixture setup was refused safely.'
+      expect(
+        await runSetupCommand(['--yes', '--opencode=1'], {
+          ...f.io,
+          migrateLocal: async () => {
+            throw new SetupRefusal(message)
+          },
+        }),
+      ).toBe(1)
+      expect(f.screen().split(message).length - 1).toBe(1)
+      expect(f.screen().endsWith(`${message}\n`)).toBe(true)
+      await expectNoDiagnostics(f)
+    },
+  )
+
+  lifetimes.test(
+    'a migrate error hides its unique path and stack from the terminal',
+    async () => {
+      const f = await callbackFixture()
+      const path = join(f.env.HOME!, 'private-migration-source.json')
+      const stack = 'at uniqueMigrationStackFrame (private-module.ts:123:4)'
+      const error = new Error(`Cannot migrate ${path}`)
+      error.stack = `${error.message}\n${stack}`
+      expect(
+        await runSetupCommand(['--yes', '--opencode=1'], {
+          ...f.io,
+          migrateLocal: async () => {
+            throw error
+          },
+        }),
+      ).toBe(1)
+      const record = await screenDiagnostic(
+        f,
+        'Setup failed (cli-setup/unexpected-error).',
+      )
+      expect(record.text).toContain(path)
+      expect(record.text).toContain(stack)
+      expect(f.screen()).not.toContain(path)
+      expect(f.screen()).not.toContain(stack)
+      expect(f.screen()).not.toContain('Cannot migrate')
+      expect(
+        f.screen().split('Setup failed (cli-setup/unexpected-error).').length -
+          1,
+      ).toBe(1)
+    },
+  )
+
+  lifetimes.test(
+    'all-absent native sources with --yes --opencode=2 publish empty-init',
+    async () => {
+      const f = await callbackFixture()
+      expect(
+        (await setupBytes(f.plan)).every(([, bytes]) => bytes === null),
+      ).toBe(true)
+      expect(await runSetupCommand(['--yes', '--opencode=2'], f.io)).toBe(0)
+      expect(await readNativeMigrationJournal(f.plan.paths)).toMatchObject({
+        version: 5,
+        kind: 'empty-init',
+        phase: 'committed',
+        host: 'opencode',
+        storageId: f.plan.paths.storageId,
+      })
+      expect(f.screen().split(CLAUDE_POOL_LOGIN_STEP).length - 1).toBe(1)
+      await expect(stat(f.plan.hostAuthPath)).rejects.toThrow()
+    },
+  )
+})
+
+lifetimes.test(
+  'ambiguous generation without a TTY prints the runner remedy once',
+  async () => {
+    const f = await callbackFixture()
+    const message =
+      'Multiple OpenCode generations found. Choose --opencode=1|2|both before running noninteractive setup.'
+    const before = await setupBytes(f.plan)
+    expect(await runSetupCommand(['--yes'], ambiguousSetupIO(f.io))).toBe(1)
+    expect(f.screen().split(message).length - 1).toBe(1)
+    expect(f.screen().endsWith(`${message}\n`)).toBe(true)
+    expect(await setupBytes(f.plan)).toEqual(before)
+    await expectNoDiagnostics(f)
+  },
+)
+
+for (const dry of [false, true]) {
+  lifetimes.test(
+    `interactively chosen generation 2 --login ${dry ? 'previews' : 'refuses once'}`,
+    async () => {
+      const f = await callbackFixture()
+      const before = await setupBytes(f.plan)
+      const script: Array<[string, string]> = [
+        ['Select hosts to set up', '\x1b[A\r'],
+        ['Which OpenCode generation should be registered?', '\x1b[B\r'],
+      ]
+      const session = scriptedSetupTerminal(f.output, script)
+      try {
+        expect(
+          await runSetupCommand(['--login', ...(dry ? ['--dry-run'] : [])], {
+            ...ambiguousSetupIO(f.io),
+            terminal: session.terminal,
+          }),
+        ).toBe(dry ? 0 : 1)
+        expect(session.prompts).toEqual(script.map(([prompt]) => prompt))
+        expect(session.remaining).toEqual([])
+        expect(f.screen().split(CLAUDE_POOL_LOGIN_STEP).length - 1).toBe(
+          dry ? 0 : 1,
+        )
+        if (dry)
+          expect(f.screen()).toContain('Would sign in locally for opencode.')
+        else
+          expect(f.screen().endsWith(`${CLAUDE_POOL_LOGIN_STEP}\n`)).toBe(true)
+        expect(await setupBytes(f.plan)).toEqual(before)
+        await expectNoDiagnostics(f)
+      } finally {
+        session.close()
+      }
+    },
+  )
+}
+
+for (const mode of ['local', 'claustrum'] as const) {
+  lifetimes.test(
+    `Pi consent ${mode}: noninteractive refusal and dry-run bypass`,
+    async () => {
+      for (const dry of [false, true]) {
+        const f = await callbackFixture({
+          opencode: false,
+          pi: true,
+          claustrum: mode === 'claustrum',
+        })
+        const pi = await resolveNativeSetupPaths('pi', f.env)
+        await writeSetupJson(pi.hostAuthPath, { anthropic: SETUP_HOST_LOGIN })
+        const before = await setupBytes(pi)
+        const message =
+          mode === 'local'
+            ? 'Pi has a stored Anthropic login. Rerun with --remove-pi-auth to move it into the native account pool.'
+            : 'Pi has stored Anthropic authentication. Rerun with --remove-pi-auth to preserve it privately during vault use and restore it on disconnect.'
+        expect(
+          await runSetupCommand(
+            [
+              '--yes',
+              mode === 'local' ? '--no-claustrum' : '--claustrum',
+              ...(dry ? ['--dry-run'] : []),
+            ],
+            f.io,
+          ),
+        ).toBe(dry ? 0 : 1)
+        expect(f.screen().split(message).length - 1).toBe(dry ? 0 : 1)
+        if (dry)
+          expect(f.screen()).toContain(
+            'Dry run: no registrations, enrollment, sign-in or migration will be performed.',
+          )
+        else expect(f.screen().endsWith(`${message}\n`)).toBe(true)
+        expect(await setupBytes(pi)).toEqual(before)
+        await expectNoDiagnostics(f)
+      }
+    },
+  )
+}
+
+for (const answer of ['yes', 'no'] as const) {
+  lifetimes.test(
+    `interactive Pi consent asks on the injected terminal and honors ${answer}`,
+    async () => {
+      const f = await callbackFixture({
+        opencode: false,
+        pi: true,
+        claustrum: false,
+      })
+      const pi = await resolveNativeSetupPaths('pi', f.env)
+      await writeSetupJson(pi.hostAuthPath, { anthropic: SETUP_HOST_LOGIN })
+      const before = await setupBytes(pi)
+      const script: Array<[string, string]> = [
+        ['Select hosts to set up', '\x1b[A\r'],
+        [
+          'Move the Pi Anthropic OAuth login into the native account pool and remove its stored copy?',
+          answer === 'yes' ? '\x1b[B\r' : '\r',
+        ],
+      ]
+      const session = scriptedSetupTerminal(f.output, script)
+      const migrations: boolean[] = []
+      try {
+        expect(
+          await runSetupCommand(['--no-claustrum'], {
+            ...f.io,
+            terminal: session.terminal,
+            migrateLocal: async (host, options) => {
+              expect(host).toBe('pi')
+              migrations.push(options.removePiAnthropicAuth ?? false)
+            },
+          }),
+        ).toBe(answer === 'yes' ? 0 : 1)
+        expect(session.prompts).toEqual(script.map(([prompt]) => prompt))
+        expect(session.remaining).toEqual([])
+        expect(migrations).toEqual(answer === 'yes' ? [true] : [])
+        if (answer === 'no')
+          expect(f.screen()).toContain(
+            'Native account-pool setup cannot finish while the stored Pi OAuth token takes precedence.',
+          )
+        expect(await setupBytes(pi)).toEqual(before)
+        await expectNoDiagnostics(f)
+      } finally {
+        session.close()
+      }
+    },
+  )
+}
+
+for (const name of ['native-migration', 'migration-journal']) {
+  lifetimes.test(
+    `empty-init held ${name} lease exits 1 without leaking its path or stack`,
+    async () => {
+      const f = await callbackFixture()
+      const before = await setupBytes(f.plan)
+      const original = core.publishNativeEmptyInit
+      let caught: unknown
+      const spy = spyOn(core, 'publishNativeEmptyInit').mockImplementation(
+        async (input) => {
+          try {
+            return await original(input, {
+              lockOptions: { ttlMs: 30_000, timeoutMs: 30 },
+            })
+          } catch (error) {
+            caught = error
+            throw error
+          }
+        },
+      )
+      lifetimes.deferCleanup(() => spy.mockRestore())
+      const ready = lifetimes.gate()
+      const release = lifetimes.gate()
+      const holder = withLock(
+        f.plan.paths.journal,
+        { name, ttlMs: 30_000, timeoutMs: 100, renew: true },
+        async () => {
+          ready.open()
+          await release.wait
+        },
+      )
+      lifetimes.trackDetached(holder)
+      try {
+        await ready.wait
+        expect(await runSetupCommand(['--yes', '--opencode=2'], f.io)).toBe(1)
+        expect(spy).toHaveBeenCalledTimes(1)
+        expect(caught).toMatchObject({
+          name: 'LockContentionError',
+          details: { target: f.plan.paths.journal, name, timeoutMs: 30 },
+        })
+        expect(await setupBytes(f.plan)).toEqual(before)
+        expect(f.screen()).not.toContain(f.plan.paths.journal)
+        expect(f.screen()).not.toContain('LockContentionError')
+        expect(f.screen()).not.toMatch(/\n\s+at /)
+        await screenDiagnostic(f, 'Setup failed (cli-setup/unexpected-error).')
+      } finally {
+        release.open()
+        await Promise.allSettled([holder])
+      }
+    },
+  )
+}
+
+for (const key of [
+  'config',
+  'state',
+  'runtime',
+  'roster',
+  'routing',
+] as const) {
+  lifetimes.test(
+    `empty-init occupied ${key} destination exits 1 without stack or source path text`,
+    async () => {
+      const f = await callbackFixture()
+      const path =
+        key === 'routing' ? f.plan.routingDestinationPath : f.plan.paths[key]
+      await writeSetupJson(path, { occupied: true })
+      const before = await setupBytes(f.plan)
+      expect(await runSetupCommand(['--yes', '--opencode=2'], f.io)).toBe(1)
+      expect(await setupBytes(f.plan)).toEqual(before)
+      expect(f.screen()).not.toContain(path)
+      expect(f.screen()).not.toContain('NativeMigrationError')
+      expect(f.screen()).not.toMatch(/\n\s+at /)
+      expect(f.screen().endsWith('Native migration: invalid-source\n')).toBe(
+        true,
+      )
+      await expectNoDiagnostics(f)
+    },
+  )
+}
+
+for (const [key, value] of [
+  ['storageId', '0'.repeat(64)],
+  ['kind', 'legacy-import'],
+  ['host', 'pi'],
+  ['phase', 'building'],
+  ['extra', true],
+] as const) {
+  lifetimes.test(
+    `empty-init conflicting journal ${key} exits 1 without stack or source path text`,
+    async () => {
+      const f = await callbackFixture()
+      const journal = await core.publishNativeEmptyInit({
+        paths: f.plan.paths,
+        routingDestinationPath: f.plan.routingDestinationPath,
+        env: f.env,
+        processFence: async () => {},
+      })
+      await writeSetupJson(f.plan.paths.journal, { ...journal, [key]: value })
+      const before = await setupBytes(f.plan)
+      expect(await runSetupCommand(['--yes', '--opencode=2'], f.io)).toBe(1)
+      expect(await setupBytes(f.plan)).toEqual(before)
+      expect(f.screen()).not.toContain(f.plan.paths.journal)
+      expect(f.screen()).not.toContain('NativeAuthorityError')
+      expect(f.screen()).not.toMatch(/\n\s+at /)
+      const message = 'Anthropic account migration journal is invalid'
+      expect(f.screen().split(message).length - 1).toBe(1)
+      expect(f.screen().endsWith(`${message}\n`)).toBe(true)
+      await expectNoDiagnostics(f)
+    },
+  )
+}
+
+for (const fault of [
+  'ownership-lost',
+  'destination-race',
+  'unsafe-source',
+  'enrollment-flip',
+] as const) {
+  lifetimes.test(
+    `empty-init ${fault} before rename exits 1 without leaking paths or stack`,
+    async () => {
+      const f = await callbackFixture()
+      const before = await setupBytes(f.plan)
+      const original = core.publishNativeEmptyInit
+      let injected = false
+      let caught: unknown
+      let restoreStat: (() => void) | undefined
+      const spy = spyOn(core, 'publishNativeEmptyInit').mockImplementation(
+        async (input) => {
+          try {
+            return await original(input, {
+              onStep: async (step) => {
+                if (step !== 'before-write:journal:committed') return
+                injected = true
+                if (fault === 'ownership-lost') {
+                  const path = lockPathFor(
+                    f.plan.paths.journal,
+                    'native-migration',
+                  )
+                  const lease = JSON.parse(await readFile(path, 'utf8'))
+                  await writeSetupJson(path, {
+                    ...lease,
+                    ownerId: 'other-owner',
+                  })
+                } else if (fault === 'destination-race') {
+                  await writeSetupJson(f.plan.paths.runtime, { external: true })
+                } else if (fault === 'unsafe-source') {
+                  const originalStat = fsPromises.lstat
+                  const statSpy = spyOn(fsPromises, 'lstat').mockImplementation(
+                    new Proxy(originalStat, {
+                      apply(target, receiver, args) {
+                        if (String(args[0]) === f.plan.paths.runtime)
+                          return Promise.reject(
+                            Object.assign(
+                              new Error('Private destination is unreadable'),
+                              { code: 'EACCES' },
+                            ),
+                          )
+                        return Reflect.apply(target, receiver, args)
+                      },
+                    }),
+                  )
+                  restoreStat = () => statSpy.mockRestore()
+                } else {
+                  await writeSetupJson(
+                    getHostClaustrumEnrollmentPaths('opencode', f.env)
+                      .tokenPath,
+                    { token: 'c'.repeat(64), token_generation: 1 },
+                  )
+                }
+              },
+            })
+          } catch (error) {
+            caught = error
+            throw error
+          }
+        },
+      )
+      lifetimes.deferCleanup(() => spy.mockRestore())
+      try {
+        expect(await runSetupCommand(['--yes', '--opencode=2'], f.io)).toBe(1)
+      } finally {
+        restoreStat?.()
+      }
+      expect(injected).toBe(true)
+      expect(spy).toHaveBeenCalledTimes(1)
+      if (fault === 'enrollment-flip') {
+        const message = 'Disconnect from the vault first.'
+        expect(f.screen().split(message).length - 1).toBe(1)
+        expect(f.screen().endsWith(`${message}\n`)).toBe(true)
+        await expectNoDiagnostics(f)
+      } else {
+        expect(caught).toMatchObject({
+          code: fault === 'destination-race' ? 'invalid-source' : fault,
+        })
+        const message = `Native migration: ${fault === 'destination-race' ? 'invalid-source' : fault}`
+        expect(f.screen().split(message).length - 1).toBe(1)
+        expect(f.screen().endsWith(`${message}\n`)).toBe(true)
+        await expectNoDiagnostics(f)
+      }
+      const expected = before.map(([path, bytes]) => [
+        path,
+        fault === 'destination-race' && path === f.plan.paths.runtime
+          ? JSON.stringify({ external: true })
+          : bytes,
+      ])
+      expect(await setupBytes(f.plan)).toEqual(expected)
+      for (const path of [f.plan.paths.journal, f.plan.paths.runtime])
+        expect(f.screen()).not.toContain(path)
+      expect(f.screen()).not.toMatch(/\n\s+at /)
+      expect(f.screen()).not.toContain('NativeMigrationError')
+      if (process.platform !== 'win32')
+        expect(
+          (await readdir(dirname(f.plan.paths.journal))).filter((name) =>
+            name.endsWith('.tmp'),
+          ),
+        ).toEqual([])
+    },
+  )
+}
