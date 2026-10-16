@@ -89,7 +89,6 @@ import {
   getQuotaNextRefreshAt,
   getRoutingMode,
   getScopedQuotaWindowForModel,
-  getStickyRoutingStatePath,
   getThinkingPrefixMismatchBehavior,
   type IdentityState,
   inspectNativeHostAuthEntry,
@@ -1738,20 +1737,23 @@ const anthropicAuthPlugin = async (
   const desktopNoticeMessageIds = new Map<string, Set<string>>()
   const desktopNoticeProbes = new Map<string, number>()
   // Session-to-account assignments live in separate files for local and vault
-  // accounts. A local host keeps its configured assignment file; an enrolled
+  // accounts. A local host uses the committed migration destination; an enrolled
   // host uses only the vault routing file the native runtime names, so vault
   // routing never opens or rewrites the local file. The runtime's mode is read
   // per use because enrollment can change while the plugin runs.
-  const localStickyRoutingPath =
-    process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE ||
-    getStickyRoutingStatePath(accountStoragePath)
   const stickySessionRouters = new Map<string, StickySessionRouter>()
   async function currentStickyRouting(): Promise<{
     router: StickySessionRouter
     accountIdentities?: ReadonlyMap<string, string>
   }> {
     const snapshot = await nativeAccounts.read()
-    let path = localStickyRoutingPath
+    const path = snapshot.routingPath
+    if (!path)
+      throw new Error(
+        snapshot.mode === 'claustrum'
+          ? 'Vault routing storage is unavailable'
+          : 'Native routing storage is unavailable',
+      )
     // Vault pins are bound to the verified account UUID behind each route, so
     // a route whose vault account was replaced (such as a new default account
     // under the same credential) loses its pins and quota preference, while
@@ -1759,9 +1761,6 @@ const anthropicAuthPlugin = async (
     // assignments unchanged.
     let accountIdentities: Map<string, string> | undefined
     if (snapshot.mode === 'claustrum') {
-      if (!snapshot.routingPath)
-        throw new Error('Vault routing storage is unavailable')
-      path = snapshot.routingPath
       accountIdentities = new Map()
       for (const account of snapshot.accounts)
         if (account.source === 'vault' && account.accountIdentity)
@@ -1772,6 +1771,8 @@ const anthropicAuthPlugin = async (
       router = new StickySessionRouter({
         path,
         vaultSeed: snapshot.routingSeed,
+        localRecoveryPath:
+          snapshot.mode === 'local' ? snapshot.routingRecoveryPath : undefined,
       })
       stickySessionRouters.set(path, router)
     }

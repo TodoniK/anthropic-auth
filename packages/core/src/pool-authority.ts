@@ -509,12 +509,13 @@ export function nativeMigrationAuthorityPhase(
 /** An empty or readable store is not proof that the offline authority flip completed. */
 export async function requireNativePoolAuthority(
   paths: NativePoolPaths,
-): Promise<void> {
+): Promise<NativeMigrationJournal> {
   const journal = await readNativeMigrationJournal(paths)
   if (!journal) throw new NativeAuthorityError('migration-required')
   if (!nativeMigrationAuthorityPhase(journal)) {
     throw new NativeAuthorityError('migration-incomplete')
   }
+  return journal
 }
 
 interface JournalHooks {

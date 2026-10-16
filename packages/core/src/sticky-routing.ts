@@ -537,6 +537,9 @@ export function stickyRetryAfterWithJitter(
   return Math.max(1, Math.ceil(retryAfterSeconds)) + (hash % 21)
 }
 
+// Share recovery attempts across router instances, including concurrent plugin loads.
+const localRecoveries = new Map<string, Promise<void>>()
+
 export class StickySessionRouter {
   private loaded = false
   private state: StickyRouteState
@@ -550,6 +553,7 @@ export class StickySessionRouter {
       now?: () => number
       assignmentTtlMs?: number
       vaultSeed?: NativeVaultRoutingSeed
+      localRecoveryPath?: string
     },
   ) {
     this.state = emptyState(this.now())
@@ -623,6 +627,48 @@ export class StickySessionRouter {
       await new Promise((resolve) =>
         setTimeout(resolve, STICKY_ROUTING_LOCK_POLL_MS),
       )
+    }
+  }
+
+  private async recoverLocalPins() {
+    const source = this.options.localRecoveryPath
+    if (!source || source === this.options.path) return
+    const key = JSON.stringify([this.options.path, source])
+    let recovery = localRecoveries.get(key)
+    if (!recovery) {
+      recovery = this.fillLocalPins(source)
+      localRecoveries.set(key, recovery)
+    }
+    await recovery
+  }
+
+  private async fillLocalPins(source: string) {
+    const lock = await this.acquireLock()
+    try {
+      let legacy: StickyRouteState | undefined
+      try {
+        legacy = normalizeState(JSON.parse(await readFile(source, 'utf8')))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+        throw error
+      }
+      if (!legacy) return
+      const state = await this.readState()
+      let changed = false
+      for (const [key, assignment] of Object.entries(legacy.assignments)) {
+        if (
+          !/^[0-9a-f]{64}$/.test(key) ||
+          Object.hasOwn(state.assignments, key)
+        )
+          continue
+        state.assignments[key] = assignment
+        changed = true
+      }
+      // Imported pins must not replace newer destination choices. Ordinary
+      // routing handles expired pins and accounts that no longer exist.
+      if (changed) await this.writeState(state, () => lock.assertOwned(), false)
+    } finally {
+      await lock.release()
     }
   }
 
@@ -874,6 +920,7 @@ export class StickySessionRouter {
     excludeAccountIds?: ReadonlySet<string>
   }): Promise<StickyRouteResolution | null> {
     if (!input.sessionId) return null
+    await this.recoverLocalPins()
     await this.prepareLegacySeed()
     await this.refreshStateIfChanged()
     const key = sessionKey(input.sessionId)
@@ -1013,6 +1060,7 @@ export class StickySessionRouter {
 
   async clear(sessionId: string) {
     if (!sessionId) return
+    await this.recoverLocalPins()
     const key = sessionKey(sessionId)
     const lock = await this.acquireLock()
     try {

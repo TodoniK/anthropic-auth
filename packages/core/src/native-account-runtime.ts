@@ -381,11 +381,13 @@ export function createNativeAccountRuntime(
     if (shutdown.signal.aborted) throw new NativeCustodyError('closed')
     signal?.throwIfAborted()
   }
+  let localRouting: { destination: string; source: string } | undefined
   async function authority(signal?: AbortSignal) {
     check(signal)
     let mode = await readNativeEnrollmentMode(options.host, env)
     if (mode === 'local') {
-      await requireNativePoolAuthority(paths)
+      // Reuse the authority read rather than opening the journal again for routing.
+      localRouting = (await requireNativePoolAuthority(paths)).routingPaths
       // Enrollment can land while the local journal is being read.
       mode = await readNativeEnrollmentMode(options.host, env)
     }
@@ -643,6 +645,10 @@ export function createNativeAccountRuntime(
       await vaultRouter.prepareLegacySeed(roster ?? null)
       snapshot.routingPath = vaultPaths.routing
       snapshot.routingSeed = { ...routingSeed }
+    } else if (localRouting) {
+      snapshot.routingPath = localRouting.destination
+      if (localRouting.source !== localRouting.destination)
+        snapshot.routingRecoveryPath = localRouting.source
     }
     return {
       snapshot,

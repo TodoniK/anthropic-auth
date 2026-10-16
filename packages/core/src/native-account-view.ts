@@ -77,8 +77,10 @@ export interface NativeAccountSnapshot {
   mode: 'local' | 'claustrum'
   settings: Record<string, unknown>
   accounts: NativeAccountView[]
-  /** Vault session-to-account assignments use this separate file. Local mode keeps the assignment file at the destination recorded by migration. */
+  /** Vault storage, or the local destination recorded by the authorized migration journal. */
   routingPath?: string
+  /** Distinct pre-migration routing file that OpenCode local serving may have recreated. */
+  routingRecoveryPath?: string
   routingSeed?: NativeVaultRoutingSeed
   /** AccountStorage-shaped input for pure policy predicates, never a credential or persistence authority. */
   policyStorage: AccountStorage

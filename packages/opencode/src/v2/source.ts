@@ -3,7 +3,6 @@ import {
   getClaudeCodeIdentityForVerifiedAccount,
   getQuotaCheckIntervalMs,
   getRoutingMode,
-  getStickyRoutingStatePath,
   isQuotaBearingHeaderFrame,
   mergeHeaderQuotaForPersistence,
   type NativeAccountRuntime,
@@ -122,17 +121,18 @@ export function createNativeAnthropicSource(
   const usagePublications = createNativeUsagePublisher('native-auth')
   // Vault mode keeps session affinity in its own file, named by the snapshot,
   // so vault sessions never read or write the local account's routing state.
-  // Local mode leaves routingPath unset and uses the local routing file.
+  // Local mode uses the destination from the runtime's existing authority read.
   const routers = new Map<string, StickySessionRouter>()
   const routerFor = (snapshot: NativeAccountSnapshot) => {
-    const path =
-      snapshot.routingPath ??
-      getStickyRoutingStatePath(options.paths.legacyConfig)
+    const path = snapshot.routingPath
+    if (!path) throw new Error('Native routing storage is unavailable')
     let router = routers.get(path)
     if (!router) {
       router = new StickySessionRouter({
         path,
         vaultSeed: snapshot.routingSeed,
+        localRecoveryPath:
+          snapshot.mode === 'local' ? snapshot.routingRecoveryPath : undefined,
       })
       routers.set(path, router)
     }

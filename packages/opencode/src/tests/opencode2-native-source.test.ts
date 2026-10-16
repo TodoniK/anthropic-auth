@@ -1243,15 +1243,11 @@ describe('OC2 source over actual native services', () => {
     const native = source(fixture.runtime, fixture.paths)
     expect(await native.chooseAccount(scope)).toBe('main')
     const snapshot = await fixture.runtime.read()
-    expect(snapshot.routingPath).toBeUndefined()
+    expect(snapshot.routingPath).toBe(
+      join(dirname(fixture.paths.config), 'native-routing.json'),
+    )
     const pin = JSON.parse(
-      rawPin(
-        await readFile(
-          getStickyRoutingStatePath(fixture.paths.legacyConfig),
-          'utf8',
-        ),
-        scope.sessionID,
-      ),
+      rawPin(await readFile(snapshot.routingPath!, 'utf8'), scope.sessionID),
     )
     expect(pin.accountId).toBe('main')
     expect(pin).not.toHaveProperty('accountIdentity')
