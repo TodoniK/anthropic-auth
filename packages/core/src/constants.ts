@@ -65,10 +65,23 @@ export const PARALLEL_TOOL_CALLS_SYSTEM_PROMPT = [
 
 export const CCH_SALT = '59cf53e54c78'
 export const CCH_POSITIONS = [4, 7, 20]
-export const CLAUDE_CODE_VERSION = '2.1.280'
+export const CLAUDE_CODE_VERSION = '2.1.302'
 export const CLAUDE_CODE_ENTRYPOINT = 'cli'
-export const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION = '0.112.1'
+export const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION = '0.128.0'
 export const CLAUDE_CODE_STAINLESS_RUNTIME_VERSION = 'v26.3.0'
+
+/**
+ * Whether the emulated Claude Code version gzips request bodies. Claude Code
+ * 2.1.302 compresses every request body of at least
+ * `CLAUDE_CODE_GZIP_MIN_BODY_CHARS` characters that goes straight to
+ * api.anthropic.com, and leaves it uncompressed behind a proxy, a custom CA
+ * or client certificates. A gzipped body carries `cch=00000` and trailing
+ * whitespace padding, which only a gzipping version sends, so this switch
+ * belongs to the version above and must change with it.
+ */
+export const CLAUDE_CODE_GZIPS_REQUEST_BODIES = true
+/** Smallest body, in UTF-16 characters (`string.length`), Claude Code gzips. */
+export const CLAUDE_CODE_GZIP_MIN_BODY_CHARS = 4096
 
 export const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, ${CLAUDE_CODE_ENTRYPOINT})`
 

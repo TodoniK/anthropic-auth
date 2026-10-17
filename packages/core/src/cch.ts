@@ -5,11 +5,19 @@ import { CCH_POSITIONS, CCH_SALT, CLAUDE_CODE_VERSION } from './constants.ts'
 const ANTHROPIC_REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]{8,128}$/
 const PROMPT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const BILLING_LINEAGE_FIELD_PATTERN = / cc_(?:prev_req|prompt_id)=[^;\r\n]*;/g
+const BILLING_LINEAGE_FIELD_PATTERN =
+  / cc_(?:prev_req|prompt_id|turn_origin|prompt_index|turn_index)=[^;\r\n]*;/g
 
 export interface BillingLineageFields {
   previousRequestId?: string
   promptId?: string
+  /**
+   * 1-based position of the current user prompt in the conversation. Claude
+   * Code sends it as `cc_prompt_index` and `cc_turn_index` (equal for a turn a
+   * person started) after `cc_turn_origin=human`, and keeps it for every
+   * request that serves the same prompt, tool-result follow-ups included.
+   */
+  promptIndex?: number
 }
 
 export function isValidAnthropicRequestId(value: string): boolean {
@@ -173,6 +181,35 @@ export function computeCcVersionSuffix(
 }
 
 /**
+ * Number of user prompts in a Messages API history: user messages that carry
+ * anything besides tool results. A tool-result message continues the prompt
+ * before it, so the request that answers a tool call keeps that prompt's
+ * position, as Claude Code's `cc_prompt_index` does.
+ */
+export function countUserPrompts(messages: unknown): number {
+  if (!Array.isArray(messages)) return 0
+  let count = 0
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue
+    const { role, content } = message as { role?: unknown; content?: unknown }
+    if (role !== 'user') continue
+    if (
+      Array.isArray(content) &&
+      content.length > 0 &&
+      content.every(
+        (block) =>
+          !!block &&
+          typeof block === 'object' &&
+          (block as { type?: unknown }).type === 'tool_result',
+      )
+    )
+      continue
+    count += 1
+  }
+  return count
+}
+
+/**
  * Build the billing header with a cch placeholder.
  * signRequestBody() must run after final request serialization to replace it.
  */
@@ -201,8 +238,38 @@ export function buildBillingHeaderValue(
   }
   if (lineage?.promptId && isValidBillingPromptId(lineage.promptId)) {
     value += ` cc_prompt_id=${lineage.promptId};`
+    const index = lineage.promptIndex
+    // Claude Code 2.1.302 follows every cc_prompt_id with these three fields
+    // and never sends them without one; without a usable prompt position the
+    // block keeps the older prompt-id-only shape.
+    if (index !== undefined && Number.isSafeInteger(index) && index > 0) {
+      value +=
+        ' cc_turn_origin=human;' +
+        ` cc_prompt_index=${index};` +
+        ` cc_turn_index=${index};`
+    }
   }
   return value
+}
+
+/**
+ * The `cc_prompt_id` in a signed body's billing block, or undefined. Claude
+ * Code also sends this id as the `x-claude-code-prompt-id` header.
+ */
+export function extractBillingPromptId(
+  body: Record<string, unknown> | null | undefined,
+): string | undefined {
+  const system = body?.system
+  if (!Array.isArray(system)) return undefined
+  const first = system[0] as { text?: unknown } | undefined
+  const text = first?.text
+  if (
+    typeof text !== 'string' ||
+    !text.startsWith('x-anthropic-billing-header:')
+  )
+    return undefined
+  const id = / cc_prompt_id=([^;\r\n]*);/.exec(text)?.[1]
+  return id && isValidBillingPromptId(id) ? id : undefined
 }
 
 /** Remove request-scoped Claude Code lineage from a billing header string. */

@@ -67,6 +67,20 @@ export function usesPerTurnControl(model: unknown): boolean {
 }
 
 /**
+ * Models whose OAuth requests carry `PER_TURN_CONTROL_BETA`: Opus 5.5 and
+ * Sonnet 5.5, plus Fable 5.1 and Haiku 5.5, which Claude Code 2.1.302 also
+ * sends it on. Sending the beta does not by itself make a model eligible for
+ * effort markers; `supportsPerMessageEffort` decides that.
+ */
+export function sendsPerTurnControlBeta(model: unknown): boolean {
+  return (
+    usesPerTurnControl(model) ||
+    isClaudeFable51Model(model) ||
+    isClaudeHaiku55Model(model)
+  )
+}
+
+/**
  * Whether a request may move effort changes into empty system messages.
  *
  * Fable 5.1 is always eligible, whatever its thinking field says. Opus 5.5

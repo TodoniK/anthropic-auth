@@ -228,7 +228,11 @@ describe('per-message effort beyond Fable 5.1', () => {
     const request = body()
     expect(supportsPerMessageEffort(request)).toBe(true)
     expect(usesPerTurnControl(request.model)).toBe(false)
-    expect(selectClaudeCodeBetas(request).split(',')).not.toContain(
+    // Claude Code 2.1.302 also sends per-turn control on Fable 5.1; its
+    // effort markers still rely on the mid-conversation output-config beta,
+    // which the OAuth header helpers add for every Fable 5.1 request.
+    expect(usesMidConversationOutputConfig(request)).toBe(true)
+    expect(selectClaudeCodeBetas(request).split(',')).toContain(
       PER_TURN_CONTROL_BETA,
     )
   })
@@ -256,8 +260,18 @@ describe('per-message effort beyond Fable 5.1', () => {
       ).toEqual({ applied: false, inserted: 0 })
       expect(JSON.stringify(request)).toBe(before)
       const betas = selectClaudeCodeBetas(request)
-      expect(betas).toBe(betasBefore)
-      expect(betas.split(',')).not.toContain(PER_TURN_CONTROL_BETA)
+      // Claude Code 2.1.302 sends per-turn control on Haiku 5.5 requests (and
+      // moves claude-code-20250219 next to it); that is the only header
+      // difference, and the body above stays unchanged.
+      expect(
+        betas
+          .split(',')
+          .filter((beta) => beta !== PER_TURN_CONTROL_BETA)
+          .sort(),
+      ).toEqual(betasBefore.split(',').sort())
+      expect(betas.split(',').includes(PER_TURN_CONTROL_BETA)).toBe(
+        model === 'claude-haiku-5-5',
+      )
       expect(betas.split(',')).not.toContain(
         MID_CONVERSATION_OUTPUT_CONFIG_BETA,
       )

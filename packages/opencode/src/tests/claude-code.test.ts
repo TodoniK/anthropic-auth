@@ -105,46 +105,75 @@ describe('Claude Code fingerprint helpers', () => {
       ...CLAUDE_CODE_FULL_AGENT_BETAS,
     ])
     const fullBetas = selectClaudeCodeBetas(body).split(',')
-    expect(fullBetas[0]).toBe('oauth-2025-04-20')
+    // Claude Code 2.1.302 puts claude-code-20250219 first.
+    expect(fullBetas[0]).toBe('claude-code-20250219')
+    expect(fullBetas[1]).toBe('oauth-2025-04-20')
     expect(fullBetas).toContain('thinking-token-count-2026-05-13')
     expect(fullBetas).not.toContain('redact-thinking-2026-02-12')
-    expect(fullBetas).toContain('claude-code-20250219')
     expect(fullBetas).not.toContain('context-1m-2025-08-07')
     expect(fullBetas).toContain('effort-2025-11-24')
     expect(fullBetas).toContain('mid-conversation-system-2026-04-07')
     expect(fullBetas).toContain('fallback-credit-2026-06-01')
+    // Claude Code 2.1.302 sends these on every full-agent request; 2.1.280
+    // did not.
+    expect(fullBetas).toContain('mid-conversation-tool-changes-2026-07-01')
+    expect(fullBetas).toContain('mid-conversation-system-clear-at-2026-08-21')
+    expect(fullBetas).toContain('thinking-binding-controls-2026-08-01')
+    // Claude Code sends this beta with thinking.display "updates"; these
+    // requests keep "summarized", so they leave it out.
+    expect(fullBetas).not.toContain('thinking-display-updates-2026-08-18')
   })
 
-  test('adds the per-turn control beta after the mid-conversation system beta for Opus 5.5 and Sonnet 5.5', () => {
-    for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5']) {
-      const betas = selectClaudeCodeBetas({
-        model,
-        messages: [{ role: 'user', content: 'hi' }],
-        system: [{ type: 'text', text: 'system' }],
-        tools: [{ name: 'mcp_Read', input_schema: { type: 'object' } }],
-        thinking: { type: 'adaptive' },
-        context_management: { edits: [] },
-        output_config: { effort: 'high' },
-        diagnostics: { enabled: true },
-        stream: true,
-      }).split(',')
-      const systemIndex = CLAUDE_CODE_FULL_AGENT_BETAS.indexOf(
-        'mid-conversation-system-2026-04-07',
-      )
-      expect(betas).toEqual([
-        ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(0, systemIndex + 1),
+  test('adds the per-turn control beta after the prompt-caching scope beta for Opus 5.5, Sonnet 5.5, Fable 5.1 and Haiku 5.5', () => {
+    const agentBody = (model: string) => ({
+      model,
+      messages: [{ role: 'user', content: 'hi' }],
+      system: [{ type: 'text', text: 'system' }],
+      tools: [{ name: 'mcp_Read', input_schema: { type: 'object' } }],
+      thinking: { type: 'adaptive' },
+      context_management: { edits: [] },
+      output_config: { effort: 'high' },
+      diagnostics: { enabled: true },
+      stream: true,
+    })
+    const scopeIndex = CLAUDE_CODE_FULL_AGENT_BETAS.indexOf(
+      'prompt-caching-scope-2026-01-05',
+    )
+    for (const model of [
+      'claude-opus-5-5',
+      'claude-sonnet-5-5',
+      'claude-fable-5-1',
+    ]) {
+      expect(selectClaudeCodeBetas(agentBody(model)).split(',')).toEqual([
+        ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(0, scopeIndex + 1),
         'per-turn-control-2026-07-01',
-        ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(systemIndex + 1),
+        ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(scopeIndex + 1),
       ])
     }
+    // Haiku 5.5, as captured: claude-code-20250219 moves after the scope
+    // beta and per-turn control follows it.
+    expect(
+      selectClaudeCodeBetas(agentBody('claude-haiku-5-5')).split(','),
+    ).toEqual([
+      ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(1, scopeIndex + 1),
+      'claude-code-20250219',
+      'per-turn-control-2026-07-01',
+      ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(scopeIndex + 1),
+    ])
+    // Opus 4.8 gets the list unchanged.
+    expect(
+      selectClaudeCodeBetas(agentBody('claude-opus-4-8')).split(','),
+    ).toEqual([...CLAUDE_CODE_FULL_AGENT_BETAS])
 
     const base = selectClaudeCodeBetas({
       model: 'claude-opus-5-5[1m]',
       messages: [{ role: 'user', content: 'hi' }],
     }).split(',')
-    expect(base.at(-1)).toBe('per-turn-control-2026-07-01')
+    expect(base[base.indexOf('prompt-caching-scope-2026-01-05') + 1]).toBe(
+      'per-turn-control-2026-07-01',
+    )
     expect(
-      selectClaudeCodeBetas({ model: 'claude-fable-5-1', messages: [] }),
+      selectClaudeCodeBetas({ model: 'claude-opus-5', messages: [] }),
     ).not.toContain('per-turn-control-2026-07-01')
   })
 
@@ -214,7 +243,10 @@ describe('Claude Code fingerprint helpers', () => {
 
     expect(headers.get('user-agent')).toBe(USER_AGENT)
     expect(headers.get('x-claude-code-session-id')).toBe(identity.sessionId)
-    expect(headers.get('x-stainless-package-version')).toBe('0.112.1')
+    expect(headers.get('x-stainless-package-version')).toBe('0.128.0')
+    expect(headers.get('x-claude-code-request-class')).toBe('main')
+    // No billing block with a prompt id: no prompt-id header.
+    expect(headers.get('x-claude-code-prompt-id')).toBeNull()
     expect(headers.get('x-stainless-runtime-version')).toBe('v26.3.0')
     expect(headers.get('x-app')).toBe('cli')
     expect(headers.get('anthropic-dangerous-direct-browser-access')).toBe(
@@ -230,6 +262,38 @@ describe('Claude Code fingerprint helpers', () => {
       account_uuid: '11111111-2222-4333-8444-555555555555',
       session_id: identity.sessionId,
     })
+  })
+
+  test('repeats the billing prompt id as a header and marks auxiliary requests', () => {
+    const promptId = '33333333-3333-4333-8333-333333333333'
+    const body = {
+      model: 'claude-sonnet-5-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: [
+        {
+          type: 'text',
+          text: `x-anthropic-billing-header: cc_version=2.1.302.abc; cc_entrypoint=cli; cch=00000; cc_prompt_id=${promptId}; cc_turn_origin=human; cc_prompt_index=1; cc_turn_index=1;`,
+        },
+      ],
+    }
+    const main = applyClaudeCodeHeaders(
+      new Headers({ 'x-claude-code-prompt-id': 'stale' }),
+      'sk-ant-oat-test',
+      { body },
+    )
+    expect(main.get('x-claude-code-prompt-id')).toBe(promptId)
+    expect(main.get('x-claude-code-request-class')).toBe('main')
+
+    const auxiliary = applyClaudeCodeHeaders(
+      new Headers({ 'x-claude-code-prompt-id': 'stale' }),
+      'sk-ant-oat-test',
+      {
+        body: { ...body, system: [{ type: 'text', text: 'other' }] },
+        requestClass: 'auxiliary',
+      },
+    )
+    expect(auxiliary.get('x-claude-code-prompt-id')).toBeNull()
+    expect(auxiliary.get('x-claude-code-request-class')).toBe('auxiliary')
   })
 
   test('shares the no-account identity between resolution and default headers', async () => {

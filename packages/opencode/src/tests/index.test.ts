@@ -21,6 +21,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import type {
   NativeRefreshSubject,
   PrimeManager,
@@ -7789,6 +7790,120 @@ describe('auth.loader', () => {
         process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
       }
       await rm(dumpDir, { recursive: true, force: true })
+    }
+  })
+
+  // A loopback server stands in for api.anthropic.com: the plugin's fetch
+  // still sees the production URL (so the gzip host rule applies) and the
+  // stand-in network forwards the exact bytes to the server.
+  async function gzipWireScenario(replies: Response[]) {
+    await useTempAccountFile(
+      createFallbackStorage({ quota: { enabled: false }, accounts: [] }),
+    )
+    const received: Array<{ headers: Headers; body: Uint8Array }> = []
+    const upstream = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(request) {
+        received.push({
+          headers: new Headers(request.headers),
+          body: new Uint8Array(await request.arrayBuffer()),
+        })
+        return (
+          replies.shift() ??
+          new Response('event: message_stop\ndata: {}\n\n', {
+            status: 200,
+            headers: { 'request-id': 'req_011CGzipOk00000000000001' },
+          })
+        )
+      },
+    })
+    globalThis.fetch = mock(
+      withNativeAdmission(async (input: any, init: any) => {
+        const target = new URL(input instanceof Request ? input.url : input)
+        return Bun.fetch(
+          `http://127.0.0.1:${upstream.port}${target.pathname}${target.search}`,
+          init,
+        )
+      }),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'sk-ant-oat01-main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const send = () =>
+      result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-gzip-wire' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-5-5',
+          max_tokens: 32000,
+          stream: true,
+          messages: [{ role: 'user', content: `Review: ${'x'.repeat(9000)}` }],
+        }),
+      }) as Promise<Response>
+    return { received, send, stop: () => upstream.stop(true) }
+  }
+
+  test('sends a large OAuth body gzipped with cch=00000 and padding', async () => {
+    const { received, send, stop } = await gzipWireScenario([])
+    try {
+      const response = await send()
+      await response.text()
+      expect(received).toHaveLength(1)
+      const wire = received[0]!
+      expect(wire.headers.get('content-encoding')).toBe('gzip')
+      expect(wire.headers.get('x-claude-code-request-class')).toBe('main')
+      const plain = new TextDecoder().decode(gunzipSync(wire.body))
+      const trimmed = plain.trimEnd()
+      expect(plain.slice(trimmed.length)).toMatch(/^\n[ \t]{0,256}$/)
+      const parsed = JSON.parse(trimmed)
+      expect(parsed.system[0].text).toContain(' cch=00000;')
+      // The same body signed is what an uncompressed send would carry.
+      const signed = await Core.signRequestBody(trimmed)
+      expect(signed).not.toBe(trimmed)
+    } finally {
+      stop()
+    }
+  })
+
+  test('resends a rejected gzipped body uncompressed once with the same request id', async () => {
+    const { received, send, stop } = await gzipWireScenario([
+      new Response('Bad Request', { status: 400 }),
+    ])
+    try {
+      const response = await send()
+      await response.text()
+      expect(response.status).toBe(200)
+      expect(received).toHaveLength(2)
+      const [first, resend] = received
+      expect(first?.headers.get('content-encoding')).toBe('gzip')
+      expect(resend?.headers.get('content-encoding')).toBeNull()
+      expect(resend?.headers.get('x-client-request-id')).toBe(
+        first?.headers.get('x-client-request-id'),
+      )
+      expect(resend?.headers.get('x-stainless-retry-count')).toBe('0')
+      const identity = new TextDecoder().decode(resend!.body)
+      expect(Core.extractBillingHeaderCCH(identity)).not.toBe('00000')
+      expect(await Core.signRequestBody(identity)).toBe(identity)
+      expect(Core.resetBillingHeaderCCH(identity)).toBe(
+        new TextDecoder().decode(gunzipSync(first!.body)).trimEnd(),
+      )
+
+      // Latched: the next request goes out uncompressed on the first try.
+      const next = await send()
+      await next.text()
+      expect(received).toHaveLength(3)
+      expect(received[2]?.headers.get('content-encoding')).toBeNull()
+    } finally {
+      stop()
     }
   })
 

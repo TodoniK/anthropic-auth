@@ -284,6 +284,45 @@ describe('conversation-start billing suffix pinning', () => {
     )
   })
 
+  test('numbers the prompt from the history and keeps it on a tool-result follow-up', async () => {
+    const rewrite = async (messages: unknown[]) =>
+      JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({ model: 'claude-sonnet-5-5', messages, system: [] }),
+          {
+            billingLineage: {
+              promptId: '00000000-0000-4000-8000-000000000001',
+            },
+          },
+        ),
+      ).system[0].text as string
+    const history = [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'read notes.txt' },
+    ]
+    expect(await rewrite(history)).toEndWith(
+      'cc_prompt_id=00000000-0000-4000-8000-000000000001; cc_turn_origin=human; cc_prompt_index=2; cc_turn_index=2;',
+    )
+    expect(
+      await rewrite([
+        ...history,
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'toolu_1', name: 'read', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'toolu_1', content: 'hi' },
+          ],
+        },
+      ]),
+    ).toEndWith('cc_prompt_index=2; cc_turn_index=2;')
+  })
+
   test('tracks changing first-user text without a session pin', async () => {
     const first = JSON.parse(await rewriteForSession('messCage'))
     const changed = JSON.parse(await rewriteForSession('messDage'))
@@ -879,8 +918,23 @@ describe('setOAuthHeaders', () => {
       ])
       const headers = new Headers()
       setOAuthHeaders(headers, 'token', { body })
+      // Claude Code 2.1.302 sends the per-turn-control beta (per-message
+      // effort) on Haiku 5.5 too, after
+      // claude-code-20250219, which it moves behind the prompt-caching scope
+      // beta. No effort marker or other beta changes.
+      const scope = CLAUDE_CODE_FULL_AGENT_BETAS.indexOf(
+        'prompt-caching-scope-2026-01-05',
+      )
       expect(headers.get('anthropic-beta')).toBe(
-        CLAUDE_CODE_FULL_AGENT_BETAS.join(','),
+        (model === 'claude-haiku-5-5'
+          ? [
+              ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(1, scope + 1),
+              'claude-code-20250219',
+              'per-turn-control-2026-07-01',
+              ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(scope + 1),
+            ]
+          : CLAUDE_CODE_FULL_AGENT_BETAS
+        ).join(','),
       )
     }
   })

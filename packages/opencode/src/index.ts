@@ -88,6 +88,8 @@ import {
   getPersistedLogLevel,
   getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
+  getRequestGzipLatch,
+  getRequestGzipLatchPath,
   getRoutingMode,
   getScopedQuotaWindowForModel,
   getThinkingPrefixMismatchBehavior,
@@ -188,6 +190,7 @@ import {
   type StickyRouteCandidate,
   StickySessionRouter,
   sendViaRelay,
+  sendWithRequestGzip,
   setCache1hState,
   setDumpEnabled,
   setFastModeEnabled,
@@ -251,6 +254,11 @@ import { createNativeCommand } from './native-command.js'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import { logFallbackQuotaPreflightWarning } from './quota-preflight.ts'
+import {
+  isAuxiliaryAgent,
+  REQUEST_CLASS_REQUEST_HEADER,
+  takeRequestClassHeader,
+} from './request-class.ts'
 import {
   formatKillswitchBlockMessage,
   resolveScopedDrivenBlock,
@@ -1159,6 +1167,9 @@ const anthropicAuthPlugin = async (
   const { client } = ctx
   const profileFetch = globalThis.fetch
   const accountStoragePath = getAccountStoragePath()
+  const requestGzipLatch = getRequestGzipLatch(
+    getRequestGzipLatchPath(accountStoragePath),
+  )
 
   // -- OAuth add-flow pending state (Add account modal) --------------------
   interface OAuthPendingEntry {
@@ -3734,6 +3745,8 @@ const anthropicAuthPlugin = async (
       setOAuthHeaders(headers, accessToken, {
         body: JSON.parse(body),
         identity,
+        // Claude Code marks its own quota-check request as auxiliary.
+        requestClass: 'auxiliary',
       })
       headers.delete('content-length')
       headers.delete('transfer-encoding')
@@ -5983,13 +5996,17 @@ const anthropicAuthPlugin = async (
     'chat.headers': async (
       {
         sessionID,
+        agent,
         message,
       }: {
         sessionID: string
+        agent?: string
         message: { id: string }
       },
       output: { headers: Record<string, string> },
     ) => {
+      if (isAuxiliaryAgent(agent))
+        output.headers[REQUEST_CLASS_REQUEST_HEADER] = 'auxiliary'
       laneStartTracker.markHeaders({
         sessionId: sessionID,
         messageId: message.id,
@@ -6881,6 +6898,8 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete('x-opencode-parent-session-id')
             requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
             requestHeaders.delete(BILLING_LINEAGE_REQUEST_HEADER)
+            // The API-key route sends no Claude Code headers; drop the marker.
+            requestHeaders.delete(REQUEST_CLASS_REQUEST_HEADER)
             let body = await fetchBody(input, init)
             let streaming = false
             let dump: DumpHandle | null = null
@@ -7083,6 +7102,7 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete('x-opencode-parent-session-id')
             requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
             requestHeaders.delete(BILLING_LINEAGE_REQUEST_HEADER)
+            const requestClass = takeRequestClassHeader(requestHeaders)
             let body = await fetchBody(input, init)
             const previousDiagnosticsMessage = relayAffinity
               ? cacheDiagnosticsTracker.previousFor(relayAffinity)
@@ -7227,6 +7247,7 @@ const anthropicAuthPlugin = async (
                 setOAuthHeaders(requestHeaders, accessToken, {
                   body: finalBody,
                   identity,
+                  requestClass,
                 })
                 const diagnostics = finalBody.diagnostics
                 const sentPreviousMessageId =
@@ -7266,7 +7287,10 @@ const anthropicAuthPlugin = async (
                   parsed: true,
                 })
               } catch {
-                setOAuthHeaders(requestHeaders, accessToken, { identity })
+                setOAuthHeaders(requestHeaders, accessToken, {
+                  identity,
+                  requestClass,
+                })
                 trace?.mark('set_oauth_headers_body_parse', {
                   route,
                   ms: roundMs(nowMs() - headerBodyParseStart),
@@ -7397,13 +7421,31 @@ const anthropicAuthPlugin = async (
                 streaming ? 'event-stream' : 'http',
               )
               try {
-                const response = scope.redactResponse(
-                  await fetch(rewritten.input, {
+                const physicalSend = (
+                  wireBody: RequestInit['body'],
+                  wireHeaders: Headers,
+                ) =>
+                  fetch(rewritten.input, {
                     ...init,
-                    body,
-                    headers: requestHeaders,
+                    body: wireBody,
+                    headers: wireHeaders,
                     ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-                  }),
+                  })
+                // Claude Code gzips large bodies on the wire. `body` stays the
+                // signed uncompressed text: request dumps, CacheKeep prewarm
+                // replays and the relay's direct fallback all reuse it.
+                const response = scope.redactResponse(
+                  typeof body === 'string'
+                    ? await sendWithRequestGzip({
+                        url:
+                          rewritten.url?.toString() ??
+                          fetchInputUrl(rewritten.input),
+                        body,
+                        headers: requestHeaders,
+                        latch: requestGzipLatch,
+                        send: physicalSend,
+                      })
+                    : await physicalSend(body, requestHeaders),
                 )
                 if (typeof body === 'string') {
                   directDump = await dumpDirectRequest({

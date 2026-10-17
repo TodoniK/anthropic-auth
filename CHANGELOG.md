@@ -17,6 +17,16 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 - Move to `@cortexkit/common-auth` 0.19.0 and `@cortexkit/claustrum-client` 0.10.0.
 
+### Claude Code identity
+
+- OAuth requests now present as Claude Code 2.1.302 instead of 2.1.280, matched against an interactive 2.1.302 capture: `User-Agent: claude-cli/2.1.302 (external, cli)`, `x-stainless-package-version: 0.128.0`, and the 2.1.302 billing block. A request for a user prompt now also carries `cc_turn_origin=human; cc_prompt_index=N; cc_turn_index=N;`, where `N` counts the prompts in the conversation and stays the same for tool-result follow-ups, plus the `x-claude-code-prompt-id` header. Every request carries `x-claude-code-request-class` (`main`, or `auxiliary` for title, summary and quota-window requests). The `cc_version` suffix and `cch` rules are unchanged.
+- Beta lists follow 2.1.302: `claude-code-20250219` comes first in the full-agent list, `per-turn-control-2026-07-01` sits directly after `prompt-caching-scope-2026-01-05` and is now also sent on Fable 5.1 and Haiku 5.5, and full-agent requests add `mid-conversation-tool-changes-2026-07-01`, `mid-conversation-system-clear-at-2026-08-21` and `thinking-binding-controls-2026-08-01`. Betas Claude Code only sends behind a feature flag (`advisor-tool`, `fallback-credit`, `mid-conversation-system`) and `mid-conversation-output-config` for Fable 5.1 effort changes are kept. `thinking-display-updates-2026-08-18` is not sent because thinking stays `display: "summarized"`.
+
+### Request compression
+
+- OAuth bodies of 4,096 characters or more sent directly to `api.anthropic.com` now go out gzipped, as Claude Code 2.1.302 sends them: billing `cch` reset to `00000`, a newline and up to 256 random spaces and tabs appended, gzip level 6, `content-encoding: gzip`. Requests through a proxy, a custom CA or client certificates, API-key routes and relays stay uncompressed and signed. Set `CLAUDE_CODE_GZIP_REQUEST_BODIES=0` to turn it off.
+- If something on the way rejects a gzipped body, OpenCode 1 and Pi resend it once uncompressed with the same request id, and gzip stays off for the process; after a proxy rejection that Anthropic then accepted uncompressed, it stays off for seven days (recorded next to the account storage file, not in settings). OpenCode 2 cannot resend from the plugin, so the rejected request fails and the next one goes out uncompressed. See [transports](docs/transports.md#request-body-compression).
+
 ## 2.0.3
 
 ### Prompt cache

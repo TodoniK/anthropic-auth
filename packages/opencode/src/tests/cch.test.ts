@@ -3,6 +3,7 @@ import {
   buildBillingHeaderValue,
   computeCCH,
   computeCcVersionSuffix,
+  countUserPrompts,
   extractFirstUserMessageText,
   signRequestBody,
   stripBillingLineageFields,
@@ -247,6 +248,61 @@ describe('billing header helpers', () => {
     ).toBe(
       'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=00000; cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001;',
     )
+  })
+
+  test('appends the 2.1.302 turn fields after the prompt id, and only with one', () => {
+    const messages = [{ role: 'user', content: 'hello world test message' }]
+    expect(
+      buildBillingHeaderValue(messages, '2.1.302', 'cli', undefined, {
+        previousRequestId: 'req_011111111111111111111111',
+        promptId: '00000000-0000-4000-8000-000000000001',
+        promptIndex: 2,
+      }),
+    ).toEndWith(
+      '; cch=00000; cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001; cc_turn_origin=human; cc_prompt_index=2; cc_turn_index=2;',
+    )
+    // No prompt id (a background request): no turn fields either.
+    expect(
+      buildBillingHeaderValue(messages, '2.1.302', 'cli', undefined, {
+        promptIndex: 2,
+      }),
+    ).toEndWith('; cch=00000;')
+    for (const promptIndex of [0, -1, 1.5]) {
+      expect(
+        buildBillingHeaderValue(messages, '2.1.302', 'cli', undefined, {
+          promptId: '00000000-0000-4000-8000-000000000001',
+          promptIndex,
+        }),
+      ).toEndWith('cc_prompt_id=00000000-0000-4000-8000-000000000001;')
+    }
+    expect(
+      stripBillingLineageFields(
+        'x-anthropic-billing-header: cc_version=2.1.302.ef1; cc_entrypoint=cli; cch=abcde; cc_prompt_id=00000000-0000-4000-8000-000000000001; cc_turn_origin=human; cc_prompt_index=3; cc_turn_index=3;',
+      ),
+    ).toBe(
+      'x-anthropic-billing-header: cc_version=2.1.302.ef1; cc_entrypoint=cli; cch=abcde;',
+    )
+  })
+
+  test('counts user prompts, not tool-result follow-ups', () => {
+    expect(countUserPrompts(undefined)).toBe(0)
+    expect(
+      countUserPrompts([
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1' }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1' }] },
+        { role: 'system', content: [] },
+        { role: 'assistant', content: 'done' },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 't2' },
+            { type: 'text', text: 'and another thing' },
+          ],
+        },
+        { role: 'user', content: [{ type: 'text', text: 'second' }] },
+      ]),
+    ).toBe(3)
   })
 
   test('strips lineage only from the generated billing block', () => {

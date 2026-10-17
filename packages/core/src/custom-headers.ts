@@ -19,6 +19,8 @@ const PROTECTED_HEADERS = new Set([
   'host',
   'content-length',
   'content-type',
+  // The request-body gzip helper alone decides the body encoding.
+  'content-encoding',
   'connection',
   'transfer-encoding',
   'upgrade',
@@ -32,6 +34,7 @@ const PROTECTED_HEADERS = new Set([
   'x-opencode-session',
   'x-anthropic-effort-plan',
   'x-cortexkit-billing-lineage',
+  'x-cortexkit-request-class',
 ])
 
 function cacheParsed(raw: string, entries: HeaderEntries | null) {

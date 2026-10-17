@@ -9,12 +9,19 @@ import {
   applyCustomHeaders,
   assertNotCustodyTombstone,
   type ClaudeCodeIdentity,
+  classifyGzipRejection,
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
+  decideRequestGzip,
+  encodeGzipRequestBody,
+  getAccountStoragePath,
+  getRequestGzipLatch,
+  getRequestGzipLatchPath,
   mergeAnthropicBetas,
   type ProviderErrorRedactor,
   type ProviderErrorResponseScope,
   type ProviderResponseMode,
+  type RequestGzipLatch,
   remapModelId,
   remapRequestBodyModel,
   stripEmptyTrailingAssistantMessages,
@@ -40,6 +47,7 @@ import {
   EffortMarkerCorrelationError,
 } from '../effort-history'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
+import { isAuxiliaryAgent } from '../request-class'
 import {
   applyServerSideFallbackToBody,
   SERVER_SIDE_FALLBACK_BETA,
@@ -366,6 +374,11 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
    * ended; the source's work is not cancelled.
    */
   readonly attemptEndTimeoutMs?: number
+  /**
+   * Remembers a rejected gzipped body. Defaults to the latch next to the
+   * OpenCode account storage file.
+   */
+  readonly requestGzipLatch?: RequestGzipLatch
 }
 
 export interface NativeAnthropicAdapter<Q, P> {
@@ -620,6 +633,15 @@ export function createNativeAnthropicAdapter<Q, P>(
   const endTimeoutMs =
     deps.attemptEndTimeoutMs ?? DEFAULT_ATTEMPT_END_TIMEOUT_MS
   type Data = NativeAnthropicAttemptData<P>
+  const requestGzipLatch =
+    deps.requestGzipLatch ??
+    getRequestGzipLatch(getRequestGzipLatchPath(getAccountStoragePath()))
+  // Direct sends whose body this adapter gzipped. The host performs the fetch
+  // and its limit and output detection see the response before
+  // rewriteResponse does, so a rejected gzipped body cannot be resent here
+  // the way OpenCode 1 and Pi resend it. Instead a rejection turns gzip off
+  // for this process and the next request goes out uncompressed.
+  const gzippedSends = new WeakSet<Data>()
 
   // Keyed by the fresh per-send data object that `accountHeaders` returns
   // alongside the credential headers, so two sends never share an entry even
@@ -981,6 +1003,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         setOAuthHeaders(headers, accessToken, {
           body: finalBody,
           ...(identity ? { identity } : {}),
+          requestClass: isAuxiliaryAgent(attempt.agent) ? 'auxiliary' : 'main',
         })
       } else {
         if (body !== undefined && messages) body = rewriteApiBody(body)
@@ -1080,12 +1103,28 @@ export function createNativeAnthropicAdapter<Q, P>(
         body: JSON.stringify(envelope),
       })
     }
+    let wireBody: string | Uint8Array | undefined = body
+    if (data.route === 'oauth' && messages && body !== undefined) {
+      const decision = await decideRequestGzip({
+        url,
+        body,
+        latch: requestGzipLatch,
+      })
+      ensureLive()
+      if (decision.gzip) {
+        // `body` stays the signed identity text; only the wire bytes change.
+        wireBody = await encodeGzipRequestBody(body)
+        headers.set('content-encoding', 'gzip')
+        gzippedSends.add(data)
+        ensureLive()
+      }
+    }
     return new Request(url, {
       method: request.method,
       headers,
       redirect: request.redirect,
       signal: request.signal,
-      ...(body !== undefined ? { body } : {}),
+      ...(wireBody !== undefined ? { body: wireBody } : {}),
     })
   }
 
@@ -1127,6 +1166,21 @@ export function createNativeAnthropicAdapter<Q, P>(
         // The relay's own failure can repeat the relay token or the
         // credential in the envelope it was given.
         return scrubResponse(data, response)
+      }
+      if (data && gzippedSends.has(data)) {
+        gzippedSends.delete(data)
+        // Classify before the body is scrubbed or read; a clone is read.
+        void classifyGzipRejection(response).then(
+          (kind) => {
+            if (!kind) return
+            requestGzipLatch.latchProcess()
+            log?.warn(
+              'gzipped request body rejected; later requests go uncompressed',
+              { kind, status: response.status },
+            )
+          },
+          () => {},
+        )
       }
       // Remove this send's secrets from provider errors before any other
       // reader; successful bytes pass through unchanged.

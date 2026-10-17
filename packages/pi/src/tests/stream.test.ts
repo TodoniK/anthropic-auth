@@ -2,9 +2,12 @@ import { afterEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
   createNativePoolStore,
+  resetBillingHeaderCCH,
   resolveNativePoolPaths,
+  signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import {
@@ -295,6 +298,96 @@ describe('Pi API fallback routing helpers', () => {
     expect(requestHeaders?.get('anthropic-beta')).toContain(
       'mid-conversation-output-config-2026-07-01',
     )
+  })
+
+  test('sends a large OAuth body gzipped and resends a rejected one uncompressed once', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-request-gzip-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+      },
+      storagePath,
+    )
+    // A loopback server stands in for api.anthropic.com and records the
+    // exact bytes; the first answer is a proxy-style 400 (no request id).
+    const received: Array<{ headers: Headers; body: Uint8Array }> = []
+    const replies = [new Response('Bad Request', { status: 400 })]
+    const upstream = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(request) {
+        received.push({
+          headers: new Headers(request.headers),
+          body: new Uint8Array(await request.arrayBuffer()),
+        })
+        return (
+          replies.shift() ??
+          new Response(
+            [
+              'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+              'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+              'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            ].join(''),
+            {
+              status: 200,
+              headers: { 'request-id': 'req_011CPiGzipOk000000000001' },
+            },
+          )
+        )
+      },
+    })
+    try {
+      globalThis.fetch = mock(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          const url = new URL(input instanceof Request ? input.url : input)
+          if (url.pathname.includes('/api/claude_cli/bootstrap'))
+            return new Response(
+              JSON.stringify({
+                oauth_account: { account_uuid: 'pi-gzip-account' },
+              }),
+            )
+          return Bun.fetch(
+            `http://127.0.0.1:${upstream.port}${url.pathname}${url.search}`,
+            init,
+          )
+        },
+      ) as unknown as typeof fetch
+      const context = {
+        systemPrompt: 'test',
+        tools: [],
+        messages: [
+          {
+            role: 'user',
+            content: `Review: ${'x'.repeat(9000)}`,
+            timestamp: 0,
+          },
+        ],
+      } as any
+      const result = await streamCortexKitAnthropic(anthropicModel, context, {
+        apiKey: 'sk-ant-oat-pi-gzip',
+        sessionId: 'ses_pi_gzip',
+      }).result()
+      expect(result.stopReason).toBe('stop')
+      expect(received).toHaveLength(2)
+      const [first, resend] = received
+      expect(first?.headers.get('content-encoding')).toBe('gzip')
+      const plain = new TextDecoder().decode(gunzipSync(first!.body))
+      expect(plain.trimEnd()).toContain(' cch=00000;')
+      expect(plain.slice(plain.trimEnd().length)).toMatch(/^\n[ \t]{0,256}$/)
+      expect(resend?.headers.get('content-encoding')).toBeNull()
+      expect(resend?.headers.get('x-client-request-id')).toBe(
+        first?.headers.get('x-client-request-id'),
+      )
+      const identity = new TextDecoder().decode(resend!.body)
+      expect(await signRequestBody(identity)).toBe(identity)
+      expect(resetBillingHeaderCCH(identity)).toBe(plain.trimEnd())
+    } finally {
+      upstream.stop(true)
+    }
   })
 
   test('sends Opus 5.5 effort changes as system markers with the per-turn control beta', async () => {

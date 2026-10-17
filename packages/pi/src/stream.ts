@@ -19,6 +19,8 @@ import {
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
   getQuotaCheckIntervalMs,
+  getRequestGzipLatch,
+  getRequestGzipLatchPath,
   getRoutingMode,
   getScopedQuotaWindowForModel,
   getThinkingPrefixMismatchBehavior,
@@ -58,6 +60,7 @@ import {
   type StickyRouteCandidate,
   StickySessionRouter,
   sendViaRelay,
+  sendWithRequestGzip,
   setDumpEnabled,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
@@ -689,7 +692,22 @@ async function sendAnthropicRequest(options: {
     const send = async () => {
       const scope = createProviderErrorResponseScope([secret], 'event-stream')
       physical.scope = scope
-      return scope.redactResponse(await fetch(input, init))
+      // OAuth bodies go gzipped as Claude Code sends them; `bodyText` stays
+      // the signed identity text for dumps and CacheKeep.
+      if (options.apiAccount || typeof init.body !== 'string')
+        return scope.redactResponse(await fetch(input, init))
+      return scope.redactResponse(
+        await sendWithRequestGzip({
+          url: input,
+          body: init.body,
+          headers,
+          latch: getRequestGzipLatch(
+            getRequestGzipLatchPath(options.storagePath),
+          ),
+          send: (wireBody, wireHeaders) =>
+            fetch(input, { ...init, body: wireBody, headers: wireHeaders }),
+        }),
+      )
     }
     let response: Response
     try {

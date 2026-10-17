@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { gunzipSync } from 'node:zlib'
 import {
   CLAUDE_CODE_IDENTITY,
   CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   type ClaudeCodeIdentity,
+  extractBillingHeaderCCH,
   FAST_MODE_BETA,
   type ProviderAccountUuid,
+  RequestGzipLatch,
   signRequestBody,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
   USER_AGENT,
@@ -1754,3 +1757,151 @@ function contractChecks(_scope: RequestScope, limit: LimitSignal) {
   void [typed, rejected]
 }
 void contractChecks
+
+describe('OpenCode 2 native Anthropic adapter: request-body gzip', () => {
+  // The host performs the physical fetch; these tests send the adapter's
+  // final request to a loopback server so the exact wire bytes are checked.
+  let upstream: ReturnType<typeof Bun.serve> | undefined
+  const received: Array<{ headers: Headers; body: Uint8Array }> = []
+  beforeEach(() => {
+    received.length = 0
+    upstream = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(request) {
+        received.push({
+          headers: new Headers(request.headers),
+          body: new Uint8Array(await request.arrayBuffer()),
+        })
+        return new Response('{}', { status: 200 })
+      },
+    })
+  })
+  afterEach(() => {
+    upstream?.stop(true)
+  })
+
+  const largePayload = () => {
+    const payload = sonnetPayload()
+    payload.messages[0] = {
+      role: 'user',
+      content: [{ type: 'text', text: `Review: ${'x'.repeat(9000)}` }],
+    }
+    return payload
+  }
+
+  async function wire(final: Request) {
+    const response = await fetch(
+      `http://127.0.0.1:${upstream?.port}/v1/messages`,
+      {
+        method: 'POST',
+        headers: final.headers,
+        body: await final.clone().arrayBuffer(),
+      },
+    )
+    await response.text()
+    return received.at(-1)!
+  }
+
+  test('a large OAuth body goes out gzipped; a proxy rejection latches the next one off', async () => {
+    const { source } = makeSource()
+    const latch = new RequestGzipLatch()
+    const native = createNativeAnthropicAdapter({
+      source,
+      requestGzipLatch: latch,
+    })
+    const host = new Host(native.adapter)
+
+    const { final, attempt } = await host.run(
+      scopeOf(),
+      hostRequest(largePayload()),
+    )
+    const sent = await wire(final)
+    expect(sent.headers.get('content-encoding')).toBe('gzip')
+    expect(sent.headers.get('x-claude-code-request-class')).toBe('main')
+    const plain = new TextDecoder().decode(gunzipSync(sent.body))
+    const trimmed = plain.trimEnd()
+    expect(plain.slice(trimmed.length)).toMatch(/^\n[ \t]{0,256}$/)
+    expect(extractBillingHeaderCCH(trimmed)).toBe('00000')
+
+    // No hook can resend here: the rejection is classified and latched, and
+    // the host's next request goes out uncompressed and signed.
+    await native.adapter.rewriteResponse?.({
+      ...attempt,
+      request: final,
+      response: new Response('Bad Request', { status: 400 }),
+      attempt,
+    })
+    await until(() => latch.latchedThisProcess)
+    const next = await host.run(scopeOf(), hostRequest(largePayload()))
+    const identity = await wire(next.final)
+    expect(identity.headers.get('content-encoding')).toBeNull()
+    const text = new TextDecoder().decode(identity.body)
+    expect(extractBillingHeaderCCH(text)).not.toBe('00000')
+    expect(await signRequestBody(text)).toBe(text)
+  })
+
+  test('an ordinary API 400 does not latch gzip off', async () => {
+    const { source } = makeSource()
+    const latch = new RequestGzipLatch()
+    const native = createNativeAnthropicAdapter({
+      source,
+      requestGzipLatch: latch,
+    })
+    const host = new Host(native.adapter)
+    const { final, attempt } = await host.run(
+      scopeOf(),
+      hostRequest(largePayload()),
+    )
+    expect(final.headers.get('content-encoding')).toBe('gzip')
+    await native.adapter.rewriteResponse?.({
+      ...attempt,
+      request: final,
+      response: Response.json(
+        {
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'max_tokens' },
+        },
+        { status: 400, headers: { 'request-id': 'req_011CTestOrdinary0001' } },
+      ),
+      attempt,
+    })
+    await Bun.sleep(5)
+    expect(latch.latchedThisProcess).toBe(false)
+  })
+
+  test('title requests are auxiliary; the HTTP relay envelope stays identity', async () => {
+    const { source } = makeSource({
+      authorize: () =>
+        oauth(
+          'sk-ant-oat01-local-token',
+          { custody: 'local', receipt: 'local:relay' },
+          {
+            dispatch: {
+              kind: 'http-relay',
+              url: 'https://relay.invalid/send',
+              token: 'relay-secret',
+            },
+          },
+        ),
+    })
+    const native = createNativeAnthropicAdapter({
+      source,
+      requestGzipLatch: new RequestGzipLatch(),
+    })
+    const host = new Host(native.adapter)
+    const { final } = await host.run(
+      scopeOf({ agent: 'title' }),
+      hostRequest(largePayload()),
+    )
+    expect(new URL(final.url).host).toBe('relay.invalid')
+    expect(final.headers.get('content-encoding')).toBeNull()
+    const envelope = JSON.parse(await final.clone().text())
+    expect(envelope.upstream.headers['content-encoding']).toBeUndefined()
+    expect(envelope.upstream.headers['x-claude-code-request-class']).toBe(
+      'auxiliary',
+    )
+    expect(await signRequestBody(envelope.body)).toBe(envelope.body)
+    expect(extractBillingHeaderCCH(envelope.body)).not.toBe('00000')
+  })
+})

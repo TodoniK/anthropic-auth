@@ -18,6 +18,8 @@ import {
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
+  type ClaudeCodeRequestClass,
+  countUserPrompts,
   createSseFramer,
   FAST_MODE_BETA,
   hasThinkingBindingControls,
@@ -269,6 +271,7 @@ export function setOAuthHeaders(
   options: {
     body?: Record<string, unknown> | null
     identity?: ClaudeCodeIdentity
+    requestClass?: ClaudeCodeRequestClass
   } = {},
 ): Headers {
   // This is the shared boundary where an access value becomes a bearer header.
@@ -1651,7 +1654,14 @@ export async function rewriteRequestBody(
                   options.laneStart === true,
                 )
               : undefined,
-            options.billingLineage,
+            options.billingLineage?.promptId
+              ? {
+                  ...options.billingLineage,
+                  promptIndex:
+                    options.billingLineage.promptIndex ??
+                    countUserPrompts(parsed.messages),
+                }
+              : options.billingLineage,
           )
         : null
     options.perf?.('billing_header', {

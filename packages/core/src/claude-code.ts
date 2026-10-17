@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto'
+import { extractBillingPromptId } from './cch.ts'
 import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_STAINLESS_PACKAGE_VERSION,
@@ -9,8 +10,9 @@ import {
 } from './constants.ts'
 import {
   PER_TURN_CONTROL_BETA,
-  usesPerTurnControl,
+  sendsPerTurnControlBeta,
 } from './mid-conversation-output-config.ts'
+import { isClaudeHaiku55Model } from './models.ts'
 
 export type ProviderAccountUuid = string & {
   readonly __providerAccountUuid: unique symbol
@@ -382,20 +384,30 @@ export function applyClaudeCodeMetadata(
   return true
 }
 
-// Claude Code 2.1.258 sends redact-thinking-2026-02-12, but it suppresses
-// thinking-block content that OpenCode displays; deliberately omitted after A/B proof on 2026-09-01.
+// Claude Code sends redact-thinking-2026-02-12 (2.1.258 to 2.1.302), but it
+// suppresses thinking-block content that OpenCode displays; deliberately
+// omitted after A/B proof on 2026-09-01.
+//
+// The lists follow Claude Code 2.1.302's order. Some betas Claude Code adds
+// only when a feature flag or entitlement is on (advisor-tool, fallback-credit,
+// mid-conversation-system): they are kept because real users' requests carry
+// them. thinking-display-updates-2026-08-18 is omitted because it goes with
+// `thinking.display: "updates"`, and these requests keep `"summarized"`.
 export const CLAUDE_CODE_FULL_AGENT_BETAS = [
+  'claude-code-20250219',
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
   'thinking-token-count-2026-05-13',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'claude-code-20250219',
+  'mid-conversation-tool-changes-2026-07-01',
   'advisor-tool-2026-03-01',
   'advanced-tool-use-2025-11-20',
   'mid-conversation-system-2026-04-07',
+  'mid-conversation-system-clear-at-2026-08-21',
   'effort-2025-11-24',
   'fallback-credit-2026-06-01',
+  'thinking-binding-controls-2026-08-01',
   'extended-cache-ttl-2025-04-11',
   'cache-diagnosis-2026-04-07',
 ] as const
@@ -406,7 +418,10 @@ const CLAUDE_CODE_STRUCTURED_OUTPUT_BETAS = [
   'thinking-token-count-2026-05-13',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
+  'mid-conversation-tool-changes-2026-07-01',
   'advisor-tool-2026-03-01',
+  'mid-conversation-system-clear-at-2026-08-21',
+  'effort-2025-11-24',
   'structured-outputs-2025-12-15',
   'cache-diagnosis-2026-04-07',
 ] as const
@@ -422,6 +437,9 @@ const CLAUDE_CODE_BASE_BETAS = [
   'extended-cache-ttl-2025-04-11',
   'cache-diagnosis-2026-04-07',
 ] as const
+
+const CLAUDE_CODE_BETA = 'claude-code-20250219'
+const PROMPT_CACHING_SCOPE_BETA = 'prompt-caching-scope-2026-01-05'
 
 function hasStructuredOutput(body: Record<string, unknown>) {
   const outputConfig = body.output_config as Record<string, unknown> | undefined
@@ -453,15 +471,28 @@ export function selectClaudeCodeBetas(
         : [...CLAUDE_CODE_BASE_BETAS]
     : [...CLAUDE_CODE_BASE_BETAS]
 
-  // Claude Code sends this beta on every Opus 5.5 and Sonnet 5.5 request,
-  // directly after the mid-conversation system beta when that is present.
-  if (body && usesPerTurnControl(body.model)) {
-    const systemIndex = selected.indexOf('mid-conversation-system-2026-04-07')
-    if (systemIndex >= 0) {
-      selected.splice(systemIndex + 1, 0, PER_TURN_CONTROL_BETA)
-    } else {
-      selected.push(PER_TURN_CONTROL_BETA)
+  // Claude Code 2.1.302 puts claude-code-20250219 after the prompt-caching
+  // scope beta on Haiku 5.5 requests instead of first.
+  if (body && isClaudeHaiku55Model(body.model)) {
+    const codeIndex = selected.indexOf(CLAUDE_CODE_BETA)
+    if (codeIndex >= 0) {
+      selected.splice(codeIndex, 1)
+      selected.splice(
+        selected.indexOf(PROMPT_CACHING_SCOPE_BETA) + 1,
+        0,
+        CLAUDE_CODE_BETA,
+      )
     }
+  }
+
+  // Claude Code 2.1.302 sends per-turn control on these models directly after
+  // the prompt-caching scope beta (and after claude-code-20250219 where that
+  // follows it).
+  if (body && sendsPerTurnControlBeta(body.model)) {
+    let index = selected.indexOf(PROMPT_CACHING_SCOPE_BETA)
+    if (index >= 0 && selected[index + 1] === CLAUDE_CODE_BETA) index += 1
+    if (index >= 0) selected.splice(index + 1, 0, PER_TURN_CONTROL_BETA)
+    else selected.push(PER_TURN_CONTROL_BETA)
   }
 
   if (body?.speed === 'fast') selected.push(FAST_MODE_BETA)
@@ -500,6 +531,8 @@ function stainlessArch() {
   }
 }
 
+export type ClaudeCodeRequestClass = 'main' | 'auxiliary'
+
 export function applyClaudeCodeHeaders(
   headers: Headers,
   accessToken: string,
@@ -507,6 +540,11 @@ export function applyClaudeCodeHeaders(
     body?: Record<string, unknown> | null
     identity?: ClaudeCodeIdentity
     extraBetas?: string[]
+    /**
+     * Claude Code's `x-claude-code-request-class`: `main` for a conversation
+     * turn, `auxiliary` for background requests such as title generation.
+     */
+    requestClass?: ClaudeCodeRequestClass
   } = {},
 ): Headers {
   const identity = options.identity ?? getClaudeCodeIdentity(accessToken)
@@ -526,6 +564,12 @@ export function applyClaudeCodeHeaders(
   headers.set('x-app', 'cli')
   headers.set('x-client-request-id', randomUUID())
   headers.set('x-claude-code-session-id', identity.sessionId)
+  headers.set('x-claude-code-request-class', options.requestClass ?? 'main')
+  // Claude Code repeats the billing block's cc_prompt_id in this header; a
+  // request without one (a background or reused body) sends neither.
+  const promptId = extractBillingPromptId(options.body)
+  if (promptId) headers.set('x-claude-code-prompt-id', promptId)
+  else headers.delete('x-claude-code-prompt-id')
   headers.set('x-stainless-arch', stainlessArch())
   headers.set('x-stainless-lang', 'js')
   headers.set('x-stainless-os', stainlessOS())
