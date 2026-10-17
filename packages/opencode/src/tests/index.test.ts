@@ -85,10 +85,10 @@ import {
 } from '../server-fallback'
 import {
   __setInitialSidebarRoutingTestHooks,
-  __setSidebarStateWriteTestHooks,
   drainSidebarWrites,
   getSidebarState,
   getSidebarStateFile,
+  __setSidebarStateWriteTestHooks as installSidebarStateWriteHooks,
   resolveActiveAccount,
   setSidebarState,
 } from '../sidebar-state'
@@ -325,6 +325,113 @@ function deferred() {
 function lifetimeSignal() {
   const gate = bodyLifetime().gate()
   return { raised: gate.wait, raise: gate.open }
+}
+
+/**
+ * Paces a helper that re-reads state until it matches. `notify` wakes the
+ * current wait (an event source calls it after each write that may matter).
+ * Without an event source, pass `pauseMs` and each wait is that short pause.
+ * There is no attempt count or deadline: the helper keeps reading until its
+ * state arrives or the test ends, so the test's own timeout is the only
+ * limit. Teardown ends the wait, so a test whose state never arrives fails on
+ * its own mismatch error instead of hanging.
+ */
+function untilStateOrTestEnd(pauseMs?: number) {
+  // A body that outlived its test has no lifetime left: make one final check.
+  const ended = testLifetime?.gate() ?? {
+    wait: Promise.resolve(),
+    open() {},
+  }
+  let over = false
+  void ended.wait.then(() => {
+    over = true
+  })
+  // The first wait returns at once so the caller reads the current state.
+  // With an event source, a write landing between reads is never missed.
+  let changed = true
+  let wake: (() => void) | undefined
+  return {
+    /** True once the test has ended; the caller makes its final check. */
+    get ended() {
+      return over
+    },
+    notify() {
+      changed = true
+      wake?.()
+    },
+    async next(): Promise<void> {
+      if (!changed && !over)
+        await Promise.race([
+          new Promise<void>((resolve) => {
+            wake = resolve
+          }),
+          ...(pauseMs === undefined ? [] : [Bun.sleep(pauseMs)]),
+          ended.wait,
+        ])
+      wake = undefined
+      changed = false
+    },
+    close() {
+      ended.open()
+    },
+  }
+}
+
+// Sidebar write hooks are installed per state file and replace each other.
+// Tests set their own hooks through the wrapper below, so a helper waiting for
+// sidebar writes can listen on the same file without removing a test's hooks.
+type SidebarWriteHooks = NonNullable<
+  Parameters<typeof installSidebarStateWriteHooks>[0]
+>
+const testSidebarWriteHooks = new Map<string, SidebarWriteHooks>()
+const sidebarWriteListeners = new Map<string, Set<() => void>>()
+
+function syncSidebarWriteHooks(stateFile: string) {
+  const own = testSidebarWriteHooks.get(stateFile)
+  const listeners = sidebarWriteListeners.get(stateFile)
+  if (!listeners?.size) {
+    installSidebarStateWriteHooks(own ?? null, stateFile)
+    return
+  }
+  installSidebarStateWriteHooks(
+    {
+      ...own,
+      afterRename: async (file) => {
+        try {
+          await own?.afterRename?.(file)
+        } finally {
+          for (const listener of [...listeners]) listener()
+        }
+      },
+    },
+    stateFile,
+  )
+}
+
+/** Sidebar-state's test hook setter, keeping any helper's write listener. */
+function __setSidebarStateWriteTestHooks(
+  hooks: SidebarWriteHooks | null,
+  stateFile = getSidebarStateFile(),
+) {
+  if (hooks) testSidebarWriteHooks.set(stateFile, hooks)
+  else testSidebarWriteHooks.delete(stateFile)
+  syncSidebarWriteHooks(stateFile)
+}
+
+/** Call `listener` after each completed write of `stateFile`; returns removal. */
+function onSidebarWrite(stateFile: string, listener: () => void) {
+  let listeners = sidebarWriteListeners.get(stateFile)
+  if (!listeners) {
+    listeners = new Set()
+    sidebarWriteListeners.set(stateFile, listeners)
+  }
+  listeners.add(listener)
+  syncSidebarWriteHooks(stateFile)
+  return () => {
+    listeners.delete(listener)
+    if (!listeners.size) sidebarWriteListeners.delete(stateFile)
+    syncSidebarWriteHooks(stateFile)
+  }
 }
 
 /**
@@ -1164,7 +1271,17 @@ async function refreshPoolMainElsewhere(successor: {
   await refreshPoolLoginElsewhere('main', successor)
 }
 
-/** Wait for an account-bound credential write without changing test deadlines. */
+/**
+ * The pause between reads of shared files, which no in-process event reports.
+ * It paces the reads; it is not a budget, since the wait lasts until the state
+ * arrives or the test ends.
+ */
+const FILE_STATE_READ_PAUSE_MS = 10
+
+/**
+ * Wait for an account-bound credential write without changing test deadlines:
+ * re-read the pool until the successor lands or the test ends.
+ */
 async function waitForPoolCredential(routeId: string, access: string) {
   const pool = migratedPool
   if (!pool) throw new Error('Expected migrated pool')
@@ -1176,8 +1293,10 @@ async function waitForPoolCredential(routeId: string, access: string) {
     paths: pool.paths,
     quota: nativeQuotaCodec,
   })
+  const changes = untilStateOrTestEnd(FILE_STATE_READ_PAUSE_MS)
   try {
-    for (let attempt = 0; attempt < 50; attempt++) {
+    while (!changes.ended) {
+      await changes.next()
       const subject = await reader.captureLocalSubject(routeId)
       const read = await store.read()
       const row =
@@ -1194,12 +1313,12 @@ async function waitForPoolCredential(routeId: string, access: string) {
         subject.version?.accessFingerprint === tokenFingerprint(access)
       )
         return { subject, credential }
-      await Bun.sleep(10)
     }
     throw new Error(
       `Expected a persisted native OAuth successor for ${routeId}`,
     )
   } finally {
+    changes.close()
     reader.close()
   }
 }
@@ -1795,13 +1914,25 @@ function restoreProcessTestFiles() {
   )
 }
 
+/**
+ * Wait for the plugin's sidebar write that satisfies `predicate`: the state
+ * file is re-read after each completed sidebar write (sidebar-state's
+ * after-rename hook), never after a fixed number of polls.
+ */
 async function waitForSidebarState(
   predicate: (state: Awaited<ReturnType<typeof getSidebarState>>) => boolean,
 ) {
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const state = await getSidebarState()
-    if (predicate(state)) return state
-    await Bun.sleep(10)
+  const changes = untilStateOrTestEnd()
+  const stopListening = onSidebarWrite(getSidebarStateFile(), changes.notify)
+  try {
+    while (!changes.ended) {
+      await changes.next()
+      const state = await getSidebarState()
+      if (predicate(state)) return state
+    }
+  } finally {
+    stopListening()
+    changes.close()
   }
   const state = await getSidebarState()
   throw new Error(`Sidebar state did not match: ${JSON.stringify(state)}`)
@@ -1831,13 +1962,22 @@ async function readAccountStorage(): Promise<AccountStorage | null> {
   }
 }
 
+/**
+ * Wait for an account storage write that satisfies `predicate`, re-reading
+ * the pool (or the unmigrated legacy store) until it matches or the test ends.
+ */
 async function waitForAccountStorage(
   predicate: (storage: AccountStorage | null) => boolean,
 ) {
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const storage = await readAccountStorage()
-    if (predicate(storage)) return storage
-    await Bun.sleep(10)
+  const changes = untilStateOrTestEnd(FILE_STATE_READ_PAUSE_MS)
+  try {
+    while (!changes.ended) {
+      await changes.next()
+      const storage = await readAccountStorage()
+      if (predicate(storage)) return storage
+    }
+  } finally {
+    changes.close()
   }
   const storage = await readAccountStorage()
   throw new Error(`Account storage did not match: ${JSON.stringify(storage)}`)
@@ -2342,22 +2482,29 @@ async function readFeedEntries() {
   }
 }
 
+/**
+ * Wait for the committed feed leases to satisfy `predicate`, re-reading them
+ * until they match or the test ends instead of polling to a fixed wall-clock
+ * deadline.
+ */
 async function waitForFeedEntries(
   predicate: (entries: Awaited<ReturnType<typeof readFeedEntries>>) => boolean,
   description: string,
 ) {
-  const deadline = performance.now() + 2_500
-  let entries = await readFeedEntries()
-  while (!predicate(entries) && performance.now() < deadline) {
-    await Bun.sleep(10)
-    entries = await readFeedEntries()
+  const changes = untilStateOrTestEnd(FILE_STATE_READ_PAUSE_MS)
+  try {
+    while (!changes.ended) {
+      await changes.next()
+      const entries = await readFeedEntries()
+      if (predicate(entries)) return entries
+    }
+  } finally {
+    changes.close()
   }
-  if (!predicate(entries)) {
-    throw new Error(
-      `Quota header feed did not match ${description}: ${JSON.stringify(entries)}`,
-    )
-  }
-  return entries
+  const entries = await readFeedEntries()
+  throw new Error(
+    `Quota header feed did not match ${description}: ${JSON.stringify(entries)}`,
+  )
 }
 
 async function waitForLogRecord(
@@ -10751,11 +10898,17 @@ describe('auth.loader', () => {
         sessionID: 'session-1',
       }),
     )
+    let lockReleased = false
+    void release.wait.then(() => {
+      lockReleased = true
+    })
     try {
-      const rendered = await Promise.race([
-        command.then(() => true),
-        Bun.sleep(100).then(() => false),
-      ])
+      // Only teardown opens the release gate before this point. A status that
+      // waited for the held writer (whose lock wait outlasts this test)
+      // would complete only after teardown frees the lock. Waiting for the
+      // command itself, not for a fixed time, keeps this independent of
+      // machine speed.
+      const rendered = await command.then(() => !lockReleased)
 
       expect(rendered).toBe(true)
       expect(profileCalls).toBe(1)
@@ -12587,43 +12740,29 @@ describe('auth.loader', () => {
     for (const handler of intervalHandlers) handler()
     const pool = migratedPool
     if (!pool) throw new Error('Expected migrated pool')
-    const reader = createNativeAccountRuntime({
+    // Wait for the background refresh's write itself, not a fixed poll count.
+    const { subject } = await waitForPoolCredential(
+      'main',
+      'sk-ant-oat01-background-access-new',
+    )
+    const stored = await createNativePoolStore({
       paths: pool.paths,
-      host: 'opencode',
+      quota: nativeQuotaCodec,
+    }).read()
+    expect(stored.status).toBe('ready')
+    const credential =
+      stored.status === 'ready'
+        ? stored.rows.find((row) => row.id === subject.binding.rowId)
+            ?.credential
+        : undefined
+    expect(credential).toMatchObject({
+      type: 'oauth',
+      refresh: 'background-refresh-new',
+      access: 'sk-ant-oat01-background-access-new',
+      expires: expect.any(Number),
     })
-    try {
-      let subject = await reader.captureLocalSubject('main')
-      for (
-        let attempt = 0;
-        attempt < 50 &&
-        subject.version?.accessFingerprint !==
-          tokenFingerprint('sk-ant-oat01-background-access-new');
-        attempt++
-      ) {
-        await Bun.sleep(10)
-        subject = await reader.captureLocalSubject('main')
-      }
-      const stored = await createNativePoolStore({
-        paths: pool.paths,
-        quota: nativeQuotaCodec,
-      }).read()
-      expect(stored.status).toBe('ready')
-      const credential =
-        stored.status === 'ready'
-          ? stored.rows.find((row) => row.id === subject.binding.rowId)
-              ?.credential
-          : undefined
-      expect(credential).toMatchObject({
-        type: 'oauth',
-        refresh: 'background-refresh-new',
-        access: 'sk-ant-oat01-background-access-new',
-        expires: expect.any(Number),
-      })
-      expect(subject.binding.identity).toBe(syntheticMainAccountUuid)
-      expect(mockClient.auth.set).not.toHaveBeenCalled()
-    } finally {
-      reader.close()
-    }
+    expect(subject.binding.identity).toBe(syntheticMainAccountUuid)
+    expect(mockClient.auth.set).not.toHaveBeenCalled()
   })
 
   test('background refresh retries after a permanent main backoff belongs to an older refresh token', async () => {
