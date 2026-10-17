@@ -12,7 +12,11 @@ import {
   type SetupPlugin,
 } from '@cortexkit/anthropic-auth-core'
 import { confirm } from '@cortexkit/common-auth/auth-menu'
-import { knownFailureMessage, reportThrownFailure } from '../cli-failure.ts'
+import {
+  knownFailureMessage,
+  reportThrownFailure,
+  setupEnrollmentOutcomes,
+} from '../cli-failure.ts'
 import { CLAUDE_POOL_LOGIN_STEP } from '../v2/activation.ts'
 import { defaultCommandRunner } from './command-runner.ts'
 import {
@@ -333,21 +337,26 @@ export async function runSetupCommand(
     await runSetup(plugin, args, { ...options, env, terminal, runner, fence })
     return 0
   } catch (error) {
-    const message = setupRefusalMessage(error) ?? knownFailureMessage(error)
+    // runSetup records each host's vault enrollment on a failure after
+    // enrollment began, and adds one line per host to the message for
+    // callers that print it as is. This command prints its own host lines
+    // below, so it classifies the message without those added lines.
+    const enrollment = setupEnrollmentOutcomes(error)
+    const message =
+      setupRefusalMessage(error) ??
+      knownFailureMessage(error, enrollment?.length ?? 0)
     const text = message ?? (await reportThrownFailure(phase, error, env))
     if (text) print(text)
-    for (const host of vault.keys()) {
-      try {
-        if ((await readNativeEnrollmentMode(host, env)) !== 'claustrum')
-          continue
-      } catch {
-        // Only claim a retained connection when enrollment authority confirms it.
-        continue
-      }
+    for (const { host, outcome } of enrollment ?? []) {
       const name = host === 'opencode' ? 'OpenCode' : 'Pi'
-      print(
-        `${name} stays connected to the vault. In ${name}, run /claude → Accounts → Disconnect from the vault to undo it. Or run setup again to finish connecting.`,
-      )
+      if (outcome === 'enrolled')
+        print(
+          `${name} stays connected to the vault. In ${name}, run /claude → Accounts → Disconnect from the vault to undo it. Or run setup again to finish connecting.`,
+        )
+      else if (outcome === 'unknown')
+        print(
+          `${name} may be connected to the vault; setup could not tell. Check with ck auth status.`,
+        )
     }
     return 1
   } finally {

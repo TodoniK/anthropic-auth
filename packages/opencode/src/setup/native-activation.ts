@@ -16,6 +16,7 @@ import {
   enrollNativeVaultForHost,
   grantNativeVaultForHost,
   type NativeVaultEnrollmentOptions,
+  nativeVaultGrantArgs,
 } from './native-enrollment.ts'
 import { nativeSetupFileFingerprint } from './native-local.ts'
 import {
@@ -30,30 +31,75 @@ import {
   setupProcessInspectionMessage,
 } from './types.ts'
 
-export class NativeVaultActivationError extends Error {
-  constructor(
-    public readonly code:
-      | 'auth-content-refused'
-      | 'host-auth-invalid'
-      | 'primary-conflict'
-      | 'consent-required'
-      | 'primary-unverified',
-  ) {
-    super(
-      {
-        'auth-content-refused':
-          'Run setup without OPENCODE_AUTH_CONTENT in the environment.',
-        'host-auth-invalid': 'The host auth file could not be read safely.',
-        'primary-conflict':
-          'Pi has a stored Anthropic API key, which would take precedence over the vault account. Remove it in Pi, then rerun setup.',
-        'consent-required':
-          'Pi has stored Anthropic authentication. Explicit consent is required to move it aside for vault use.',
-        'primary-unverified':
-          'The vault has no verified default Claude account. Sign in through the vault and rerun setup.',
-      }[code],
-    )
-    this.name = 'NativeVaultActivationError'
+type HostIndependentActivationCode =
+  | 'auth-content-refused'
+  | 'host-auth-invalid'
+  | 'primary-conflict'
+  | 'consent-required'
+  | 'primary-unverified'
+
+/** Activation codes whose remedy names the host, so the host is required. */
+type HostActivationCode = 'no-read-grant' | 'grant-reaches-nothing'
+
+const HOST_LABELS = { opencode: 'OpenCode', pi: 'Pi' } as const
+
+function activationMessage(
+  code: HostIndependentActivationCode | HostActivationCode,
+  host: HarnessKind,
+): string {
+  switch (code) {
+    case 'auth-content-refused':
+      return 'Run setup without OPENCODE_AUTH_CONTENT in the environment.'
+    case 'host-auth-invalid':
+      return 'The host auth file could not be read safely.'
+    case 'primary-conflict':
+      return 'Pi has a stored Anthropic API key, which would take precedence over the vault account. Remove it in Pi, then rerun setup.'
+    case 'consent-required':
+      return 'Pi has stored Anthropic authentication. Explicit consent is required to move it aside for vault use.'
+    case 'primary-unverified':
+      return 'The vault has no verified default Claude account. Sign in through the vault and rerun setup.'
+    case 'no-read-grant':
+      return `${HOST_LABELS[host]} has no read grant in the vault, so setup cannot see any Claude login. Run ${['ck', ...nativeVaultGrantArgs(host)].join(' ')}, then rerun setup.`
+    case 'grant-reaches-nothing':
+      return `${HOST_LABELS[host]}'s vault read grant reaches no Claude login: no vault login carries the anthropic-native category, which logins saved before vault categories existed lack. Run ck auth reclassify --from-registry, check the logins with ck auth status, then rerun setup.`
   }
+}
+
+export class NativeVaultActivationError extends Error {
+  readonly code: HostIndependentActivationCode | HostActivationCode
+
+  constructor(code: HostIndependentActivationCode)
+  constructor(code: HostActivationCode, host: HarnessKind)
+  constructor(
+    code: HostIndependentActivationCode | HostActivationCode,
+    host: HarnessKind = 'opencode',
+  ) {
+    // Every message is fixed text chosen by code and host; nothing from a
+    // vault reply or a caught error is ever part of it.
+    super(activationMessage(code, host))
+    this.name = 'NativeVaultActivationError'
+    this.code = code
+  }
+}
+
+/**
+ * Why setup found no verified default account, from its latest vault listing.
+ * The listing's grant reach separates an enrollment with no grant at all from
+ * a grant that reaches no login. It is undefined when the vault is too old to
+ * report grants or setup never saw a listing; that, and a listing that did
+ * reach logins, keep the generic message.
+ */
+function unservedCode(
+  inventory: NativeCustodyInventory | undefined,
+): 'primary-unverified' | HostActivationCode {
+  const reach = inventory?.grantReach
+  if (
+    !reach ||
+    inventory.credentials.length > 0 ||
+    inventory.skipped.length > 0
+  )
+    return 'primary-unverified'
+  return reach.grants === 0 ? 'no-read-grant' : 'grant-reaches-nothing'
 }
 
 export interface NativeVaultActivationOptions {
@@ -197,7 +243,7 @@ export async function completeNativeVaultActivation(
     processFence,
     ckBinary: options.enrollment?.ckBinary,
   })
-  const discover =
+  const listVault =
     options.discover ??
     (() =>
       discoverNativeVaultInventory({
@@ -212,6 +258,12 @@ export async function completeNativeVaultActivation(
               }
             : env,
       }))
+  // Keep this setup's own latest listing to explain an empty result.
+  let listed: NativeCustodyInventory | undefined
+  const discover = async () => {
+    listed = await listVault()
+    return listed
+  }
   const runtime = createNativeAccountRuntime({
     paths: plan.paths,
     host,
@@ -226,8 +278,12 @@ export async function completeNativeVaultActivation(
       snapshot.mode !== 'claustrum' ||
       !main?.accountIdentity ||
       main.source !== 'vault'
-    )
-      throw new NativeVaultActivationError('primary-unverified')
+    ) {
+      const code = unservedCode(listed)
+      throw code === 'primary-unverified'
+        ? new NativeVaultActivationError(code)
+        : new NativeVaultActivationError(code, host)
+    }
     await processFence()
     if (host === 'pi')
       await openNativePiAuthSlot({

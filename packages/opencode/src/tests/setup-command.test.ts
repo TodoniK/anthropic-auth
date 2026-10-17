@@ -1224,6 +1224,75 @@ for (const host of ['opencode', 'pi'] as const) {
   )
 }
 
+const STAYS_CONNECTED =
+  'OpenCode stays connected to the vault. In OpenCode, run /claude → Accounts → Disconnect from the vault to undo it. Or run setup again to finish connecting.'
+const MAYBE_CONNECTED =
+  'OpenCode may be connected to the vault; setup could not tell. Check with ck auth status.'
+
+lifetimes.test(
+  'a failed vault setup trusts its own enrollment record over the files left on disk',
+  async () => {
+    const f = await callbackFixture({
+      opencode: true,
+      pi: false,
+      claustrum: true,
+    })
+    const enrollment = getHostClaustrumEnrollmentPaths('opencode', f.env)
+    expect(
+      await runSetupCommand(['--yes', '--claustrum', '--opencode=2'], {
+        ...f.io,
+        vaultActivate: async () => {
+          // Approval landed, so the host is enrolled with the vault even
+          // though its local enrollment files are gone by the time setup fails.
+          await rm(enrollment.tokenPath, { force: true })
+          await rm(enrollment.statePath, { force: true })
+          throw new NativeVaultActivationError('primary-unverified')
+        },
+      }),
+    ).toBe(1)
+    const screen = f.screen()
+    expect(screen).toContain(
+      'The vault has no verified default Claude account. Sign in through the vault and rerun setup.',
+    )
+    expect(screen).toContain(STAYS_CONNECTED)
+    expect(screen).not.toContain(MAYBE_CONNECTED)
+    expect(screen).not.toContain('OpenCode: connected to the vault')
+    expect(screen).not.toContain('unexpected-error')
+    await expectNoDiagnostics(f)
+  },
+)
+
+lifetimes.test(
+  'a vault setup that fails mid-enrollment says the connection is unknown instead of claiming either way',
+  async () => {
+    const f = await callbackFixture({
+      opencode: true,
+      pi: false,
+      claustrum: true,
+    })
+    const enrollment = getHostClaustrumEnrollmentPaths('opencode', f.env)
+    expect(
+      await runSetupCommand(['--yes', '--claustrum', '--opencode=2'], {
+        ...f.io,
+        connect: async () => ({
+          close() {},
+          enrollPropose: async () => ({ requestId: 'fixture-request' }),
+          enrollPoll: async () => {
+            // The vault call fails after the request was recorded, and the
+            // recorded state can no longer be read, so nothing settles it.
+            await writeFile(enrollment.statePath, '{', { mode: 0o600 })
+            throw new Error(ECHO_SK)
+          },
+        }),
+      }),
+    ).toBe(1)
+    const screen = f.screen()
+    expect(screen).toContain(MAYBE_CONNECTED)
+    expect(screen).not.toContain(STAYS_CONNECTED)
+    expect(screen).not.toContain(ECHO_SK)
+  },
+)
+
 lifetimes.test(
   'all-host local setup names both enrollments despite legacy local settings and preserves every file',
   async () => {
@@ -3338,6 +3407,105 @@ lifetimes.test(
     ).toBe(false)
   },
 )
+
+// An empty vault listing is explained by the grants it reports: none at all
+// needs a grant, a grant that reaches nothing needs the logins categorized,
+// and an older vault that reports no grants keeps the generic message.
+const READ_TUPLE = {
+  selectorKind: 'category',
+  selector: 'anthropic-native',
+  operation: 'read',
+}
+const NO_GRANT_TEXT =
+  'OpenCode has no read grant in the vault, so setup cannot see any Claude login. Run ck auth grant --principal enrolled:anthropic-auth-opencode --selector-kind category --selector anthropic-native --operation read, then rerun setup.'
+const UNREACHED_TEXT =
+  "OpenCode's vault read grant reaches no Claude login: no vault login carries the anthropic-native category, which logins saved before vault categories existed lack. Run ck auth reclassify --from-registry, check the logins with ck auth status, then rerun setup."
+const UNVERIFIED_TEXT =
+  'The vault has no verified default Claude account. Sign in through the vault and rerun setup.'
+for (const { name, inventory, code, text } of [
+  {
+    name: 'no grant at all',
+    inventory: { grantReach: { grants: 0, tuples: [] }, credentials: [] },
+    code: 'no-read-grant',
+    text: NO_GRANT_TEXT,
+  },
+  {
+    name: 'a grant that reaches no login',
+    inventory: {
+      grantReach: { grants: 1, tuples: [READ_TUPLE] },
+      credentials: [],
+    },
+    code: 'grant-reaches-nothing',
+    text: UNREACHED_TEXT,
+  },
+  {
+    name: 'a reached login without a verified identity',
+    inventory: {
+      grantReach: { grants: 1, tuples: [READ_TUPLE] },
+      credentials: [
+        {
+          credentialId: 'oauth:anthropic',
+          credentialType: 'oauth' as const,
+          state: 'active',
+        },
+      ],
+    },
+    code: 'primary-unverified',
+    text: UNVERIFIED_TEXT,
+  },
+  {
+    name: 'a vault too old to report grants',
+    inventory: { credentials: [] },
+    code: 'primary-unverified',
+    text: UNVERIFIED_TEXT,
+  },
+]) {
+  lifetimes.test(
+    `vault setup with ${name} explains the empty listing with one fixed remedy`,
+    async () => {
+      const f = await callbackFixture({
+        opencode: true,
+        pi: false,
+        claustrum: true,
+      })
+      let refusal: unknown
+      expect(
+        await runSetupCommand(['--yes', '--claustrum', '--opencode=2'], {
+          ...f.io,
+          vaultActivate: async (host, options, preflight) => {
+            try {
+              return await completeNativeVaultActivation(
+                host,
+                {
+                  ...options,
+                  discover: async () => ({
+                    view: 'fixture',
+                    skipped: [],
+                    ...inventory,
+                  }),
+                },
+                preflight,
+              )
+            } catch (error) {
+              refusal = error
+              throw error
+            }
+          },
+        }),
+      ).toBe(1)
+      expect(refusal).toMatchObject({
+        name: 'NativeVaultActivationError',
+        code,
+      })
+      const screen = f.screen()
+      expect(screen).toContain(text)
+      for (const other of [NO_GRANT_TEXT, UNREACHED_TEXT, UNVERIFIED_TEXT])
+        if (other !== text) expect(screen).not.toContain(other)
+      expect(screen).not.toContain('unexpected-error')
+      await expectNoDiagnostics(f)
+    },
+  )
+}
 
 for (const failure of [
   'missing-stash',

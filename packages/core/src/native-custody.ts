@@ -117,6 +117,20 @@ export interface NativeCustodyInventory {
       | 'blank account identity'
       | 'empty state'
   }[]
+  /**
+   * What this host's enrollment is granted, as the vault's list reply named
+   * it. It explains an empty listing: `grants === 0` means no grant at all,
+   * while `grants > 0` means a grant that reaches no credential. Undefined
+   * means unknown (the vault predates these fields), never zero grants.
+   */
+  readonly grantReach?: {
+    readonly grants: number
+    readonly tuples: readonly {
+      readonly selectorKind: string
+      readonly selector: string
+      readonly operation: string
+    }[]
+  }
 }
 
 export type NativeCustodyErrorCode =

@@ -26,7 +26,11 @@ import {
   NativePiAuthSlotError,
   type ProviderErrorRedactor,
 } from '@cortexkit/anthropic-auth-core'
-import type { SetupCommandError } from '@cortexkit/common-auth/setup'
+import {
+  type SetupCommandError,
+  type SetupEnrollmentOutcome,
+  setupEnrollment,
+} from '@cortexkit/common-auth/setup'
 import { NativeVaultActivationError } from './setup/native-activation.ts'
 import { NativeVaultEnrollmentError } from './setup/native-enrollment.ts'
 import { ProcessFenceViolationError } from './setup/process-fence.ts'
@@ -62,12 +66,18 @@ function everyCode<Code extends string>() {
   ): List => list
 }
 
+const SETUP_HOSTS = ['opencode', 'pi'] as const
+const ENROLLMENT_OUTCOMES: ReadonlySet<unknown> =
+  new Set<SetupEnrollmentOutcome>(['enrolled', 'not-enrolled', 'unknown'])
+
 const ACTIVATION_CODES = everyCode<NativeVaultActivationError['code']>()([
   'auth-content-refused',
   'host-auth-invalid',
   'primary-conflict',
   'consent-required',
   'primary-unverified',
+  'no-read-grant',
+  'grant-reaches-nothing',
 ])
 const ENROLLMENT_CODES = everyCode<NativeVaultEnrollmentError['code']>()([
   'enrollment-refused',
@@ -130,8 +140,12 @@ const CUSTODY_CODES = everyCode<NativeCustodyErrorCode>()([
  * of displaying unchecked text.
  */
 const CLOSED_MESSAGES: ReadonlySet<string> = new Set([
-  ...ACTIVATION_CODES.map(
-    (code) => new NativeVaultActivationError(code).message,
+  ...ACTIVATION_CODES.flatMap((code) =>
+    code === 'no-read-grant' || code === 'grant-reaches-nothing'
+      ? SETUP_HOSTS.map(
+          (host) => new NativeVaultActivationError(code, host).message,
+        )
+      : [new NativeVaultActivationError(code).message],
   ),
   ...ENROLLMENT_CODES.map(
     (code) => new NativeVaultEnrollmentError(code).message,
@@ -277,12 +291,20 @@ function closedFenceHosts(
  * an OAuth metadata error matching its own integer HTTP status (100–599), or
  * a running-host list rebuilt from validated own host names and PIDs.
  */
-export function knownFailureMessage(error: unknown): string | undefined {
+export function knownFailureMessage(
+  error: unknown,
+  appendedLines = 0,
+): string | undefined {
   try {
     if (!isInspectable(error)) return undefined
     if (ownData(error, 'name') === 'ProcessInspectionError') return ''
-    const message = ownData(error, 'message')
-    if (typeof message !== 'string') return undefined
+    const raw = ownData(error, 'message')
+    if (typeof raw !== 'string') return undefined
+    // A failed setup run adds one line per host after the original message
+    // (see setupEnrollmentOutcomes); compare the original text without them.
+    const lines = raw.split('\n')
+    if (appendedLines >= lines.length) return undefined
+    const message = lines.slice(0, lines.length - appendedLines).join('\n')
     if (CLOSED_MESSAGES.has(message)) return message
     if (message.startsWith('Unknown setup argument: ')) return message
     const status = ownData(error, 'status')
@@ -303,6 +325,43 @@ export function knownFailureMessage(error: unknown): string | undefined {
     // Unreadable values are treated as unknown.
   }
   return undefined
+}
+
+/**
+ * The vault enrollment outcome runSetup recorded for each selected host when
+ * it failed after enrollment began, or undefined when it recorded none. The
+ * shared setupEnrollment reads the record; it is consulted only when the
+ * record is an own data property of a real (non-proxy) object, and each entry
+ * is accepted only when its host and outcome are own data properties holding
+ * known values, so no getter or proxy trap runs.
+ */
+export function setupEnrollmentOutcomes(
+  error: unknown,
+):
+  | { host: (typeof SETUP_HOSTS)[number]; outcome: SetupEnrollmentOutcome }[]
+  | undefined {
+  try {
+    if (!isInspectable(error)) return undefined
+    const field = Object.getOwnPropertyDescriptor(error, 'enrollment')
+    if (field === undefined || !('value' in field)) return undefined
+    const entries = ownDataElements(setupEnrollment(error), SETUP_HOSTS.length)
+    if (entries === undefined) return undefined
+    const outcomes: {
+      host: (typeof SETUP_HOSTS)[number]
+      outcome: SetupEnrollmentOutcome
+    }[] = []
+    for (const entry of entries) {
+      if (!isInspectable(entry)) return undefined
+      const host = SETUP_HOSTS.find((name) => name === ownData(entry, 'host'))
+      const outcome = ownData(entry, 'outcome')
+      if (host === undefined || !ENROLLMENT_OUTCOMES.has(outcome))
+        return undefined
+      outcomes.push({ host, outcome: outcome as SetupEnrollmentOutcome })
+    }
+    return outcomes
+  } catch {
+    return undefined
+  }
 }
 
 /**

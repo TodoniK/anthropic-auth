@@ -24,6 +24,7 @@ import { nativeVaultPaths } from '../native-vault-paths.ts'
 import {
   acquireNativeVaultRuntime,
   createNativeVaultRuntime,
+  discoverNativeVaultInventory,
   publishNativeVaultRosterSeed,
   publishNativeVaultRuntimeSeed,
 } from '../native-vault-runtime.ts'
@@ -461,6 +462,38 @@ test('incomplete and unasserted vault lists retain prior accounts and cannot sil
   expect(malformed?.rows).toHaveLength(1)
   f.rows([])
   expect((await f.runtime.refresh())?.rows).toHaveLength(0)
+})
+
+test('setup discovery reports the grants an empty vault listing names, and leaves them unknown when the vault sends none', async () => {
+  const f = await fixture()
+  const listing = (
+    grants: number | undefined,
+    grantTuples:
+      | { selectorKind: string; selector: string; operation: string }[]
+      | undefined,
+  ) =>
+    discoverNativeVaultInventory({
+      ...f.options,
+      connect: async () => ({
+        ...f.client,
+        listScoped: async () => ({
+          view: 'empty',
+          rows: [],
+          grants,
+          grantTuples,
+        }),
+      }),
+    })
+  const tuple = {
+    selectorKind: 'category',
+    selector: 'anthropic-native',
+    operation: 'read',
+  }
+  expect((await listing(0, [])).grantReach).toEqual({ grants: 0, tuples: [] })
+  const reached = await listing(1, [tuple])
+  expect(reached.credentials).toEqual([])
+  expect(reached.grantReach).toEqual({ grants: 1, tuples: [tuple] })
+  expect((await listing(undefined, undefined)).grantReach).toBeUndefined()
 })
 
 test('closing a pending vault list cannot publish its late result', async () => {

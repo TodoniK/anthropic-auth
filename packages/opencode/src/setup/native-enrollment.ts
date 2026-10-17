@@ -176,6 +176,26 @@ export async function enrollNativeVaultForHost(
   }
 }
 
+/**
+ * The `ck` arguments that grant this host's enrolled principal read access to
+ * the vault's anthropic-native category. Setup runs them, and the empty-vault
+ * message shows the same command so the user can run it by hand.
+ */
+export function nativeVaultGrantArgs(host: HarnessKind): string[] {
+  return [
+    'auth',
+    'grant',
+    '--principal',
+    `enrolled:${NATIVE_VAULT_HOST_NAMES[host]}`,
+    '--selector-kind',
+    'category',
+    '--selector',
+    'anthropic-native',
+    '--operation',
+    'read',
+  ]
+}
+
 /** Grant this OpenCode or Pi principal read access to the vault's anthropic-native category; enrollment alone grants no provider access. */
 export async function grantNativeVaultForHost(
   host: HarnessKind,
@@ -188,18 +208,7 @@ export async function grantNativeVaultForHost(
     await options.processFence()
     const grant = await options.runner.run(
       options.ckBinary ?? 'ck',
-      [
-        'auth',
-        'grant',
-        '--principal',
-        `enrolled:${NATIVE_VAULT_HOST_NAMES[host]}`,
-        '--selector-kind',
-        'category',
-        '--selector',
-        'anthropic-native',
-        '--operation',
-        'read',
-      ],
+      nativeVaultGrantArgs(host),
       { env: options.env },
     )
     if (grant.exitCode !== 0)
