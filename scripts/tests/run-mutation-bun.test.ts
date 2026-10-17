@@ -592,6 +592,14 @@ function junit(caseLines: string[]) {
 function testcase(leaf: string, classname = '', suffix = ' />') {
   return `    <testcase name="${leaf}" classname="${classname}" time="0.001" file="src/tests/fixture.test.ts" line="12" assertions="1"${suffix}`
 }
+// Bun writes one nested <testsuite> per describe block around its testcases.
+function describeSuite(name: string, caseLines: string[]) {
+  return [
+    `    <testsuite name="${name}" file="src/tests/fixture.test.ts" line="10" tests="${caseLines.length}" assertions="1" failures="0" skipped="0" time="0" hostname="fixture">`,
+    ...caseLines,
+    '    </testsuite>',
+  ]
+}
 function event(
   name: string,
   status: 'pass' | 'fail' = 'pass',
@@ -627,6 +635,69 @@ test('package events count only executed results, not a passing timeout title', 
   ).toThrow()
 })
 
+test('a result line without a duration still parses to its exact name', () => {
+  // Bun 1.3.14 prints no " [x ms]" for a test that finishes in under about
+  // 10 microseconds; these result lines are verbatim from a pinned Bun run.
+  const transcript = {
+    ...packageGreen(),
+    stderr: packageGreen()
+      .stderr.replace(
+        '(pass) handles timeout [1.00ms]',
+        '(pass) outer > one-level',
+      )
+      .replace(
+        '(pass) scope > second [2.00ms]',
+        '(pass) outer > a > b & <c> "q" > each 2',
+      ),
+  }
+  expect(parseExecution(undefined, transcript).events).toEqual([
+    event('outer > one-level'),
+    event('outer > a > b & <c> "q" > each 2'),
+  ])
+  // A trailing bracketed duration is still read as the duration.
+  expect(
+    parseExecution(undefined, packageGreen()).events.map((entry) => entry.name),
+  ).toEqual(['handles timeout', 'scope > second'])
+  // Nothing else about the result line became optional.
+  for (const malformed of [
+    '(pass)  [1.00ms]',
+    '(pass) [1.00ms]',
+    '(pass)',
+    '(passed) outer > one-level',
+  ])
+    expect(() =>
+      parseExecution(undefined, {
+        ...transcript,
+        stderr: transcript.stderr.replace(
+          '(pass) outer > one-level',
+          malformed,
+        ),
+      }),
+    ).toThrow()
+})
+
+test('a timed-out test is refused as a timeout, not as a missing expect diagnostic', () => {
+  // Bun 1.3.14 prints no "error:" line for a timeout; it marks the line after
+  // the (fail) result instead.
+  for (const marker of [
+    '  ^ this test timed out after 5000ms.',
+    '  ^ a beforeEach/afterEach hook timed out for this test.',
+  ]) {
+    const timedOut = {
+      ...packageGreen(),
+      exitCode: 1,
+      stderr: packageGreen()
+        .stderr.replace(
+          '(pass) scope > second [2.00ms]',
+          `(fail) scope > second [5001.00ms]\n${marker}`,
+        )
+        .replace(' 2 pass\n 0 fail', ' 1 pass\n 1 fail'),
+    }
+    expect(() => parseExecution(undefined, timedOut)).toThrow(
+      'Timeout, hook or unhandled error',
+    )
+  }
+})
 test('normalizes only JUnit name attributes and preserves native named row identities', () => {
   const fullName =
     'buildAnthropicRequest — Fable/Mythos thinking > does not add Fable 5.1 binding controls to an API-key request'
@@ -634,10 +705,12 @@ test('normalizes only JUnit name attributes and preserves native named row ident
     testcase(
       'refuses unknown or meaningful content 0 without mutating history',
     ),
-    testcase(
-      'does not add Fable 5.1 binding controls to an API-key request',
-      'buildAnthropicRequest — Fable/Mythos thinking',
-    ),
+    ...describeSuite('buildAnthropicRequest — Fable/Mythos thinking', [
+      testcase(
+        'does not add Fable 5.1 binding controls to an API-key request',
+        'buildAnthropicRequest — Fable/Mythos thinking',
+      ),
+    ]),
   ]
   const raw = junit(caseLines)
   const events = [
@@ -667,15 +740,17 @@ test('normalizes only JUnit name attributes and preserves native named row ident
 })
 
 test('XML entity and dollar punctuation normalization cannot rewrite result data', () => {
-  const raw = junit([
-    testcase(
-      'a &amp; &quot;b&quot; &apos;c&apos; &#36;&amp; &#x41;',
-      'scope &lt;x&gt;',
-      '>',
-    ),
-    '      <failure message="expect(received).toBe(expected)"><![CDATA[Expected: false\nReceived: true]]></failure>',
-    '    </testcase>',
-  ])
+  const raw = junit(
+    describeSuite('scope &lt;x&gt;', [
+      testcase(
+        'a &amp; &quot;b&quot; &apos;c&apos; &#36;&amp; &#x41;',
+        'scope &lt;x&gt;',
+        '>',
+      ),
+      '      <failure message="expect(received).toBe(expected)"><![CDATA[Expected: false\nReceived: true]]></failure>',
+      '    </testcase>',
+    ]),
+  )
   const normalized = normalizeReport(raw, [
     event('scope <x> > a & "b" \'c\' $& A', 'fail'),
   ])
@@ -684,6 +759,67 @@ test('XML entity and dollar punctuation normalization cannot rewrite result data
   expect(normalized.xml.slice(normalized.xml.indexOf('      <failure'))).toBe(
     raw.slice(raw.indexOf('      <failure')),
   )
+})
+
+// Verbatim Bun 1.3.14 JUnit for three describe levels (hostname shortened).
+// Beyond the first level its classname lists the describes innermost first and
+// escapes the joining " > " twice, so it cannot name the test.
+const nestedJunit = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="4" assertions="4" failures="1" skipped="0" time="0.016184604">
+  <testsuite name="src/tests/nested.test.ts" file="src/tests/nested.test.ts" tests="4" assertions="4" failures="1" skipped="0" time="0" hostname="h">
+    <testcase name="top" classname="" time="0.000027" file="src/tests/nested.test.ts" line="2" assertions="1" />
+    <testsuite name="outer" file="src/tests/nested.test.ts" line="3" tests="3" assertions="3" failures="1" skipped="0" time="0" hostname="h">
+      <testcase name="one-level" classname="outer" time="0.000007" file="src/tests/nested.test.ts" line="4" assertions="1" />
+      <testsuite name="inner" file="src/tests/nested.test.ts" line="5" tests="2" assertions="2" failures="1" skipped="0" time="0" hostname="h">
+        <testsuite name="deepest" file="src/tests/nested.test.ts" line="7" tests="1" assertions="1" failures="0" skipped="0" time="0" hostname="h">
+          <testcase name="three-level" classname="deepest &amp;gt; inner &amp;gt; outer" time="0.000245" file="src/tests/nested.test.ts" line="8" assertions="1" />
+        </testsuite>
+        <testcase name="two-level after" classname="inner &amp;gt; outer" time="0.000107" file="src/tests/nested.test.ts" line="10" assertions="1">
+          <failure type="AssertionError" />
+        </testcase>
+      </testsuite>
+    </testsuite>
+  </testsuite>
+</testsuites>
+`
+
+test('nested describe names come from the testsuite nesting, outer to inner', () => {
+  const file = 'src/tests/nested.test.ts'
+  const names = [
+    'top',
+    'outer > one-level',
+    'outer > inner > deepest > three-level',
+    'outer > inner > two-level after',
+  ]
+  const events = names.map((name, index) => ({
+    name,
+    file,
+    status: index === 3 ? ('fail' as const) : ('pass' as const),
+    occurrence: 1,
+  }))
+  const normalized = normalizeReport(nestedJunit, events)
+  expect(normalized.ids).toEqual(names)
+  // Classnames stay byte-exact, including Bun's reversed nested form.
+  expect(normalized.xml).toContain(
+    'name="outer &gt; inner &gt; deepest &gt; three-level" classname="deepest &amp;gt; inner &amp;gt; outer"',
+  )
+  // Outcomes and order are still checked against the console events.
+  expect(() =>
+    normalizeReport(
+      nestedJunit,
+      events.map((event, index) =>
+        index === 3 ? { ...event, status: 'pass' as const } : event,
+      ),
+    ),
+  ).toThrow('JUnit identity or outcome does not match console execution')
+  expect(() =>
+    normalizeReport(nestedJunit, [
+      ...events.slice(0, 1),
+      ...events.slice(2, 3),
+      ...events.slice(1, 2),
+      ...events.slice(3),
+    ]),
+  ).toThrow('JUnit identity or outcome does not match console execution')
 })
 
 test('repeated Bun table cases retain every result with deterministic occurrence IDs', () => {
@@ -736,6 +872,17 @@ test('missing, empty, garbage and mismatched report identities refuse', () => {
     junit([testcase('one')]).replace('classname=""', ''),
     junit([testcase('one')]).replace('name="one"', 'name="one" name="two"'),
     junit([testcase('bad &unknown;')]),
+    // Unbalanced or missing <testsuite> nesting leaves no trustworthy name.
+    junit([testcase('one')]).replace('  </testsuite>\n', ''),
+    junit([testcase('one'), '    </testsuite>']),
+    junit([testcase('one'), '    <testsuite name="open">']),
+    junit([testcase('one')]).replace(
+      '<testsuite name="src/tests/fixture.test.ts">',
+      '<testsuite file="src/tests/fixture.test.ts">',
+    ),
+    junit([testcase('one')])
+      .replace('  <testsuite name="src/tests/fixture.test.ts">\n', '')
+      .replace('  </testsuite>\n', ''),
   ]) {
     expect(() => normalizeReport(raw, [event('one')])).toThrow()
   }
@@ -849,7 +996,10 @@ test('broad dispatch uses full package argv and writes only verified nonempty re
   const output = sinks()
   let actualArgv: string[] = []
   let actualIds: string[] = []
-  const raw = junit([testcase('handles timeout'), testcase('second', 'scope')])
+  const raw = junit([
+    testcase('handles timeout'),
+    ...describeSuite('scope', [testcase('second', 'scope')]),
+  ])
   expect(
     await runPackage(
       'packages/core',
@@ -1629,6 +1779,7 @@ async function pinnedChild(
   selected: string | undefined,
   github: boolean,
   lifetime: Pick<TestLifetime, 'gate' | 'trackDetached'> = filesystemTests,
+  extraArgs: readonly string[] = [],
 ): Promise<Transcript> {
   const env = testEnvironment(sandbox, process.env)
   delete env.GITHUB_ACTIONS
@@ -1645,6 +1796,7 @@ async function pinnedChild(
             '--test-name-pattern',
             exactPattern(selected.replaceAll(' > ', ' ')),
           ]),
+      ...extraArgs,
     ],
     { cwd: sandbox, env, stdout: 'pipe', stderr: 'pipe' },
   )
@@ -1778,6 +1930,135 @@ filesystemTests.test(
         )
         expect(() => parseExecution(selected, transcript)).toThrow(reason)
       }
+    }
+  },
+)
+
+// Describe blocks one, two and three levels deep, a describe name holding the
+// " > " separator and XML-escaped characters, a repeated table case and a
+// failing nested assertion, so names, occurrences and outcomes all cross the
+// console/JUnit comparison.
+const nestedFixture = `import { describe, expect, test } from 'bun:test'
+
+test('top level', () => {
+  expect(1).toBe(1)
+})
+describe('outer', () => {
+  test('one level', () => {
+    expect(1).toBe(1)
+  })
+  describe('inner', () => {
+    test('two levels', () => {
+      expect(1).toBe(1)
+    })
+    describe('deepest', () => {
+      test('three levels', () => {
+        expect(1).toBe(1)
+      })
+    })
+    test('two levels failing', () => {
+      expect(1).toBe(2)
+    })
+  })
+  describe('a > b & <c> "q"', () => {
+    test.each([1, 2])('repeated', (value) => {
+      expect(value).toBe(value)
+    })
+  })
+})
+`
+
+filesystemTests.test(
+  'real pinned Bun JUnit for nested describes matches the console names',
+  async () => {
+    const sandbox = await promiseFixtureSandbox()
+    await writeFile(resolve(sandbox, 'src/tests/nested.test.ts'), nestedFixture)
+    const file = 'src/tests/nested.test.ts'
+    const repeated = 'outer > a > b & <c> "q" > repeated'
+    const expected: ExecutionEvent[] = [
+      { name: 'top level', file, status: 'pass', occurrence: 1 },
+      { name: 'outer > one level', file, status: 'pass', occurrence: 1 },
+      {
+        name: 'outer > inner > two levels',
+        file,
+        status: 'pass',
+        occurrence: 1,
+      },
+      {
+        name: 'outer > inner > deepest > three levels',
+        file,
+        status: 'pass',
+        occurrence: 1,
+      },
+      {
+        name: 'outer > inner > two levels failing',
+        file,
+        status: 'fail',
+        occurrence: 1,
+      },
+      { name: repeated, file, status: 'pass', occurrence: 1 },
+      { name: repeated, file, status: 'pass', occurrence: 2 },
+    ]
+    for (const github of [false, true]) {
+      const report = resolve(sandbox, `nested-${github}.xml`)
+      const transcript = await pinnedChild(
+        sandbox,
+        'nested.test.ts',
+        undefined,
+        github,
+        filesystemTests,
+        ['--reporter=junit', `--reporter-outfile=${report}`],
+      )
+      expect(transcript.exitCode, transcript.stderr).toBe(1)
+      const raw = await readFile(report, 'utf8')
+      // Bun's own classname for the two- and three-level cases is reversed and
+      // escaped twice; if this changes, the fixture no longer covers that.
+      expect(raw).toContain('classname="inner &amp;gt; outer"')
+      expect(raw).toContain('classname="deepest &amp;gt; inner &amp;gt; outer"')
+      const execution = parseExecution(undefined, transcript)
+      expect(execution.events).toEqual(expected)
+      expect(normalizeReport(raw, execution.events).ids).toEqual([
+        ...expected.slice(0, 5).map((entry) => entry.name),
+        `${repeated} [case 1 at ${file}:24]`,
+        `${repeated} [case 2 at ${file}:24]`,
+      ])
+    }
+  },
+)
+
+// A test that can never settle, so Bun's own per-test timeout always ends it.
+const timeoutFixture = `import { expect, test } from 'bun:test'
+
+test('healthy companion', () => {
+  expect(1).toBe(1)
+})
+test('never settles', async () => {
+  await new Promise(() => {})
+}, 50)
+`
+
+filesystemTests.test(
+  'real pinned Bun timeouts are refused as timeouts',
+  async () => {
+    const sandbox = await promiseFixtureSandbox()
+    await writeFile(
+      resolve(sandbox, 'src/tests/timeout.test.ts'),
+      timeoutFixture,
+    )
+    for (const github of [false, true]) {
+      const transcript = await pinnedChild(
+        sandbox,
+        'timeout.test.ts',
+        undefined,
+        github,
+      )
+      expect(transcript.exitCode).toBe(1)
+      expect(`${transcript.stdout}\n${transcript.stderr}`).toContain(
+        '\n  ^ this test timed out after 50ms.\n',
+      )
+      expect(() => parseExecution(undefined, transcript)).toThrow(
+        'Timeout, hook or unhandled error',
+      )
     }
   },
 )

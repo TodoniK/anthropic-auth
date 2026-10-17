@@ -160,14 +160,23 @@ the intended assertion caught the mutation.
 
 ### JUnit identity normalization
 
-Real Bun 1.3.14 XML uses a leaf `name` and a describe `classname`; top-level tests
-have an empty classname. Core has three duplicated leaf names in different
-classes, and Pi has two repeated table-test names where Bun leaves `%s` unexpanded.
-One unconditional `{classname} > {name}` template would also prepend ` > ` to
-Core's top-level row IDs. The wrapper therefore changes **only** each testcase's
-`name` attribute to the full descriptive name (a nonempty classname followed by
-` > ` and the leaf, otherwise the leaf alone). Classnames, suite totals, case
-order, statuses, failure/error bodies and all other bytes remain unchanged.
+Real Bun 1.3.14 XML nests one `<testsuite>` per describe block inside each test
+file's own `<testsuite>`, and gives each testcase its leaf `name` and a
+`classname`. Top-level tests have an empty classname. The classname is only
+reliable one describe deep: for deeper nesting Bun lists the describes
+innermost first and escapes the joining ` > ` a second time (a test in describe
+`inner` inside describe `outer` gets `classname="inner &amp;gt; outer"`).
+The wrapper therefore builds each full descriptive name from the enclosing
+`<testsuite>` names, outer to inner and without the file-level suite, followed
+by ` > ` and the leaf; a top-level test keeps its leaf alone. That is the name
+Bun prints on the console, also when a describe name itself contains ` > `.
+Core has three duplicated leaf names in different classes, and Pi has two
+repeated table-test names where Bun leaves `%s` unexpanded. The wrapper changes
+**only** each testcase's `name` attribute to that full descriptive name.
+Classnames (including Bun's reversed nested form), suite totals, case order,
+statuses, failure/error bodies and all other bytes remain unchanged. A report
+whose `<testsuite>` elements do not nest cleanly, or with a testcase outside a
+file suite, returns 126.
 
 Before changing name attributes or emitting a verified count, the wrapper compares
 every testcase with the corresponding observed console event in execution order:

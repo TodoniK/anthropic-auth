@@ -155,7 +155,8 @@ const TEST_FILE_HEADER = /^(?:::group::)?(src\/tests\/[^:\r\n]+\.test\.ts):$/
 // .rejects. or .resolves. (optionally .not.) for the expected outcome, and the
 // block ends at its owning (fail) line. Under GitHub Actions Bun inserts a
 // blank line and an ::error annotation repeating the same message and frames.
-// Hook failures and timeouts are still refused by the checks after this one.
+// Hook failures and timeouts are still refused by their own checks in
+// parseExecution.
 function isPromiseOutcomeFailure(
   lines: readonly string[],
   index: number,
@@ -289,9 +290,18 @@ export function parseExecution(
       continue
     }
     if (!/^\((?:pass|fail)\) /.test(line)) continue
-    const match = /^\((pass|fail)\) (.+) \[\d+(?:\.\d+)?(?:ms|s)\]$/.exec(line)
+    // Bun leaves out the " [1.23ms]" duration for a test that finishes in under
+    // about 10 microseconds, so a line may end without one. A line that ends in
+    // a bracketed duration is read exactly as before: the bracket is the
+    // duration and a nonempty name must precede it. A line without a duration
+    // is read whole as the name, and is refused if it still ends in something
+    // shaped like a duration, such as an empty name before "[1.00ms]".
+    const match =
+      /^\((pass|fail)\) (?:(.+) \[\d+(?:\.\d+)?(?:ms|s)\]|(?!.*\[\d+(?:\.\d+)?(?:ms|s)\]$)(.+))$/.exec(
+        line,
+      )
     const status = match?.[1]
-    const testName = match?.[2]
+    const testName = match?.[2] ?? match?.[3]
     if (!testFile || !testName || (status !== 'pass' && status !== 'fail'))
       throw new Error('Malformed test result or missing test file header')
     const occurrence = (ordinals.get(testName) ?? 0) + 1
@@ -343,23 +353,18 @@ export function parseExecution(
     !/^ (?:\d+ snapshots?, )?[1-9]\d* expect\(\) calls$/.test(expects[0] ?? '')
   )
     throw new Error('No verified assertion executed')
-  const errors = lines.flatMap((line, index) =>
-    /^error:/.test(line) ? [index] : [],
-  )
-  if (
-    errors.length !== failed ||
-    errors.some(
-      (index) =>
-        !/^error: expect\(received\)\.(?:not\.)?[A-Za-z]+\([^\r\n]*\)$/.test(
-          lines[index] ?? '',
-        ) && !isPromiseOutcomeFailure(lines, index, recapIndex ?? lines.length),
-    )
-  )
-    throw new Error('Not a genuine selected expect assertion failure')
+  // Look for timeouts, hook failures and unhandled errors before the
+  // expect-diagnostic count below. Bun prints no "error:" line for a timed-out
+  // test, so the count check would otherwise refuse first and name the wrong
+  // cause. Both checks still run, so the same transcripts are refused.
   if (
     matches(
       /^(?:Test .*timed? out|(?:beforeEach|afterEach|beforeAll|afterAll).*|Unhandled.*)/i,
-    ).length
+    ).length ||
+    // Bun 1.3.14 marks a timeout on the line after its (fail) result, as
+    // "  ^ this test timed out after 5000ms." or
+    // "  ^ a beforeEach/afterEach hook timed out for this test."
+    matches(/^ *\^ .*\btimed out\b/).length
   )
     throw new Error('Timeout, hook or unhandled error')
   // An assertion in beforeEach/afterEach can resemble a test failure. Check
@@ -381,6 +386,19 @@ export function parseExecution(
     )
       throw new Error('Timeout, hook or unhandled error')
   }
+  const errors = lines.flatMap((line, index) =>
+    /^error:/.test(line) ? [index] : [],
+  )
+  if (
+    errors.length !== failed ||
+    errors.some(
+      (index) =>
+        !/^error: expect\(received\)\.(?:not\.)?[A-Za-z]+\([^\r\n]*\)$/.test(
+          lines[index] ?? '',
+        ) && !isPromiseOutcomeFailure(lines, index, recapIndex ?? lines.length),
+    )
+  )
+    throw new Error('Not a genuine selected expect assertion failure')
   if (
     matches(/^ \d+ (?:error|errors|skip|todo)/).length ||
     matches(/^\((?:skip|todo)\) /).length ||
@@ -434,9 +452,36 @@ function encodeAttribute(value: string) {
     .replaceAll("'", '&apos;')
 }
 
-// Bun writes one testcase opening tag per line. Only its name is changed;
-// outcomes, failure messages, classnames, totals and order stay byte-exact.
-// ckdev-mutate then validates the complete XML before grading the mutation.
+// Parse the attributes of one opening tag written on its own line, refusing
+// anything other than plain, unique name="value" pairs.
+function tagAttributes(tag: 'testcase' | 'testsuite', line: string) {
+  const opening = new RegExp(`^(\\s*<${tag} )([^<>]+?)(\\s*\\/?>)$`).exec(line)
+  if (!opening) throw new Error(`Malformed ${tag} opening tag`)
+  const attributes = opening[2] ?? ''
+  const pairs = [...attributes.matchAll(/([a-z]+)="([^"]*)"/g)]
+  if (
+    attributes.replace(/([a-z]+)="([^"]*)"/g, '').trim() ||
+    new Set(pairs.map((pair) => pair[1])).size !== pairs.length
+  )
+    throw new Error(`Malformed or duplicate ${tag} attributes`)
+  const attrs: Record<string, string> = Object.fromEntries(
+    pairs.map((pair) => [pair[1], decodeAttribute(pair[2] ?? '')]),
+  )
+  return { attrs, selfClosing: (opening[3] ?? '').trim().startsWith('/') }
+}
+
+// Bun writes one testcase or testsuite opening tag per line. Only testcase
+// names are changed; outcomes, failure messages, classnames, totals and order
+// stay byte-exact. ckdev-mutate then validates the complete XML before grading
+// the mutation.
+//
+// The full descriptive name comes from the enclosing <testsuite> elements, not
+// from the classname. Bun nests one <testsuite> per describe block inside the
+// file's own <testsuite>, so the describe names read outer to inner from that
+// nesting, which is also the order Bun prints on the console
+// ("outer > inner > leaf"). Bun 1.3.14's classname is only usable for a single
+// describe level: for deeper nesting it lists the describes innermost first and
+// escapes the joining " > " a second time (classname="inner &amp;gt; outer").
 export function normalizeReport(
   raw: string,
   events: readonly ExecutionEvent[],
@@ -447,20 +492,31 @@ export function normalizeReport(
   )
     throw new Error('Missing or unsupported Bun JUnit document')
   const lines = raw.split('\n')
-  const cases = lines.flatMap((line, index) => {
-    if (!/^\s*<testcase\b/.test(line)) return []
-    const opening = /^(\s*<testcase )([^<>]+?)(\s*\/?>)$/.exec(line)
-    if (!opening) throw new Error('Malformed testcase opening tag')
-    const attributes = opening[2] ?? ''
-    const pairs = [...attributes.matchAll(/([a-z]+)="([^"]*)"/g)]
-    if (
-      attributes.replace(/([a-z]+)="([^"]*)"/g, '').trim() ||
-      new Set(pairs.map((pair) => pair[1])).size !== pairs.length
-    )
-      throw new Error('Malformed or duplicate testcase attributes')
-    const attrs: Record<string, string> = Object.fromEntries(
-      pairs.map((pair) => [pair[1], decodeAttribute(pair[2] ?? '')]),
-    )
+  const cases: {
+    index: number
+    name: string
+    file: string
+    status: 'pass' | 'fail'
+    location: string
+  }[] = []
+  // Names of the open <testsuite> elements, outermost first. The first entry
+  // is the file-level suite and is not part of a test's descriptive name.
+  const suites: string[] = []
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index] ?? ''
+    if (/^\s*<testsuite\b/.test(line)) {
+      const suite = tagAttributes('testsuite', line)
+      if (!suite.attrs.name) throw new Error('Missing testsuite name')
+      if (!suite.selfClosing) suites.push(suite.attrs.name)
+      continue
+    }
+    if (/^\s*<\/testsuite>\s*$/.test(line)) {
+      if (!suites.length) throw new Error('Unbalanced testsuite nesting')
+      suites.pop()
+      continue
+    }
+    if (!/^\s*<testcase\b/.test(line)) continue
+    const { attrs, selfClosing } = tagAttributes('testcase', line)
     if (
       !attrs.name ||
       attrs.classname === undefined ||
@@ -468,17 +524,17 @@ export function normalizeReport(
       !/^\d+$/.test(attrs.line ?? '')
     )
       throw new Error('Missing testcase identity attributes')
-    const name = attrs.classname
-      ? `${attrs.classname} > ${attrs.name}`
-      : attrs.name
+    if (!suites.length) throw new Error('Testcase outside a file testsuite')
+    const name = [...suites.slice(1), attrs.name].join(' > ')
     let status: 'pass' | 'fail' = 'pass'
-    if (!(opening[3] ?? '').trim().startsWith('/')) {
+    const opened = index
+    if (!selfClosing) {
       const closing = lines.findIndex(
         (line, position) =>
-          position > index && /^\s*<\/testcase>\s*$/.test(line),
+          position > opened && /^\s*<\/testcase>\s*$/.test(line),
       )
       if (closing < 0) throw new Error('Unclosed testcase')
-      const children = lines.slice(index + 1, closing)
+      const children = lines.slice(opened + 1, closing)
       if (
         children.some((line) => /^\s*<(?:testcase|error|skipped)\b/.test(line))
       )
@@ -488,17 +544,18 @@ export function normalizeReport(
       if (failures.length === 1) status = 'fail'
       else if (children.some((line) => line.trim()))
         throw new Error('Unsupported testcase contents')
+      // Failure bodies are not markup to track; resume after the closing tag.
+      index = closing
     }
-    return [
-      {
-        index,
-        name,
-        file: attrs.file,
-        status,
-        location: `${attrs.file}:${attrs.line}`,
-      },
-    ]
-  })
+    cases.push({
+      index: opened,
+      name,
+      file: attrs.file,
+      status,
+      location: `${attrs.file}:${attrs.line}`,
+    })
+  }
+  if (suites.length) throw new Error('Unbalanced testsuite nesting')
   if (!cases.length || cases.length !== events.length)
     throw new Error(
       'JUnit testcase count does not match executed console events',
