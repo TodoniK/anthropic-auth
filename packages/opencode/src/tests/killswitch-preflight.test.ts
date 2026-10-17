@@ -224,7 +224,7 @@ try {
 type WriterEvent = { event: string; [key: string]: unknown }
 type WriterResult = {
   exitCode: number | null
-  signalCode: string | null
+  signalCode: Bun.Subprocess['signalCode']
   events: WriterEvent[]
   stderr: string
 }
@@ -942,7 +942,7 @@ test('finishing the owning lifetime kills a held writer and joins its exit and b
   // Bun reports a SIGTERM exit as status 143 (128 + 15).
   const killed = {
     exitCode: 143,
-    signalCode: 'SIGTERM',
+    signalCode: 'SIGTERM' as const,
     stderr: '',
     events: [expect.objectContaining({ event: 'held' })],
   }
