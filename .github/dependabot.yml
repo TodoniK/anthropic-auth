@@ -13,6 +13,19 @@ updates:
       opentui:
         patterns:
           - "@opentui/*"
+      # @opencode-ai/plugin pins an exact @opencode-ai/sdk version. Bumping
+      # one without the other installs a second, nested SDK whose client types
+      # don't match, so the family moves in one pull request.
+      opencode-ai:
+        patterns:
+          - "@opencode-ai/*"
+      # The Pi SDK packages release in lockstep and depend on each other
+      # (pi-agent-core can pin an exact pi-ai). Bumping one alone installs a
+      # second, nested pi-ai whose types don't match, so the family moves in
+      # one pull request.
+      earendil-works:
+        patterns:
+          - "@earendil-works/*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
