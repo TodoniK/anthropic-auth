@@ -264,6 +264,7 @@ export interface NativeAccountRuntime {
     signal?: AbortSignal,
   ): Promise<NativeDisplayProfile>
   close(): void
+  getSettingsPath(): Promise<string>
 }
 
 const sharedAccounts = new NativeRuntimeRegistry<NativeAccountRuntime>()
@@ -296,6 +297,7 @@ export function acquireNativeAccountRuntime(
     quotaObservations,
     drainQuotaPublications: () => quotaObservations.drain(),
     getRelayConfig: () => use().getRelayConfig(),
+    getSettingsPath: () => use().getSettingsPath(),
     updateRelay: (patch) => use().updateRelay(patch),
     read: () => use().read(),
     authorizeLocal: (id, request) => use().authorizeLocal(id, request),
@@ -876,6 +878,9 @@ export function createNativeAccountRuntime(
           await writeFlags(next)
         },
       )
+    },
+    async getSettingsPath() {
+      return (await selectedStorage()).paths.config
     },
     async read() {
       const view = await readView()

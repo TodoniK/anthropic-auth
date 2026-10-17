@@ -39,13 +39,16 @@ export function parseFastModeCommandAction(
   return { type: 'usage' }
 }
 
-export function buildFastModeStatusSummary(input?: { enabled?: boolean }) {
+export function buildFastModeStatusSummary(input?: {
+  enabled?: boolean
+  settingsPath?: string
+}) {
   const enabled = input?.enabled ?? fastModeEnabled
   return [
     FAST_STATUS_TITLE,
     '',
     `- Enabled: ${enabled ? 'enabled' : 'disabled'}`,
-    '- Persisted: ~/.config/opencode/anthropic-auth.json',
+    ...(input?.settingsPath ? [`- Persisted: ${input.settingsPath}`] : []),
     '- Scope: adds Anthropic fast mode to supported Opus requests',
     '- Supported models: claude-opus-4-8, claude-opus-5, and claude-opus-5-5',
     '- Request changes: adds `speed: "fast"` and the `fast-mode-2026-02-01` beta header',
@@ -56,17 +59,25 @@ export function buildFastModeStatusSummary(input?: { enabled?: boolean }) {
 export function executeFastModeCommand(input: {
   argumentsText: string
   enabled?: boolean
+  settingsPath?: string
 }) {
   const action = parseFastModeCommandAction(input.argumentsText)
   const enabled = input.enabled ?? fastModeEnabled
 
-  if (action.type === 'status') return buildFastModeStatusSummary({ enabled })
+  if (action.type === 'status')
+    return buildFastModeStatusSummary({
+      enabled,
+      settingsPath: input.settingsPath,
+    })
 
   if (action.type === 'enable') {
     return [
       FAST_ENABLED_TITLE,
       '',
-      buildFastModeStatusSummary({ enabled: true }),
+      buildFastModeStatusSummary({
+        enabled: true,
+        settingsPath: input.settingsPath,
+      }),
     ].join('\n')
   }
 
@@ -74,7 +85,10 @@ export function executeFastModeCommand(input: {
     return [
       FAST_DISABLED_TITLE,
       '',
-      buildFastModeStatusSummary({ enabled: false }),
+      buildFastModeStatusSummary({
+        enabled: false,
+        settingsPath: input.settingsPath,
+      }),
     ].join('\n')
   }
 
@@ -83,6 +97,9 @@ export function executeFastModeCommand(input: {
     '',
     FAST_USAGE,
     '',
-    buildFastModeStatusSummary({ enabled }),
+    buildFastModeStatusSummary({
+      enabled,
+      settingsPath: input.settingsPath,
+    }),
   ].join('\n')
 }

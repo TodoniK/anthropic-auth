@@ -34,13 +34,16 @@ export function parseLoggingCommandAction(
   return { type: 'usage' }
 }
 
-export function buildLoggingStatusSummary(input?: { level?: LogLevel }) {
+export function buildLoggingStatusSummary(input?: {
+  level?: LogLevel
+  settingsPath?: string
+}) {
   const level = input?.level ?? 'info'
   return [
     '## Claude Log Level',
     '',
     `Current log level: \`${level}\``,
-    '- Persisted: ~/.config/opencode/anthropic-auth.json',
+    ...(input?.settingsPath ? [`- Persisted: ${input.settingsPath}`] : []),
     '- Valid levels: error, warn, info, debug, trace',
     '',
     LOGGING_USAGE,
@@ -50,11 +53,16 @@ export function buildLoggingStatusSummary(input?: { level?: LogLevel }) {
 export function executeLoggingCommand(input: {
   argumentsText: string
   level?: LogLevel
+  settingsPath?: string
 }) {
   const action = parseLoggingCommandAction(input.argumentsText)
   const level = input.level ?? 'info'
 
-  if (action.type === 'status') return buildLoggingStatusSummary({ level })
+  if (action.type === 'status')
+    return buildLoggingStatusSummary({
+      level,
+      settingsPath: input.settingsPath,
+    })
 
   if (action.type === 'level') {
     return [
@@ -62,7 +70,10 @@ export function executeLoggingCommand(input: {
       '',
       `Level set to \`${action.level}\`.`,
       '',
-      ...buildLoggingStatusSummary({ level: action.level })
+      ...buildLoggingStatusSummary({
+        level: action.level,
+        settingsPath: input.settingsPath,
+      })
         .split('\n')
         .slice(2),
     ].join('\n')
@@ -73,6 +84,11 @@ export function executeLoggingCommand(input: {
     '',
     LOGGING_USAGE,
     '',
-    ...buildLoggingStatusSummary({ level }).split('\n').slice(2),
+    ...buildLoggingStatusSummary({
+      level,
+      settingsPath: input.settingsPath,
+    })
+      .split('\n')
+      .slice(2),
   ].join('\n')
 }

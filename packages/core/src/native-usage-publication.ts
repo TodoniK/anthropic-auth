@@ -1,4 +1,6 @@
+import { types } from 'node:util'
 import { logger } from './logger.ts'
+import { transientNetworkErrorCode } from './network-errors.ts'
 
 /**
  * Custody, ownership and integrity refusals need an ERROR diagnostic; ordinary
@@ -19,8 +21,11 @@ export function usagePublicationRefusalIsFatal(error: unknown): boolean {
 
 const names = new Set([
   'Error',
+  'TypeError',
+  'AbortError',
   'NativeCustodyError',
   'NativeRuntimeError',
+  'NativeAccountReadError',
   'LockContentionError',
 ])
 const codes = new Set([
@@ -53,27 +58,64 @@ const codes = new Set([
   'EACCES',
   'EPERM',
   'ENOSPC',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
 ])
 
-function logPublicationFailure(channel: string, error: unknown): void {
-  let level: 'error' | 'warn' = 'warn'
+/** Return only allowlisted classes and codes, never the exception text. */
+export function classifySafeErrorForLog(error: unknown) {
   let name = 'unknown'
   let code = 'unknown'
   try {
-    if (usagePublicationRefusalIsFatal(error)) level = 'error'
-    if (error instanceof Error) {
-      if (names.has(error.name)) name = error.name
-      const value: unknown = Reflect.get(error, 'code')
-      if (typeof value === 'string' && codes.has(value)) code = value
+    if (error instanceof Error && names.has(error.name)) name = error.name
+    if (!error || typeof error !== 'object' || types.isProxy(error))
+      return { name, code }
+    const field = (key: string) =>
+      Object.getOwnPropertyDescriptor(error, key)?.value
+    const value = field('code')
+    if (typeof value === 'string' && codes.has(value)) code = value
+    else {
+      const status = field('status')
+      if (
+        typeof status === 'number' &&
+        Number.isInteger(status) &&
+        status >= 100 &&
+        status <= 599
+      )
+        code = `HTTP_${status}`
+      else {
+        code =
+          transientNetworkErrorCode({
+            code: value,
+            message: field('message'),
+          }) ?? 'unknown'
+      }
     }
+  } catch {
+    // Arbitrary thrown objects may have hostile getters; omit them entirely.
+  }
+  return { name, code }
+}
+
+function logPublicationFailure(channel: string, error: unknown): void {
+  let level: 'error' | 'warn' = 'warn'
+  try {
+    if (usagePublicationRefusalIsFatal(error)) level = 'error'
   } catch {
     // An arbitrary thrown object may have getters that throw. Do not inspect
     // it further or let diagnostic extraction reject the detached task.
   }
-  logger[level](channel, 'Account usage publication unavailable', {
-    name,
-    code,
-  })
+  logger[level](
+    channel,
+    'Account usage publication unavailable',
+    classifySafeErrorForLog(error),
+  )
 }
 
 /** Own advisory writes for one host instance and join them before runtime close. */

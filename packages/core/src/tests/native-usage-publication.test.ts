@@ -8,6 +8,7 @@ import {
 import { NativeCustodyError } from '../native-custody.ts'
 import { NativeRuntimeError } from '../native-runtime.ts'
 import {
+  classifySafeErrorForLog,
   createNativeUsagePublisher,
   usagePublicationRefusalIsFatal,
 } from '../native-usage-publication.ts'
@@ -41,6 +42,32 @@ test('usage publication classification retains the custody and runtime refusal p
     null,
   ])
     expect(usagePublicationRefusalIsFatal(error)).toBe(false)
+})
+
+test('safe error classification exposes known network, HTTP and native refusal codes only', () => {
+  expect(
+    classifySafeErrorForLog(
+      Object.assign(new TypeError('socket failed: private text'), {
+        code: 'ECONNRESET',
+      }),
+    ),
+  ).toEqual({ name: 'TypeError', code: 'ECONNRESET' })
+  expect(
+    classifySafeErrorForLog(
+      Object.assign(new Error('provider body'), { status: 503 }),
+    ),
+  ).toEqual({ name: 'Error', code: 'HTTP_503' })
+  expect(
+    classifySafeErrorForLog(new NativeCustodyError('route-unavailable')),
+  ).toEqual({ name: 'NativeCustodyError', code: 'route-unavailable' })
+  expect(
+    classifySafeErrorForLog(
+      Object.assign(new Error('credential secret'), {
+        name: '/private/name',
+        code: 'secret-code',
+      }),
+    ),
+  ).toEqual({ name: 'unknown', code: 'unknown' })
 })
 
 test('advisory usage publication starts after handoff and drains every write', async () => {

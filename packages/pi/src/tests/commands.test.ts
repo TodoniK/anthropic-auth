@@ -242,6 +242,15 @@ describe('native diagnostics persistence', () => {
       'debug',
     )
   })
+  test('settings status shows the selected native settings file for every persistent setting', async () => {
+    const expectedPath = (await resolveNativePoolPaths(storagePath)).config
+    for (const command of ['cache', 'dump', 'fast', 'logging'] as const) {
+      expect(await controller().backend.readStatus(command, {})).toContain(
+        `- Persisted: ${expectedPath}`,
+      )
+    }
+  })
+
   test('logging status shows current level without mutating', async () => {
     await controller().execute({
       action: 'logging-level',

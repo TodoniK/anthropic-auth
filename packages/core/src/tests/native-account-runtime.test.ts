@@ -3,6 +3,7 @@ import * as filesystem from 'node:fs/promises'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { disconnectClaustrumEnrollment } from '@cortexkit/common-auth/claustrum'
+
 import { ClaudeOAuthRefreshError } from '../auth.ts'
 import {
   type ProviderAccountUuid,
@@ -32,6 +33,7 @@ import {
 } from '../native-quota-observations.ts'
 import * as runtimeWriter from '../native-runtime.ts'
 import { readNativeRuntime } from '../native-runtime.ts'
+import { nativeVaultPaths } from '../native-vault-paths.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
@@ -113,6 +115,11 @@ async function fixture(
   })
   return { paths, runtime, store, counts, env }
 }
+
+test('native runtime reports the selected local settings file', async () => {
+  const f = await fixture()
+  expect(await f.runtime.getSettingsPath()).toBe(f.paths.config)
+})
 
 test('native facade reads no legacy authority and does not import legacy persistence', async () => {
   for (const filename of [
@@ -1425,6 +1432,9 @@ test('vault mode refuses direct local API authorization without changing stored 
     enrollment.tokenPath,
     JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
     { mode: 0o600 },
+  )
+  expect(await f.runtime.getSettingsPath()).toBe(
+    nativeVaultPaths(f.paths).config,
   )
   const before = await Promise.all([
     readFile(f.paths.config, 'utf8'),

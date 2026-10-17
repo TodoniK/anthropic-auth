@@ -293,14 +293,17 @@ export function parseDumpCommandAction(
   return { type: 'usage' }
 }
 
-export function buildDumpStatusSummary(input?: { enabled?: boolean }) {
+export function buildDumpStatusSummary(input?: {
+  enabled?: boolean
+  settingsPath?: string
+}) {
   const enabled = input?.enabled ?? dumpEnabled
   return [
     DUMP_STATUS_TITLE,
     '',
     `- Enabled: ${enabled ? 'enabled' : 'disabled'}`,
     `- Directory: ${getDumpDirectory()}`,
-    '- Persisted: ~/.config/opencode/anthropic-auth.json',
+    ...(input?.settingsPath ? [`- Persisted: ${input.settingsPath}`] : []),
     '- Captures: final rewritten Anthropic body in direct and relay modes; request/relay metadata is redacted',
     '- Warning: body dumps may contain prompt/session content; turn this off after debugging',
   ].join('\n')
@@ -309,17 +312,25 @@ export function buildDumpStatusSummary(input?: { enabled?: boolean }) {
 export function executeDumpCommand(input: {
   argumentsText: string
   enabled?: boolean
+  settingsPath?: string
 }) {
   const action = parseDumpCommandAction(input.argumentsText)
   const enabled = input.enabled ?? dumpEnabled
 
-  if (action.type === 'status') return buildDumpStatusSummary({ enabled })
+  if (action.type === 'status')
+    return buildDumpStatusSummary({
+      enabled,
+      settingsPath: input.settingsPath,
+    })
 
   if (action.type === 'enable') {
     return [
       DUMP_ENABLED_TITLE,
       '',
-      buildDumpStatusSummary({ enabled: true }),
+      buildDumpStatusSummary({
+        enabled: true,
+        settingsPath: input.settingsPath,
+      }),
     ].join('\n')
   }
 
@@ -327,7 +338,10 @@ export function executeDumpCommand(input: {
     return [
       DUMP_DISABLED_TITLE,
       '',
-      buildDumpStatusSummary({ enabled: false }),
+      buildDumpStatusSummary({
+        enabled: false,
+        settingsPath: input.settingsPath,
+      }),
     ].join('\n')
   }
 
@@ -336,7 +350,7 @@ export function executeDumpCommand(input: {
     '',
     DUMP_USAGE,
     '',
-    buildDumpStatusSummary({ enabled }),
+    buildDumpStatusSummary({ enabled, settingsPath: input.settingsPath }),
   ].join('\n')
 }
 

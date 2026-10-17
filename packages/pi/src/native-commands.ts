@@ -348,7 +348,10 @@ export function createPiNativeCommands(
         case 'killswitch':
           return `Killswitch: ${isKillswitchEnabled(storage) ? 'enabled' : 'disabled'}\n${JSON.stringify(storage.killswitch ?? {})}`
         case 'cache':
-          return `1-hour cache: ${isCache1hPersistentlyEnabled(storage) ? 'enabled' : 'disabled'}; mode: ${getCache1hPersistentMode(storage)}`
+          return [
+            `1-hour cache: ${isCache1hPersistentlyEnabled(storage) ? 'enabled' : 'disabled'}; mode: ${getCache1hPersistentMode(storage)}`,
+            `- Persisted: ${await runtime.getSettingsPath()}`,
+          ].join('\n')
         case 'cachekeep': {
           const sessions = await getPiTrackedCacheKeepSessions()
           return executeCacheKeepCommand({
@@ -365,11 +368,20 @@ export function createPiNativeCommands(
           })
         }
         case 'dump':
-          return `Request dumping: ${isDumpPersistentlyEnabled(storage) ? 'enabled' : 'disabled'}`
+          return [
+            `Request dumping: ${isDumpPersistentlyEnabled(storage) ? 'enabled' : 'disabled'}`,
+            `- Persisted: ${await runtime.getSettingsPath()}`,
+          ].join('\n')
         case 'logging':
-          return `Logging: ${getPersistedLogLevel(storage) ?? 'info'}`
+          return [
+            `Logging: ${getPersistedLogLevel(storage) ?? 'info'}`,
+            `- Persisted: ${await runtime.getSettingsPath()}`,
+          ].join('\n')
         case 'fast':
-          return `Fast mode: ${isFastModePersistentlyEnabled(storage) ? 'enabled' : 'disabled'}`
+          return [
+            `Fast mode: ${isFastModePersistentlyEnabled(storage) ? 'enabled' : 'disabled'}`,
+            `- Persisted: ${await runtime.getSettingsPath()}`,
+          ].join('\n')
         case 'prime':
           return executePrimeCommand({
             argumentsText: 'status',

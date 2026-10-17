@@ -15,16 +15,20 @@ function errorField(error: unknown, field: 'code' | 'message') {
   return typeof value === 'string' ? value : undefined
 }
 
-export function isTransientNetworkError(error: unknown) {
+export function transientNetworkErrorCode(error: unknown) {
   const code = errorField(error, 'code')
-  if (code && TRANSIENT_NETWORK_ERROR_CODES.has(code)) return true
+  if (code && TRANSIENT_NETWORK_ERROR_CODES.has(code)) return code
 
   const message =
     error instanceof Error
       ? error.message
       : (errorField(error, 'message') ?? String(error))
-  if (message.includes('fetch failed')) return true
-  return [...TRANSIENT_NETWORK_ERROR_CODES].some((candidate) =>
+  if (message.includes('fetch failed')) return 'ECONNRESET'
+  return [...TRANSIENT_NETWORK_ERROR_CODES].find((candidate) =>
     message.includes(candidate),
   )
+}
+
+export function isTransientNetworkError(error: unknown) {
+  return transientNetworkErrorCode(error) !== undefined
 }

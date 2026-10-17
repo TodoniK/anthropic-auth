@@ -248,6 +248,7 @@ import {
 import { createNativeCommand } from './native-command.js'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
+import { logFallbackQuotaPreflightWarning } from './quota-preflight.ts'
 import {
   formatKillswitchBlockMessage,
   resolveScopedDrivenBlock,
@@ -2756,11 +2757,7 @@ const anthropicAuthPlugin = async (
         // A refused account read need not persist a quota error. Keep that
         // missing reading visible to admission without poisoning token state.
         unavailable.add(account.id)
-        logger.warn(
-          'quota',
-          'fallback quota preflight could not obtain a reading',
-          { accountId: account.id, requiredByPolicy },
-        )
+        logFallbackQuotaPreflightWarning(account.id, requiredByPolicy, error)
       }
     }
     // Poll readings are visible in memory; publication and sidebar I/O must
@@ -4605,7 +4602,12 @@ const anthropicAuthPlugin = async (
       const mode = getCache1hPersistentMode(storage)
       setCache1hState({ enabled, mode })
       logger.info('commands', 'cache enabled changed', { enabled })
-      return executeCache1hCommand({ argumentsText, enabled, mode })
+      return executeCache1hCommand({
+        argumentsText,
+        enabled,
+        mode,
+        settingsPath: await nativeAccounts.getSettingsPath(),
+      })
     }
 
     if (action.type === 'mode') {
@@ -4617,6 +4619,7 @@ const anthropicAuthPlugin = async (
         argumentsText,
         enabled,
         mode: action.mode,
+        settingsPath: await nativeAccounts.getSettingsPath(),
       })
     }
 
@@ -4679,7 +4682,11 @@ const anthropicAuthPlugin = async (
       await setDumpPersistentEnabled(enabled)
       setDumpEnabled(enabled)
       logger.info('commands', 'dump changed', { enabled })
-      return executeDumpCommand({ argumentsText, enabled })
+      return executeDumpCommand({
+        argumentsText,
+        enabled,
+        settingsPath: await nativeAccounts.getSettingsPath(),
+      })
     }
 
     const storage = await loadAccounts(accountStoragePath)
@@ -4695,7 +4702,11 @@ const anthropicAuthPlugin = async (
       await setFastModePersistentEnabled(enabled)
       setFastModeEnabled(enabled)
       logger.info('commands', 'fast mode changed', { enabled })
-      return executeFastModeCommand({ argumentsText, enabled })
+      return executeFastModeCommand({
+        argumentsText,
+        enabled,
+        settingsPath: await nativeAccounts.getSettingsPath(),
+      })
     }
 
     const storage = await loadAccounts(accountStoragePath)
@@ -4752,12 +4763,20 @@ const anthropicAuthPlugin = async (
       // The native runtime stores the level, applies it to this process's
       // logger and logs a live level change.
       await setLogLevelPersistent(action.level)
-      return executeLoggingCommand({ argumentsText, level: action.level })
+      return executeLoggingCommand({
+        argumentsText,
+        level: action.level,
+        settingsPath: await nativeAccounts.getSettingsPath(),
+      })
     }
 
     const storage = await loadAccounts(accountStoragePath)
     const level = getPersistedLogLevel(storage) ?? 'info'
-    return executeLoggingCommand({ argumentsText, level })
+    return executeLoggingCommand({
+      argumentsText,
+      level,
+      settingsPath: await nativeAccounts.getSettingsPath(),
+    })
   }
 
   async function executePersistentPrimeCommand(argumentsText: string) {

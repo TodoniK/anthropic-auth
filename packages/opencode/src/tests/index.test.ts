@@ -10027,6 +10027,27 @@ describe('auth.loader', () => {
     expect(result.text).toContain('Mode updated to `hybrid`.')
   })
 
+  test('persistent cache, dump, fast and logging replies show the selected settings file', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const plugin = await getPlugin(undefined, tempConfigDir)
+    const settingsPath = migratedPool!.paths.config
+    const actions = [
+      { sectionId: 'Cache', actionId: 'cache-on' },
+      { sectionId: 'Diagnostics', actionId: 'dump-on' },
+      { sectionId: 'Extras', actionId: 'fast-on' },
+      {
+        sectionId: 'Diagnostics',
+        actionId: 'logging-level',
+        values: { level: 'debug' },
+      },
+    ] as const
+
+    for (const action of actions) {
+      const result = await applyMenuAction(plugin, 'settings-path', action)
+      expect(result.text).toContain(`- Persisted: ${settingsPath}`)
+    }
+  })
+
   test('native quota status works before the host auth loader has run', async () => {
     const checkedAt = Date.now()
     await useTempAccountFile(

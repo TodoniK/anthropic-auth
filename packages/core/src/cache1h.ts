@@ -73,6 +73,7 @@ export function parseCache1hCommandAction(
 export function buildCache1hStatusSummary(input?: {
   enabled?: boolean
   mode?: Cache1hMode
+  settingsPath?: string
 }) {
   const enabled = input?.enabled ?? cache1hEnabled
   const mode = input?.mode ?? cache1hMode
@@ -81,7 +82,7 @@ export function buildCache1hStatusSummary(input?: {
     '',
     `- Enabled: ${enabled ? 'enabled' : 'disabled'}`,
     `- Mode: ${mode}`,
-    '- Persisted: ~/.config/opencode/anthropic-auth.json',
+    ...(input?.settingsPath ? [`- Persisted: ${input.settingsPath}`] : []),
     '- Scope: main sessions only; subagent sessions keep default ephemeral cache behavior',
     '- Modes: explicit = existing OpenCode breakpoints; automatic = top-level cache_control only; hybrid = system + messages[0] + top-level cache_control',
     '- TTL: 1h when enabled for main sessions; default ephemeral cache behavior otherwise',
@@ -92,19 +93,28 @@ export function executeCache1hCommand(input: {
   argumentsText: string
   enabled?: boolean
   mode?: Cache1hMode
+  settingsPath?: string
 }) {
   const action = parseCache1hCommandAction(input.argumentsText)
   const enabled = input.enabled ?? cache1hEnabled
   const mode = input.mode ?? cache1hMode
 
   if (action.type === 'status')
-    return buildCache1hStatusSummary({ enabled, mode })
+    return buildCache1hStatusSummary({
+      enabled,
+      mode,
+      settingsPath: input.settingsPath,
+    })
 
   if (action.type === 'enable') {
     return [
       CACHE_1H_ENABLED_TITLE,
       '',
-      buildCache1hStatusSummary({ enabled: true, mode }),
+      buildCache1hStatusSummary({
+        enabled: true,
+        mode,
+        settingsPath: input.settingsPath,
+      }),
     ].join('\n')
   }
 
@@ -112,7 +122,11 @@ export function executeCache1hCommand(input: {
     return [
       CACHE_1H_DISABLED_TITLE,
       '',
-      buildCache1hStatusSummary({ enabled: false, mode }),
+      buildCache1hStatusSummary({
+        enabled: false,
+        mode,
+        settingsPath: input.settingsPath,
+      }),
     ].join('\n')
   }
 
@@ -122,7 +136,11 @@ export function executeCache1hCommand(input: {
       '',
       `Mode updated to \`${action.mode}\`.`,
       '',
-      buildCache1hStatusSummary({ enabled, mode: action.mode }),
+      buildCache1hStatusSummary({
+        enabled,
+        mode: action.mode,
+        settingsPath: input.settingsPath,
+      }),
     ].join('\n')
   }
 
@@ -131,6 +149,10 @@ export function executeCache1hCommand(input: {
     '',
     CACHE_1H_USAGE,
     '',
-    buildCache1hStatusSummary({ enabled, mode }),
+    buildCache1hStatusSummary({
+      enabled,
+      mode,
+      settingsPath: input.settingsPath,
+    }),
   ].join('\n')
 }
