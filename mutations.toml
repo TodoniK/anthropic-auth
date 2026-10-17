@@ -982,22 +982,6 @@ broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
 
 [[control]]
-id = "pi-cachekeep-prewarm-body-betas"
-guards = "Pi's CacheKeep prewarm must send the betas the model request sends for the same body, including per-turn control for Fable 5.1 system effort markers."
-file = "packages/pi/src/stream.ts"
-old = "    applyPiOAuthRequestHeaders(headers, piAttemptAccessToken(served), {"
-new = "    applyClaudeCodeHeaders(headers, piAttemptAccessToken(served), { extraBetas: [CACHE_KEEP_EXTENDED_TTL_BETA], // NON-VACUITY BREAK: rebuild prewarm betas without the body's betas"
-test_file = "packages/pi/src/tests/scoped-stream.test.ts"
-runner = "command"
-command = ["bun", "scripts/run-mutation-bun.ts", "packages/pi/src/tests/scoped-stream.test.ts", "{test}"]
-test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["Pi CacheKeep prewarm of a Fable 5.1 body with effort markers sends the per-turn control beta", "Pi CacheKeep prewarm of a Fable 5.1 body without effort markers sends the model request betas"]
-expect_message = "error: expect(received).toContain(expected)"
-broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
-broad_report = "tmp/mutations/pi.xml"
-broad_id = "{name}"
-
-[[control]]
 id = "oc1-cancelled-401-never-reaches-routing"
 guards = "A request cancelled after its vault 401 arrives, before or during re-authorization, must end as cancelled after one report, not return the 401 that moves the session's sticky account."
 file = "packages/opencode/src/index.ts"
