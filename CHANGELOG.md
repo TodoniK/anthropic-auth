@@ -2,6 +2,32 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Setup
+
+- `bunx @cortexkit/opencode-anthropic-auth setup` now runs on common-auth's shared setup runner, the same one the other CortexKit auth plugins use. Host detection, the OpenCode generation choice, the running-process check, host registration and vault enrollment come from the shared runner; Anthropic keeps its own sign-in, migration, Pi consent and vault activation. Pressing Escape or Ctrl-C at the vault question now stops setup without changes.
+- OpenCode 2 alone can now be set up without OpenCode 1: setup records an empty local account pool, and you then sign in from OpenCode with "Claude Pro / Max (native account pool)". Setup does not read OpenCode 1's login or open any OpenCode database.
+- A later OpenCode 1 setup can import an older 1.x account setup into that pool while it still holds no accounts. Your native preferences stay, and existing session pins are kept. Once the pool holds accounts, setup skips the import instead of overwriting them.
+- OpenCode 1 now serves from the native pool even when OpenCode still holds its own separate Anthropic login, as long as the pool has a usable sign-in. `/claude` → Accounts notes that the separate login is not used. Its tokens are never used.
+- Setup with no hosts selected now exits quietly instead of failing.
+
+### Documentation
+
+- The READMEs are now short entry pages. Reference material moved to `docs/`: installation, accounts and routing, vault, commands, cache, transports, OpenCode 2, models, sidebar, environment variables, request rewriting, troubleshooting, development and releases.
+
+## 2.0.2
+
+### Fixes
+
+- OpenCode 1 and OpenCode 2 local serving now read the session-routing file that the 2.0 setup migration fills, the same file Pi uses. Before, they read the old file name, so after upgrading each existing conversation picked an account again and rebuilt its prompt cache. Pins saved at the old name since upgrading are merged in once on the first routed request, never replacing a newer pin; a damaged or unreadable old file is skipped with one warning. OpenCode 2 also honors `OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE`. Vault mode was not affected.
+- Map tool names in Claude's responses back using only the tools that request declared (#286). A guessed short name such as `mcp_Search` is mapped to a declared tool only when exactly one declared tool matches; it no longer defaults to an AFT tool or rewrites a correctly called tool named `search`. A name that cannot be mapped back without risk of selecting a different declared tool stops the response with a fixed, non-retryable error. Tool arguments are never changed, and outgoing tool names are unchanged.
+
+### Compatibility
+
+- Support Pi 1.x (tested with 1.1) alongside Pi 0.86, and build the OpenCode sidebar for OpenTUI 0.6.
+- Move to `@cortexkit/common-auth` 0.17.0.
+
 ## 2.0.1
 
 ### Fixes

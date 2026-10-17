@@ -162,7 +162,10 @@ function createNetwork() {
     profileAccounts: [] as string[],
     unexpected: [] as string[],
     respond: undefined as
-      | ((account: string) => Promise<Response | undefined>)
+      | ((
+          account: string,
+          signal?: AbortSignal | null,
+        ) => Promise<Response | undefined>)
       | undefined,
   }
   const saved = globalThis.fetch
@@ -182,7 +185,7 @@ function createNetwork() {
       const account = bearerIdentity[bearer] ?? `unknown:${bearer}`
       network.profileBearers.push(bearer)
       network.profileAccounts.push(account)
-      const replaced = await network.respond?.(account)
+      const replaced = await network.respond?.(account, init?.signal)
       if (replaced) return replaced
       const tier = accountTier[account]
       return tier
@@ -579,6 +582,7 @@ test('a profile read for a replaced account is not shown or saved for its succes
     hostAuth: localHostAuth(),
   })
   const release = gate()
+  const replacementIdentified = gate()
   let hold: ReturnType<typeof holdPoolConfigLock> | undefined
   let bothArrived!: () => void
   const arrived = new Promise<void>((resolve) => {
@@ -608,16 +612,20 @@ test('a profile read for a replaced account is not shown or saved for its succes
         expect((await runtime.authorizeLocal('fallback-route')).status).toBe(
           'usable',
         )
+        replacementIdentified.open()
       } finally {
         runtime.close()
       }
     }
+    // Taking the config lock before the new login commits would block that
+    // login until after the menu's last display, leaving no successor to fetch.
+    await replacementIdentified.wait
     // Hold the lock every local profile save needs while the menu renders.
     // The previous account's profile save for this route is refused at once
     // anyway, because it no longer matches the route's credential, so the
     // test checks the outcome (that profile never appears on the replacement
     // account) rather than which of the display's guards stopped it.
-    if (s.network.profileAccounts.length === 2 && !hold) {
+    if (s.network.profileAccounts.length >= 2 && !hold) {
       hold = holdPoolConfigLock(s.paths, release.wait)
       await hold.held
       bothArrived()
@@ -637,6 +645,79 @@ test('a profile read for a replaced account is not shown or saved for its succes
     accountTier[otherIdentity],
   )
 })
+test('an expired unidentified profile attempt cannot replace its successor account request', async () => {
+  const s = await start(
+    { legacyConfig: localLegacyConfig(), hostAuth: localHostAuth() },
+    {
+      beforePlugin: async (paths) => {
+        await seedProfile(
+          paths,
+          'main',
+          accountTier[mainIdentity] ?? '',
+          Date.now(),
+        )
+      },
+    },
+  )
+  const release = gate()
+  const expired = gate()
+  let firstSignal: AbortSignal | undefined
+  s.network.respond = async (account, signal) => {
+    if (account !== fallbackIdentity || firstSignal) return undefined
+    if (!signal) throw new Error('Profile request has no deadline signal')
+    firstSignal = signal
+    signal.addEventListener('abort', () => expired.open(), { once: true })
+    // Ignore cancellation until teardown so the expired attempt remains
+    // pending when a later display has to choose the successor's request.
+    await release.wait
+    return undefined
+  }
+  const firstMenu = s.readMenu()
+  trackDetached(firstMenu)
+  await expired.wait
+  await firstMenu
+  expect(firstSignal?.aborted).toBe(true)
+
+  const runtime = createNativeAccountRuntime({
+    paths: s.paths,
+    host: 'opencode',
+    local: nativeLocal(),
+  })
+  try {
+    await runtime.loginOAuth({
+      routeId: 'fallback-route',
+      credential: {
+        access: 'sk-ant-oat01-synthetic-other-access',
+        refresh: 'synthetic-other-refresh',
+        expires: Date.now() + 8 * 60 * 60_000,
+      },
+      replace: true,
+    })
+    expect((await runtime.authorizeLocal('fallback-route')).status).toBe(
+      'usable',
+    )
+  } finally {
+    runtime.close()
+  }
+
+  const text = await s.readMenu()
+  expect(accountLine(text, 'fallback-route')).toContain('Max 10x')
+  expect(accountLine(text, 'fallback-route')).not.toContain('Max 5x')
+  expect(
+    s.network.profileAccounts.filter((id) => id === otherIdentity),
+  ).toHaveLength(1)
+  // The /claude menu renders Accounts before Quota. The first readMenu call's
+  // Quota display retries the expired request while its transport is held.
+  expect(
+    s.network.profileAccounts.filter((id) => id === fallbackIdentity),
+  ).toHaveLength(2)
+  release.open()
+  await s.dispose()
+  expect((await storedTiers(s.paths))['fallback-route']).toBe(
+    accountTier[otherIdentity],
+  )
+})
+
 test('vault accounts show fetched profiles through vault-issued credentials', async () => {
   const row = (id: string, accountId: string) => ({
     id,
