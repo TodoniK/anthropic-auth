@@ -794,8 +794,10 @@ const STEPS = [
   'before-write:journal:committed',
 ]
 
-test('an interruption at every boundary leaves serving refused and resumes to the same vault state', async () => {
-  for (const point of STEPS) {
+// One test per boundary: each builds its own fixture, so a slow machine spends
+// one activation per test budget and a failure names the boundary.
+for (const point of STEPS) {
+  test(`an interruption at ${point} leaves serving refused and resumes to the same vault state`, async () => {
     const f = await fixture()
     await interrupted(f, point)
     const journal = await readNativeMigrationJournal(f.paths)
@@ -808,8 +810,8 @@ test('an interruption at every boundary leaves serving refused and resumes to th
       'committed',
     )
     await expectVault(f)
-  }
-})
+  })
+}
 
 test('an interrupted removal between its config and state writes completes through the attributed fence', async () => {
   const f = await fixture()
@@ -862,41 +864,47 @@ async function addInAnotherProcess(
   expect(code, errors).toBe(0)
 }
 
-test('resume refuses a removed id re-added at a new epoch, a changed token and an added row', async () => {
-  const mutations: Array<[string, (f: Fixture) => Promise<void>]> = [
-    [
-      'after:remove:0',
-      async (f) => {
-        const removed = [f.main, 'work-route'].sort()[0] as string
-        // The original store remembers its removal. Use another process to
-        // simulate a later login that creates a new account under the same ID.
-        await addInAnotherProcess(f.paths, {
-          id: removed,
-          credential: removed === f.main ? MAIN_TOKEN : WORK_TOKEN,
-          identity: removed === f.main ? MAIN_IDENTITY : WORK_IDENTITY,
-        })
-      },
-    ],
-    [
-      'after:roster',
-      async (f) => {
-        await f.store.rotate('work-route', {
-          ...WORK_TOKEN,
-          access: 'synthetic-rotated-access',
-        })
-      },
-    ],
-    [
-      'after:prepare',
-      async (f) => {
-        await f.store.add({
-          id: 'added-api',
-          credential: { ...API_KEY, apiKey: 'synthetic-added-key' },
-        })
-      },
-    ],
-  ]
-  for (const [point, mutate] of mutations) {
+// One test per change, each on its own fixture, so a failure names the change.
+const credentialChanges: Array<
+  [string, string, (f: Fixture) => Promise<void>]
+> = [
+  [
+    'a removed id re-added at a new epoch',
+    'after:remove:0',
+    async (f) => {
+      const removed = [f.main, 'work-route'].sort()[0] as string
+      // The original store remembers its removal. Use another process to
+      // simulate a later login that creates a new account under the same ID.
+      await addInAnotherProcess(f.paths, {
+        id: removed,
+        credential: removed === f.main ? MAIN_TOKEN : WORK_TOKEN,
+        identity: removed === f.main ? MAIN_IDENTITY : WORK_IDENTITY,
+      })
+    },
+  ],
+  [
+    'a changed token',
+    'after:roster',
+    async (f) => {
+      await f.store.rotate('work-route', {
+        ...WORK_TOKEN,
+        access: 'synthetic-rotated-access',
+      })
+    },
+  ],
+  [
+    'an added row',
+    'after:prepare',
+    async (f) => {
+      await f.store.add({
+        id: 'added-api',
+        credential: { ...API_KEY, apiKey: 'synthetic-added-key' },
+      })
+    },
+  ],
+]
+for (const [change, point, mutate] of credentialChanges) {
+  test(`resume refuses ${change} (${point})`, async () => {
     const f = await fixture()
     await interrupted(f, point)
     await mutate(f)
@@ -906,8 +914,8 @@ test('resume refuses a removed id re-added at a new epoch, a changed token and a
     })
     expect(await files(f)).toEqual(before)
     await expectPending(f.paths)
-  }
-})
+  })
+}
 
 async function changeRoutingPreference(f: Fixture): Promise<void> {
   // A separate store instance stands in for a user editing preferences.
@@ -919,38 +927,38 @@ async function changeRoutingPreference(f: Fixture): Promise<void> {
   })
 }
 
-test('resume refuses changed preferences, runtime metadata and roster before any forward write', async () => {
-  const mutations: Array<[string, string, (f: Fixture) => Promise<void>]> = [
-    ['after:prepare', 'settings-conflict', changeRoutingPreference],
-    ['after:roster', 'settings-conflict', changeRoutingPreference],
-    ['after:runtime', 'settings-conflict', changeRoutingPreference],
-    ['after:remove:0', 'settings-conflict', changeRoutingPreference],
-    [
-      'after:prepare',
-      'runtime-conflict',
-      async (f) => {
-        await updateNativeRuntime(
-          f.paths.runtime,
-          f.paths.storageId,
-          (state) => {
-            const entry = state.accounts['api-route']
-            if (entry) entry.lastUsed = 999
-            return state
-          },
-        )
-      },
-    ],
-    [
-      'after:roster',
-      'roster-conflict',
-      async (f) => {
-        const roster = JSON.parse(await readFile(f.paths.roster, 'utf8'))
-        roster.rows[1].label = 'Renamed'
-        await writeFile(f.paths.roster, JSON.stringify(roster), { mode: 0o600 })
-      },
-    ],
-  ]
-  for (const [point, code, mutate] of mutations) {
+// One test per interruption point and conflict, each on its own fixture, so a
+// failure names the pair.
+const forwardWriteConflicts: Array<
+  [string, string, (f: Fixture) => Promise<void>]
+> = [
+  ['after:prepare', 'settings-conflict', changeRoutingPreference],
+  ['after:roster', 'settings-conflict', changeRoutingPreference],
+  ['after:runtime', 'settings-conflict', changeRoutingPreference],
+  ['after:remove:0', 'settings-conflict', changeRoutingPreference],
+  [
+    'after:prepare',
+    'runtime-conflict',
+    async (f) => {
+      await updateNativeRuntime(f.paths.runtime, f.paths.storageId, (state) => {
+        const entry = state.accounts['api-route']
+        if (entry) entry.lastUsed = 999
+        return state
+      })
+    },
+  ],
+  [
+    'after:roster',
+    'roster-conflict',
+    async (f) => {
+      const roster = JSON.parse(await readFile(f.paths.roster, 'utf8'))
+      roster.rows[1].label = 'Renamed'
+      await writeFile(f.paths.roster, JSON.stringify(roster), { mode: 0o600 })
+    },
+  ],
+]
+for (const [point, code, mutate] of forwardWriteConflicts) {
+  test(`resume after ${point} refuses a ${code} before any forward write`, async () => {
     const f = await fixture()
     await interrupted(f, point)
     await mutate(f)
@@ -963,8 +971,8 @@ test('resume refuses changed preferences, runtime metadata and roster before any
     ).rejects.toMatchObject({ code })
     expect(await files(f), `${point} ${code}`).toEqual(before)
     await expectPending(f.paths)
-  }
-})
+  })
+}
 
 test('a preference changed during a run refuses before the next roster, runtime or removal write', async () => {
   for (const point of ['before:roster', 'before:runtime', 'before:remove:0']) {
