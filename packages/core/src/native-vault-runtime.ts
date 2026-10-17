@@ -42,7 +42,10 @@ import {
 } from './native-custody.ts'
 import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
 import { fromNativeQuotaMap, nativeQuotaCodec } from './native-quota-codec.ts'
-import { NativeQuotaObservations } from './native-quota-observations.ts'
+import {
+  NativeQuotaObservations,
+  nativePollQuotaGenerallyExhausted,
+} from './native-quota-observations.ts'
 import {
   buildNativeVaultRosterSeed,
   type NativeRosterSeedInput,
@@ -821,7 +824,7 @@ export function createNativeVaultRuntime(
           ]),
           accountUuid,
           entry: { quota, checkedAt, refreshAfter: checkedAt },
-          generalExhausted: false,
+          generalExhausted: nativePollQuotaGenerallyExhausted(quota),
           quotaErrorClearedAt,
         },
         () => runtime.publish(result.receipt, { quota, quotaErrorClearedAt }),

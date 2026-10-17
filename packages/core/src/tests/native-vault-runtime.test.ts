@@ -1559,11 +1559,13 @@ test('vault poll returns and native views use its reading before runtime sync wh
             utilization: 98,
             resets_at: new Date(now + 3_600_000).toISOString(),
           },
+          seven_day: { utilization: 100 },
         }),
       { preconnect: fetch.preconnect },
     ),
   )
   await arrived.wait
+  expect(native.quotaObservations.get('main')?.generalExhausted).toBe(true)
   expect(polled.five_hour?.remainingPercent).toBe(2)
   expect(
     (await native.read()).accounts.find((row) => row.id === 'main')?.quota

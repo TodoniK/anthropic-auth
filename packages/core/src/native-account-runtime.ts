@@ -59,6 +59,7 @@ import {
 import {
   type NativeQuotaObservations,
   nativeLocalQuotaLineage,
+  nativePollQuotaGenerallyExhausted,
 } from './native-quota-observations.ts'
 import type {
   NativeKnownCredentialSubject,
@@ -1562,7 +1563,7 @@ export function createNativeAccountRuntime(
             checkedAt: quota.checkedAt ?? now(),
             refreshAfter: quota.checkedAt ?? now(),
           },
-          generalExhausted: false,
+          generalExhausted: nativePollQuotaGenerallyExhausted(quota),
           quotaErrorClearedAt,
         },
         () =>

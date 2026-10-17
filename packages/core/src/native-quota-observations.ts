@@ -22,6 +22,14 @@ export type NativeQuotaObservation = {
   quotaErrorClearedAt?: number
 }
 
+export function nativePollQuotaGenerallyExhausted(
+  quota: OAuthQuotaSnapshot,
+): boolean {
+  return (['five_hour', 'seven_day'] as const).some(
+    (key) => (quota[key]?.remainingPercent ?? 1) <= 0,
+  )
+}
+
 export function nativeLocalQuotaLineage(
   binding: NativeLocalPoolBinding & { readonly identity: string },
 ): string

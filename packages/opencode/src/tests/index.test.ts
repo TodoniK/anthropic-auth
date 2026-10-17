@@ -17718,6 +17718,97 @@ describe('auth.loader', () => {
       authHeader: 'authorization-bearer' as const,
     }
 
+    for (const exhausted of [true, false]) {
+      test(`pending seven-day poll ${exhausted ? 'confirms general exhaustion for paid fallback' : 'with quota left cannot license paid fallback'} while runtime sync is held`, async () => {
+        await useTempAccountFile(
+          harvestStorage([apiFallbackForHeaderTests], {
+            routing: { mode: 'fallback-first' },
+            quota: { enabled: true },
+          }),
+        )
+        const lifetime = bodyLifetime()
+        const entered = lifetime.gate()
+        const release = lifetime.gate()
+        let servingRuntime:
+          | ReturnType<typeof Core.createNativeAccountRuntime>
+          | undefined
+        const factory = Core.createNativeAccountRuntime
+        const factorySpy = spyOn(
+          Core,
+          'createNativeAccountRuntime',
+        ).mockImplementation((options) => {
+          servingRuntime = factory(options)
+          return servingRuntime
+        })
+        lifetime.deferCleanup(() => factorySpy.mockRestore())
+        const authorizations: Array<string | null> = []
+        globalThis.fetch = mock(
+          withNativeAdmission(
+            (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+              if (extractUrl(input) === QUOTA_URL)
+                return Promise.resolve(
+                  Response.json({
+                    five_hour: { utilization: 20 },
+                    seven_day: { utilization: exhausted ? 100 : 20 },
+                  }),
+                )
+              authorizations.push(
+                new Headers(init?.headers).get('authorization'),
+              )
+              return Promise.resolve(new Response('ok'))
+            },
+          ),
+        ) as unknown as typeof fetch
+        const result = await loadFetch()
+        if (!servingRuntime || !migratedPool)
+          throw new Error('Missing serving pool')
+        const runtime = servingRuntime
+        const runtimePath = migratedPool.paths.runtime
+        const realOpen = filesystem.open
+        let intercepted = false
+        const openSpy = spyOn(filesystem, 'open').mockImplementation(
+          async (path, flags, mode) => {
+            const file = await realOpen(path, flags, mode)
+            if (String(path).startsWith(`${runtimePath}.native-runtime.`)) {
+              const sync = file.sync.bind(file)
+              file.sync = async () => {
+                const staged: {
+                  accounts: Record<string, { quotaErrorClearedAt?: number }>
+                } = JSON.parse(await readFile(path, 'utf8'))
+                if (
+                  !intercepted &&
+                  Object.values(staged.accounts).some(
+                    (entry) => entry.quotaErrorClearedAt,
+                  )
+                ) {
+                  intercepted = true
+                  entered.open()
+                  await release.wait
+                }
+                return sync()
+              }
+            }
+            return file
+          },
+        )
+        lifetime.deferCleanup(() => openSpy.mockRestore())
+        await runtime.fetchQuota('main')
+        await entered.wait
+        expect((await result.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+        expect(authorizations).toEqual([
+          exhausted ? 'Bearer header-key' : 'Bearer sk-ant-oat01-main-access',
+        ])
+        // Polls replace the per-account entry also used by response headers.
+        // Its exhaustion flag must mean no five-hour or seven-day quota remains;
+        // rounding a display to 100% is not permission to spend on an API key.
+        expect(runtime.quotaObservations.get('main')?.generalExhausted).toBe(
+          exhausted,
+        )
+        release.open()
+        await runtime.drainQuotaPublications()
+      })
+    }
+
     test('pending quota routes without waiting for header publication', async () => {
       await useTempAccountFile(
         harvestStorage([apiFallbackForHeaderTests], {

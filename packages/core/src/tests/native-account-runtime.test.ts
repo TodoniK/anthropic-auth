@@ -26,7 +26,10 @@ import {
   type NativeLocalCredentialServiceOptions,
 } from '../native-local-credential-service.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
-import { NativeQuotaObservations } from '../native-quota-observations.ts'
+import {
+  NativeQuotaObservations,
+  nativePollQuotaGenerallyExhausted,
+} from '../native-quota-observations.ts'
 import * as runtimeWriter from '../native-runtime.ts'
 import { readNativeRuntime } from '../native-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
@@ -1737,6 +1740,33 @@ test('supported OAuth successor with a failed account lookup keeps validation re
   const entry = metadata.state.accounts['imported-main']
   expect(entry?.validationRetry?.nextRetryAt).toBeGreaterThan(now)
   expect(entry?.credentialValidation).toBeUndefined()
+})
+
+test('poll general exhaustion requires a depleted standard window, not missing or scoped-only quota', () => {
+  const window = (remainingPercent: number) => ({
+    remainingPercent,
+    usedPercent: 100 - remainingPercent,
+    checkedAt: now,
+  })
+  expect(nativePollQuotaGenerallyExhausted({})).toBe(false)
+  expect(nativePollQuotaGenerallyExhausted({ five_hour: window(0) })).toBe(true)
+  expect(nativePollQuotaGenerallyExhausted({ seven_day: window(0) })).toBe(true)
+  expect(nativePollQuotaGenerallyExhausted({ seven_day: window(-1) })).toBe(
+    true,
+  )
+  expect(
+    nativePollQuotaGenerallyExhausted({
+      five_hour: window(1),
+      seven_day: window(1),
+    }),
+  ).toBe(false)
+  expect(
+    nativePollQuotaGenerallyExhausted({
+      scoped: [
+        { ...window(0), id: 'model', title: 'Model', modelName: 'Model' },
+      ],
+    }),
+  ).toBe(false)
 })
 
 test('poll overlay leaves committed headers alone without a matching pending poll', () => {
