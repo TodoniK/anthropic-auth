@@ -549,6 +549,175 @@ for (const mode of [
   })
 }
 
+/**
+ * A sticky-balanced Pi session over two vault accounts whose model endpoint is
+ * an owned loopback server. The first model send of the test is rejected with
+ * 401; every later send succeeds. `served` lists the vault credential each
+ * model send used, in order. `afterSend` sees each model response before Pi
+ * does.
+ */
+async function stickyRejectedFirstSend(
+  afterSend?: (response: Response) => void,
+) {
+  const f = await fixture('sticky-balanced')
+  f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+  const service = await f.native.service()
+  await service.vault.refresh()
+  await service.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: false },
+  }))
+  const served: string[] = []
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request) {
+      // Sticky routing needs current quota for both accounts before it sends.
+      if (new URL(request.url).pathname === '/api/oauth/usage')
+        return Response.json({
+          five_hour: { utilization: 0 },
+          seven_day: { utilization: 0 },
+        })
+      const index =
+        Number(
+          /vault-test-access-(\d+)$/.exec(
+            request.headers.get('authorization') ?? '',
+          )?.[1],
+        ) - 1
+      served.push(f.gets[index]?.credentialId ?? 'missing receipt')
+      if (served.length === 1)
+        return Response.json(
+          {
+            type: 'error',
+            error: { type: 'authentication_error', message: 'Synthetic 401' },
+          },
+          { status: 401 },
+        )
+      return success()
+    },
+  })
+  deferCleanup(() => server.stop(true))
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (
+        !url.pathname.startsWith('/v1/messages') &&
+        url.pathname !== '/api/oauth/usage'
+      )
+        throw new Error(`Unexpected outbound request: ${url.pathname}`)
+      const response = await originalFetch(
+        `http://127.0.0.1:${server.port}${url.pathname}${url.search}`,
+        init,
+      )
+      if (url.pathname.startsWith('/v1/messages')) afterSend?.(response)
+      return response
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  return { f, served }
+}
+
+test('Pi cancel during vault re-authorization after a 401 ends aborted and keeps the sticky account', async () => {
+  const { f, served } = await stickyRejectedFirstSend()
+  const entered = lifetimes.gate()
+  const release = lifetimes.gate()
+  const get = f.client.getScoped.bind(f.client)
+  let held = false
+  f.client.getScoped = async (input) => {
+    // The first read of the rejected credential after its 401 is the
+    // re-authorization. Hold it until the request is cancelled.
+    if (!held && served.length === 1 && input.credentialId === served[0]) {
+      held = true
+      entered.open()
+      await release.wait
+    }
+    return get(input)
+  }
+  const options = { sessionId: 'pi-cancel-during-reauth' }
+  const controller = new AbortController()
+  const pending = streamCortexKitAnthropic(model, context, {
+    ...options,
+    signal: controller.signal,
+  }).result()
+  await entered.wait
+  controller.abort()
+  const cancelled = await pending
+  release.open()
+  expect(cancelled.stopReason).toBe('aborted')
+  expect(cancelled.errorMessage).not.toContain('401')
+  const assigned = served[0]
+  if (!assigned) throw new Error('No model send reached the provider')
+  expect(served).toEqual([assigned])
+  // The 401 arrived before the cancel; it is reported once, before
+  // re-authorization starts.
+  expect(
+    f.reports.map((report) => [report.credentialId, report.providerStatus]),
+  ).toEqual([[assigned, 401]])
+  const next = await streamCortexKitAnthropic(model, context, options).result()
+  expect(next.stopReason).toBe('stop')
+  expect(served).toEqual([assigned, assigned])
+  expect(f.reports).toHaveLength(1)
+})
+
+test('Pi cancel after a 401 arrives and before re-authorization ends aborted and keeps the sticky account', async () => {
+  const controller = new AbortController()
+  let readsAtRejection: number | undefined
+  const { f, served } = await stickyRejectedFirstSend((response) => {
+    // Cancel once the rejection has arrived, before Pi acts on it.
+    if (response.status !== 401) return
+    readsAtRejection = f.gets.length
+    controller.abort()
+  })
+  const options = { sessionId: 'pi-cancel-after-401' }
+  const cancelled = await streamCortexKitAnthropic(model, context, {
+    ...options,
+    signal: controller.signal,
+  }).result()
+  expect(cancelled.stopReason).toBe('aborted')
+  const assigned = served[0]
+  if (!assigned) throw new Error('No model send reached the provider')
+  expect(served).toEqual([assigned])
+  // Nothing was read from the vault after the cancel: no re-authorization
+  // and no authorization of another account.
+  expect(f.gets).toHaveLength(readsAtRejection ?? -1)
+  expect(
+    f.reports.map((report) => [report.credentialId, report.providerStatus]),
+  ).toEqual([[assigned, 401]])
+  const next = await streamCortexKitAnthropic(model, context, options).result()
+  expect(next.stopReason).toBe('stop')
+  expect(served).toEqual([assigned, assigned])
+  expect(f.reports).toHaveLength(1)
+})
+
+test('Pi failed vault re-authorization after a 401 still reports and moves the sticky account', async () => {
+  const { f, served } = await stickyRejectedFirstSend()
+  const get = f.client.getScoped.bind(f.client)
+  let refused = false
+  f.client.getScoped = async (input) => {
+    if (!refused && served.length === 1 && input.credentialId === served[0]) {
+      refused = true
+      throw new Error('synthetic vault unavailable')
+    }
+    return get(input)
+  }
+  const options = { sessionId: 'pi-failed-reauth' }
+  const first = await streamCortexKitAnthropic(model, context, options).result()
+  expect(first.stopReason).toBe('stop')
+  const [rejected, migrated] = served
+  if (!rejected || !migrated)
+    throw new Error('The rejected send was not rerouted')
+  expect(served).toHaveLength(2)
+  expect(migrated).not.toBe(rejected)
+  expect(
+    f.reports.map((report) => [report.credentialId, report.providerStatus]),
+  ).toEqual([[rejected, 401]])
+  expect(
+    (await streamCortexKitAnthropic(model, context, options).result())
+      .stopReason,
+  ).toBe('stop')
+  expect(served).toEqual([rejected, migrated, migrated])
+})
+
 registerTest.each([500, 401])(
   'relay status %i falls back direct with a fresh version-fenced credential',
   wrapBody(async (relayStatus) => {

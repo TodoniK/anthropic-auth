@@ -730,6 +730,11 @@ async function sendAnthropicRequest(options: {
         }
       }
       if (attempt) await report(attempt, response.status, 'direct')
+      // The vault has been told about the 401 above. If the request was
+      // cancelled after the 401 arrived (before or while the vault was asked
+      // for a newer credential), end it as cancelled here.
+      if (attempt && response.status === 401)
+        await endIfCancelled(response, init.signal)
       await dumpDirectRequest({
         affinity: relayAffinity,
         route:
@@ -834,9 +839,29 @@ async function sendAnthropicRequest(options: {
       await Promise.all(relayReports)
     }
   }
+  // A relayed 401 is reported to the vault as soon as the relay returns it.
+  // If the request was cancelled since, end it as cancelled here.
+  if (relay401Attempt && response.status === 401)
+    await endIfCancelled(response, init.signal)
   if (response.ok && lastTransport === 'relay' && relayAttempt)
     markServed(relayAttempt)
   return response
+}
+
+/**
+ * If the request's signal is aborted, cancels the response body and throws the
+ * signal's abort error; otherwise does nothing. Call it before a rejected
+ * response is handed to account routing. Routing treats a returned 401 as a
+ * failure of the account and may move the session to another account (sticky
+ * migration); a request the user cancelled must end as cancelled instead.
+ */
+async function endIfCancelled(
+  response: Response,
+  signal: AbortSignal | null | undefined,
+) {
+  if (!signal?.aborted) return
+  await response.body?.cancel().catch(() => {})
+  signal.throwIfAborted()
 }
 
 function quotaSnapshotIsExhausted(
@@ -1466,6 +1491,11 @@ async function executeWithFallback(options: {
       }
 
       if (migrate) {
+        // A cancelled request must not move the session's account.
+        await endIfCancelled(
+          preflight instanceof Response ? preflight : response,
+          options.streamOptions?.signal,
+        )
         const failedRouteId = route.id
         routes = await buildStickyRoutes(options.model.id)
         if (

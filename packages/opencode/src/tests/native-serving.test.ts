@@ -886,12 +886,14 @@ async function sendNative(
   model = 'claude-sonnet-4-6',
   sessionId = `synthetic-session-${directory}`,
   stream = false,
+  signal?: AbortSignal,
 ) {
   const options = await load(plugin, async () =>
     custodyTombstoneOAuth('anthropic'),
   )
   return requestFetch(options)('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    signal,
     headers: {
       'content-type': 'application/json',
       'x-session-affinity': sessionId,
@@ -2624,4 +2626,234 @@ test('OpenCode routes normally during roster deferral without publishing an empt
     runtime.close()
   }
   expect(await readFile(configPath, 'utf8')).toBe(legacy)
+})
+
+/**
+ * An enrolled host serving two vault accounts with sticky-balanced routing,
+ * directly or through an HTTP relay. Model sends reach an owned loopback
+ * server that rejects the test's first send with 401 and accepts every later
+ * one. `served` lists the vault credential each model send used, in order.
+ * `afterSend` sees each model response before the plugin does.
+ */
+async function stickyVaultRejectedFirstSend(
+  relay: boolean,
+  afterSend?: (response: Response) => void,
+) {
+  const fixture = await migrateServingFixture('claustrum', true)
+  const relayServer = relay ? new MockRelayServer() : undefined
+  if (relayServer) relays.add(relayServer)
+  const relayAddress = await relayServer?.start({
+    token: 'synthetic-native-relay-token',
+  })
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+    vault: { connect: async () => fixture.scopedClient },
+  })
+  try {
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      quota: { enabled: true },
+      routing: { mode: 'sticky-balanced' },
+    }))
+    // Sticky routing chooses only between accounts with current quota.
+    const window = () => ({
+      remainingPercent: 90,
+      usedPercent: 10,
+      checkedAt: Date.now(),
+    })
+    for (const route of (await runtime.read()).accounts) {
+      const receipt = await runtime.authorizeVault(route.id)
+      expect(
+        await runtime.vault.publish(receipt, {
+          quota: {
+            checkedAt: Date.now(),
+            five_hour: window(),
+            seven_day: window(),
+            accountIdentity: receipt.accountIdentity,
+          },
+        }),
+      ).toBe(true)
+    }
+    if (relayAddress)
+      await runtime.updateRelay({
+        enabled: true,
+        url: relayAddress.url,
+        token: 'synthetic-native-relay-token',
+        transport: 'http',
+        fallbackToDirect: false,
+      })
+  } finally {
+    runtime.close()
+  }
+  const served: string[] = []
+  const upstream = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request) {
+      const authorization = request.headers.get('authorization') ?? ''
+      served.push(
+        authorization.includes('-fallback-')
+          ? 'oauth:secondary'
+          : 'oauth:anthropic',
+      )
+      // An Anthropic request id is what lets a relayed status count as upstream.
+      const headers = { 'request-id': `req_synthetic_sticky_${served.length}` }
+      if (served.length === 1)
+        return Response.json(
+          {
+            type: 'error',
+            error: {
+              type: 'authentication_error',
+              message: 'Synthetic physical rejection',
+            },
+          },
+          { status: 401, headers },
+        )
+      return Response.json(
+        {
+          id: 'synthetic-message',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'native-serving-ok' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        { headers },
+      )
+    },
+  })
+  lifetimes.deferCleanup(() => upstream.stop(true))
+  network.mockImplementation(async (input, init) => {
+    const url = input instanceof Request ? input.url : input.toString()
+    if (relayAddress && url.startsWith(relayAddress.url))
+      return originalFetch(input, init)
+    if (url.includes('/v1/messages')) {
+      const target = new URL(url)
+      const response = await originalFetch(
+        `http://127.0.0.1:${upstream.port}${target.pathname}${target.search}`,
+        init,
+      )
+      afterSend?.(response)
+      return response
+    }
+    return fixture.fetchProvider(input, init)
+  })
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  return { fixture, served, plugin }
+}
+
+const reportedRecords = (fixture: ServingFixture) =>
+  fixture.scopedReports.map((report) => [
+    report.credentialId,
+    report.recordVersion,
+    report.providerStatus,
+  ])
+
+for (const relay of [false, true]) {
+  const transport = relay ? 'HTTP relay' : 'direct'
+  test(`vault ${transport} cancel during 401 re-authorization ends aborted, reports the 401 once and keeps the sticky account`, async () => {
+    const { fixture, served, plugin } =
+      await stickyVaultRejectedFirstSend(relay)
+    const entered = lifetimes.gate()
+    const release = lifetimes.gate()
+    const get = fixture.scopedClient.getScoped.bind(fixture.scopedClient)
+    let held = false
+    fixture.scopedClient.getScoped = async (input) => {
+      // The first read of the rejected credential after its 401 is the
+      // re-authorization. Hold it until the request is cancelled.
+      if (!held && served.length === 1 && input.credentialId === served[0]) {
+        held = true
+        entered.open()
+        await release.wait
+      }
+      return get(input)
+    }
+    const sessionId = `synthetic-cancel-${relay ? 'relay' : 'direct'}`
+    const controller = new AbortController()
+    const pending = sendNative(
+      plugin,
+      undefined,
+      sessionId,
+      false,
+      controller.signal,
+    ).then(
+      (response) => response.status,
+      (error: unknown) => error,
+    )
+    await entered.wait
+    controller.abort()
+    const outcome = await pending
+    release.open()
+    expect(outcome).toBe(controller.signal.reason)
+    const assigned = served[0]
+    if (!assigned) throw new Error('No model send reached the provider')
+    expect(served).toEqual([assigned])
+    expect(reportedRecords(fixture)).toEqual([[assigned, 1, 401]])
+    expect((await sendNative(plugin, undefined, sessionId)).status).toBe(200)
+    expect(served).toEqual([assigned, assigned])
+    expect(fixture.scopedReports).toHaveLength(1)
+  })
+
+  test(`vault ${transport} failed 401 re-authorization still reports the 401 and moves the sticky account`, async () => {
+    const { fixture, served, plugin } =
+      await stickyVaultRejectedFirstSend(relay)
+    const get = fixture.scopedClient.getScoped.bind(fixture.scopedClient)
+    let refused = false
+    fixture.scopedClient.getScoped = async (input) => {
+      if (!refused && served.length === 1 && input.credentialId === served[0]) {
+        refused = true
+        throw new Error('synthetic vault unavailable')
+      }
+      return get(input)
+    }
+    const sessionId = `synthetic-refused-${relay ? 'relay' : 'direct'}`
+    expect((await sendNative(plugin, undefined, sessionId)).status).toBe(200)
+    const [rejected, migrated] = served
+    if (!rejected || !migrated)
+      throw new Error('The rejected send was not rerouted')
+    expect(served).toHaveLength(2)
+    expect(migrated).not.toBe(rejected)
+    expect(reportedRecords(fixture)).toEqual([[rejected, 1, 401]])
+    expect((await sendNative(plugin, undefined, sessionId)).status).toBe(200)
+    expect(served).toEqual([rejected, migrated, migrated])
+  })
+}
+
+test('vault direct cancel after a 401 arrives and before re-authorization ends aborted, reports the 401 once and keeps the sticky account', async () => {
+  const controller = new AbortController()
+  let readsAtRejection: number | undefined
+  const { fixture, served, plugin } = await stickyVaultRejectedFirstSend(
+    false,
+    (response) => {
+      // Cancel once the rejection has arrived, before the plugin acts on it.
+      if (response.status !== 401) return
+      readsAtRejection = fixture.authorizedGets.length
+      controller.abort()
+    },
+  )
+  const sessionId = 'synthetic-cancel-after-401'
+  const outcome = await sendNative(
+    plugin,
+    undefined,
+    sessionId,
+    false,
+    controller.signal,
+  ).then(
+    (response) => response.status,
+    (error: unknown) => error,
+  )
+  expect(outcome).toBe(controller.signal.reason)
+  const assigned = served[0]
+  if (!assigned) throw new Error('No model send reached the provider')
+  expect(served).toEqual([assigned])
+  // Nothing was read from the vault after the cancel: no re-authorization
+  // and no authorization of another account.
+  expect(fixture.authorizedGets).toHaveLength(readsAtRejection ?? -1)
+  expect(reportedRecords(fixture)).toEqual([[assigned, 1, 401]])
+  expect((await sendNative(plugin, undefined, sessionId)).status).toBe(200)
+  expect(served).toEqual([assigned, assigned])
+  expect(fixture.scopedReports).toHaveLength(1)
 })

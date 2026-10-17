@@ -1136,6 +1136,44 @@ describe('OC2 source over actual native services', () => {
       7, 8,
     ])
   })
+  // OpenCode 2 reports a vault 401 when it arrives, before re-authorizing.
+  // The source's session signal is the cancellation that reaches the
+  // re-authorization; a cancel there must reject, not offer a reroute.
+  test('vault 401 re-authorization cancelled with its session rejects after one report and keeps the sticky account', async () => {
+    const fixture = await vaultWithFallback()
+    const reports: string[] = []
+    fixture.client.reportAuthFailureScoped = async (input) => {
+      reports.push(`${input.credentialId}:${input.providerStatus}`)
+    }
+    const native = source(fixture.runtime, fixture.paths)
+    const session = { ...scope, sessionID: 'ses_vault_cancel_reauth' }
+    expect(await native.chooseAccount(session)).toBe('main')
+    const served = await native.authorizeAccount(session, 'main')
+    if (!served) throw new Error('Vault authorization refused')
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const get = fixture.client.getScoped.bind(fixture.client)
+    fixture.client.getScoped = async (input) => {
+      entered.resolve()
+      await release.promise
+      return get(input)
+    }
+    cleanups.push(() => release.resolve())
+    const pending = native.limitFromResponse?.({
+      ...context(served.provenance),
+      sessionID: session.sessionID,
+      status: 401,
+      headers: new Headers({ 'request-id': 'req_vault_cancel' }),
+      body: async () => '{}',
+    })
+    await entered.promise
+    native.forgetSession?.(session.sessionID)
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    release.resolve()
+    fixture.client.getScoped = get
+    expect(reports).toEqual(['oauth:anthropic:401'])
+    expect(await native.chooseAccount(session)).toBe('main')
+  })
   test('unchanged vault version cannot authorize a 401 retry', async () => {
     const fixture = await vault([7, 7])
     const native = source(fixture.runtime, fixture.paths)

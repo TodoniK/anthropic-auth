@@ -330,6 +330,22 @@ function localInvalidRequestResponse(message: string): Response {
   return response
 }
 
+/**
+ * If the request's signal is aborted, cancels the response body and throws the
+ * signal's abort error; otherwise does nothing. Call it before a rejected
+ * response is handed to account routing. Routing treats a returned 401 as a
+ * failure of the account and may move the session to another account (sticky
+ * migration); a request the user cancelled must end as cancelled instead.
+ */
+async function endIfCancelled(
+  response: Response,
+  signal: AbortSignal | null | undefined,
+) {
+  if (!signal?.aborted) return
+  await response.body?.cancel().catch(() => {})
+  signal.throwIfAborted()
+}
+
 // Selecting another account cannot repair locally invalid conversation history.
 // Provider-generated 400 responses still follow the configured fallbackOn list.
 function shouldFallbackResponse(
@@ -7650,6 +7666,11 @@ const anthropicAuthPlugin = async (
             if (!usedDirectFetch && relay401Attempt) {
               await reportScoped401(relay401Attempt, 'relay_status_field')
             }
+            // The vault has been told about the 401 above. If the request was
+            // cancelled after the 401 arrived (before or while the vault was
+            // asked for a newer credential), end it as cancelled here.
+            if (response.status === 401)
+              await endIfCancelled(response, init?.signal)
             if (response.ok) {
               usagePublications.publish(async () => {
                 if (served.scopedAttempt)
@@ -9208,6 +9229,8 @@ const anthropicAuthPlugin = async (
                     }
 
                     if (migrate) {
+                      // A cancelled request must not move the session's account.
+                      await endIfCancelled(inspected.response, init?.signal)
                       const failedRouteId = route.id
                       stickyRoutes = await buildStickyOAuthRoutes({
                         storage: stickyRoutes.storage,
