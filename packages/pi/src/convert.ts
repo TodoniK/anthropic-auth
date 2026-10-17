@@ -399,8 +399,11 @@ function addEphemeralCacheControl(body: AnthropicRequestBody): void {
     const message = body.messages[index]
     if (message?.role !== 'user') continue
     const content = message.content
-    if (Array.isArray(content)) {
-      const lastBlock = content.at(-1)
+    if (typeof content === 'string') {
+      message.content = [{ type: 'text', text: content }]
+    }
+    if (Array.isArray(message.content)) {
+      const lastBlock = message.content.at(-1)
       if (lastBlock && typeof lastBlock === 'object') {
         lastBlock.cache_control = { type: 'ephemeral' }
       }

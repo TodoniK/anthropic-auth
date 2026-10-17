@@ -780,3 +780,21 @@ expect_message = "Expected promise that resolves"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "pi-cache-marker-text-only-latest-user"
+guards = "The newest plain-text user message must be represented as a block so it receives its cache breakpoint."
+file = "packages/pi/src/convert.ts"
+old = '''    if (typeof content === 'string') {
+      message.content = [{ type: 'text', text: content }]
+    }'''
+new = '''    // NON-VACUITY BREAK: leave the newest plain-text user message unmarked'''
+test_file = "packages/pi/src/tests/convert.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/pi/src/tests/convert.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["buildAnthropicRequest — cache breakpoint budget > text-only newest user gets the fourth explicit cache marker"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
+broad_report = "tmp/mutations/pi.xml"
+broad_id = "{name}"

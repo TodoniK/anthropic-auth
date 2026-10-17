@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  CLAUDE_CODE_ENTRYPOINT,
+  CLAUDE_CODE_IDENTITY,
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
   type ProviderAccountUuid,
@@ -217,7 +219,18 @@ describe('buildAnthropicRequest — trailing assistant boundary', () => {
       userMsg('hello'),
       assistantMsg(' \n\t'),
     ])
-    expect(messages).toEqual([{ role: 'user', content: 'hello' }])
+    expect(messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'hello',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      },
+    ])
   })
 })
 
@@ -225,13 +238,31 @@ describe('convertMessages — basic transforms', () => {
   test('converts user text message', async () => {
     const messages = await buildMessages([userMsg('hello world')])
     expect(messages.length).toBe(1)
-    expect(messages[0]).toEqual({ role: 'user', content: 'hello world' })
+    expect(messages[0]).toEqual({
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: 'hello world',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    })
   })
 
   test('skips empty user messages', async () => {
     const messages = await buildMessages([userMsg(''), userMsg('real message')])
     expect(messages.length).toBe(1)
-    expect(messages[0]).toEqual({ role: 'user', content: 'real message' })
+    expect(messages[0]).toEqual({
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: 'real message',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    })
   })
 
   test('converts assistant text blocks', async () => {
@@ -330,7 +361,13 @@ describe('convertMessages — basic transforms', () => {
     const messages = await buildMessages([userMsg('hello \uD800 world')])
     expect(messages[0]).toEqual({
       role: 'user',
-      content: 'hello \uFFFD world',
+      content: [
+        {
+          type: 'text',
+          text: 'hello \uFFFD world',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
     })
   })
 
@@ -341,7 +378,13 @@ describe('convertMessages — basic transforms', () => {
     const messages = await buildMessages([userMsg('hi \uD83D\uDE00 there')])
     expect(messages[0]).toEqual({
       role: 'user',
-      content: 'hi \uD83D\uDE00 there',
+      content: [
+        {
+          type: 'text',
+          text: 'hi \uD83D\uDE00 there',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
     })
   })
 
@@ -521,7 +564,16 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
   test('leaves system[] and messages untouched when no prompt is set', async () => {
     const body = await buildBody([userMsg('hello')])
     expect(body.system).toHaveLength(2)
-    expect(body.messages[0]).toEqual({ role: 'user', content: 'hello' })
+    expect(body.messages[0]).toEqual({
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: 'hello',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    })
   })
 
   test('pins the Claude Code suffix by Pi session across compacted history', async () => {
@@ -1262,7 +1314,16 @@ describe('buildAnthropicRequest — host system prompt shapes', () => {
   test('treats an empty block list as no prompt', async () => {
     const body = await buildBody([])
     expect(body.system).toHaveLength(2)
-    expect(body.messages[0]).toEqual({ role: 'user', content: 'hello' })
+    expect(body.messages[0]).toEqual({
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: 'hello',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    })
   })
 })
 
@@ -1297,6 +1358,193 @@ describe('buildAnthropicRequest — cache breakpoint budget', () => {
 
   const countBreakpoints = (body: unknown) =>
     JSON.stringify(body).split('"cache_control"').length - 1
+
+  async function buildLatestTextOnlyBody(cache: {
+    enabled: boolean
+    mode: 'explicit' | 'automatic' | 'hybrid'
+  }) {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      {
+        messages: [
+          userMsg('first user message'),
+          assistantMsg('previous response'),
+          userMsg('newest user message'),
+        ],
+        systemPrompt: PI_PROMPT,
+        tools: [
+          {
+            name: 'read',
+            description: 'read a file',
+            parameters: { properties: {}, required: [] },
+          },
+        ],
+      } satisfies Context,
+      undefined,
+      cache,
+    )
+    return body
+  }
+
+  test('text-only newest user gets the fourth explicit cache marker', async () => {
+    const body = await buildLatestTextOnlyBody({
+      enabled: true,
+      mode: 'explicit',
+    })
+    expect(countBreakpoints(body)).toBe(4)
+    expect(body.messages.at(-1)?.content).toEqual([
+      {
+        type: 'text',
+        text: 'newest user message',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ])
+  })
+
+  test('only wraps the newest text-only user and leaves earlier history unchanged', async () => {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      {
+        messages: [
+          userMsg('earlier user message'),
+          assistantMsg('previous response'),
+          userMsg('newest user message'),
+        ],
+        tools: [],
+      } satisfies Context,
+      undefined,
+      defaultCache,
+    )
+
+    expect(body.messages).toEqual([
+      { role: 'user', content: 'earlier user message' },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'previous response' }],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'newest user message',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      },
+    ])
+  })
+
+  test('automatic cache mode replaces the text-only request markers with one 1h control', async () => {
+    const body = await buildLatestTextOnlyBody({
+      enabled: true,
+      mode: 'automatic',
+    })
+    expect(countBreakpoints(body)).toBe(1)
+    expect(body.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+    expect(body.system?.some((block) => block.cache_control)).toBe(false)
+    expect(body.tools?.some((tool) => tool.cache_control)).toBe(false)
+    expect(
+      body.messages.some(
+        (message) =>
+          Array.isArray(message.content) &&
+          message.content.some((block) => block.cache_control),
+      ),
+    ).toBe(false)
+    expect(body.messages.at(-1)?.content).toEqual([
+      { type: 'text', text: 'newest user message' },
+    ])
+  })
+
+  test('hybrid cache mode keeps the four text-only request holders at 1h', async () => {
+    const body = await buildLatestTextOnlyBody({
+      enabled: true,
+      mode: 'hybrid',
+    })
+    const firstUserBlocks = body.messages[0]?.content as Array<
+      Record<string, unknown>
+    >
+    const newestUserBlocks = body.messages.at(-1)?.content as Array<
+      Record<string, unknown>
+    >
+    const oneHourControl = { type: 'ephemeral', ttl: '1h' }
+
+    expect(countBreakpoints(body)).toBe(4)
+    expect(body.cache_control).toBeUndefined()
+    expect(firstUserBlocks[0]?.cache_control).toEqual(oneHourControl)
+    expect(body.system?.at(-1)?.cache_control).toEqual(oneHourControl)
+    expect(body.tools?.at(-1)?.cache_control).toEqual(oneHourControl)
+    expect(newestUserBlocks[0]?.cache_control).toEqual(oneHourControl)
+  })
+
+  test('leaves the full body for an image-bearing array user message unchanged', async () => {
+    const firstUserText = 'earlier user message'
+    const text = 'look at this'
+    const imageData = 'aGVsbG8='
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      {
+        messages: [
+          userMsg(firstUserText),
+          assistantMsg('previous response'),
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text },
+              { type: 'image', mimeType: 'image/png', data: imageData },
+            ],
+            timestamp: 0,
+          } as Message,
+        ],
+        tools: [],
+      } satisfies Context,
+      undefined,
+      defaultCache,
+    )
+    const billingHeader =
+      `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.` +
+      `${computeCcVersionSuffix(firstUserText)}; cc_entrypoint=${CLAUDE_CODE_ENTRYPOINT}; cch=00000;`
+    const expected = {
+      model: TEST_MODEL_ID,
+      max_tokens: 16_384,
+      stream: true,
+      system: [
+        {
+          type: 'text',
+          text: billingHeader,
+        },
+        {
+          type: 'text',
+          text: CLAUDE_CODE_IDENTITY,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      messages: [
+        { role: 'user', content: firstUserText },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'previous response' }],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text },
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/png',
+                data: imageData,
+              },
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        },
+      ],
+    }
+
+    expect(JSON.stringify(body)).toBe(JSON.stringify(expected))
+  })
 
   test('places four breakpoints and no top-level control by default', async () => {
     const body = await buildBody({ enabled: false, mode: 'hybrid' })
