@@ -3,6 +3,11 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  createNativePoolStore,
+  resolveNativePoolPaths,
+} from '@cortexkit/anthropic-auth-core'
+import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
+import {
   buildExplicitBaseMessagesUrl,
   configureApiRouteHeaders,
   parseSse,
@@ -88,6 +93,109 @@ describe('Pi API fallback routing helpers', () => {
     await expect(readFile(storagePath, 'utf8')).rejects.toMatchObject({
       code: 'ENOENT',
     })
+  })
+
+  /**
+   * Save a Pi relay with the given URL, remove its stored transport (as in a
+   * configuration saved before the field existed or edited by hand), send one
+   * request and return the relay fetches and WebSocket connection attempts.
+   */
+  async function sendWithoutStoredTransport(
+    url: string,
+    transport: 'http' | 'websocket',
+  ) {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-relay-default-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+        relay: {
+          enabled: true,
+          url,
+          token: 'synthetic-pi-relay-token',
+          fallbackToDirect: false,
+          transport,
+        },
+      },
+      storagePath,
+    )
+    await createNativePoolStore({
+      paths: await resolveNativePoolPaths(storagePath),
+      quota: nativeQuotaCodec,
+    }).updateSettings((settings) => {
+      const { transport: _omitted, ...relay } = settings.relay as Record<
+        string,
+        unknown
+      >
+      settings.relay = relay
+    })
+    expect((await readNativePiFixture(storagePath)).relay?.transport).toBe(
+      undefined,
+    )
+
+    const sent: string[] = []
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const requested = input.toString()
+      if (requested.includes('/api/claude_cli/bootstrap'))
+        return new Response(
+          JSON.stringify({
+            oauth_account: { account_uuid: 'pi-relay-default-account' },
+          }),
+        )
+      sent.push(requested)
+      return new Response(
+        [
+          'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ].join(''),
+        { status: 200 },
+      )
+    }) as unknown as typeof fetch
+
+    // A failed WebSocket attempt falls back to the HTTP relay, so the fetch
+    // alone cannot show which transport was chosen. Record every socket and
+    // refuse it, letting the request finish over HTTP.
+    const sockets: string[] = []
+    const OriginalWebSocket = globalThis.WebSocket
+    globalThis.WebSocket = class {
+      constructor(socketUrl: string | URL) {
+        sockets.push(String(socketUrl))
+        throw new Error('this test refuses WebSocket relay connections')
+      }
+    } as unknown as typeof WebSocket
+    try {
+      const result = await streamCortexKitAnthropic(
+        anthropicModel,
+        anthropicContext,
+        { apiKey: 'sk-ant-oat-pi-relay', sessionId: 'ses_pi_relay_default' },
+      ).result()
+      return { result, sent, sockets }
+    } finally {
+      globalThis.WebSocket = OriginalWebSocket
+    }
+  }
+
+  test('a relay saved with an https URL and no transport sends over HTTP', async () => {
+    const { result, sent, sockets } = await sendWithoutStoredTransport(
+      'https://relay.invalid',
+      'http',
+    )
+    expect(sockets).toEqual([])
+    expect(result.stopReason).toBe('stop')
+    expect(sent).toEqual(['https://relay.invalid'])
+  })
+
+  test('a relay saved with a wss URL and no transport keeps using WebSocket', async () => {
+    const { sockets } = await sendWithoutStoredTransport(
+      'wss://relay.invalid',
+      'websocket',
+    )
+    expect(sockets).toHaveLength(1)
+    expect(sockets[0]).toStartWith('wss://relay.invalid/ws?')
   })
 
   test('sends Fable 5.1 thinking binding controls after compacted signed history', async () => {

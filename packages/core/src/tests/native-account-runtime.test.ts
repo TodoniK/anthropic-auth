@@ -36,6 +36,7 @@ import { readNativeRuntime } from '../native-runtime.ts'
 import { nativeVaultPaths } from '../native-vault-paths.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
+import { effectiveRelayStatus, effectiveRelayTransport } from '../relay.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
@@ -545,6 +546,154 @@ test('relay transport reads fresh private token while native public snapshots an
   expect(
     state.status === 'ready' ? state.state.relay : undefined,
   ).toBeUndefined()
+})
+
+test('a stored relay without a transport sends over HTTP and only an explicit websocket selects WebSocket', async () => {
+  const f = await fixture()
+  await f.runtime.updateRelay({
+    enabled: true,
+    url: 'https://relay.example.test',
+    transport: 'websocket',
+    fallbackToDirect: false,
+    token: 'synthetic-private-relay-ws',
+  })
+  expect((await f.runtime.getRelayConfig())?.transport).toBe('websocket')
+  expect(
+    effectiveRelayStatus((await f.runtime.read()).policyStorage.relay),
+  ).toEqual({ enabled: true, transport: 'websocket' })
+  // A configuration saved before the transport field existed, or edited by
+  // hand, has no transport at all.
+  await f.store.updateSettings((settings) => {
+    const { transport: _omitted, ...relay } = settings.relay as Record<
+      string,
+      unknown
+    >
+    settings.relay = relay
+  })
+  const snapshot = await f.runtime.read()
+  expect(snapshot.policyStorage.relay?.transport).toBeUndefined()
+  expect((await f.runtime.getRelayConfig())?.transport).toBe('http')
+  expect(effectiveRelayStatus(snapshot.policyStorage.relay)).toEqual({
+    enabled: true,
+    transport: 'http',
+  })
+  // Updating another relay field records the transport requests were using.
+  await f.runtime.updateRelay({ fallbackToDirect: true })
+  expect((await f.runtime.read()).policyStorage.relay?.transport).toBe('http')
+})
+
+test('a stored relay without a transport infers WebSocket from a wss URL, and a stored http transport with a wss URL stays refused', async () => {
+  const f = await fixture()
+  await f.runtime.updateRelay({
+    enabled: true,
+    url: 'wss://relay.example.test',
+    transport: 'websocket',
+    fallbackToDirect: false,
+    token: 'synthetic-private-relay-wss',
+  })
+  const setTransport = (transport: string | undefined) =>
+    f.store.updateSettings((settings) => {
+      const { transport: _omitted, ...relay } = settings.relay as Record<
+        string,
+        unknown
+      >
+      settings.relay = transport === undefined ? relay : { ...relay, transport }
+    })
+  await setTransport(undefined)
+  const snapshot = await f.runtime.read()
+  expect(snapshot.policyStorage.relay?.transport).toBeUndefined()
+  expect(effectiveRelayStatus(snapshot.policyStorage.relay)).toEqual({
+    enabled: true,
+    transport: 'websocket',
+  })
+  expect(await f.runtime.getRelayConfig()).toMatchObject({
+    url: 'wss://relay.example.test',
+    transport: 'websocket',
+  })
+  // An explicit HTTP transport is never overridden by the URL; HTTP cannot
+  // send to a WebSocket URL, so the configuration is refused.
+  await setTransport('http')
+  await expect(f.runtime.getRelayConfig()).rejects.toMatchObject({
+    code: 'publication-refused',
+  })
+})
+
+test('a relay without its private token is unusable for both dispatch and the status display', async () => {
+  const f = await fixture()
+  await f.runtime.updateRelay({
+    enabled: true,
+    url: 'https://relay.example.test',
+    transport: 'http',
+    token: 'synthetic-private-relay-gone',
+  })
+  const configured = (await f.runtime.read()).policyStorage.relay
+  expect(configured?.tokenConfigured).toBe(true)
+  expect(effectiveRelayStatus(configured)).toEqual({
+    enabled: true,
+    transport: 'http',
+  })
+  // Lose only the private token; the public settings still say enabled.
+  await runtimeWriter.updateNativeRuntime(
+    f.paths.runtime,
+    f.paths.storageId,
+    (state) => {
+      delete state.relay
+      return state
+    },
+  )
+  const snapshot = await f.runtime.read()
+  expect(snapshot.policyStorage.relay).toMatchObject({
+    enabled: true,
+    url: 'https://relay.example.test',
+    tokenConfigured: false,
+  })
+  expect(await f.runtime.getRelayConfig()).toBeNull()
+  expect(effectiveRelayStatus(snapshot.policyStorage.relay)).toBeNull()
+})
+
+test('effective relay transport and status follow the stored values', () => {
+  const https = 'https://relay.example.test'
+  const wss = 'wss://relay.example.test'
+  expect(effectiveRelayTransport(undefined, https)).toBe('http')
+  expect(effectiveRelayTransport(undefined, 'http://relay.example.test')).toBe(
+    'http',
+  )
+  expect(effectiveRelayTransport(undefined, undefined)).toBe('http')
+  // A missing transport is inferred from a WebSocket URL scheme.
+  expect(effectiveRelayTransport(undefined, wss)).toBe('websocket')
+  expect(effectiveRelayTransport(undefined, ' WS://relay.example.test')).toBe(
+    'websocket',
+  )
+  // A stored transport wins over the URL scheme.
+  expect(effectiveRelayTransport('http', wss)).toBe('http')
+  expect(effectiveRelayTransport('websocket', https)).toBe('websocket')
+  // An unrecognized stored value counts as missing.
+  expect(effectiveRelayTransport('ws', https)).toBe('http')
+  expect(effectiveRelayTransport('ws', wss)).toBe('websocket')
+  const relay = { enabled: true, url: https }
+  expect(
+    effectiveRelayStatus({ ...relay, url: wss, tokenConfigured: true }),
+  ).toEqual({ enabled: true, transport: 'websocket' })
+  expect(effectiveRelayStatus(undefined)).toBeNull()
+  expect(effectiveRelayStatus(relay)).toBeNull()
+  expect(effectiveRelayStatus({ ...relay, token: ' ' })).toBeNull()
+  expect(effectiveRelayStatus({ ...relay, token: 'legacy-token' })).toEqual({
+    enabled: true,
+    transport: 'http',
+  })
+  expect(
+    effectiveRelayStatus({
+      ...relay,
+      tokenConfigured: true,
+      transport: 'websocket',
+    }),
+  ).toEqual({ enabled: true, transport: 'websocket' })
+  expect(
+    effectiveRelayStatus({ ...relay, enabled: false, tokenConfigured: true }),
+  ).toBeNull()
+  expect(
+    effectiveRelayStatus({ ...relay, url: ' ', tokenConfigured: true }),
+  ).toBeNull()
 })
 
 test('interrupted relay private publication leaves relay disabled and old token bound to no dispatch', async () => {

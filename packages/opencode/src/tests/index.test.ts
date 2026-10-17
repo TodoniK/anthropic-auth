@@ -9713,6 +9713,252 @@ describe('auth.loader', () => {
     expect(state.relay).toEqual({ enabled: true, transport: 'websocket' })
   })
 
+  test('a relay saved without a transport sends over HTTP and the sidebar shows HTTP', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        relay: {
+          enabled: true,
+          url: 'https://relay.example.test',
+          token: 'relay-token',
+          fallbackToDirect: true,
+        },
+      }),
+      {
+        access: 'sk-ant-oat01-my-access-token',
+        refresh: 'refresh',
+        expires: Date.now() + 100000,
+      },
+    )
+    expect((await readAccountStorage())?.relay?.transport).toBeUndefined()
+
+    const sent: string[] = []
+    globalThis.fetch = mock(
+      withNativeAdmission((input: any) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage'))
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+          )
+        sent.push(url)
+        return Promise.resolve(
+          new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
+        )
+      }),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'sk-ant-oat01-my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    // A failed WebSocket attempt falls back to the HTTP relay, so the fetch
+    // alone cannot show which transport was chosen. Record every socket.
+    const sockets: string[] = []
+    const OriginalWebSocket = globalThis.WebSocket
+    globalThis.WebSocket = class {
+      constructor(url: string | URL) {
+        sockets.push(String(url))
+        throw new Error('this test permits no WebSocket relay connection')
+      }
+    } as unknown as typeof WebSocket
+    try {
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'session-relay-default' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'hello' }],
+          system: 'system',
+        }),
+      })
+    } finally {
+      globalThis.WebSocket = OriginalWebSocket
+    }
+
+    expect(sockets).toEqual([])
+    expect(sent).toEqual(['https://relay.example.test/'])
+    const state = await waitForSidebarState((value) => value.relay !== null)
+    expect(state.relay).toEqual({ enabled: true, transport: 'http' })
+  })
+
+  test('a relay saved with a wss URL and no transport keeps using WebSocket', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        relay: {
+          enabled: true,
+          url: 'https://relay.example.test',
+          token: 'relay-token',
+          fallbackToDirect: true,
+          transport: 'http',
+        },
+      }),
+      {
+        access: 'sk-ant-oat01-my-access-token',
+        refresh: 'refresh',
+        expires: Date.now() + 100000,
+      },
+    )
+    // Migration accepts only http(s) relay URLs, so switch to a WebSocket URL
+    // here and then delete the stored transport field, simulating a
+    // configuration file edited by hand.
+    await updatePoolRelay({
+      url: 'wss://relay.example.test',
+      transport: 'websocket',
+    })
+    const pool = migratedPool
+    if (!pool) throw new Error('This test has no migrated pool')
+    await createNativePoolStore({
+      paths: pool.paths,
+      quota: nativeQuotaCodec,
+    }).updateSettings((settings) => {
+      const { transport: _omitted, ...relay } = settings.relay as Record<
+        string,
+        unknown
+      >
+      settings.relay = relay
+    })
+    expect((await readAccountStorage())?.relay).toMatchObject({
+      url: 'wss://relay.example.test',
+    })
+    expect((await readAccountStorage())?.relay?.transport).toBeUndefined()
+
+    globalThis.fetch = mock(
+      withNativeAdmission((input: any) => {
+        if (extractUrl(input).includes('/api/oauth/usage'))
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+          )
+        return Promise.resolve(
+          new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
+        )
+      }),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'sk-ant-oat01-my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    // Record the WebSocket connection the relay opens; refusing it lets the
+    // request finish over the relay's HTTP fallback.
+    const sockets: string[] = []
+    const OriginalWebSocket = globalThis.WebSocket
+    globalThis.WebSocket = class {
+      constructor(url: string | URL) {
+        sockets.push(String(url))
+        throw new Error('this test refuses the WebSocket relay connection')
+      }
+    } as unknown as typeof WebSocket
+    try {
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'session-relay-wss' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'hello' }],
+          system: 'system',
+        }),
+      })
+    } finally {
+      globalThis.WebSocket = OriginalWebSocket
+    }
+
+    expect(sockets).toHaveLength(1)
+    expect(sockets[0]).toStartWith('wss://relay.example.test/ws?')
+    const state = await waitForSidebarState((value) => value.relay !== null)
+    expect(state.relay).toEqual({ enabled: true, transport: 'websocket' })
+  })
+
+  test('sidebar shows no relay when the relay token is missing', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        relay: {
+          enabled: true,
+          url: 'https://relay.example.test',
+          fallbackToDirect: true,
+          transport: 'http',
+        },
+      }),
+      {
+        access: 'sk-ant-oat01-my-access-token',
+        refresh: 'refresh',
+        expires: Date.now() + 100000,
+      },
+    )
+    expect((await readAccountStorage())?.relay).toMatchObject({
+      enabled: true,
+      url: 'https://relay.example.test',
+    })
+
+    const sent: string[] = []
+    globalThis.fetch = mock(
+      withNativeAdmission((input: any) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage'))
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+          )
+        sent.push(url)
+        return Promise.resolve(
+          new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
+        )
+      }),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'sk-ant-oat01-my-access-token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const requestedAt = Date.now()
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'session-relay-no-token' },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: 'hello' }],
+        system: 'system',
+      }),
+    })
+
+    // Without a token the request goes direct, so the sidebar must not
+    // claim a relay.
+    expect(
+      sent.some((url) => url.startsWith('https://relay.example.test')),
+    ).toBe(false)
+    const state = await waitForSidebarState(
+      (value) => value.lastUpdated >= requestedAt,
+    )
+    expect(state.relay).toBeNull()
+  })
+
   test('registers /claude and handles cache settings with ignored status replies', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()

@@ -16,6 +16,11 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode 1 now serves from the native pool even when OpenCode still holds its own separate Anthropic login, as long as the pool has a usable sign-in. `/claude` → Accounts notes that the separate login is not used. Its tokens are never used.
 - Setup with no hosts selected now exits quietly instead of failing.
 
+### Relay
+
+- When a relay has no stored transport, the transport is now inferred from its URL, as documented: a `wss://` URL uses WebSocket and an `https://` URL uses HTTP. Before, OpenCode 1 and Pi used WebSocket for every such relay. Set `transport: "websocket"` to keep WebSocket on an `https://` URL; a stored transport always wins. OpenCode 2 now sends such `https://` relays over HTTP instead of refusing them as WebSocket, and still refuses `wss://` ones (#336).
+- The OpenCode 1 sidebar now shows the relay only when requests can use it, with the transport requests actually use. A relay enabled without its stored secret, whose requests go direct, no longer appears as active (#336).
+
 ### Documentation
 
 - The READMEs are now short entry pages. Reference material moved to `docs/`: installation, accounts and routing, vault, commands, cache, transports, OpenCode 2, models, sidebar, environment variables, request rewriting, troubleshooting, development and releases.

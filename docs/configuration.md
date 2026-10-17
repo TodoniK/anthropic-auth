@@ -21,7 +21,7 @@ The imported preference fields are listed below. Values such as quota thresholds
 | `claudeFast` | `enabled`: supported Opus fast mode |
 | `thinkingBinding` | `prefixMismatchBehavior`: `account-default`, `error`, `drop_block` |
 | `costZeroing` | `enabled`: OpenCode OAuth price display, true by default |
-| `relay` | `enabled`, `url`, `transport` (`http` / `websocket`), `fallbackToDirect`; its token is private credential state |
+| `relay` | `enabled`, `url`, `transport` (`http` / `websocket`; when missing, inferred from the URL: `wss://` uses `websocket`, `https://` uses `http`), `fallbackToDirect`; its token is private credential state |
 
 [Cache](cache.md), [models](models.md) and [transports](transports.md) describe the effects. `quota.showToasts: true` opts into OpenCode quota notifications. Local credential state and per-account runtime metadata are separate from preferences; quota, profile, validation and Prime state are not all in the same file.
 

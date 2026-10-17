@@ -55,6 +55,7 @@ import {
   detectClaustrumConnection,
   dumpDirectRequest,
   dumpResponseArtifact,
+  effectiveRelayStatus,
   exchange,
   executeAccountCommand,
   executeCache1hCommand,
@@ -4262,10 +4263,9 @@ const anthropicAuthPlugin = async (
         }),
       activeId: options.activeId,
       route: options.route,
-      relay:
-        storage?.relay?.enabled && storage.relay.url
-          ? { enabled: true, transport: storage.relay.transport ?? 'http' }
-          : null,
+      // Same transport rule as request dispatch, and no relay unless requests
+      // can actually use it (enabled, with a URL and a stored token).
+      relay: effectiveRelayStatus(storage?.relay),
       fastMode: isFastModeEnabled(),
       cacheKeep: {
         enabled: isCacheKeepHybridActive(storage),

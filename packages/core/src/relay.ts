@@ -23,6 +23,49 @@ export type RelayConfig = {
   transport: 'http' | 'websocket'
 }
 
+/** A relay URL whose scheme names a WebSocket endpoint (`ws://` or `wss://`). */
+const WEBSOCKET_RELAY_URL = /^wss?:\/\//i
+
+/**
+ * The transport a stored relay configuration selects. A stored `http` or
+ * `websocket` value always wins. Without one (missing or unrecognized), the
+ * URL decides: a `ws://` or `wss://` URL selects WebSocket, so hand-edited
+ * WebSocket configurations keep working; any other URL selects HTTP, the
+ * documented default. Request dispatch and the relay status shown to users
+ * both call this, so they cannot report different transports.
+ */
+export function effectiveRelayTransport(
+  stored: unknown,
+  url: unknown,
+): RelayConfig['transport'] {
+  if (stored === 'http' || stored === 'websocket') return stored
+  return typeof url === 'string' && WEBSOCKET_RELAY_URL.test(url.trim())
+    ? 'websocket'
+    : 'http'
+}
+
+/**
+ * Secret-free relay status for displays such as the OpenCode sidebar: the
+ * transport requests will use, or null when requests cannot use the relay
+ * because it is disabled, has no URL or has no token. Native account
+ * snapshots never carry the private token; they set `tokenConfigured` to say
+ * whether one is stored.
+ */
+export function effectiveRelayStatus(
+  relay: AccountStorage['relay'] | undefined,
+): { enabled: true; transport: RelayConfig['transport'] } | null {
+  if (relay?.enabled !== true) return null
+  if (typeof relay.url !== 'string' || !relay.url.trim()) return null
+  const hasToken =
+    relay.tokenConfigured === true ||
+    (typeof relay.token === 'string' && relay.token.trim() !== '')
+  if (!hasToken) return null
+  return {
+    enabled: true,
+    transport: effectiveRelayTransport(relay.transport, relay.url),
+  }
+}
+
 export type RelayPatch = {
   start: number
   deleteCount: number
@@ -277,7 +320,7 @@ export function getRelayConfig(
     logRelayConfigOnce('disabled: missing relay url or token')
     return null
   }
-  const transport = relay.transport === 'http' ? 'http' : 'websocket'
+  const transport = effectiveRelayTransport(relay.transport, relay.url)
   logRelayConfigOnce(
     `configured transport=${transport} protocol=${transport === 'websocket' ? 2 : 1} url=${relay.url.trim()} fallbackToDirect=${relay.fallbackToDirect !== false}`,
   )

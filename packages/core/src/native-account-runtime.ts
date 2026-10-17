@@ -107,7 +107,7 @@ import {
 } from './pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
 import type { QuotaRequestDispatch } from './quota-manager.ts'
-import type { RelayConfig } from './relay.ts'
+import { effectiveRelayTransport, type RelayConfig } from './relay.ts'
 import { StickySessionRouter } from './sticky-routing.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
@@ -1764,7 +1764,7 @@ function relayFlags(input: unknown): Omit<RelayConfig, 'token'> {
   const value =
     input && typeof input === 'object' ? (input as Record<string, unknown>) : {}
   const url = typeof value.url === 'string' ? value.url.trim() : ''
-  const transport = value.transport === 'http' ? 'http' : 'websocket'
+  const transport = effectiveRelayTransport(value.transport, url)
   if (url) {
     try {
       const parsed = new URL(url)

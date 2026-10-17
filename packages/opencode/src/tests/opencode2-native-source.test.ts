@@ -1088,6 +1088,61 @@ describe('OC2 source over actual native services', () => {
     expect(fixture.gets).toHaveLength(0)
     expect(fixture.reports).toHaveLength(0)
   })
+  test('a relay saved without a transport dispatches over HTTP relay, not the WebSocket refusal', async () => {
+    const fixture = await vault()
+    await fixture.runtime.updateRelay({
+      enabled: true,
+      transport: 'http',
+      url: 'https://relay.invalid',
+      token: 'synthetic-relay-token',
+    })
+    await fixture.store.updateSettings((settings) => {
+      const { transport: _omitted, ...relay } = settings.relay as Record<
+        string,
+        unknown
+      >
+      settings.relay = relay
+    })
+    expect(
+      (await fixture.runtime.read()).policyStorage.relay?.transport,
+    ).toBeUndefined()
+    const native = source(fixture.runtime, fixture.paths)
+    expect(await native.chooseAccount(scope)).toBe('main')
+    const auth = await native.authorizeAccount(scope, 'main')
+    expect(auth?.dispatch).toMatchObject({
+      kind: 'http-relay',
+      url: 'https://relay.invalid',
+    })
+  })
+  test('a relay saved with a wss URL and no transport is refused as WebSocket before any vault get', async () => {
+    const fixture = await vault()
+    await fixture.runtime.updateRelay({
+      enabled: true,
+      transport: 'websocket',
+      url: 'wss://relay.invalid',
+      token: 'synthetic-relay-token',
+    })
+    await fixture.store.updateSettings((settings) => {
+      const { transport: _omitted, ...relay } = settings.relay as Record<
+        string,
+        unknown
+      >
+      settings.relay = relay
+    })
+    expect(
+      (await fixture.runtime.read()).policyStorage.relay?.transport,
+    ).toBeUndefined()
+    const native = source(fixture.runtime, fixture.paths)
+    const adapter = createNativeAnthropicAdapter({ source: native })
+    const refused = adapter.adapter.chooseAccount(scope)
+    await expect(refused).rejects.toBeInstanceOf(
+      NativeAnthropicTransportRefusal,
+    )
+    await expect(refused).rejects.toThrow(
+      'request refused: WebSocket relay is not supported on OpenCode 2; select HTTP relay or direct transport',
+    )
+    expect(fixture.gets).toHaveLength(0)
+  })
   test('vault 401 reports each physical version and permits exactly one strict-newer same-account retry', async () => {
     const fixture = await vault()
     const native = source(fixture.runtime, fixture.paths)

@@ -1,5 +1,6 @@
 import {
   buildPrimeRequestBody,
+  effectiveRelayTransport,
   type NativeAccountRuntime,
   type NativePoolPaths,
   nativeAccountCanServe,
@@ -220,7 +221,10 @@ export function createNativePrime(options: {
         return undefined
       if (
         snapshot.policyStorage.relay?.enabled === true &&
-        snapshot.policyStorage.relay.transport !== 'http'
+        effectiveRelayTransport(
+          snapshot.policyStorage.relay.transport,
+          snapshot.policyStorage.relay.url,
+        ) === 'websocket'
       )
         return undefined
       if (account.source === 'vault') {
@@ -238,7 +242,10 @@ export function createNativePrime(options: {
       const snapshot = await runtime.read()
       if (
         snapshot.policyStorage.relay?.enabled === true &&
-        snapshot.policyStorage.relay.transport !== 'http'
+        effectiveRelayTransport(
+          snapshot.policyStorage.relay.transport,
+          snapshot.policyStorage.relay.url,
+        ) === 'websocket'
       )
         throw new Error('WebSocket relay is unsupported on OpenCode 2')
       return {

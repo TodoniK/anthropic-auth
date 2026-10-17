@@ -348,7 +348,13 @@ export type AccountStorage = {
     enabled?: boolean
     url?: string
     token?: string
+    /**
+     * Whether a private relay token is stored. Native account snapshots set
+     * this instead of `token`, which they never include.
+     */
+    tokenConfigured?: boolean
     fallbackToDirect?: boolean
+    /** When missing, inferred from `url`; see `effectiveRelayTransport`. */
     transport?: 'http' | 'websocket'
   }
   claustrum?: ClaustrumConfig

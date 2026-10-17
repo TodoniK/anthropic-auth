@@ -1,4 +1,5 @@
 import {
+  effectiveRelayTransport,
   getQuotaCheckIntervalMs,
   logger,
   type NativeAccountRuntime,
@@ -23,7 +24,10 @@ export function startNativeAnthropicLifecycle(
     abort.signal.throwIfAborted()
     if (
       snapshot.policyStorage.relay?.enabled === true &&
-      snapshot.policyStorage.relay.transport !== 'http'
+      effectiveRelayTransport(
+        snapshot.policyStorage.relay.transport,
+        snapshot.policyStorage.relay.url,
+      ) === 'websocket'
     )
       return
     const current = snapshot
@@ -69,7 +73,10 @@ export function startNativeAnthropicLifecycle(
       const snapshot = await runtime.read()
       return (
         snapshot.policyStorage.relay?.enabled !== true ||
-        snapshot.policyStorage.relay.transport === 'http'
+        effectiveRelayTransport(
+          snapshot.policyStorage.relay.transport,
+          snapshot.policyStorage.relay.url,
+        ) === 'http'
       )
     },
   })

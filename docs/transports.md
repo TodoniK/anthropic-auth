@@ -13,7 +13,9 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... \
 
 This creates a KV namespace, uploads/enables the Worker, generates a relay shared secret and saves the URL, secret and HTTP transport in OpenCode's local settings. The Cloudflare API token is used for provisioning, not stored by the plugin. Keep it and the relay secret out of reports. This command does not configure Pi: Pi's existing relay settings can be imported from its legacy `anthropic-auth.json` during Pi migration. `/claude` has no relay actions.
 
-`relay.transport` is `http` by default. `websocket` is opt-in for OpenCode 1 and Pi, uses protocol v2 on `/ws` and requires the current Worker deployment. Redeploy an existing Worker with the same Worker name when upgrading its protocol. OpenCode 2 supports direct and HTTP only and refuses a selected WebSocket relay before dispatch.
+`relay.transport` is `http` by default. A missing transport is inferred from the URL: `wss://` (or `ws://`) uses WebSocket, `https://` (or `http://`) uses HTTP. A stored `transport` always wins over the URL. WebSocket is opt-in for OpenCode 1 and Pi, uses protocol v2 on `/ws` and requires the current Worker deployment. Redeploy an existing Worker with the same Worker name when upgrading its protocol. OpenCode 2 supports direct and HTTP only and refuses a selected WebSocket relay before dispatch.
+
+The OpenCode 1 sidebar shows the relay and its transport only when requests can use it: relay enabled, with a URL and a stored relay secret. Without the secret, requests go direct and the sidebar shows no relay. A shown relay can still fall back to direct for a single request when the relay fails.
 
 `relay.fallbackToDirect` allows direct fallback on relay failures before streaming; set it to `false` if direct dispatch is not acceptable. Genuine upstream authorization failures and relay failures have different provenance; a relay's own 401 must not invalidate a Claude account. Vault mode still authorizes each physical send through the vault.
 

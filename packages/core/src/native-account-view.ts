@@ -784,6 +784,14 @@ export function projectNativeAccountViews(input: {
     ...settings,
     accounts: fallbacks,
   }
+  // The relay token is private credential state and never enters this
+  // projection. Record only whether one is stored, so a status display can
+  // tell a relay that requests use from one they skip for lack of a token.
+  if (policyStorage.relay)
+    policyStorage.relay = {
+      ...policyStorage.relay,
+      tokenConfigured: Boolean(input.runtime?.relay?.token),
+    }
   const main = accounts.find((row) => row.id === 'main')
   const primary = nativeVaultPrimaryRow(
     input.roster,

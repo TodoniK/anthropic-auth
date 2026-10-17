@@ -929,3 +929,35 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
 broad_report = "tmp/mutations/pi.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "relay-missing-transport-uses-http"
+guards = "A stored relay without a transport and with an http(s) URL must send over HTTP, as documented; WebSocket needs an explicit websocket value or a ws(s) URL."
+file = "packages/core/src/relay.ts"
+old = "    : 'http'"
+new = "    : 'websocket' // NON-VACUITY BREAK: restore the WebSocket default"
+test_file = "packages/core/src/tests/native-account-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-account-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a stored relay without a transport sends over HTTP and only an explicit websocket selects WebSocket", "effective relay transport and status follow the stored values"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "relay-missing-transport-infers-websocket-url"
+guards = "A stored relay without a transport and with a ws:// or wss:// URL must keep using WebSocket instead of being refused as HTTP."
+file = "packages/core/src/relay.ts"
+old = "WEBSOCKET_RELAY_URL.test(url.trim())"
+new = "false /* NON-VACUITY BREAK: ignore WebSocket URL schemes */"
+test_file = "packages/core/src/tests/native-account-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-account-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a stored relay without a transport infers WebSocket from a wss URL, and a stored http transport with a wss URL stays refused"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

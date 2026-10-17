@@ -1,5 +1,6 @@
 import {
   createNativeUsagePublisher,
+  effectiveRelayTransport,
   getClaudeCodeIdentityForVerifiedAccount,
   getQuotaCheckIntervalMs,
   getRoutingMode,
@@ -209,7 +210,10 @@ export function createNativeAnthropicSource(
 
   const assertTransport = (snapshot: NativeAccountSnapshot) => {
     const selected = snapshot.policyStorage.relay
-    if (selected?.enabled === true && selected.transport !== 'http')
+    if (
+      selected?.enabled === true &&
+      effectiveRelayTransport(selected.transport, selected.url) === 'websocket'
+    )
       throw new NativeAnthropicTransportRefusal()
   }
   const dispatchFor = async (
