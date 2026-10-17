@@ -26,6 +26,7 @@ import {
   type NativeLocalCredentialServiceOptions,
 } from '../native-local-credential-service.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
+import { NativeQuotaObservations } from '../native-quota-observations.ts'
 import * as runtimeWriter from '../native-runtime.ts'
 import { readNativeRuntime } from '../native-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
@@ -103,7 +104,10 @@ async function fixture(
       ...local,
     },
   })
-  deferCleanup(() => runtime.close())
+  deferCleanup(async () => {
+    await runtime.drainQuotaPublications()
+    runtime.close()
+  })
   return { paths, runtime, store, counts, env }
 }
 
@@ -1733,4 +1737,178 @@ test('supported OAuth successor with a failed account lookup keeps validation re
   const entry = metadata.state.accounts['imported-main']
   expect(entry?.validationRetry?.nextRetryAt).toBeGreaterThan(now)
   expect(entry?.credentialValidation).toBeUndefined()
+})
+
+test('poll overlay leaves committed headers alone without a matching pending poll', () => {
+  const observations = new NativeQuotaObservations()
+  const committed = {
+    source: 'headers' as const,
+    checkedAt: now,
+    accountIdentity: uuid,
+  }
+  const storage = { version: 1 as const, accounts: [] }
+  const overlay = () =>
+    observations.quota('current', uuid, committed, storage, now)
+  expect(overlay()).toBeUndefined()
+  observations.set('main', {
+    lineage: 'current',
+    accountUuid: uuid,
+    generalExhausted: false,
+    entry: { quota: committed, checkedAt: now, refreshAfter: now },
+  })
+  expect(overlay()).toBeUndefined()
+  observations.set('main', {
+    lineage: 'replaced',
+    accountUuid: uuid,
+    generalExhausted: false,
+    entry: {
+      quota: { ...committed, source: 'poll' },
+      checkedAt: now,
+      refreshAfter: now,
+    },
+  })
+  expect(overlay()).toBeUndefined()
+})
+
+test('slow superseded poll publication cannot overwrite newer quota on disk', async () => {
+  let clock = now
+  const f = await fixture({ now: () => clock })
+  const held = gate()
+  const arrived = gate()
+  const publish = f.runtime.publishLocal.bind(f.runtime)
+  let first = true
+  const delayed = spyOn(f.runtime, 'publishLocal').mockImplementation(
+    async (subject, patch) => {
+      if (patch.quota && first) {
+        first = false
+        arrived.open()
+        await held.wait
+      }
+      return publish(subject, patch)
+    },
+  )
+  deferCleanup(() => delayed.mockRestore())
+  const transport: typeof fetch = Object.assign(
+    async () =>
+      Response.json({
+        five_hour: {
+          utilization: clock === now ? 10 : 98,
+          resets_at: new Date(now + 3_600_000).toISOString(),
+        },
+      }),
+    { preconnect: fetch.preconnect },
+  )
+  await f.runtime.fetchQuota('main', transport)
+  await arrived.wait
+  clock++
+  await f.runtime.fetchQuota('main', transport)
+  // Persist the newer reading while the older writer is still held outside its locks.
+  const latest = f.runtime.quotaObservations.get('main')!
+  const admission = await f.runtime.authorizeLocal('main')
+  if (admission.status !== 'usable') throw new Error('Expected usable account')
+  await publish(admission.subject, { quota: latest.entry.quota })
+  const before = await f.store.read()
+  held.open()
+  await f.runtime.drainQuotaPublications()
+  expect(
+    (await f.runtime.read()).accounts[0]?.quota?.five_hour?.remainingPercent,
+  ).toBe(2)
+  expect(await f.store.read()).toEqual(before)
+})
+
+test('refused poll publication drops only its own pending reading with a fixed warning', async () => {
+  const f = await fixture()
+  const held = gate()
+  const arrived = gate()
+  const records: LogTestRecord[] = []
+  const level = getLogLevel()
+  setLogLevel('warn')
+  __setLogTestSink((record) => records.push(record))
+  deferCleanup(() => {
+    __setLogTestSink(null)
+    setLogLevel(level)
+  })
+  const refused = spyOn(f.runtime, 'publishLocal').mockImplementation(
+    async () => {
+      arrived.open()
+      await held.wait
+      throw new Error('synthetic-private-credential-and-exception')
+    },
+  )
+  deferCleanup(() => refused.mockRestore())
+  await f.runtime.fetchQuota(
+    'main',
+    Object.assign(async () => Response.json({}), {
+      preconnect: fetch.preconnect,
+    }),
+  )
+  await arrived.wait
+  expect(f.runtime.quotaObservations.has('main')).toBe(true)
+  held.open()
+  await f.runtime.drainQuotaPublications()
+  expect(f.runtime.quotaObservations.has('main')).toBe(false)
+  expect(
+    records.map(({ level, channel, message, payload }) => ({
+      level,
+      channel,
+      message,
+      payload,
+    })),
+  ).toEqual([
+    {
+      level: 'warn',
+      channel: 'quota',
+      message: 'Quota publication discarded',
+      payload: undefined,
+    },
+  ])
+})
+
+test('pending poll quota cannot cross a replaced credential epoch', async () => {
+  const f = await fixture()
+  const held = gate()
+  const arrived = gate()
+  const publish = f.runtime.publishLocal.bind(f.runtime)
+  const delayed = spyOn(f.runtime, 'publishLocal').mockImplementation(
+    async (subject, patch) => {
+      if (patch.quota) {
+        arrived.open()
+        await held.wait
+      }
+      return publish(subject, patch)
+    },
+  )
+  deferCleanup(() => delayed.mockRestore())
+  await f.runtime.fetchQuota(
+    'main',
+    Object.assign(
+      async () =>
+        Response.json({
+          five_hour: {
+            utilization: 98,
+            resets_at: new Date(now + 3_600_000).toISOString(),
+          },
+        }),
+      { preconnect: fetch.preconnect },
+    ),
+  )
+  await arrived.wait
+  expect(
+    (await f.runtime.read()).accounts[0]?.quota?.five_hour?.remainingPercent,
+  ).toBe(2)
+  await f.runtime.putAccount({
+    routeId: 'imported-main',
+    replace: true,
+    accountIdentity: uuid,
+    credential: {
+      type: 'oauth',
+      access: 'sk-ant-oat01-replacement',
+      refresh: 'replacement-refresh',
+      expires: now + 3_600_000,
+    },
+  })
+  expect((await f.runtime.read()).accounts[0]?.quota).toBeUndefined()
+  held.open()
+  await f.runtime.drainQuotaPublications()
+  expect((await f.runtime.read()).accounts[0]?.quota).toBeUndefined()
 })

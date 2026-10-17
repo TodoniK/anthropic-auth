@@ -14,6 +14,7 @@ import {
   type OAuthAccountProfile,
   type OAuthQuotaSnapshot,
   type PrimeUsageDelta,
+  quotaSnapshotCheckedAt,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
 } from './accounts.ts'
@@ -50,7 +51,15 @@ import {
   type NativeLocalCredentialServiceOptions,
 } from './native-local-credential-service.ts'
 import type { NativeLocalExternalPolicy } from './native-local-runtime-readers.ts'
-import { nativeQuotaCodec, toNativeQuotaMap } from './native-quota-codec.ts'
+import {
+  fromNativeQuotaMap,
+  nativeQuotaCodec,
+  toNativeQuotaMap,
+} from './native-quota-codec.ts'
+import {
+  type NativeQuotaObservations,
+  nativeLocalQuotaLineage,
+} from './native-quota-observations.ts'
 import type {
   NativeKnownCredentialSubject,
   NativeRefreshResult,
@@ -149,6 +158,8 @@ export type NativeRelayUpdate = Partial<Omit<RelayConfig, 'token'>> & {
 
 export interface NativeAccountRuntime {
   readonly vault: NativeVaultRuntime
+  readonly quotaObservations: NativeQuotaObservations
+  drainQuotaPublications(): Promise<void>
   /** Fresh private relay authorization for transport only; never include it in a status snapshot. */
   getRelayConfig(): Promise<RelayConfig | null>
   updateRelay(patch: NativeRelayUpdate): Promise<void>
@@ -278,8 +289,11 @@ export function acquireNativeAccountRuntime(
     createNativeAccountRuntime(options),
   )
   const vault = leaseNativeVaultRuntime(() => use().vault, close)
+  const quotaObservations = use().quotaObservations
   return {
     vault,
+    quotaObservations,
+    drainQuotaPublications: () => quotaObservations.drain(),
     getRelayConfig: () => use().getRelayConfig(),
     updateRelay: (patch) => use().updateRelay(patch),
     read: () => use().read(),
@@ -649,6 +663,53 @@ export function createNativeAccountRuntime(
       runtime: metadata.status === 'ready' ? metadata.state : undefined,
       roster,
     })
+    for (const account of snapshot.accounts) {
+      const lineage =
+        mode === 'local'
+          ? nativeLocalQuotaLineage(account.binding)
+          : vault.quotaLineage(
+              account.id,
+              account.credentialId,
+              account.accountIdentity,
+            )
+      const pending = vault.quotaObservations.quota(
+        lineage,
+        account.accountIdentity,
+        account.quota,
+        snapshot.policyStorage,
+        now(),
+      )
+      if (!pending) continue
+      account.quota = pending.quota
+      if (pending.clearAt) {
+        account.quotaErrorClearedAt = Math.max(
+          account.quotaErrorClearedAt ?? 0,
+          pending.clearAt,
+        )
+        if (
+          (account.lastQuotaRefreshError?.checkedAt ?? Infinity) <=
+          account.quotaErrorClearedAt
+        )
+          delete account.lastQuotaRefreshError
+      }
+      if (account.id === 'main')
+        snapshot.policyStorage.quota = {
+          ...snapshot.policyStorage.quota,
+          mainQuota: account.quota,
+          mainQuotaCheckedAt: account.quota.checkedAt,
+          mainQuotaErrorClearedAt: account.quotaErrorClearedAt,
+          mainLastQuotaApiError: account.lastQuotaRefreshError,
+        }
+      else {
+        const projected = snapshot.policyStorage.accounts.find(
+          (row) => row.id === account.id,
+        )
+        if (projected?.type === 'oauth') {
+          projected.quota = account.quota
+          projected.lastQuotaRefreshError = account.lastQuotaRefreshError
+        }
+      }
+    }
     if (mode === 'claustrum') {
       routingSeed.mainRouteId =
         typeof settings.settings.mainAccountId === 'string'
@@ -695,6 +756,8 @@ export function createNativeAccountRuntime(
   }
   const runtime: NativeAccountRuntime = {
     vault,
+    quotaObservations: vault.quotaObservations,
+    drainQuotaPublications: () => vault.quotaObservations.drain(),
     async getRelayConfig() {
       const { mode, paths, store } = await selectedStorage()
       return withLock(
@@ -1341,6 +1404,13 @@ export function createNativeAccountRuntime(
       )
         return false
       if (quota) {
+        if (
+          quota.source !== 'headers' &&
+          row.quota &&
+          quotaSnapshotCheckedAt(fromNativeQuotaMap(row.quota)) >
+            quotaSnapshotCheckedAt(quota)
+        )
+          return false
         if (quota.accountIdentity !== subject.binding.identity)
           throw new NativeRuntimeError('publication-refused')
         // Pool quota belongs to the account/epoch, not a rotating access token.
@@ -1477,14 +1547,30 @@ export function createNativeAccountRuntime(
         before.binding.identity === result.attempt.binding.identity
           ? before
           : undefined
-      await runtime.publishLocal(result.attempt.subject, {
-        quota,
-        quotaErrorClearedAt: Math.max(
-          quota.checkedAt ?? now(),
-          matched?.quotaErrorClearedAt ?? 0,
-          matched?.lastQuotaRefreshError?.checkedAt ?? 0,
-        ),
-      })
+      const quotaErrorClearedAt = Math.max(
+        quota.checkedAt ?? now(),
+        matched?.quotaErrorClearedAt ?? 0,
+        matched?.lastQuotaRefreshError?.checkedAt ?? 0,
+      )
+      void runtime.quotaObservations.publish(
+        routeId,
+        {
+          lineage: nativeLocalQuotaLineage(result.attempt.subject.binding),
+          accountUuid: result.attempt.subject.binding.identity,
+          entry: {
+            quota,
+            checkedAt: quota.checkedAt ?? now(),
+            refreshAfter: quota.checkedAt ?? now(),
+          },
+          generalExhausted: false,
+          quotaErrorClearedAt,
+        },
+        () =>
+          runtime.publishLocal(result.attempt.subject, {
+            quota,
+            quotaErrorClearedAt,
+          }),
+      )
       return quota
     },
     async fetchProfile(routeId, fetchImpl = fetch, signal) {

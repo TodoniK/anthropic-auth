@@ -798,3 +798,19 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
 broad_report = "tmp/mutations/pi.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "quota-poll-publication-detached"
+guards = "A quota poll's runtime sync must not hold a request; its pending reading serves routing and dispose drains the write."
+file = "packages/core/src/native-account-runtime.ts"
+old = "void runtime.quotaObservations.publish("
+new = "await runtime.quotaObservations.publish( // NON-VACUITY BREAK: wait for quota durability on the request"
+test_file = "packages/opencode/src/tests/quota-sweep.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/quota-sweep.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["quota poll serves its reading while runtime sync is held and dispose drains publication"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"

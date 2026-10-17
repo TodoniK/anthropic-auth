@@ -1969,21 +1969,32 @@ test('OC1 API lastUsed storage failure is detached, drained and warns without ch
   const original = filesystem.open
   const staging = spyOn(filesystem, 'open').mockImplementation(
     async (path, flags, mode) => {
+      const file = await original(path, flags, mode)
       if (
-        armed &&
-        !fired &&
         typeof path === 'string' &&
         basename(path).includes('.native-runtime.') &&
         path.endsWith('.partial')
       ) {
-        fired = true
-        entered.open()
-        await release.wait
-        throw Object.assign(new Error(`/private/roster/${PAID_KEY}`), {
-          code: 'EIO',
-        })
+        const write = file.writeFile.bind(file)
+        file.writeFile = async (data, options) => {
+          // Quota publication can start after the paid reply too. Fail only
+          // the API usage update, not whichever runtime write wins the race.
+          if (
+            armed &&
+            !fired &&
+            JSON.parse(String(data)).accounts.paid?.lastUsed
+          ) {
+            fired = true
+            entered.open()
+            await release.wait
+            throw Object.assign(new Error(`/private/roster/${PAID_KEY}`), {
+              code: 'EIO',
+            })
+          }
+          return write(data, options)
+        }
       }
-      return original(path, flags, mode)
+      return file
     },
   )
   lifetimes.deferCleanup(() => staging.mockRestore())

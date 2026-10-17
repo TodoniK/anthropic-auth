@@ -133,8 +133,10 @@ import {
   type NativeCustodyReceipt,
   type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
   type NativeMenuDispatch,
+  type NativeQuotaObservation,
   type NativeUiOptions,
   NativeVaultNoAccountError,
+  nativeLocalQuotaLineage,
   nativeMigrationAuthorityPhase,
   normalizeQuotaHeaders,
   type OAuthAccount,
@@ -799,12 +801,7 @@ type MainQuotaIdentityResolution = MainQuotaIdentityBinding & {
 
 const HEADER_ROUTING_OBSERVATION_LIMIT = 1000
 
-type HeaderRoutingObservation = {
-  lineage: string
-  accountUuid: string
-  entry: QuotaEntry
-  generalExhausted: boolean
-}
+type HeaderRoutingObservation = NativeQuotaObservation
 
 type ServedQuotaHeaders = {
   accountId: 'main' | string
@@ -1203,20 +1200,11 @@ const anthropicAuthPlugin = async (
       ? { connect: runtimeOverrides.claustrumScopedConnect }
       : undefined,
   })
-  // Routing may use received headers before disk publication, but only for
-  // the current account and credential epoch. Display and cache publication
-  // continue through the guarded writer below; this map contains no tokens.
-  const headerRoutingObservations = new Map<string, HeaderRoutingObservation>()
+  // Header and poll readings share the native account/epoch-fenced overlay.
+  const headerRoutingObservations = nativeAccounts.quotaObservations
   let headerRoutingPolicyStorage: AccountStorage | null = null
   function localHeaderRoutingLineage(binding: NativeAccountView['binding']) {
-    return binding?.identity
-      ? JSON.stringify([
-          binding.storageId,
-          binding.rowId,
-          binding.credentialEpoch,
-          binding.identity,
-        ])
-      : undefined
+    return nativeLocalQuotaLineage(binding)
   }
   function headerRoutingLineage(
     subject: NativeKnownCredentialSubject | undefined,
@@ -1276,10 +1264,15 @@ const anthropicAuthPlugin = async (
           observation.entry.checkedAt,
         ),
       }
-    const quota = mergeHeaderQuotaForPersistence(
-      committed.quota,
-      observation.entry.quota,
-    )
+    const quota =
+      observation.entry.quota.source !== 'headers' &&
+      quotaSnapshotCheckedAt(committed.quota) >
+        quotaSnapshotCheckedAt(observation.entry.quota)
+        ? committed.quota
+        : mergeHeaderQuotaForPersistence(
+            committed.quota,
+            observation.entry.quota,
+          )
     return {
       ...observation.entry,
       quota,
@@ -1488,6 +1481,7 @@ const anthropicAuthPlugin = async (
   ): Promise<void> {
     vaultWatch?.close()
     await usagePublications.drain()
+    await nativeAccounts.drainQuotaPublications()
     nativeAccounts.close()
   }
 
@@ -2769,8 +2763,8 @@ const anthropicAuthPlugin = async (
         )
       }
     }
-    // Poll results and their backoff are already stored. Publish them without
-    // waiting for sidebar I/O or changing the active request's route.
+    // Poll readings are visible in memory; publication and sidebar I/O must
+    // not delay the active request's route.
     void refreshSidebarQuota().catch(() => {})
     return unavailable
   }
@@ -7547,7 +7541,7 @@ const anthropicAuthPlugin = async (
             if (isKillswitchEnabled(storageArg)) {
               const unavailable = await refreshFallbackQuotas(false, true)
               // Polling can also bind a newly discovered account UUID. Filter
-              // the published quotas, not the request's earlier account view.
+              // the fresh native overlay, not the request's earlier account view.
               storageArg = await loadAccounts(accountStoragePath)
               if (storageArg && unavailable.size)
                 storageArg = {

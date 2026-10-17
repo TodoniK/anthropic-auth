@@ -207,6 +207,7 @@ export {
   runPiCommandMenu,
 } from './native-ui.ts'
 export * from './native-usage-publication.ts'
+export * from './native-quota-observations.ts'
 export {
   NATIVE_VAULT_NO_ACCOUNT_MESSAGE,
   NativeVaultNoAccountError,

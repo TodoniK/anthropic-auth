@@ -142,7 +142,10 @@ async function fixture() {
     readToken: async () => ({ token, token_generation: 1 }),
   }
   const runtime = createNativeVaultRuntime(options)
-  deferCleanup(() => runtime.close())
+  deferCleanup(async () => {
+    await runtime.drainQuotaPublications()
+    runtime.close()
+  })
   return {
     paths,
     vaultPaths,
@@ -188,7 +191,10 @@ test('delayed vault fallback GET rejects a newly expired or revoked roster row b
       ...f.options,
       connect: async () => backend,
     })
-    deferCleanup(() => runtime.close())
+    deferCleanup(async () => {
+      await runtime.drainQuotaPublications()
+      runtime.close()
+    })
     const roster = await runtime.refresh()
     const route = roster?.rows.find(
       (row) => row.credentialId === work.id,
@@ -297,7 +303,10 @@ test('vault close interrupts a pending connection and closes its late client exa
       return client
     },
   })
-  deferCleanup(() => runtime.close())
+  deferCleanup(async () => {
+    await runtime.drainQuotaPublications()
+    runtime.close()
+  })
   const pending = runtime.authorize('main')
   await entered.wait
   runtime.close()
@@ -466,7 +475,10 @@ test('closing a pending vault list cannot publish its late result', async () => 
       },
     }),
   })
-  deferCleanup(() => runtime.close())
+  deferCleanup(async () => {
+    await runtime.drainQuotaPublications()
+    runtime.close()
+  })
   const pending = runtime.refresh()
   await entered.wait
   runtime.close()
@@ -560,7 +572,10 @@ for (const scenario of finalReportCases) {
         },
       }),
     })
-    deferCleanup(() => runtime.close())
+    deferCleanup(async () => {
+      await runtime.drainQuotaPublications()
+      runtime.close()
+    })
     const headers: string[] = []
     const transport: typeof fetch = Object.assign(
       async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -870,7 +885,10 @@ test('vault failed failure-report telemetry cannot block its one fresh retry or 
       },
     }),
   })
-  deferCleanup(() => runtime.close())
+  deferCleanup(async () => {
+    await runtime.drainQuotaPublications()
+    runtime.close()
+  })
   let http = 0
   const transport: typeof fetch = Object.assign(
     async () => {
@@ -918,6 +936,7 @@ test('vault quota success and failure cannot inherit another account runtime cle
       await expect(
         f.runtime.fetchQuota('main', transport),
       ).rejects.toMatchObject({ status: 429 })
+    await f.runtime.drainQuotaPublications()
     const state = await readNativeRuntime(
       f.vaultPaths.runtime,
       f.vaultPaths.storageId,
@@ -969,7 +988,10 @@ function accountRuntime(f: Awaited<ReturnType<typeof fixture>>) {
     host: 'opencode',
     vault: f.options,
   })
-  deferCleanup(() => runtime.close())
+  deferCleanup(async () => {
+    await runtime.drainQuotaPublications()
+    runtime.close()
+  })
   return runtime
 }
 
@@ -1422,7 +1444,10 @@ test('offline setup inventory populates only vault files and cannot replace per-
       }
     },
   })
-  deferCleanup(() => runtime.close())
+  deferCleanup(async () => {
+    await runtime.drainQuotaPublications()
+    runtime.close()
+  })
   await runtime.refresh()
   expect(discoveries).toBe(1)
   expect(f.counts.connects).toBe(0)
@@ -1498,3 +1523,68 @@ for (const change of ['mode', 'subject'] as const) {
     ).toBe(firstStamp)
   })
 }
+
+test('vault poll returns and native views use its reading before runtime sync while drain waits', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  const native = accountRuntime(f)
+  const held = gate()
+  const arrived = gate()
+  const realOpen = filesystem.open
+  let intercepted = false
+  const openSpy = spyOn(filesystem, 'open').mockImplementation(
+    async (path, flags, mode) => {
+      const file = await realOpen(path, flags, mode)
+      if (String(path).startsWith(`${f.vaultPaths.runtime}.native-runtime.`)) {
+        const sync = file.sync.bind(file)
+        file.sync = async () => {
+          if (!intercepted) {
+            intercepted = true
+            arrived.open()
+            await held.wait
+          }
+          return sync()
+        }
+      }
+      return file
+    },
+  )
+  deferCleanup(() => openSpy.mockRestore())
+  const polled = await native.fetchQuota(
+    'main',
+    Object.assign(
+      async () =>
+        Response.json({
+          five_hour: {
+            utilization: 98,
+            resets_at: new Date(now + 3_600_000).toISOString(),
+          },
+        }),
+      { preconnect: fetch.preconnect },
+    ),
+  )
+  await arrived.wait
+  expect(polled.five_hour?.remainingPercent).toBe(2)
+  expect(
+    (await native.read()).accounts.find((row) => row.id === 'main')?.quota
+      ?.five_hour?.remainingPercent,
+  ).toBe(2)
+  let drained = false
+  const draining = native.drainQuotaPublications().then(() => {
+    drained = true
+  })
+  trackDetached(draining)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  expect(drained).toBe(false)
+  held.open()
+  await draining
+  expect(drained).toBe(true)
+  const durable = await readNativeRuntime(
+    f.vaultPaths.runtime,
+    f.vaultPaths.storageId,
+  )
+  expect(
+    durable.status === 'ready' &&
+      durable.state.accounts[f.primaryRouteId]?.quota?.anthropic,
+  ).toMatchObject({ remainingPercent: { five_hour: 2 } })
+})

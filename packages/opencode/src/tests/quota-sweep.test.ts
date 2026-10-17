@@ -1,4 +1,5 @@
 import { expect, spyOn } from 'bun:test'
+import * as fsPromises from 'node:fs/promises'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -361,9 +362,11 @@ async function startBody(options: BodyOptions) {
       for (const deliver of heldDeliveries.splice(0)) deliver()
     },
   }
+  let servingRuntime: NativeRuntime | undefined
   const spy = spyOn(Core, 'createNativeAccountRuntime').mockImplementation(
     (runtimeOptions) => {
       const runtime: NativeRuntime = factory(runtimeOptions)
+      servingRuntime = runtime
       const readPool = runtime.read.bind(runtime)
       runtime.read = () => {
         const result = readPool()
@@ -466,6 +469,12 @@ async function startBody(options: BodyOptions) {
     dispatches,
     read,
     reads,
+    stop,
+    paths: fixture.paths,
+    servingView: () => {
+      if (!servingRuntime) throw new Error('Missing serving runtime')
+      return servingRuntime.read()
+    },
     startupSweep,
     backgroundSweep,
     /** Resolves when the given fallback usage GET reaches the transport. */
@@ -712,4 +721,69 @@ test('simultaneous requests during the held startup usage GET wait for it and ar
     fiveHourRemaining: 90,
     sevenDayRemaining: 90,
   })
+})
+
+test('quota poll serves its reading while runtime sync is held and dispose drains publication', async () => {
+  const f = await startBody({ quotaEnabled: false, fallbackUsed: 20 })
+  await f.startupSweep
+  const held = lifetimes.gate()
+  const arrived = signal()
+  const stallDeadline = () =>
+    new Promise<string>((resolve) =>
+      setTimeout(() => resolve('blocked on sync'), 250),
+    )
+  const realOpen = fsPromises.open
+  let intercepted = false
+  const openSpy = spyOn(fsPromises, 'open').mockImplementation(
+    async (path, flags, mode) => {
+      const file = await realOpen(path, flags, mode)
+      if (String(path).startsWith(`${f.paths.runtime}.native-runtime.`)) {
+        const sync = file.sync.bind(file)
+        file.sync = async () => {
+          const staged = JSON.parse(await readFile(path, 'utf8'))
+          if (
+            !intercepted &&
+            staged.accounts[FALLBACK_ID]?.quotaErrorClearedAt
+          ) {
+            intercepted = true
+            arrived.resolve()
+            await held.wait
+          }
+          return sync()
+        }
+      }
+      return file
+    },
+  )
+  lifetimes.deferCleanup(() => openSpy.mockRestore())
+  const request = f.request()
+  await arrived.promise
+  const result = await Promise.race([
+    request.then(() => 'served'),
+    stallDeadline(),
+  ])
+  expect(result).toBe('served')
+  expect(f.dispatches).toEqual([
+    usage(FALLBACK_BEARER),
+    messages(FALLBACK_BEARER),
+  ])
+  expect(fallbackQuota(await f.servingView())).toMatchObject({
+    fiveHourRemaining: 80,
+    sevenDayRemaining: 80,
+  })
+  expect((await f.request()).status).toBe(200)
+  expect(f.dispatches.filter((entry) => entry.kind === 'usage')).toEqual([
+    usage(FALLBACK_BEARER),
+  ])
+  let disposed = false
+  const disposal = f.stop().then(() => {
+    disposed = true
+  })
+  lifetimes.trackDetached(disposal)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  expect(disposed).toBe(false)
+  held.open()
+  await disposal
+  expect(disposed).toBe(true)
+  expect(fallbackQuota(await f.read())).toMatchObject({ fiveHourRemaining: 80 })
 })

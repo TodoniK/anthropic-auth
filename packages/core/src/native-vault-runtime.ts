@@ -17,6 +17,7 @@ import {
   type OAuthAccountProfile,
   type OAuthQuotaSnapshot,
   type PrimeUsageDelta,
+  quotaSnapshotCheckedAt,
 } from './accounts.ts'
 import { logger } from './logger.ts'
 import {
@@ -40,7 +41,8 @@ import {
   type NativeCustodyRetry,
 } from './native-custody.ts'
 import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
-import { nativeQuotaCodec } from './native-quota-codec.ts'
+import { fromNativeQuotaMap, nativeQuotaCodec } from './native-quota-codec.ts'
+import { NativeQuotaObservations } from './native-quota-observations.ts'
 import {
   buildNativeVaultRosterSeed,
   type NativeRosterSeedInput,
@@ -170,6 +172,13 @@ export function nativeDisplayProfile(
 }
 
 export interface NativeVaultRuntime {
+  readonly quotaObservations: NativeQuotaObservations
+  drainQuotaPublications(): Promise<void>
+  quotaLineage(
+    routeId: string,
+    credentialId: string | undefined,
+    accountIdentity: string | undefined,
+  ): string | undefined
   /** Subscribe to one discovery loop; notifications contain no credential material. */
   watch(options: NativeVaultWatchOptions): NativeVaultWatch
   initializeSettings(): Promise<void>
@@ -510,7 +519,25 @@ export function createNativeVaultRuntime(
     if (!route) throw new NativeCustodyError('no-receipt')
     return route
   }
+  const quotaObservations = new NativeQuotaObservations()
   const runtime: NativeVaultRuntime = {
+    quotaObservations,
+    drainQuotaPublications: () => quotaObservations.drain(),
+    quotaLineage(routeId, credentialId, accountIdentity) {
+      if (!credentialId || !accountIdentity) return undefined
+      const key = JSON.stringify([routeId, credentialId, accountIdentity])
+      let version = versions.get(key)
+      if (version === undefined && routeId === 'main') {
+        for (const [key, candidate] of versions) {
+          const [, id, identity] = JSON.parse(key)
+          if (id === credentialId && identity === accountIdentity)
+            version = Math.max(version ?? 0, candidate)
+        }
+      }
+      return version === undefined
+        ? undefined
+        : JSON.stringify([credentialId, accountIdentity, version])
+    },
     watch(options) {
       check()
       if (!Number.isFinite(options.intervalMs) || options.intervalMs < 0)
@@ -662,7 +689,17 @@ export function createNativeVaultRuntime(
       const patch = captureNativeMetadataPatch(rawPatch)
       return mutateReceipt(
         receipt,
-        (old) => applyNativeMetadataPatch(old, patch),
+        (old) => {
+          if (
+            patch.quota &&
+            patch.quota.source !== 'headers' &&
+            old.quota &&
+            quotaSnapshotCheckedAt(fromNativeQuotaMap(old.quota)) >
+              quotaSnapshotCheckedAt(patch.quota)
+          )
+            throw new NativeRuntimeError('runtime-conflict')
+          return applyNativeMetadataPatch(old, patch)
+        },
         recencyOnly(patch) ? 'skip' : 'refuse',
       )
     },
@@ -765,15 +802,30 @@ export function createNativeVaultRuntime(
         ...result.value,
         accountIdentity: result.receipt.assertedAccountIdentity,
       }
+      const accountUuid = result.receipt.assertedAccountIdentity
+      if (!accountUuid) throw new NativeCustodyError('identity-unasserted')
       const matched = matchingBefore(result.receipt)
-      await runtime.publish(result.receipt, {
-        quota,
-        quotaErrorClearedAt: Math.max(
-          quota.checkedAt ?? options.now?.() ?? Date.now(),
-          matched?.quotaErrorClearedAt ?? 0,
-          matched?.lastQuotaRefreshError?.checkedAt ?? 0,
-        ),
-      })
+      const checkedAt = quota.checkedAt ?? options.now?.() ?? Date.now()
+      const quotaErrorClearedAt = Math.max(
+        checkedAt,
+        matched?.quotaErrorClearedAt ?? 0,
+        matched?.lastQuotaRefreshError?.checkedAt ?? 0,
+      )
+      void quotaObservations.publish(
+        routeId,
+        {
+          lineage: JSON.stringify([
+            result.receipt.credentialId,
+            result.receipt.accountIdentity,
+            result.receipt.recordVersion,
+          ]),
+          accountUuid,
+          entry: { quota, checkedAt, refreshAfter: checkedAt },
+          generalExhausted: false,
+          quotaErrorClearedAt,
+        },
+        () => runtime.publish(result.receipt, { quota, quotaErrorClearedAt }),
+      )
       return quota
     },
     async fetchProfile(routeId, fetchImpl = fetch, signal) {
@@ -1182,7 +1234,12 @@ export function leaseNativeVaultRuntime(
   close: () => void,
 ): NativeVaultRuntime {
   const watches = new Set<NativeVaultWatch>()
+  const quotaObservations = use().quotaObservations
   return {
+    quotaObservations,
+    drainQuotaPublications: () => quotaObservations.drain(),
+    quotaLineage: (routeId, credentialId, accountIdentity) =>
+      use().quotaLineage(routeId, credentialId, accountIdentity),
     watch: (options) => {
       const watch = use().watch(options)
       watches.add(watch)
