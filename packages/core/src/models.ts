@@ -125,6 +125,15 @@ export function isClaudeFable51Model(model: unknown) {
   )
 }
 
+export function isClaudeMythos51Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
+  return (
+    normalized === CLAUDE_MYTHOS_5_1_MODEL_ID ||
+    normalized.startsWith(`${CLAUDE_MYTHOS_5_1_MODEL_ID}-`)
+  )
+}
+
 export function getClaudeFableMythos5ReleaseDate(model: unknown) {
   return isClaudeFableOrMythos51Model(model)
     ? CLAUDE_FABLE_MYTHOS_5_1_RELEASE_DATE

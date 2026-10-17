@@ -1,9 +1,14 @@
 import { describe, expect, test } from 'bun:test'
+import { selectClaudeCodeBetas } from '../claude-code.ts'
 import {
   applyMidConversationOutputConfig,
+  defaultAdaptiveEffort,
   MID_CONVERSATION_OUTPUT_CONFIG_BETA,
   normalizeAdaptiveEffort,
+  PER_TURN_CONTROL_BETA,
+  supportsPerMessageEffort,
   usesMidConversationOutputConfig,
+  usesPerTurnControl,
 } from '../mid-conversation-output-config.ts'
 
 function body(model = 'claude-fable-5-1') {
@@ -121,5 +126,138 @@ describe('Fable 5.1 mid-conversation output configuration', () => {
     expect(normalizeAdaptiveEffort('xhigh')).toBe('xhigh')
     expect(normalizeAdaptiveEffort('off')).toBeUndefined()
     expect(normalizeAdaptiveEffort('unknown')).toBeUndefined()
+  })
+})
+
+const PER_TURN_CONTROL_MODELS = [
+  'claude-mythos-5-1',
+  'claude-opus-5-5',
+  'claude-opus-5-5[1m]',
+  'claude-opus-5',
+  'claude-sonnet-5-5',
+  'claude-haiku-5-5',
+] as const
+
+function adaptiveBody(model: string) {
+  return {
+    ...body(model),
+    thinking: { type: 'adaptive', display: 'summarized' },
+  } as Record<string, unknown>
+}
+
+describe('per-message effort beyond Fable 5.1', () => {
+  for (const model of PER_TURN_CONTROL_MODELS) {
+    test(`${model} keeps top-level effort at the earliest value and inserts system markers`, () => {
+      const request = adaptiveBody(model)
+
+      expect(
+        applyMidConversationOutputConfig(request, [
+          { afterAssistantMessages: 0, effort: 'low' },
+          { afterAssistantMessages: 1, effort: 'high' },
+          { afterAssistantMessages: 2, effort: 'max' },
+        ]),
+      ).toEqual({ applied: true, inserted: 2 })
+      expect(request.output_config).toEqual({
+        effort: 'low',
+        format: { type: 'json_schema' },
+      })
+      expect(request.messages).toEqual([
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: 'one' },
+        { role: 'system', content: [], output_config: { effort: 'high' } },
+        { role: 'user', content: 'second' },
+        { role: 'assistant', content: 'two' },
+        { role: 'system', content: [], output_config: { effort: 'max' } },
+        { role: 'user', content: 'third' },
+      ])
+    })
+
+    test(`${model} leaves a request without an effort change byte-identical`, () => {
+      for (const transitions of [
+        [],
+        [{ afterAssistantMessages: 0, effort: 'medium' as const }],
+        [
+          { afterAssistantMessages: 0, effort: 'medium' as const },
+          { afterAssistantMessages: 2, effort: 'medium' as const },
+        ],
+      ]) {
+        const request = adaptiveBody(model)
+        const before = JSON.stringify(request)
+        expect(applyMidConversationOutputConfig(request, transitions)).toEqual({
+          applied: false,
+          inserted: 0,
+        })
+        expect(JSON.stringify(request)).toBe(before)
+      }
+    })
+
+    test(`${model} carries the per-turn control beta, not the Fable 5.1 beta`, () => {
+      const request = adaptiveBody(model)
+      expect(supportsPerMessageEffort(request)).toBe(true)
+      expect(usesPerTurnControl(model)).toBe(true)
+      expect(usesMidConversationOutputConfig(request)).toBe(false)
+      const betas = selectClaudeCodeBetas(request).split(',')
+      expect(betas).toContain(PER_TURN_CONTROL_BETA)
+      expect(betas).not.toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+    })
+  }
+
+  test('requires adaptive thinking on models other than Fable 5.1', () => {
+    for (const [model, thinking] of [
+      ['claude-sonnet-5-5', { type: 'between_tools' }],
+      ['claude-haiku-5-5', { type: 'disabled' }],
+      ['claude-opus-5', { type: 'disabled' }],
+      ['claude-opus-5-5', undefined],
+    ] as const) {
+      const request = body(model)
+      if (thinking) request.thinking = { ...thinking }
+      const before = JSON.stringify(request)
+      expect(supportsPerMessageEffort(request)).toBe(false)
+      expect(
+        applyMidConversationOutputConfig(request, [
+          { afterAssistantMessages: 0, effort: 'low' },
+          { afterAssistantMessages: 1, effort: 'high' },
+        ]),
+      ).toEqual({ applied: false, inserted: 0 })
+      expect(JSON.stringify(request)).toBe(before)
+      // The beta follows the model, as in Claude Code, whatever the thinking mode.
+      expect(selectClaudeCodeBetas(request).split(',')).toContain(
+        PER_TURN_CONTROL_BETA,
+      )
+    }
+  })
+
+  test('keeps Fable 5.1 eligible without inspecting thinking and on its own beta', () => {
+    const request = body()
+    expect(supportsPerMessageEffort(request)).toBe(true)
+    expect(usesPerTurnControl(request.model)).toBe(false)
+    expect(selectClaudeCodeBetas(request).split(',')).not.toContain(
+      PER_TURN_CONTROL_BETA,
+    )
+  })
+
+  test('does not treat other model families as per-turn control models', () => {
+    for (const model of [
+      'claude-fable-5-1',
+      'claude-fable-5',
+      'claude-mythos-5',
+      'claude-sonnet-5',
+      'claude-opus-4-8',
+      'claude-haiku-4-5',
+      42,
+    ]) {
+      expect(usesPerTurnControl(model)).toBe(false)
+    }
+    expect(PER_TURN_CONTROL_BETA).toBe('per-turn-control-2026-07-01')
+  })
+
+  test('falls back to each model default effort', () => {
+    expect(defaultAdaptiveEffort('claude-opus-5-5')).toBe('medium')
+    expect(defaultAdaptiveEffort('claude-opus-5-5[1m]')).toBe('medium')
+    expect(defaultAdaptiveEffort('claude-haiku-5-5')).toBe('medium')
+    expect(defaultAdaptiveEffort('claude-sonnet-5-5')).toBe('high')
+    expect(defaultAdaptiveEffort('claude-opus-5')).toBe('high')
+    expect(defaultAdaptiveEffort('claude-fable-5-1')).toBe('high')
+    expect(defaultAdaptiveEffort(undefined)).toBe('high')
   })
 })

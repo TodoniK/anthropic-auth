@@ -1,7 +1,22 @@
-import { isClaudeFable51Model } from './models.ts'
+import {
+  isClaudeFable51Model,
+  isClaudeHaiku55Model,
+  isClaudeMythos51Model,
+  isClaudeOpus5Model,
+  isClaudeOpus55Model,
+  isClaudeSonnet55Model,
+} from './models.ts'
 
+/** Per-message effort beta sent with every OAuth Fable 5.1 request. */
 export const MID_CONVERSATION_OUTPUT_CONFIG_BETA =
   'mid-conversation-output-config-2026-07-01'
+
+/**
+ * Per-turn control beta that Claude Code sends on every Opus 5.5 and Sonnet
+ * 5.5 request. It enables effort changes carried by an empty `role: "system"`
+ * message, and is used for every per-message-effort model except Fable 5.1.
+ */
+export const PER_TURN_CONTROL_BETA = 'per-turn-control-2026-07-01'
 
 export type AdaptiveEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
@@ -31,10 +46,61 @@ export function normalizeAdaptiveEffort(
   return undefined
 }
 
+/**
+ * Whether an OAuth request for this model carries the Fable 5.1 per-message
+ * effort beta (`MID_CONVERSATION_OUTPUT_CONFIG_BETA`). Other models that
+ * support per-message effort use `PER_TURN_CONTROL_BETA` instead.
+ */
 export function usesMidConversationOutputConfig(
   body: Record<string, unknown>,
 ): boolean {
   return isClaudeFable51Model(body.model)
+}
+
+/**
+ * Models other than Fable 5.1 that accept per-message effort on the Claude
+ * API: Mythos 5.1, Opus 5.5, Opus 5, Sonnet 5.5 and Haiku 5.5, including
+ * dated and `[1m]` context-window ids. Their OAuth requests always carry
+ * `PER_TURN_CONTROL_BETA`.
+ */
+export function usesPerTurnControl(model: unknown): boolean {
+  return (
+    isClaudeMythos51Model(model) ||
+    isClaudeOpus55Model(model) ||
+    isClaudeOpus5Model(model) ||
+    isClaudeSonnet55Model(model) ||
+    isClaudeHaiku55Model(model)
+  )
+}
+
+/**
+ * Whether a request may move effort changes into empty system messages.
+ *
+ * Fable 5.1 is always eligible, whatever its thinking field says. The other
+ * models qualify only with adaptive thinking: Anthropic rejects a differing
+ * per-message effort with HTTP 400 on Sonnet 5.5 `between_tools` and Haiku
+ * 5.5 `disabled`, and asks callers to use adaptive thinking to vary effort.
+ */
+export function supportsPerMessageEffort(
+  body: Record<string, unknown>,
+): boolean {
+  if (isClaudeFable51Model(body.model)) return true
+  return (
+    usesPerTurnControl(body.model) &&
+    isRecord(body.thinking) &&
+    body.thinking.type === 'adaptive'
+  )
+}
+
+/**
+ * The effort Anthropic applies when a request sets no `output_config.effort`:
+ * `medium` on Opus 5.5 and Haiku 5.5, `high` on the other models.
+ * A history entry without a recognized effort level uses this value.
+ */
+export function defaultAdaptiveEffort(model: unknown): AdaptiveEffort {
+  return isClaudeOpus55Model(model) || isClaudeHaiku55Model(model)
+    ? 'medium'
+    : 'high'
 }
 
 function compactTransitions(
@@ -71,19 +137,26 @@ export function applyMidConversationOutputConfig(
   body: Record<string, unknown>,
   transitions: readonly MidConversationEffortTransition[],
 ): { applied: boolean; inserted: number } {
-  if (!usesMidConversationOutputConfig(body) || !Array.isArray(body.messages)) {
+  if (!supportsPerMessageEffort(body) || !Array.isArray(body.messages)) {
     return { applied: false, inserted: 0 }
   }
 
   const compacted = compactTransitions(transitions)
+  // Fable 5.1 always pins top-level effort. The other models leave a request
+  // without an effort change exactly as the host built it.
+  const pinsEveryRequest = isClaudeFable51Model(body.model)
+  if (!pinsEveryRequest && compacted.length < 2) {
+    return { applied: false, inserted: 0 }
+  }
   const currentOutputConfig = isRecord(body.output_config)
     ? body.output_config
     : {}
   const baseline =
     compacted[0]?.effort ??
     normalizeAdaptiveEffort(currentOutputConfig.effort) ??
-    'high'
-  body.output_config = { ...currentOutputConfig, effort: baseline }
+    defaultAdaptiveEffort(body.model)
+  const pinnedOutputConfig = { ...currentOutputConfig, effort: baseline }
+  if (pinsEveryRequest) body.output_config = pinnedOutputConfig
 
   if (compacted.length < 2) return { applied: true, inserted: 0 }
 
@@ -121,6 +194,12 @@ export function applyMidConversationOutputConfig(
     if (isRecord(message) && message.role === 'assistant') assistantMessages++
   }
 
+  // Without an inserted marker the top-level effort is the only effort in
+  // force, so the other models keep the host's value rather than an earlier one.
+  if (!pinsEveryRequest && inserted === 0) {
+    return { applied: false, inserted: 0 }
+  }
+  body.output_config = pinnedOutputConfig
   body.messages = rewritten
   return { applied: true, inserted }
 }

@@ -4,6 +4,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+### Prompt cache
+
+- Changing reasoning effort mid-session on OAuth Opus 5.5, Opus 5, Sonnet 5.5, Haiku 5.5 and Mythos 5.1 no longer rewrites the top-level effort and invalidates the cached conversation in OpenCode and Pi. The change is sent as an effort-only system message, as already done for Fable 5.1. These requests now always carry `per-turn-control-2026-07-01`, matching Claude Code. Sonnet 5.5 `between_tools`, Haiku 5.5 or Opus 5 with thinking disabled, and API-key routes are unchanged.
+
 ### Setup
 
 - `bunx @cortexkit/opencode-anthropic-auth setup` now runs on common-auth's shared setup runner, the same one the other CortexKit auth plugins use. Host detection, the OpenCode generation choice, the running-process check, host registration and vault enrollment come from the shared runner; Anthropic keeps its own sign-in, migration, Pi consent and vault activation. Pressing Escape or Ctrl-C at the vault question now stops setup without changes.

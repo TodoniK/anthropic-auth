@@ -6,6 +6,7 @@ import {
   FAST_MODE_BETA,
   MID_CONVERSATION_OUTPUT_CONFIG_BETA,
   OPENCODE_IDENTITY_PREFIX,
+  PER_TURN_CONTROL_BETA,
   REQUIRED_BETAS,
   selectClaudeCodeBetas,
   THINKING_BINDING_CONTROLS_BETA,
@@ -822,6 +823,110 @@ describe('setOAuthHeaders', () => {
       },
     ])
     expect(JSON.stringify(apiBody)).not.toContain('cortexkit-internal-effort')
+  })
+
+  test('rewrites Opus 5.5 effort history into a system marker and sends the per-turn control beta', async () => {
+    const sourceMessages = [
+      {
+        info: {
+          id: 'msg_low',
+          role: 'user',
+          sessionID: 'ses_opus_effort',
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-opus-5-5',
+            variant: 'low',
+          },
+        },
+        parts: [{ type: 'text', text: 'first' }],
+      },
+      {
+        info: {
+          id: 'msg_assistant',
+          role: 'assistant',
+          sessionID: 'ses_opus_effort',
+        },
+        parts: [],
+      },
+      {
+        info: {
+          id: 'msg_high',
+          role: 'user',
+          sessionID: 'ses_opus_effort',
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-opus-5-5',
+            variant: 'high',
+          },
+        },
+        parts: [{ type: 'text', text: 'second' }],
+      },
+    ]
+    const marked = markOpenCodeEffortTransitions(sourceMessages)
+    if (!marked) throw new Error('Missing effort plan')
+    const internalMarkers = sourceMessages[2]?.parts
+      .slice(1)
+      .flatMap((part) => (typeof part.text === 'string' ? [part.text] : []))
+    const request = (model: string, thinking: Record<string, unknown>) =>
+      JSON.stringify({
+        model,
+        thinking,
+        output_config: { effort: 'high' },
+        messages: [
+          { role: 'user', content: 'first' },
+          { role: 'assistant', content: 'one' },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'second' },
+              ...(internalMarkers ?? []).map((text) => ({
+                type: 'text',
+                text,
+              })),
+            ],
+          },
+        ],
+      })
+    const options = {
+      midConversationEffortEnabled: true,
+      midConversationEffortPlan: encodeOpenCodeEffortPlan(marked),
+      midConversationEffortResolvedPlan: marked,
+    }
+
+    const body = JSON.parse(
+      await rewriteRequestBody(
+        request('claude-opus-5-5', { type: 'adaptive' }),
+        options,
+      ),
+    )
+    expect(body.output_config).toEqual({ effort: 'low' })
+    expect(body.messages).toEqual([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'one' },
+      { role: 'system', content: [], output_config: { effort: 'high' } },
+      { role: 'user', content: [{ type: 'text', text: 'second' }] },
+    ])
+    const headers = new Headers()
+    setOAuthHeaders(headers, 'token', { body })
+    const betas = headers.get('anthropic-beta')?.split(',')
+    expect(betas).toContain(PER_TURN_CONTROL_BETA)
+    expect(betas).not.toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+
+    // Sonnet 5.5's thinking opt-out becomes between_tools, which rejects a
+    // changed per-message effort, so the host's top-level effort stays.
+    const sonnet = JSON.parse(
+      await rewriteRequestBody(
+        request('claude-sonnet-5-5', { type: 'disabled' }),
+        options,
+      ),
+    )
+    expect(sonnet.thinking).toEqual({ type: 'between_tools' })
+    expect(sonnet.output_config).toEqual({ effort: 'high' })
+    expect(sonnet.messages).toEqual([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'one' },
+      { role: 'user', content: [{ type: 'text', text: 'second' }] },
+    ])
   })
 })
 

@@ -14,6 +14,7 @@ import {
   CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS,
   CLAUDE_SONNET_5_5_MODEL_ID,
   CLAUDE_SONNET_5_5_PRICING,
+  defaultAdaptiveEffort,
   isClaudeFableOrMythos51Model,
   type MidConversationEffortTransition,
   type NativeAccountSnapshot,
@@ -84,11 +85,13 @@ export default async function cortexKitPiAnthropicAuth(
   pi.on('turn_start', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     if (!sessionId) return
-    // This hook only adds mid-conversation effort markers to Fable/Mythos 5.1
-    // requests. A host whose session entries do not match what this reads must
-    // cost the session its transitions and nothing else: the handler runs
-    // before every turn, and an exception here surfaced as a per-turn extension
-    // error while collecting no effort history at all (issue #200).
+    // This hook collects effort history for the per-message effort markers
+    // that core adds to Fable 5.1, Mythos 5.1, Opus 5/5.5, Sonnet 5.5 and
+    // Haiku 5.5 requests. A host whose session entries do not match what this
+    // reads must cost the session its transitions and nothing else: the
+    // handler runs before every turn, and an exception here surfaced as a
+    // per-turn extension error while collecting no effort history at all
+    // (issue #200).
     //
     // The catch stays quiet: `ExtensionAPI` carries no log surface on either
     // host, and writing to stdout from a per-turn hook corrupts the host's
@@ -97,7 +100,11 @@ export default async function cortexKitPiAnthropicAuth(
     let transitions: MidConversationEffortTransition[]
     try {
       const branch = ctx.sessionManager.getBranch()
-      transitions = collectPiEffortHistory(deriveContextEntries(branch), branch)
+      transitions = collectPiEffortHistory(
+        deriveContextEntries(branch),
+        branch,
+        defaultAdaptiveEffort(ctx.model?.id),
+      )
     } catch {
       transitions = []
     }

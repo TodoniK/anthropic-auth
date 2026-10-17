@@ -73,12 +73,18 @@ function appendTransition(
   transitions.push({ afterAssistantMessages, effort })
 }
 
-/** Build Pi's active, compaction-aware Fable 5.1 effort timeline. */
+/**
+ * Build Pi's active, compaction-aware effort timeline for per-message effort.
+ * A thinking level without an adaptive effort (such as `off`) and a branch
+ * without any level change both count as `defaultEffort`, the effort the
+ * request model applies when no top-level effort is sent.
+ */
 export function collectPiEffortHistory(
   contextEntries: readonly SessionEntryLike[],
   fullBranch: readonly SessionEntryLike[],
+  defaultEffort: AdaptiveEffort = 'high',
 ): MidConversationEffortTransition[] {
-  let activeEffort: AdaptiveEffort = 'high'
+  let activeEffort: AdaptiveEffort = defaultEffort
   let assistantMessages = 0
   const transitions: MidConversationEffortTransition[] = []
   const first = contextEntries[0]
@@ -91,7 +97,8 @@ export function collectPiEffortHistory(
     for (let index = 0; index <= compactionIndex; index++) {
       const entry = fullBranch[index]
       if (entry?.type !== 'thinking_level_change') continue
-      activeEffort = normalizeAdaptiveEffort(entry.thinkingLevel) ?? 'high'
+      activeEffort =
+        normalizeAdaptiveEffort(entry.thinkingLevel) ?? defaultEffort
     }
     appendTransition(transitions, 0, activeEffort)
   }
@@ -109,7 +116,8 @@ export function collectPiEffortHistory(
 
     if (entry.type === 'thinking_level_change') {
       if (!retainedBeforeCompaction) {
-        activeEffort = normalizeAdaptiveEffort(entry.thinkingLevel) ?? 'high'
+        activeEffort =
+          normalizeAdaptiveEffort(entry.thinkingLevel) ?? defaultEffort
       }
       continue
     }

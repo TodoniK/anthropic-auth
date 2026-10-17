@@ -713,6 +713,60 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
     })
   })
 
+  for (const model of [
+    'claude-mythos-5-1',
+    'claude-opus-5-5',
+    'claude-opus-5',
+    'claude-sonnet-5-5',
+    'claude-haiku-5-5',
+  ]) {
+    test(`injects Pi effort changes before their user turns for ${model}`, async () => {
+      const context = {
+        messages: [
+          userMsg('first'),
+          assistantMsg('first answer'),
+          userMsg('second'),
+        ],
+        systemPrompt: 'test',
+        tools: [],
+      } as any
+      const build = (
+        effortTransitions: {
+          afterAssistantMessages: number
+          effort: 'low' | 'high'
+        }[],
+      ) =>
+        buildAnthropicRequest(
+          model,
+          context,
+          { sessionId: `pi-${model}-effort`, reasoning: 'high' } as any,
+          defaultCache,
+          false,
+          undefined,
+          { effortTransitions },
+        )
+
+      const { body } = await build([
+        { afterAssistantMessages: 0, effort: 'low' },
+        { afterAssistantMessages: 1, effort: 'high' },
+      ])
+      expect(body.output_config).toEqual({ effort: 'low' })
+      expect(body.messages[2]).toEqual({
+        role: 'system',
+        content: [],
+        output_config: { effort: 'high' },
+      })
+
+      // A steady effort, and the empty history an API-key route passes,
+      // both leave the request exactly as Pi built it.
+      const untouched = (await build([])).bodyText
+      expect(
+        (await build([{ afterAssistantMessages: 0, effort: 'high' }])).bodyText,
+      ).toBe(untouched)
+      expect(JSON.parse(untouched).output_config).toEqual({ effort: 'high' })
+    })
+  }
+
   test('does not add Fable 5.1 binding controls to an API-key request', async () => {
     const { body } = await buildAnthropicRequest(
       'claude-fable-5-1',

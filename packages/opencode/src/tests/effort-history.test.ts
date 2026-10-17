@@ -800,7 +800,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(tracker.resolveHeader(secondHeader)?.messageId).toBe('msg_current_b')
   })
 
-  test('defaults absent variants to high and does not mark non-Fable requests', () => {
+  test('defaults absent variants to high and does not mark models without per-message effort', () => {
     const defaulted = [user('msg_default', 'ses_default', 'claude-fable-5-1')]
     const defaultPlan = markOpenCodeEffortTransitions(defaulted)
     expect(defaultPlan).toMatchObject({ baseline: 'high', markerCount: 0 })
@@ -822,11 +822,11 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     ).toEqual({ found: 0, inserted: 0 })
     expect(body.output_config).toEqual({ effort: 'high' })
 
-    const otherModel = [
-      user('msg_other', 'ses_other', 'claude-mythos-5-1', 'max'),
-    ]
-    expect(markOpenCodeEffortTransitions(otherModel)).toBeNull()
-    expect(markerTexts(otherModel)).toEqual([])
+    for (const model of ['claude-fable-5', 'claude-sonnet-5']) {
+      const otherModel = [user('msg_other', 'ses_other', model, 'max')]
+      expect(markOpenCodeEffortTransitions(otherModel)).toBeNull()
+      expect(markerTexts(otherModel)).toEqual([])
+    }
   })
 
   test('accepts a merged boundary whose transitions are a correctly-ordered run and emits the last effort', () => {
@@ -1223,4 +1223,206 @@ test('reports bounded shape metadata when every marker and anchor disappears but
     },
   })
   expect(JSON.stringify(refusal)).not.toContain('private text')
+})
+
+type HostMessage = ReturnType<typeof user> | ReturnType<typeof assistant>
+
+/** Lower host records the way OpenCode does: one text block per text part. */
+function lower(messages: HostMessage[]) {
+  return messages.map((message) =>
+    message.info.role === 'user'
+      ? {
+          role: 'user',
+          content: (message.parts as Array<{ text?: unknown }>).flatMap(
+            (part) =>
+              typeof part.text === 'string'
+                ? [{ type: 'text', text: part.text }]
+                : [],
+          ),
+        }
+      : { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+  )
+}
+
+const ADAPTIVE = { type: 'adaptive', display: 'summarized' }
+
+describe('OpenCode per-message effort beyond Fable 5.1', () => {
+  for (const model of [
+    'claude-mythos-5-1',
+    'claude-opus-5-5',
+    'claude-opus-5-5[1m]',
+    'claude-opus-5',
+    'claude-sonnet-5-5',
+    'claude-haiku-5-5',
+  ]) {
+    test(`${model} keeps the earliest top-level effort and inserts a system marker`, () => {
+      const session = `ses_${model}`
+      const messages: HostMessage[] = [
+        user('msg_low', session, model, 'low'),
+        assistant('msg_step', session),
+        user('msg_high', session, model, 'high'),
+      ]
+      const plan = markOpenCodeEffortTransitions(messages)
+      expect(plan).toMatchObject({ baseline: 'low', markerCount: 1 })
+      if (!plan) throw new Error('Missing effort plan')
+      const body: Record<string, unknown> = {
+        model,
+        thinking: { ...ADAPTIVE },
+        output_config: { effort: 'high' },
+        messages: lower(messages),
+      }
+
+      expect(
+        applyOpenCodeEffortMarkers(
+          body,
+          true,
+          encodeOpenCodeEffortPlan(plan),
+          plan,
+        ),
+      ).toEqual({ found: 1, inserted: 1 })
+      expect(body.output_config).toEqual({ effort: 'low' })
+      expect(body.messages).toEqual([
+        { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+        { role: 'system', content: [], output_config: { effort: 'high' } },
+        { role: 'user', content: [{ type: 'text', text: 'msg_high' }] },
+      ])
+    })
+  }
+
+  test('leaves a newly eligible request without an effort change byte-identical', () => {
+    for (const [model, variant] of [
+      ['claude-opus-5-5', 'high'],
+      ['claude-opus-5-5', undefined],
+      ['claude-sonnet-5-5', 'max'],
+    ] as const) {
+      const messages: HostMessage[] = [
+        user('msg_first', 'ses_steady', model, variant),
+        assistant('msg_step', 'ses_steady'),
+        user('msg_second', 'ses_steady', model, variant),
+      ]
+      const plan = markOpenCodeEffortTransitions(messages)
+      expect(plan).toMatchObject({ markerCount: 0 })
+      if (!plan) throw new Error('Missing effort plan')
+      const body: Record<string, unknown> = {
+        model,
+        thinking: { ...ADAPTIVE },
+        ...(variant ? { output_config: { effort: variant } } : {}),
+        messages: lower(messages),
+      }
+      const before = JSON.stringify(body)
+      expect(
+        applyOpenCodeEffortMarkers(
+          body,
+          true,
+          encodeOpenCodeEffortPlan(plan),
+          plan,
+        ),
+      ).toEqual({ found: 0, inserted: 0 })
+      expect(JSON.stringify(body)).toBe(before)
+    }
+  })
+
+  test('uses each model default effort for a turn without a variant', () => {
+    const messages: HostMessage[] = [
+      user('msg_default', 'ses_default_effort', 'claude-opus-5-5'),
+      assistant('msg_step', 'ses_default_effort'),
+      user('msg_low', 'ses_default_effort', 'claude-opus-5-5', 'low'),
+    ]
+    expect(markOpenCodeEffortTransitions(messages)).toMatchObject({
+      baseline: 'medium',
+      markerCount: 1,
+    })
+    expect(
+      markOpenCodeEffortTransitions([
+        user('msg_default', 'ses_default_sonnet', 'claude-sonnet-5-5'),
+      ]),
+    ).toMatchObject({ baseline: 'high', markerCount: 0 })
+  })
+
+  test('strips markers without inserting effort messages on Sonnet 5.5 between_tools', () => {
+    const messages: HostMessage[] = [
+      user('msg_low', 'ses_between', 'claude-sonnet-5-5', 'low'),
+      assistant('msg_step', 'ses_between'),
+      user('msg_high', 'ses_between', 'claude-sonnet-5-5', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    if (!plan) throw new Error('Missing effort plan')
+    const body: Record<string, unknown> = {
+      model: 'claude-sonnet-5-5',
+      thinking: { type: 'between_tools' },
+      output_config: { effort: 'high' },
+      messages: lower(messages),
+    }
+
+    expect(
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan),
+        plan,
+      ),
+    ).toEqual({ found: 1, inserted: 0 })
+    expect(body.output_config).toEqual({ effort: 'high' })
+    expect(body.messages).toEqual([
+      { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+      { role: 'user', content: [{ type: 'text', text: 'msg_high' }] },
+    ])
+  })
+
+  test('strips markers without inserting effort messages on an API-key route', () => {
+    const messages: HostMessage[] = [
+      user('msg_low', 'ses_api_key', 'claude-opus-5-5', 'low'),
+      assistant('msg_step', 'ses_api_key'),
+      user('msg_high', 'ses_api_key', 'claude-opus-5-5', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    if (!plan) throw new Error('Missing effort plan')
+    const body: Record<string, unknown> = {
+      model: 'claude-opus-5-5',
+      thinking: { ...ADAPTIVE },
+      output_config: { effort: 'high' },
+      messages: lower(messages),
+    }
+
+    expect(
+      applyOpenCodeEffortMarkers(
+        body,
+        false,
+        encodeOpenCodeEffortPlan(plan),
+        plan,
+      ),
+    ).toEqual({ found: 1, inserted: 0 })
+    expect(body.output_config).toEqual({ effort: 'high' })
+    expect(JSON.stringify(body)).not.toContain('cortexkit-internal-effort')
+    expect(body.messages).toHaveLength(3)
+  })
+
+  test('keeps one timeline per model family in a mixed session', () => {
+    const fable = [
+      user('msg_fable_low', 'ses_mixed', 'claude-fable-5-1', 'low'),
+      assistant('msg_step_1', 'ses_mixed'),
+      user('msg_opus_max', 'ses_mixed', 'claude-opus-5-5', 'max'),
+      assistant('msg_step_2', 'ses_mixed'),
+      user('msg_fable_current', 'ses_mixed', 'claude-fable-5-1', 'low'),
+    ]
+    expect(markOpenCodeEffortTransitions(fable)).toMatchObject({
+      baseline: 'low',
+      markerCount: 0,
+    })
+    expect(markerTexts(fable)).toEqual([])
+
+    const opus = [
+      user('msg_fable_low', 'ses_mixed', 'claude-fable-5-1', 'low'),
+      assistant('msg_step_1', 'ses_mixed'),
+      user('msg_opus_max', 'ses_mixed', 'claude-opus-5-5', 'max'),
+      assistant('msg_step_2', 'ses_mixed'),
+      user('msg_opus_current', 'ses_mixed', 'claude-opus-5-5[1m]', 'max'),
+    ]
+    expect(markOpenCodeEffortTransitions(opus)).toMatchObject({
+      baseline: 'max',
+      markerCount: 0,
+    })
+  })
 })

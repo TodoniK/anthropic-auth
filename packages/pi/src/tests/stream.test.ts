@@ -189,6 +189,112 @@ describe('Pi API fallback routing helpers', () => {
     )
   })
 
+  test('sends Opus 5.5 effort changes as system markers with the per-turn control beta', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-opus-55-effort-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+      },
+      storagePath,
+    )
+
+    const requests: { headers: Headers; body: Record<string, any> }[] = []
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = input.toString()
+        if (url.includes('/api/claude_cli/bootstrap')) {
+          return new Response(
+            JSON.stringify({
+              oauth_account: { account_uuid: 'pi-opus-55-account' },
+            }),
+          )
+        }
+        requests.push({
+          headers: new Headers(init?.headers),
+          body: JSON.parse(String(init?.body)),
+        })
+        return new Response(
+          [
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ].join(''),
+          { status: 200 },
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const context = {
+      systemPrompt: 'test',
+      tools: [],
+      messages: [
+        { role: 'user', content: 'first', timestamp: 0 },
+        {
+          role: 'assistant',
+          provider: 'anthropic',
+          api: 'cortexkit-anthropic-messages',
+          model: 'claude-opus-5-5',
+          content: [{ type: 'text', text: 'first answer' }],
+          timestamp: 0,
+        },
+        { role: 'user', content: 'second', timestamp: 0 },
+      ],
+    } as any
+    const model = {
+      ...anthropicModel,
+      id: 'claude-opus-5-5',
+      name: 'Claude Opus 5.5',
+    }
+    const drain = async (
+      transitions: { afterAssistantMessages: number; effort: 'low' | 'high' }[],
+    ) => {
+      const stream = streamCortexKitAnthropic(
+        model,
+        context,
+        {
+          apiKey: 'sk-ant-oat-pi-opus-55',
+          sessionId: 'ses_pi_opus_55',
+          reasoning: 'high',
+        } as any,
+        transitions,
+      )
+      for await (const _event of stream) {
+        // Drain the provider stream.
+      }
+    }
+
+    await drain([
+      { afterAssistantMessages: 0, effort: 'low' },
+      { afterAssistantMessages: 1, effort: 'high' },
+    ])
+    await drain([{ afterAssistantMessages: 0, effort: 'high' }])
+
+    const [changed, steady] = requests
+    expect(changed?.body.output_config).toEqual({ effort: 'low' })
+    expect(changed?.body.messages[2]).toEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'high' },
+    })
+    // Without an effort change the body keeps the host's effort and has no
+    // system marker; only the beta list differs from an ineligible model.
+    expect(steady?.body.output_config).toEqual({ effort: 'high' })
+    expect(
+      steady?.body.messages.some(
+        (message: { role?: string }) => message.role === 'system',
+      ),
+    ).toBe(false)
+    for (const request of [changed, steady]) {
+      const betas = request?.headers.get('anthropic-beta')?.split(',')
+      expect(betas).toContain('per-turn-control-2026-07-01')
+      expect(betas).not.toContain('mid-conversation-output-config-2026-07-01')
+    }
+  })
+
   test('preserves provider base path when building /v1/messages URL', () => {
     const url = buildExplicitBaseMessagesUrl('https://api.kie.ai/claude')
 

@@ -55,6 +55,27 @@ describe('Pi Fable 5.1 effort history', () => {
       { afterAssistantMessages: 1, effort: 'xhigh' },
     ])
   })
+
+  test('uses the request model default for turns without an adaptive level', () => {
+    const branch = [
+      entry('u1', 'message', { message: { role: 'user' } }),
+      entry('a1', 'message', { message: { role: 'assistant' } }),
+      entry('t1', 'thinking_level_change', { thinkingLevel: 'low' }),
+      entry('u2', 'message', { message: { role: 'user' } }),
+      entry('a2', 'message', { message: { role: 'assistant' } }),
+      entry('t2', 'thinking_level_change', { thinkingLevel: 'off' }),
+      entry('u3', 'message', { message: { role: 'user' } }),
+    ]
+    expect(collectPiEffortHistory(branch, branch, 'medium')).toEqual([
+      { afterAssistantMessages: 0, effort: 'medium' },
+      { afterAssistantMessages: 1, effort: 'low' },
+      { afterAssistantMessages: 2, effort: 'medium' },
+    ])
+    expect(collectPiEffortHistory(branch, branch)[0]).toEqual({
+      afterAssistantMessages: 0,
+      effort: 'high',
+    })
+  })
 })
 
 // The host accessor these entries came from — buildContextEntries() — exists on

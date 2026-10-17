@@ -115,6 +115,39 @@ describe('Claude Code fingerprint helpers', () => {
     expect(fullBetas).toContain('fallback-credit-2026-06-01')
   })
 
+  test('adds the per-turn control beta after the mid-conversation system beta for Opus 5.5 and Sonnet 5.5', () => {
+    for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5']) {
+      const betas = selectClaudeCodeBetas({
+        model,
+        messages: [{ role: 'user', content: 'hi' }],
+        system: [{ type: 'text', text: 'system' }],
+        tools: [{ name: 'mcp_Read', input_schema: { type: 'object' } }],
+        thinking: { type: 'adaptive' },
+        context_management: { edits: [] },
+        output_config: { effort: 'high' },
+        diagnostics: { enabled: true },
+        stream: true,
+      }).split(',')
+      const systemIndex = CLAUDE_CODE_FULL_AGENT_BETAS.indexOf(
+        'mid-conversation-system-2026-04-07',
+      )
+      expect(betas).toEqual([
+        ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(0, systemIndex + 1),
+        'per-turn-control-2026-07-01',
+        ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(systemIndex + 1),
+      ])
+    }
+
+    const base = selectClaudeCodeBetas({
+      model: 'claude-opus-5-5[1m]',
+      messages: [{ role: 'user', content: 'hi' }],
+    }).split(',')
+    expect(base.at(-1)).toBe('per-turn-control-2026-07-01')
+    expect(
+      selectClaudeCodeBetas({ model: 'claude-fable-5-1', messages: [] }),
+    ).not.toContain('per-turn-control-2026-07-01')
+  })
+
   test('selects structured-output betas without full-agent private betas', () => {
     const betas = selectClaudeCodeBetas({
       model: 'claude-haiku-4-5-20251001',

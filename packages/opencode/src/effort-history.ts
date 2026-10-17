@@ -1,8 +1,15 @@
 import { createHash } from 'node:crypto'
 import {
   type AdaptiveEffort,
+  defaultAdaptiveEffort,
   isClaudeFable51Model,
+  isClaudeHaiku55Model,
+  isClaudeMythos51Model,
+  isClaudeOpus5Model,
+  isClaudeOpus55Model,
+  isClaudeSonnet55Model,
   normalizeAdaptiveEffort,
+  supportsPerMessageEffort,
 } from '@cortexkit/anthropic-auth-core'
 
 const MAX_EFFORT_MARKERS = 512
@@ -107,11 +114,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function isFableUser(item: MutableOpenCodeMessage | undefined): boolean {
+/**
+ * Group a model id into the per-message-effort family whose user turns share
+ * one effort timeline. Turns sent to a different family in the same session
+ * are left out, so a Fable 5.1 timeline never counts Opus 5.5 turns.
+ */
+function perMessageEffortFamily(model: unknown): string | undefined {
+  if (isClaudeFable51Model(model)) return 'fable-5-1'
+  if (isClaudeMythos51Model(model)) return 'mythos-5-1'
+  if (isClaudeOpus55Model(model)) return 'opus-5-5'
+  if (isClaudeOpus5Model(model)) return 'opus-5'
+  if (isClaudeSonnet55Model(model)) return 'sonnet-5-5'
+  if (isClaudeHaiku55Model(model)) return 'haiku-5-5'
+  return undefined
+}
+
+function userEffortFamily(
+  item: MutableOpenCodeMessage | undefined,
+): string | undefined {
+  if (item?.info?.role !== 'user') return undefined
+  if (item.info.model?.providerID !== 'anthropic') return undefined
+  return perMessageEffortFamily(item.info.model.modelID)
+}
+
+function userEffort(item: MutableOpenCodeMessage): AdaptiveEffort {
   return (
-    item?.info?.role === 'user' &&
-    item.info.model?.providerID === 'anthropic' &&
-    isClaudeFable51Model(item.info.model.modelID)
+    normalizeAdaptiveEffort(item.info?.model?.variant) ??
+    defaultAdaptiveEffort(item.info?.model?.modelID)
   )
 }
 
@@ -333,7 +362,8 @@ export function markOpenCodeEffortTransitions(
   messages: MutableOpenCodeMessage[],
 ): OpenCodeEffortMarkerPlan | null {
   const currentUser = messages.findLast((item) => item.info?.role === 'user')
-  if (!currentUser || !isFableUser(currentUser)) return null
+  const family = userEffortFamily(currentUser)
+  if (!currentUser || !family) return null
 
   removeInternalMarkers(messages)
   if (!Array.isArray(currentUser.parts) || !hasLowerableUserPart(currentUser)) {
@@ -357,9 +387,8 @@ export function markOpenCodeEffortTransitions(
     typeof compaction?.info?.id === 'string' ? compaction.info.id : undefined
   let baseline: AdaptiveEffort | undefined
   let activeEffort: AdaptiveEffort | undefined
-  if (compaction && isFableUser(compaction)) {
-    baseline =
-      normalizeAdaptiveEffort(compaction.info?.model?.variant) ?? 'high'
+  if (compaction && userEffortFamily(compaction) === family) {
+    baseline = userEffort(compaction)
     activeEffort = baseline
   }
 
@@ -374,9 +403,11 @@ export function markOpenCodeEffortTransitions(
     ) {
       continue
     }
-    if (!isFableUser(item) || !hasLowerableUserPart(item)) continue
+    if (userEffortFamily(item) !== family || !hasLowerableUserPart(item)) {
+      continue
+    }
 
-    const effort = normalizeAdaptiveEffort(info.model?.variant) ?? 'high'
+    const effort = userEffort(item)
     if (!baseline) {
       baseline = effort
       activeEffort = effort
@@ -681,6 +712,8 @@ export function applyOpenCodeEffortMarkers(
         'Fable 5.1 effort marker request plan mismatch',
       )
     }
+    // Only Fable 5.1 pins top-level effort on a request without surviving
+    // markers; the other models keep the host's request unchanged here.
     if (enabled && isClaudeFable51Model(body.model)) {
       const outputConfig = isRecord(body.output_config)
         ? { ...body.output_config }
@@ -854,7 +887,7 @@ export function applyOpenCodeEffortMarkers(
     }
   }
 
-  const applyConfig = enabled && isClaudeFable51Model(body.model)
+  const applyConfig = enabled && supportsPerMessageEffort(body)
   let inserted = 0
   const rewritten: unknown[] = []
   for (const message of consumed.messages) {
@@ -870,7 +903,9 @@ export function applyOpenCodeEffortMarkers(
     rewritten.push(message.value)
   }
   body.messages = rewritten
-  if (applyConfig) {
+  // Fable 5.1 always pins the earliest effort. The other models change
+  // top-level effort only when a marker carries the later effort.
+  if (applyConfig && (inserted > 0 || isClaudeFable51Model(body.model))) {
     const outputConfig = isRecord(body.output_config)
       ? { ...body.output_config }
       : {}

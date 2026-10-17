@@ -7,6 +7,10 @@ import {
   FAST_MODE_BETA,
   USER_AGENT,
 } from './constants.ts'
+import {
+  PER_TURN_CONTROL_BETA,
+  usesPerTurnControl,
+} from './mid-conversation-output-config.ts'
 
 export type ProviderAccountUuid = string & {
   readonly __providerAccountUuid: unique symbol
@@ -448,6 +452,17 @@ export function selectClaudeCodeBetas(
         ? [...CLAUDE_CODE_STRUCTURED_OUTPUT_BETAS]
         : [...CLAUDE_CODE_BASE_BETAS]
     : [...CLAUDE_CODE_BASE_BETAS]
+
+  // Claude Code sends this beta on every Opus 5.5 and Sonnet 5.5 request,
+  // directly after the mid-conversation system beta when that is present.
+  if (body && usesPerTurnControl(body.model)) {
+    const systemIndex = selected.indexOf('mid-conversation-system-2026-04-07')
+    if (systemIndex >= 0) {
+      selected.splice(systemIndex + 1, 0, PER_TURN_CONTROL_BETA)
+    } else {
+      selected.push(PER_TURN_CONTROL_BETA)
+    }
+  }
 
   if (body?.speed === 'fast') selected.push(FAST_MODE_BETA)
   for (const beta of extraBetas) {

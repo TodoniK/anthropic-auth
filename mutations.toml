@@ -865,3 +865,19 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "per-message-effort-beyond-fable-51"
+guards = "Opus 5.5 and the other per-turn control models must move mid-session effort changes into system markers instead of rewriting top-level effort."
+file = "packages/core/src/mid-conversation-output-config.ts"
+old = "  if (isClaudeFable51Model(body.model)) return true\n  return (\n    usesPerTurnControl(body.model) &&"
+new = "  if (isClaudeFable51Model(body.model)) return true\n  return (\n    isClaudeFable51Model(body.model) && // NON-VACUITY BREAK: restore the Fable-only gate"
+test_file = "packages/core/src/tests/mid-conversation-output-config.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/mid-conversation-output-config.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["per-message effort beyond Fable 5.1 > claude-opus-5-5 keeps top-level effort at the earliest value and inserts system markers"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
