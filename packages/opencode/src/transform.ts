@@ -879,29 +879,19 @@ function applyCache1hTtl(
   parsed: Record<string, unknown>,
   cache1hEnabled: boolean,
 ) {
-  if (Array.isArray(parsed.system)) {
-    for (const block of parsed.system)
-      updateCacheControlTtl(block, cache1hEnabled)
-  } else {
-    updateCacheControlTtl(parsed.system, cache1hEnabled)
-  }
-
-  if (!Array.isArray(parsed.messages)) return
-
-  for (const message of parsed.messages) {
-    updateCacheControlTtl(message, cache1hEnabled)
-    if (isRecord(message) && Array.isArray(message.content)) {
-      for (const block of message.content) {
-        updateCacheControlTtl(block, cache1hEnabled)
-      }
-    }
-  }
+  walkCacheControlTargets(parsed, (target) =>
+    updateCacheControlTtl(target, cache1hEnabled),
+  )
 }
 
 function walkCacheControlTargets(
   parsed: Record<string, unknown>,
   visitor: (target: unknown) => void,
 ) {
+  if (Array.isArray(parsed.tools)) {
+    for (const tool of parsed.tools) visitor(tool)
+  }
+
   if (Array.isArray(parsed.system)) {
     for (const block of parsed.system) visitor(block)
   } else {
@@ -1422,6 +1412,17 @@ function applyCache1hStrategy(
 
   applyCache1hTtl(parsed, true)
   delete parsed.cacheControl
+  const marked: Record<string, unknown>[] = []
+  walkCacheControlTargets(parsed, (target) => {
+    if (isRecord(target) && getCacheControl(target)) marked.push(target)
+  })
+  if (isRecord(parsed.cache_control)) {
+    updateCacheControlTtl(parsed, true)
+    marked.push(parsed)
+  }
+  // Later breakpoints also cover earlier prefixes, so retain the last four
+  // when a host supplies more markers than Anthropic accepts.
+  for (const target of marked.slice(0, -4)) removeCacheControl(target)
   return {}
 }
 
