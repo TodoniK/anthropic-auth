@@ -7,7 +7,7 @@
 Stop every OpenCode, LiteCode and Pi process before running:
 
 ```sh
-npx @cortexkit/opencode-anthropic-auth setup
+bunx @cortexkit/opencode-anthropic-auth setup
 ```
 
 The setup CLI delegates host detection, OpenCode generation selection and package registration to common-auth's shared setup runner. Its Anthropic-specific callbacks establish local account authority or activate vault custody. Generation 1 means OpenCode 1, generation 2 means OpenCode 2, and `both` configures their shared pool. Offline means the hosts are stopped, not that network access is disabled: sign-in, package installation and vault enrollment can require network or daemon access. Do not restart hosts until setup has finished.

@@ -716,3 +716,67 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "setup-publishes-empty-init"
+guards = "OpenCode 2 setup must establish empty local authority before the registered pool login can commit an account."
+file = "packages/opencode/src/setup/command.ts"
+old = '''      else if (plan.action === 'empty-init')
+        await publishNativeEmptyInit({
+          paths: plan.paths.paths,
+          routingDestinationPath: plan.paths.routingDestinationPath,
+          env,
+          processFence: nativeLocalProcessFence(host, localOptions(host)),
+        })'''
+new = '''      else if (plan.action === 'empty-init') {
+        // NON-VACUITY BREAK: skip empty local authority publication
+      }'''
+test_file = "packages/opencode/src/tests/setup-command.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/setup-command.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["acceptance 1: offline OC2 setup, registered fixture login and first native Bearer request"]
+expect_message = "Expected promise that resolves"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "migration-capture-refuses-populated-pool"
+guards = "Legacy import must refuse a populated native pool during capture, before attempting any journal write."
+file = "packages/core/src/native-migration.ts"
+old = '''    if (checkPool && (await nativePoolHoldsAccountData({ paths: input.paths })))
+      refuse('pool-populated')'''
+new = '''    // NON-VACUITY BREAK: allow capture over existing native account data'''
+test_file = "packages/core/src/tests/native-migration.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-migration.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["direct migration refuses populated empty-init before any write for every host slot"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "custody-admits-separate-login-with-native-pool"
+guards = "A separate complete OpenCode login must not block local serving from an authorized usable native OAuth pool."
+file = "packages/opencode/src/custody-mode.ts"
+old = '''  if (
+    input.mode === 'L' &&
+    input.main === 'R' &&
+    input.evidence === 'V' &&
+    input.localOAuthServable === true
+  ) {
+    return { verdict: 'LOCAL_SERVE' }
+  }'''
+new = '''  // NON-VACUITY BREAK: refuse separate logins despite a usable native pool'''
+test_file = "packages/opencode/src/tests/setup-command.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/setup-command.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["S1 populated real-login request uses native pool (same UUID)"]
+expect_message = "Expected promise that resolves"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"

@@ -22,7 +22,7 @@ For empty-init authority, the local routing destination is `OPENCODE_ANTHROPIC_A
 
 Use `/claude` → **Accounts** to start and finish OAuth sign-in, add an API-key fallback, enable/disable, reorder, remove or reset backoff. Local changes refuse while enrolled in the vault. The [OpenCode CLI](commands.md#opencode-cli) also offers `login`, `api add` and `list` for OpenCode local custody only.
 
-OAuth login must resolve a verified Claude account UUID. Credentials and refresh operations stay in the native runtime; the host's inert marker is never a credential. Re-login an account with a permanent `invalid_grant` failure rather than copying tokens between stores. The plugin never uses a separate OC1 login's access or refresh tokens; no claim is made about OpenCode 1.18's own host-side refresh behavior.
+OAuth login must resolve a verified Claude account UUID. Credentials and refresh operations stay in the native runtime; the host's inert marker is never a credential. Re-login an account with a permanent `invalid_grant` failure rather than copying tokens between stores. The plugin never uses a separate OpenCode 1 login's access or refresh tokens.
 
 ## Routing modes
 

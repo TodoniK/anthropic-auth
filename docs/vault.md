@@ -7,7 +7,7 @@ Claustrum is a local credential-vault service. Each host explicitly enrolls as `
 Stop all OpenCode, LiteCode and Pi processes. With `ck` installed and the Claustrum daemon running, run:
 
 ```sh
-npx @cortexkit/opencode-anthropic-auth setup --claustrum
+bunx @cortexkit/opencode-anthropic-auth setup --claustrum
 ```
 
 The shared runner owns the per-host enrollment ceremony. Anthropic callbacks then ensure the host-specific grant to read the `anthropic-native` category, discover inventory and require a verified default Claude account. If that default is unverified, sign in through the vault and rerun setup; setup does not import local tokens into the vault.

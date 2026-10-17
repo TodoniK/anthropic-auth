@@ -23,11 +23,11 @@ Remove, reset-enrollment and disconnect actions require confirmation. Sign-in, A
 The CLI belongs to `@cortexkit/opencode-anthropic-auth`. It manages OpenCode's native local pool, not Pi's pool or vault credentials. Stop all hosts before CLI operations that change accounts or setup state.
 
 ```sh
-npx @cortexkit/opencode-anthropic-auth --help
-npx @cortexkit/opencode-anthropic-auth setup
-npx @cortexkit/opencode-anthropic-auth login personal-alt
-npx @cortexkit/opencode-anthropic-auth api add kie-opus
-npx @cortexkit/opencode-anthropic-auth list
+bunx @cortexkit/opencode-anthropic-auth --help
+bunx @cortexkit/opencode-anthropic-auth setup
+bunx @cortexkit/opencode-anthropic-auth login personal-alt
+bunx @cortexkit/opencode-anthropic-auth api add kie-opus
+bunx @cortexkit/opencode-anthropic-auth list
 ```
 
 `login` adds an OAuth account with a verified identity. `api add` collects an API-key route; automation can supply `OPENCODE_ANTHROPIC_AUTH_API_BASE_URL`, `OPENCODE_ANTHROPIC_AUTH_API_KEY` and `OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER`. Treat those environment values as secrets, not examples to paste into logs. Local account operations refuse while enrolled in the vault.

@@ -207,7 +207,11 @@ async function expectRefusal(
   code: string,
 ) {
   const error = await work.catch((error) => error)
-  expect(error).toBeInstanceOf(type)
+  expect({
+    instance: error instanceof type,
+    name: error instanceof Error ? error.name : undefined,
+    code: error instanceof Error && 'code' in error ? error.code : undefined,
+  }).toMatchObject({ instance: true })
   expect(
     error instanceof Error && 'code' in error ? error.code : undefined,
   ).toBe(code)

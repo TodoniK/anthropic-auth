@@ -1526,7 +1526,7 @@ lifetimes.test(
       expect(f.screen().split(CLAUDE_POOL_LOGIN_STEP).length - 1).toBe(1)
       const runtime = setupRuntime(f)
       try {
-        await poolMethodLogin(runtime)
+        await expect(poolMethodLogin(runtime)).resolves.toBeUndefined()
         expect(outbound).toBe(0)
         await runtime.updateSettings((settings) => ({
           ...settings,
@@ -1813,7 +1813,9 @@ for (const accountIdentity of [
       expect(await setupBytes(f.plan)).toEqual(before)
       expect(f.screen().split(SEPARATE_HOST_LOGIN_NOTICE).length - 1).toBe(1)
       const sent: Request[] = []
-      expect((await sendSetupOc1(f, sent)).status).toBe(200)
+      await expect(sendSetupOc1(f, sent)).resolves.toMatchObject({
+        status: 200,
+      })
       expect(sent).toHaveLength(1)
       expect(sent[0]!.headers.get('authorization')).toBe(
         `Bearer ${SETUP_ACCESS}`,

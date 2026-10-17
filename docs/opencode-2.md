@@ -7,18 +7,18 @@ OpenCode 1 and OpenCode 2 use the same native account pool for a given OpenCode 
 Stop every OpenCode, LiteCode and Pi process, then run:
 
 ```sh
-npx @cortexkit/opencode-anthropic-auth setup --yes --opencode=2
+bunx @cortexkit/opencode-anthropic-auth setup --yes --opencode=2
 ```
 
-Without `--login`, generation-2-only local setup registers the main OpenCode config and publishes a version-5 `empty-init` journal, or reuses matching completed authority. The journal records permission for the native runtime to use local storage; empty initialization authorizes a pool that has no accounts yet and does not create credentials. It does not read or write OpenCode 1's auth file, install an OpenCode 1 placeholder, create an OpenCode 2 connection, or open any OpenCode database. It opens nothing under the OpenCode data directory; path inspection for safety is allowed. No production setup code reads `OPENCODE_DB`.
+Without `--login`, generation-2-only local setup registers the main OpenCode config and initializes an empty native account pool, or reuses matching completed setup. A version-5 `empty-init` journal records that the pool is ready for sign-in. Setup does not read or write OpenCode 1's auth file, install an OpenCode 1 placeholder, create an OpenCode 2 connection, or access an OpenCode database.
 
-The OpenCode setup callback prints the registered pool-login instruction once:
+Setup prints this instruction once:
 
 In OpenCode, sign in to Anthropic with "Claude Pro / Max (native account pool)".
 
 After setup, start OpenCode and select **Claude Pro / Max (native account pool)**. The registered login verifies the Claude account identity and commits its credentials to the native pool. Only the fixed, non-secret plugin marker is returned to OpenCode through the host API. The first plugin-served request uses native pool authorization, never an old OpenCode 1 token. An empty pool cannot serve a request.
 
-Fresh empty initialization writes only its journal, in addition to shared registration's main config update. It leaves legacy account/state/routing sidecars untouched and does not write the TUI sidebar config. Reusing a matching empty-init journal leaves pool, journal and source bytes unchanged, even after later pool logins. Existing native destination files without matching authority, malformed or conflicting journals, and unfinished migrations refuse instead of being overwritten. This is an offline setup operation, not a background repair.
+Fresh initialization writes the journal and main config, not the TUI sidebar config or legacy account/state/routing sidecars. A rerun preserves existing pool and journal bytes, including accounts added later. Conflicting files or unfinished migrations refuse instead of being overwritten; see [recovery](releases.md#upgrade-and-recovery).
 
 ## Setup login and host selection
 
@@ -33,17 +33,17 @@ Fresh empty initialization writes only its journal, in addition to shared regist
 
 ## Both OpenCode generations
 
-`--opencode=both` is one OpenCode owner with one native path set and one authority journal, not two migrations or two login commits. It runs the OpenCode 1 local operation first and then reuses that authority for OpenCode 2. With all legacy sources absent, that operation produces a retired zero-row legacy-import journal, not an empty-init journal. With `--login`, there is one OpenCode login commit. The generation-2 pool-login step is not printed for `both`.
+`--opencode=both` runs OpenCode 1 migration first, then reuses that pool for OpenCode 2. There is one OpenCode journal and, with `--login`, one login commit. Even with no legacy accounts, this is a completed legacy migration rather than empty initialization. The generation-2 pool-login instruction is not printed for `both`.
 
 Shared registration writes the main and TUI sidebar configs for generation 1 or `both`; generation 2 alone writes only the main config. No selection opens an OpenCode database. Generation 1 and `both` may open the OpenCode 1 auth file for migration; that exception does not apply to generation 2 alone.
 
 ## Later OpenCode 1 use and routing
 
-Empty initialization does not retire a later OpenCode 1 import. When the native pool holds no account data, offline OpenCode 1 setup imports legacy accounts and metadata, preserves native preferences and gap-fills legacy session pins only where a native pin is absent. Once the pool holds credentials, rows or private account metadata, direct migration refuses `pool-populated` and shared OpenCode 1 setup skips the import. Pins or preferences alone do not make the pool populated. A separate OpenCode 1 login never replaces native tokens just because its account UUID matches.
+Empty initialization still allows a later OpenCode 1 import while the pool has no account data. Once populated, setup preserves native credentials rather than merging a separate OpenCode login. See [local migration](custody-state-machine.md#migration) for preservation and skip rules.
 
-For an empty-init journal, OpenCode 1 and 2 use `OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE` when set, otherwise `getStickyRoutingStatePath(paths.config)` (normally `anthropic-auth-pool-routing-state.json`). Pi uses the corresponding `PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE` override or the same config-derived rule on Pi paths. Completed legacy migrations use their recorded routing destination; that behavior is independent of empty initialization.
+OpenCode 1 and 2 share the [local routing file](accounts-and-routing.md#local-storage): with empty initialization, use `OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE` when set, otherwise the pool-config-derived `anthropic-auth-pool-routing-state.json`.
 
-Version-5 journals have no rollback path. Do not delete or rewrite a journal to make an older release accept it. A version-5 legacy-import resume requires unchanged native settings and refuses `settings-changed` before further writes if they differ. Existing version-4 journals retain their version-4 format and recovery behavior. See [upgrade and recovery](releases.md#upgrade-and-recovery).
+Version-5 journals have no rollback path. Do not delete or rewrite a journal to make an older release accept it; see [upgrade and recovery](releases.md#upgrade-and-recovery).
 
 ## Vault and transport boundaries
 
@@ -55,4 +55,4 @@ OpenCode 2 supports direct and HTTP relay requests. WebSocket relay is refused b
 
 The setup CLI lives in `@cortexkit/opencode-anthropic-auth`. Shared detection, generation choice, stopped-host safety checks, registration and enrollment come from `@cortexkit/common-auth`, which remains a devDependency of `@cortexkit/anthropic-auth-core` (Core) bundled into Core's dist. The CLI imports the shared runner through Core's bundle and gains no new runtime common-auth dependency. Anthropic callbacks own identity verification, native migration, Pi consent and vault activation.
 
-The plugin never uses access or refresh tokens from the Anthropic login stored in OpenCode 1's own auth file, separate from the native pool. OpenCode 1.18's own stored-OAuth refresh behavior is not established; this guide makes no host-side refresh claim. The [OC1 admission table](custody-state-machine.md#opencode-1) describes when a separate login can coexist with native serving.
+The plugin never uses tokens from a separate OpenCode 1 login. The [OpenCode 1 admission table](custody-state-machine.md#opencode-1) describes when that login can coexist with native serving.
