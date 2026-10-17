@@ -1071,7 +1071,7 @@ test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["EXPECT_RED_PLACEHOLDER"]
+expect_red = ["background sweep takes a fresh insula reading and sends no usage GET", "the primary account is looked up in insula by its roster row account id, not its logical id", "a stale, missing or failed insula entry falls back to one usage GET for that account only", "runtimes on one connection file and token path share one insula source until all release it", "the Fable window from extraRateWindows drives scoped routing and the scoped killswitch floor", "the source switch is logged once per change with fixed codes and no identity"]
 expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
@@ -1104,8 +1104,26 @@ test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["background sweep takes a fresh insula reading and sends no usage GET", "the primary account is looked up in insula by its roster row account id, not its logical id", "a stale, missing or failed insula entry falls back to one usage GET for that account only", "admission reads only the insula cache: never refreshes it, polls on a miss", "the Fable window from extraRateWindows drives scoped routing and the scoped killswitch floor", "the source switch is logged once per change with fixed codes and no identity"]
+expect_red = ["background sweep takes a fresh insula reading and sends no usage GET", "the primary account is looked up in insula by its roster row account id, not its logical id", "a stale, missing or failed insula entry falls back to one usage GET for that account only", "admission reads only the insula cache: never refreshes it, polls on a miss", "runtimes on one connection file and token path share one insula source until all release it", "the Fable window from extraRateWindows drives scoped routing and the scoped killswitch floor", "the source switch is logged once per change with fixed codes and no identity"]
 expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-insula-source-released-on-close"
+guards = "Closing a vault runtime must release its reference to the shared insula source, so the source is dropped once its last holder closes."
+file = "packages/core/src/native-vault-runtime.ts"
+old = """      insula?.release()
+"""
+new = """      // NON-VACUITY BREAK: never release
+"""
+test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtimes on one connection file and token path share one insula source until all release it"]
+expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
