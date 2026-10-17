@@ -55,6 +55,7 @@ function usage() {
   opencode-anthropic-auth list
   opencode-anthropic-auth relay setup
 
+Setup --yes selects every found host, including Pi. Run setup without --yes to choose hosts.
 Native credentials are managed by the offline setup migration.
 Legacy import source:
   ${getAccountStoragePath()}`)

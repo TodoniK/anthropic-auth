@@ -25,7 +25,7 @@ bunx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum
 
 ## Vault custody
 
-`Disconnect from the vault first.` means local sign-in cannot run under vault authority. Use Accounts to disconnect, or manage accounts in Claustrum. An unreadable enrollment is not local permission; repair its ownership/permissions or use **Disconnect from the vault**. Do not copy enrollment tokens between hosts.
+Local setup names hosts that are still connected to the vault. In each named host, run `/claude` → **Accounts** → **Disconnect from the vault**. Then run local setup again. Old local settings from 1.x do not undo enrollment. An unreadable enrollment does not allow local sign-in. Disconnect can clear malformed data, but unsafe storage or a record for another host can refuse. Check the host's enrollment path, ownership and private permissions. Do not delete or copy enrollment files between hosts.
 
 If OpenCode holds a separate Anthropic login while enrolled, remove that login using OpenCode's tools and choose the vault method, or disconnect. If vault setup reports no verified default Claude account, sign in through the vault and rerun setup; a local token cannot satisfy that check.
 

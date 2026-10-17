@@ -147,6 +147,8 @@ Pi's built-in Anthropic provider implementation is replaced, keeping the `anthro
 Disconnect this host from the vault and return to local accounts? The vault keeps this host's enrollment approved until an operator revokes it there.
 ```
 
+The action can clear malformed data, but it refuses unsafe storage and records for another host or plugin. Check the host's enrollment path, ownership and private permissions before retrying. Do not delete enrollment files by hand. See [disconnect recovery](vault.md#disconnect-and-recovery).
+
 OpenCode's stored sign-ins are never read or changed. For Pi, disconnect first restores the stashed login byte-for-byte in place of the placeholder, then ends the enrollment. If Pi's auth file already holds a different login, disconnect stops, keeps both logins and the enrollment, and reports the conflict for resolution with setup. After a successful disconnect the host is in local custody, and a previously migrated local pool can serve again. If the pool has never been migrated, stop the hosts and run `setup --no-claustrum`; disconnect never performs migration.
 
 ## Enrollment lifecycle

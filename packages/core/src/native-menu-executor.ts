@@ -248,7 +248,15 @@ export type NativeMenuExecutionResult =
        */
       readonly status: 'failed'
       readonly action: NativeMenuDispatchActionId | 'vault-disconnect'
-      readonly code: 'execution-failed' | 'invalid-outcome'
+      readonly code:
+        | 'execution-failed'
+        | 'invalid-outcome'
+        | 'disconnect-unsafe-file'
+        | 'disconnect-wrong-consumer'
+        | 'disconnect-pi-recovery'
+        | 'disconnect-conflict'
+        | 'disconnect-busy'
+        | 'disconnect-io'
     }
   | {
       /** The host's disconnect capability ran and reported this result. */
@@ -699,6 +707,42 @@ function invalidOption(key: string): TypeError {
   return new TypeError(`Native menu executor option ${key} is invalid`)
 }
 
+function disconnectFailureCode(
+  error: unknown,
+): Extract<NativeMenuExecutionResult, { status: 'failed' }>['code'] {
+  if (!error || typeof error !== 'object' || utilTypes.isProxy(error))
+    return 'execution-failed'
+  // Read only own data fields. Error messages, getters and proxy traps may expose secrets or run code.
+  const data = (key: string): unknown => {
+    const field = Object.getOwnPropertyDescriptor(error, key)
+    return field && 'value' in field ? field.value : undefined
+  }
+  const name = data('name')
+  if (name === 'ClaustrumConsumerError') {
+    const kind = data('kind')
+    if (kind === 'unsafe-file') return 'disconnect-unsafe-file'
+    if (kind === 'wrong-consumer') return 'disconnect-wrong-consumer'
+  }
+  if (name === 'PiSlotError') {
+    switch (data('code')) {
+      case 'unsafe-path':
+        return 'disconnect-unsafe-file'
+      case 'invalid-auth':
+      case 'invalid-stash':
+      case 'missing-stash':
+        return 'disconnect-pi-recovery'
+      case 'conflict':
+        return 'disconnect-conflict'
+      case 'lock-timeout':
+      case 'lock-compromised':
+        return 'disconnect-busy'
+      case 'io':
+        return 'disconnect-io'
+    }
+  }
+  return 'execution-failed'
+}
+
 /**
  * Creates an executor for one host. The host's available actions and their
  * safety rules come from the native menu model; `dispatch` and
@@ -743,12 +787,11 @@ export function createNativeMenuExecutor(
         undefined,
         [options],
       )
-    } catch {
-      // The thrown value is never read: it may carry secrets or run code.
+    } catch (error) {
       return Object.freeze({
         status: 'failed',
         action: 'vault-disconnect',
-        code: 'execution-failed',
+        code: disconnectFailureCode(error),
       })
     }
     if (!DISCONNECT_RESULTS.has(result))

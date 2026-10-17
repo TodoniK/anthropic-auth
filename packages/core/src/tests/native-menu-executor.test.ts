@@ -1695,3 +1695,55 @@ test('vault disconnect is unsupported without a capability and reports capabilit
     ).toThrow('Native menu executor option disconnectVault is invalid')
   }
 })
+
+test('disconnect classification ignores unknown codes, foreign names, getters and proxies', async () => {
+  let reads = 0
+  const accessor = Object.defineProperty({ kind: 'unsafe-file' }, 'name', {
+    get() {
+      reads++
+      return 'ClaustrumConsumerError'
+    },
+  })
+  const codeAccessor = Object.defineProperty({ name: 'PiSlotError' }, 'code', {
+    get() {
+      reads++
+      return 'unsafe-path'
+    },
+  })
+  const proxy = new Proxy(
+    {},
+    {
+      getOwnPropertyDescriptor() {
+        reads++
+        throw new Error('synthetic-secret')
+      },
+    },
+  )
+  for (const error of [
+    { name: 'Error', kind: 'unsafe-file', message: 'synthetic-secret' },
+    {
+      name: 'ClaustrumConsumerError',
+      kind: 'unknown',
+      message: 'synthetic-secret',
+    },
+    { name: 'PiSlotError', code: 'unknown', message: 'synthetic-secret' },
+    accessor,
+    codeAccessor,
+    proxy,
+  ]) {
+    const { executor } = disconnectHarness('opencode', async () => {
+      throw error
+    })
+    expect(
+      await executor.execute(samples['vault-disconnect'], {
+        ...full,
+        custodyMode: 'claustrum',
+      }),
+    ).toEqual({
+      status: 'failed',
+      action: 'vault-disconnect',
+      code: 'execution-failed',
+    })
+  }
+  expect(reads).toBe(0)
+})

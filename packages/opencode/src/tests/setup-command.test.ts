@@ -1197,6 +1197,78 @@ async function writeSetupJson(path: string, value: unknown) {
   await writeFile(path, JSON.stringify(value), { mode: 0o600 })
 }
 
+for (const host of ['opencode', 'pi'] as const) {
+  lifetimes.test(
+    `${host} failed activation names retained vault enrollment and both recovery steps`,
+    async () => {
+      const f = await callbackFixture({
+        opencode: host === 'opencode',
+        pi: host === 'pi',
+        claustrum: true,
+      })
+      const label = host === 'opencode' ? 'OpenCode' : 'Pi'
+      expect(
+        await runSetupCommand(['--yes', '--claustrum', '--opencode=2'], {
+          ...f.io,
+          vaultActivate: async () => {
+            throw new Error(ECHO_SK)
+          },
+        }),
+      ).toBe(1)
+      expect(f.screen()).toContain(
+        `${label} stays connected to the vault. In ${label}, run /claude → Accounts → Disconnect from the vault to undo it. Or run setup again to finish connecting.`,
+      )
+      expect(f.screen()).not.toContain(ECHO_SK)
+      expect(await readNativeEnrollmentMode(host, f.env)).toBe('claustrum')
+    },
+  )
+}
+
+lifetimes.test(
+  'all-host local setup names both enrollments despite legacy local settings and preserves every file',
+  async () => {
+    const f = await callbackFixture({
+      opencode: true,
+      pi: true,
+      claustrum: false,
+    })
+    const files: string[] = []
+    for (const host of ['opencode', 'pi'] as const) {
+      const plan = await resolveNativeSetupPaths(host, f.env)
+      const enrollment = getHostClaustrumEnrollmentPaths(host, f.env)
+      await writeSetupJson(enrollment.tokenPath, {
+        token: 'c'.repeat(64),
+        token_generation: 1,
+      })
+      await writeSetupJson(plan.paths.legacyConfig, {
+        claustrum: { mode: 'local' },
+      })
+      files.push(enrollment.tokenPath, plan.paths.legacyConfig)
+    }
+    const before = await Promise.all(files.map((path) => readFile(path)))
+    let migrations = 0
+    expect(
+      await runSetupCommand(['--yes', '--no-claustrum', '--opencode=2'], {
+        ...f.io,
+        migrateLocal: async () => {
+          migrations++
+        },
+      }),
+    ).toBe(1)
+    for (const label of ['OpenCode', 'Pi']) {
+      expect(f.screen()).toContain(
+        `${label} is still connected to the vault. Old local settings do not disconnect it. In ${label}, run /claude → Accounts → Disconnect from the vault. Then run local setup again.`,
+      )
+    }
+    expect(migrations).toBe(0)
+    expect(await Promise.all(files.map((path) => readFile(path)))).toEqual(
+      before,
+    )
+    for (const host of ['opencode', 'pi'] as const)
+      expect(await readNativeEnrollmentMode(host, f.env)).toBe('claustrum')
+  },
+)
+
 async function settleSetupSiblings<Value>(
   work: Promise<Value>[],
 ): Promise<Value[]> {
@@ -2051,7 +2123,9 @@ for (const change of ['slot', 'pool', 'custody', 'enrollment'] as const) {
       expect(changed).toBeDefined()
       expect(await setupBytes(f.plan)).toEqual(changed!)
       if (change === 'enrollment')
-        expect(f.screen()).toContain('Disconnect from the vault first.')
+        expect(f.screen()).toContain(
+          'OpenCode is still connected to the vault.',
+        )
     },
   )
 }
@@ -4105,7 +4179,8 @@ for (const fault of [
       expect(injected).toBe(true)
       expect(spy).toHaveBeenCalledTimes(1)
       if (fault === 'enrollment-flip') {
-        const message = 'Disconnect from the vault first.'
+        const message =
+          'OpenCode is still connected to the vault. Old local settings do not disconnect it. In OpenCode, run /claude → Accounts → Disconnect from the vault. Then run local setup again.'
         expect(f.screen().split(message).length - 1).toBe(1)
         expect(f.screen().endsWith(`${message}\n`)).toBe(true)
         await expectNoDiagnostics(f)

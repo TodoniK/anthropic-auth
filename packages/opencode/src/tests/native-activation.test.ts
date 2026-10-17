@@ -427,7 +427,9 @@ test('an enrolled host refuses local recovery before reading files or starting l
         ...f.options,
         ...(includeLogin ? { login } : {}),
       }),
-    ).rejects.toThrow('Disconnect from the vault first.')
+    ).rejects.toThrow(
+      'OpenCode is still connected to the vault. Old local settings do not disconnect it. In OpenCode, run /claude → Accounts → Disconnect from the vault. Then run local setup again.',
+    )
     expect(await bytes()).toEqual(before)
   }
   expect(logins).toBe(0)

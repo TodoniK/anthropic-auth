@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { disconnectClaustrumEnrollment } from '@cortexkit/common-auth/claustrum'
@@ -26,6 +26,7 @@ import {
   type NativeUiOptions,
   runPiCommandMenu,
 } from '../native-ui.ts'
+import { disconnectNativeVaultForHost } from '../native-vault-connection.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 
 const opaqueId = 'vault:oauth:team:person'
@@ -1440,7 +1441,128 @@ describe('vault custody', () => {
     }
   })
 
-  test('a failing disconnect capability is reported generically', async () => {
+  for (const kind of ['unsafe-file', 'wrong-consumer'] as const) {
+    test(`disconnect explains ${kind} from the locked helper and preserves enrollment`, async () => {
+      const root = await mkdtemp(
+        join(tmpdir(), 'native-ui-disconnect-refusal-'),
+      )
+      try {
+        const env = {
+          OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+            root,
+            'enrollment.json',
+          ),
+        }
+        const enrollment = getHostClaustrumEnrollmentPaths('opencode', env)
+        await writeFile(enrollment.tokenPath, 'synthetic-secret-token', {
+          mode: 0o600,
+        })
+        await writeFile(
+          enrollment.statePath,
+          JSON.stringify({
+            version: 1,
+            phase: 'approved',
+            proposedName: 'another-consumer',
+            tokenGeneration: 1,
+            updatedAt: 1,
+          }),
+          { mode: 0o600 },
+        )
+        if (kind === 'unsafe-file') await chmod(enrollment.statePath, 0o644)
+        const files = [enrollment.tokenPath, enrollment.statePath]
+        const before = await Promise.all(files.map((path) => readFile(path)))
+        const { apply } = setup(
+          'opencode',
+          true,
+          async () => {
+            throw new Error('synthetic-secret')
+          },
+          () => disconnectNativeVaultForHost({ host: 'opencode', env }),
+        )
+        const result = await apply('vault-disconnect')
+        expect(result).toMatchObject({
+          ok: false,
+          code: `disconnect-${kind}`,
+          text:
+            kind === 'unsafe-file'
+              ? 'OpenCode could not disconnect from the vault. Check file ownership, private permissions, and safe storage. Then try Disconnect again. Do not delete enrollment files by hand.'
+              : 'OpenCode could not disconnect from the vault. The enrollment belongs to another host or plugin. Check this host’s enrollment path. Then try Disconnect again. Do not delete another host’s enrollment.',
+        })
+        expect(JSON.stringify(result)).not.toContain('synthetic-secret')
+        expect(await Promise.all(files.map((path) => readFile(path)))).toEqual(
+          before,
+        )
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  }
+
+  test('Pi disconnect maps closed slot refusals without reading raw text or accessors', async () => {
+    const cases = [
+      ['unsafe-path', 'disconnect-unsafe-file', 'Check file ownership'],
+      [
+        'invalid-auth',
+        'disconnect-pi-recovery',
+        'Repair the Pi sign-in and its private recovery copy',
+      ],
+      [
+        'invalid-stash',
+        'disconnect-pi-recovery',
+        'Repair the Pi sign-in and its private recovery copy',
+      ],
+      [
+        'missing-stash',
+        'disconnect-pi-recovery',
+        'Repair the Pi sign-in and its private recovery copy',
+      ],
+      [
+        'conflict',
+        'disconnect-conflict',
+        'Resolve the stored Pi sign-in and its private recovery copy',
+      ],
+      [
+        'lock-timeout',
+        'disconnect-busy',
+        'Stop other setup or disconnect attempts',
+      ],
+      [
+        'lock-compromised',
+        'disconnect-busy',
+        'Stop other setup or disconnect attempts',
+      ],
+      ['io', 'disconnect-io', 'Check file access and free disk space'],
+    ]
+    let reads = 0
+    for (const [code, expectedCode, recovery] of cases) {
+      const error = Object.assign(new Error('synthetic-secret'), {
+        name: 'PiSlotError',
+        code,
+      })
+      Object.defineProperty(error, 'message', {
+        get() {
+          reads++
+          throw new Error('not safe')
+        },
+      })
+      const { apply } = setup(
+        'pi',
+        true,
+        async () => 'claustrum',
+        async () => {
+          throw error
+        },
+      )
+      const result = await apply('vault-disconnect')
+      expect(result.code).toBe(expectedCode)
+      expect(result.text).toStartWith('Pi could not disconnect from the vault.')
+      expect(result.text).toContain(recovery!)
+      expect(JSON.stringify(result)).not.toContain('synthetic-secret')
+    }
+    expect(reads).toBe(0)
+  })
+
+  test('a failing disconnect capability gives safe recovery for an unknown failure', async () => {
     const { apply } = setup(
       'pi',
       true,
@@ -1453,7 +1575,7 @@ describe('vault custody', () => {
     expect(result).toMatchObject({
       ok: false,
       code: 'execution-failed',
-      text: 'Action failed.',
+      text: 'Pi could not disconnect from the vault. Check this host’s vault connection and file access. Then try Disconnect again.',
     })
     expect(JSON.stringify(result)).not.toContain('synthetic-secret')
   })

@@ -12,6 +12,8 @@ bunx @cortexkit/opencode-anthropic-auth setup --claustrum
 
 The shared runner owns the per-host enrollment ceremony. Anthropic callbacks then ensure the host-specific grant to read the `anthropic-native` category, discover inventory and require a verified default Claude account. If that default is unverified, sign in through the vault and rerun setup; setup does not import local tokens into the vault.
 
+If setup fails after enrollment is approved, the host stays connected to the vault. Run setup again to finish connecting. Or, in that host, run `/claude` → **Accounts** → **Disconnect from the vault** to undo it. Local settings do not undo enrollment.
+
 For noninteractive setup, add `--yes`. If Pi has stored Anthropic auth, explicit `--remove-pi-auth` consent is also required; `--yes` alone is not consent. Do not combine `--login` with `--claustrum`. Dry runs invoke no callbacks and do not validate inventory or consent.
 
 Vault setup leaves local pool files, journals, runtime metadata and session pins unchanged, even if those local files are malformed. It never reads or writes OpenCode 1 auth in generation-2-only setup and never opens a host database. See [custody storage](custody-state-machine.md#storage) for the separate vault namespace.
@@ -32,8 +34,10 @@ Local accounts remain unchanged and hidden while enrolled. A failed vault author
 
 ## Disconnect and recovery
 
-Choose **Disconnect from the vault** in Accounts and confirm. It is also available when enrollment cannot be read. This removes the host's local enrollment files, not the vault's approval; an operator must revoke that approval in Claustrum separately.
+Run `/claude` → **Accounts** → **Disconnect from the vault** and confirm. The action is also offered when enrollment cannot be read. A successful disconnect removes the host's local enrollment files, not the vault's approval. Ask a vault operator to revoke that approval in Claustrum separately.
+
+Disconnect can clear malformed enrollment data. It refuses unsafe storage or a record for another host or plugin. Check the named host's enrollment path, file ownership and private permissions. Use safe storage. Do not delete enrollment files by hand or change ownership to bypass a refusal. Stop other setup or disconnect attempts before retrying a busy action.
 
 OpenCode's stored sign-ins are not read or changed by disconnect. Pi first restores its stashed slot byte-for-byte, then ends enrollment. If a different Pi login occupies the slot, disconnect refuses and preserves the stash, current login and enrollment instead of overwriting either login.
 
-Disconnect returns to local custody but does not migrate or initialize a pool. If no local authority exists, stop the hosts and run local setup. For OpenCode 2, follow [empty initialization](opencode-2.md#empty-initialization). **Reset host enrollment**, available only in local custody, clears eligible denied/blocked ceremony state; it neither enrolls nor disconnects an approved host. Only setup proposes and polls enrollment.
+A successful disconnect returns to local custody but does not migrate or initialize a pool. If no local authority exists, stop the hosts and run local setup. For OpenCode 2, follow [empty initialization](opencode-2.md#empty-initialization). **Reset host enrollment**, available only in local custody, clears eligible denied/blocked ceremony state; it neither enrolls nor disconnects an approved host. Only setup proposes and polls enrollment.

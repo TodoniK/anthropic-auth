@@ -293,7 +293,32 @@ const DISCONNECT_OUTCOMES: Readonly<
   },
 }
 
-function outcome(result: NativeMenuExecutionResult): {
+const DISCONNECT_FAILURES = {
+  'disconnect-unsafe-file':
+    'Check file ownership, private permissions, and safe storage. Then try Disconnect again. Do not delete enrollment files by hand.',
+  'disconnect-wrong-consumer':
+    'The enrollment belongs to another host or plugin. Check this host’s enrollment path. Then try Disconnect again. Do not delete another host’s enrollment.',
+  'disconnect-pi-recovery':
+    'Repair the Pi sign-in and its private recovery copy with offline setup. Keep both files. Then try Disconnect again.',
+  'disconnect-conflict':
+    'Resolve the stored Pi sign-in and its private recovery copy with offline setup. Keep both sign-ins. Then try Disconnect again.',
+  'disconnect-busy':
+    'Stop other setup or disconnect attempts. Then try Disconnect again.',
+  'disconnect-io':
+    'Check file access and free disk space. Then try Disconnect again.',
+  'execution-failed':
+    'Check this host’s vault connection and file access. Then try Disconnect again.',
+  'invalid-outcome':
+    'Check this host’s vault connection and file access. Then try Disconnect again.',
+} satisfies Record<
+  Extract<NativeMenuExecutionResult, { status: 'failed' }>['code'],
+  string
+>
+
+function outcome(
+  result: NativeMenuExecutionResult,
+  host: NativeMenuHost,
+): {
   ok: boolean
   text: string
   code?: string
@@ -314,6 +339,12 @@ function outcome(result: NativeMenuExecutionResult): {
     case 'disconnect':
       return DISCONNECT_OUTCOMES[result.result]
     case 'failed':
+      if (result.action === 'vault-disconnect')
+        return {
+          ok: false,
+          code: result.code,
+          text: `${host === 'opencode' ? 'OpenCode' : 'Pi'} could not disconnect from the vault. ${DISCONNECT_FAILURES[result.code]}`,
+        }
       return { ok: false, code: result.code, text: 'Action failed.' }
     case 'refused':
       if (result.code === 'vault-managed')
@@ -625,7 +656,7 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
       // Only the checked OAuth start that the host reports as successful may
       // show its sign-in link. Status lines and notifications stay scrubbed.
       return finish(
-        outcome(result),
+        outcome(result, host),
         result.status === 'executed' &&
           result.action === 'add-oauth-start' &&
           result.ok &&

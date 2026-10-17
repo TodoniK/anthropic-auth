@@ -50,6 +50,22 @@ export interface NativeLocalSetupOptions {
 export const SEPARATE_HOST_LOGIN_NOTICE =
   "OpenCode's separate Anthropic login is not used. Add that account through /claude Accounts if needed, or remove the separate login from OpenCode."
 
+function localVaultRecovery(host: HarnessKind): string {
+  const name = host === 'opencode' ? 'OpenCode' : 'Pi'
+  return `${name} is still connected to the vault. Old local settings do not disconnect it. In ${name}, run /claude → Accounts → Disconnect from the vault. Then run local setup again.`
+}
+
+export async function requireNativeLocalEnrollment(
+  hosts: readonly HarnessKind[],
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  const refusals: string[] = []
+  for (const host of hosts)
+    if ((await readNativeEnrollmentMode(host, env)) !== 'local')
+      refusals.push(localVaultRecovery(host))
+  if (refusals.length) throw new SetupRefusal(refusals.join('\n'))
+}
+
 export function nativeLocalProcessFence(
   host: HarnessKind,
   options: NativeLocalSetupOptions,
@@ -63,8 +79,7 @@ export function nativeLocalProcessFence(
       if (message) throw new SetupRefusal(message)
       throw error
     }
-    if ((await readNativeEnrollmentMode(host, options.env)) !== 'local')
-      throw new SetupRefusal('Disconnect from the vault first.')
+    await requireNativeLocalEnrollment([host], options.env)
   }
 }
 
@@ -316,7 +331,7 @@ export async function migrateNativeLocalForHost(
     try {
       const snapshot = await runtime.read()
       if (snapshot.mode !== 'local')
-        throw new Error('Disconnect from the vault first.')
+        throw new SetupRefusal(localVaultRecovery(host))
       await processFence()
       await runtime.loginOAuth({ routeId: 'main', replace: true, ...login })
     } finally {

@@ -34,6 +34,7 @@ import {
   type NativeLocalPlan,
   nativeLocalProcessFence,
   planNativeLocalSetup,
+  requireNativeLocalEnrollment,
   revalidateNativeLocalPlan,
   SEPARATE_HOST_LOGIN_NOTICE,
 } from './native-local.ts'
@@ -218,9 +219,11 @@ export async function runSetupCommand(
           context.opencodeGeneration === '2'
         )
           throw new SetupRefusal(CLAUDE_POOL_LOGIN_STEP)
-        if (context.mode === 'local')
+        if (context.mode === 'local') {
+          await requireNativeLocalEnrollment(context.hosts, env)
           for (const selected of context.hosts)
             await nativeLocalProcessFence(selected, localOptions(selected))()
+        }
         await piConsent(context)
         for (const selected of context.hosts) {
           if (context.mode === 'claustrum') {
@@ -333,6 +336,19 @@ export async function runSetupCommand(
     const message = setupRefusalMessage(error) ?? knownFailureMessage(error)
     const text = message ?? (await reportThrownFailure(phase, error, env))
     if (text) print(text)
+    for (const host of vault.keys()) {
+      try {
+        if ((await readNativeEnrollmentMode(host, env)) !== 'claustrum')
+          continue
+      } catch {
+        // Only claim a retained connection when enrollment authority confirms it.
+        continue
+      }
+      const name = host === 'opencode' ? 'OpenCode' : 'Pi'
+      print(
+        `${name} stays connected to the vault. In ${name}, run /claude → Accounts → Disconnect from the vault to undo it. Or run setup again to finish connecting.`,
+      )
+    }
     return 1
   } finally {
     for (const plan of local.values())

@@ -14,17 +14,19 @@ The setup CLI delegates host detection, OpenCode generation selection and packag
 
 | Option | Meaning |
 | --- | --- |
-| `--yes`, `-y` | Select every found host without an interactive host choice; does not select vault custody or grant Pi auth-removal consent |
+| `--yes`, `-y` | Select every found host, including Pi. Run without `--yes` to choose hosts. This does not select vault custody or grant Pi auth-removal consent. |
 | `--dry-run` | Preview registration and callback names without running callbacks, signing in, enrolling or writing the local authority journal |
 | `--opencode=1`, `--opencode=2`, `--opencode=both` | Choose the OpenCode generation; `both` shares one OpenCode pool and operation |
-| `--no-claustrum` | Select local custody |
+| `--no-claustrum` | Run local setup. This does not disconnect enrolled hosts. |
 | `--claustrum` | Explicitly enroll selected hosts in the vault |
 | `--login` | Explicit local OpenCode 1/Pi sign-in; cannot be combined with `--claustrum` or generation 2 alone |
 | `--remove-pi-auth` | Explicit consent for setup to remove/move aside Pi's stored Anthropic login |
 
 The two argument-level refusals (`--login --claustrum` and `--login --opencode=2`) also apply to dry runs. Callback checks for journal/destination conflicts, Pi consent and verified vault inventory do not run in a dry run, so a successful preview is not proof that the real run will proceed.
 
-Local setup refuses on a vault-enrolled host: disconnect first. A real run checks all selected hosts before the first host writes, including consent to move/remove Pi's stored Anthropic login and conflicts between host storage paths. Hosts cannot share native storage paths. A later per-host failure does not roll back hosts that have already completed.
+Local setup refuses on a vault-enrolled host. In each named host, run `/claude` → **Accounts** → **Disconnect from the vault**. Then run local setup again. Old local settings from 1.x do not disconnect a host. `--opencode` chooses a generation; it does not exclude Pi. Run without `--yes` to choose hosts.
+
+A real run checks all selected hosts before the first host writes, including consent to move/remove Pi's stored Anthropic login and conflicts between host storage paths. Hosts cannot share native storage paths. A later per-host failure does not roll back hosts that have already completed.
 
 ## After setup
 
