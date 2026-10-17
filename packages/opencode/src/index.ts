@@ -2024,6 +2024,8 @@ const anthropicAuthPlugin = async (
   // it is slow or fails. Expired pending attempts and pre-request refusals
   // can retry.
   interface ProfileHydration {
+    /** The sidebar route whose credentials produced this profile. */
+    accountId: string
     /** Settles when the profile response arrives or the attempt fails, never on the save. */
     fetched: Promise<void>
     /**
@@ -2097,20 +2099,38 @@ const anthropicAuthPlugin = async (
     return hydration.persistence === 'refused' ? undefined : hydration.profile
   }
 
+  function failedProfileHydrationsForStorage(storage: AccountStorage | null) {
+    if (!storage) return []
+    const displayedAccounts = new Set([
+      ...(storage.main ? ['main'] : []),
+      ...(storage.accounts ?? [])
+        .filter(
+          (account) =>
+            isOAuthAccount(account) &&
+            (account.enabled !== false ||
+              Boolean(account.claustrumScopedCredentialId)),
+        )
+        .map((account) => account.id),
+    ])
+    return [...new Set(profileHydrations.values())].filter(
+      (hydration) =>
+        hydration.persistence === 'failed' &&
+        hydration.profile !== undefined &&
+        displayedAccounts.has(hydration.accountId),
+    )
+  }
+
   async function overlayCurrentHydratedProfile(
-    storage: AccountStorage | null,
-    accountId: string,
+    storage: AccountStorage,
     hydration: ProfileHydration,
+    current: Awaited<ReturnType<typeof nativeAccounts.read>>,
+    profile: OAuthAccountProfile,
   ) {
     // A failed save may still supply a sidebar tier, but only if the reloaded
     // account has the same identity and current credentials that fetched it.
     // Local accounts also match their pool row and credential epoch; vault
     // accounts are checked against their current record version.
-    if (!storage) return storage
-    const profile = await displayableProfile(hydration, Date.now())
-    if (!profile) return storage
-
-    const current = await nativeAccounts.read()
+    const accountId = hydration.accountId
     const account = current.accounts.find(
       (candidate) => candidate.id === accountId,
     )
@@ -2128,11 +2148,10 @@ const anthropicAuthPlugin = async (
     )
       return storage
 
-    if (accountId === 'main') {
+    if (accountId === 'main')
       return storage.main
         ? { ...storage, main: { ...storage.main, profile } }
         : storage
-    }
     const stored = storage.accounts?.find(
       (candidate) => candidate.id === accountId,
     )
@@ -2145,6 +2164,35 @@ const anthropicAuthPlugin = async (
           : candidate,
       ),
     }
+  }
+
+  async function overlayFailedHydratedProfiles(
+    storage: AccountStorage | null,
+    currentSnapshot?: Awaited<ReturnType<typeof nativeAccounts.read>>,
+    candidates = failedProfileHydrationsForStorage(storage),
+  ) {
+    if (!storage || candidates.length === 0) return storage
+
+    const displayable: Array<{
+      hydration: ProfileHydration
+      profile: OAuthAccountProfile
+    }> = []
+    for (const hydration of candidates) {
+      const profile = await displayableProfile(hydration, Date.now())
+      if (profile) displayable.push({ hydration, profile })
+    }
+    if (!displayable.length) return storage
+
+    const current = currentSnapshot ?? (await nativeAccounts.read())
+    let displayStorage = storage
+    for (const candidate of displayable)
+      displayStorage = await overlayCurrentHydratedProfile(
+        displayStorage,
+        candidate.hydration,
+        current,
+        candidate.profile,
+      )
+    return displayStorage
   }
 
   function startProfileHydration(
@@ -2165,6 +2213,7 @@ const anthropicAuthPlugin = async (
       { preconnect: profileFetch.preconnect },
     )
     const hydration: ProfileHydration = {
+      accountId: account.id,
       fetched: Promise.resolve(),
       lineage: profileHydrationLineage(account),
       ...(signal && { deadline: signal }),
@@ -2211,15 +2260,12 @@ const anthropicAuthPlugin = async (
               (outcome === 'saved' || outcome === 'failed') &&
               !profileHydrationShutdown.signal.aborted
             ) {
-              const displayProfile =
+              const displayableFailure =
                 outcome === 'failed' &&
                 (await displayableProfile(hydration, Date.now()))
-                  ? { accountId: account.id, hydration }
-                  : undefined
-              if (outcome === 'saved' || displayProfile) {
-                // Sidebar refreshes reload account storage. Reread native state
-                // after a saved profile or a displayable failed save so the
-                // fresh view can include the fetched tier.
+              if (outcome === 'saved' || displayableFailure) {
+                // Refresh after saving a profile or after a current fetched
+                // profile's save fails so the sidebar can include its tier.
                 try {
                   const current = await nativeAccounts.read()
                   if (!profileHydrationShutdown.signal.aborted)
@@ -2229,7 +2275,7 @@ const anthropicAuthPlugin = async (
                         ...lastSidebarRouting,
                         routingAuthoritative: false,
                       },
-                      displayProfile,
+                      current,
                     )
                 } catch {
                   logger.debug(
@@ -4236,50 +4282,71 @@ const anthropicAuthPlugin = async (
   function writeSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
     options: SidebarStateInput,
-    displayProfile?: { accountId: string; hydration: ProfileHydration },
+    currentSnapshot?: Awaited<ReturnType<typeof nativeAccounts.read>>,
   ) {
     const routingAuthoritative = options.routingAuthoritative !== false
     if (routingAuthoritative) {
       lastSidebarRouting = { activeId: options.activeId, route: options.route }
     }
-    const state = buildSidebarState(storage, options)
-    return setSidebarState(state, sidebarStateFile, {
-      routingAuthoritative,
-      resolvePreservedRouting: routingAuthoritative
-        ? undefined
-        : async (current) => {
-            const preservedRouting = await resolveFreshSidebarRouting(
-              current,
-              () => loadAccounts(accountStoragePath),
-              { activeId: state.activeId, route: state.route },
-            )
-            const displayStorage = displayProfile
-              ? await overlayCurrentHydratedProfile(
-                  preservedRouting.freshStorage,
-                  displayProfile.accountId,
-                  displayProfile.hydration,
-                )
-              : preservedRouting.freshStorage
-            return {
-              activeId: preservedRouting.activeId,
-              route: preservedRouting.route,
-              state: buildSidebarState(displayStorage, {
-                ...options,
+
+    function write(state: SidebarState) {
+      return setSidebarState(state, sidebarStateFile, {
+        routingAuthoritative,
+        resolvePreservedRouting: routingAuthoritative
+          ? undefined
+          : async (current) => {
+              const preservedRouting = await resolveFreshSidebarRouting(
+                current,
+                () => loadAccounts(accountStoragePath),
+                { activeId: state.activeId, route: state.route },
+              )
+              const displayStorage = await overlayFailedHydratedProfiles(
+                preservedRouting.freshStorage,
+                currentSnapshot,
+              )
+              return {
                 activeId: preservedRouting.activeId,
                 route: preservedRouting.route,
-              }),
-            }
-          },
-      onRoutingResolved: routingAuthoritative
-        ? undefined
-        : (routing) => {
-            lastSidebarRouting = routing
-          },
-    }).catch((error) =>
-      logger.warn('sidebar', 'state write failed', {
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    )
+                state: buildSidebarState(displayStorage, {
+                  ...options,
+                  activeId: preservedRouting.activeId,
+                  route: preservedRouting.route,
+                }),
+              }
+            },
+        onRoutingResolved: routingAuthoritative
+          ? undefined
+          : (routing) => {
+              lastSidebarRouting = routing
+            },
+      }).catch((error) =>
+        logger.warn('sidebar', 'state write failed', {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+    }
+
+    if (routingAuthoritative) {
+      const candidates = failedProfileHydrationsForStorage(storage)
+      if (candidates.length > 0) {
+        return overlayFailedHydratedProfiles(
+          storage,
+          currentSnapshot,
+          candidates,
+        )
+          .then((displayStorage) =>
+            write(buildSidebarState(displayStorage, options)),
+          )
+          .catch(() => {
+            logger.debug(
+              'quota',
+              'failed to recheck account profile for sidebar',
+            )
+            return write(buildSidebarState(storage, options))
+          })
+      }
+    }
+    return write(buildSidebarState(storage, options))
   }
 
   async function resolveSidebarQuotaAccess() {
@@ -10015,6 +10082,7 @@ const anthropicAuthPlugin = async (
     __cacheKeepManager: cacheKeepManager,
     __resolveMainQuotaIdentityForTest: resolveMainQuotaAccountIdentity,
     __resolveSidebarQuotaAccessForTest: resolveSidebarQuotaAccess,
+    __refreshSidebarQuotaForTest: refreshSidebarQuota,
     __mainProviderAccountUuidForTest: () => mainProviderAccountUuid,
     __fallbackRefreshReady: fallbackRefreshReady,
     get __scopedRuntime() {

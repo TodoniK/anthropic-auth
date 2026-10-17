@@ -936,7 +936,7 @@ test('missing native authority refuses status without any profile request', asyn
   expect(s.network.profileBearers).toEqual([])
 })
 
-test('sidebar shows a fetched main tier after profile persistence fails', async () => {
+test('sidebar keeps a failed-save tier through refresh and drops it after replacement', async () => {
   const savedLevel = getLogLevel()
   const s = await start({
     legacyConfig: { ...localLegacyConfig(), accounts: [] },
@@ -977,6 +977,36 @@ test('sidebar shows a fetched main tier after profile persistence fails', async 
 
     const state = await waitForSidebarMainTier('Max 20x')
     expect(state.main.tierLabel).toBe('Max 20x')
+
+    const refreshSidebarQuota = (s.plugin as any)
+      .__refreshSidebarQuotaForTest as () => Promise<void>
+    await refreshSidebarQuota()
+    await drainSidebarWrites()
+    expect((await getSidebarState()).main.tierLabel).toBe('Max 20x')
+
+    const runtime = createNativeAccountRuntime({
+      paths: s.paths,
+      host: 'opencode',
+      local: nativeLocal(),
+    })
+    try {
+      await runtime.loginOAuth({
+        routeId: 'main',
+        credential: {
+          access: 'sk-ant-oat01-synthetic-other-access',
+          refresh: 'synthetic-other-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        },
+        replace: true,
+      })
+      expect((await runtime.authorizeLocal('main')).status).toBe('usable')
+    } finally {
+      runtime.close()
+    }
+    await refreshSidebarQuota()
+    await drainSidebarWrites()
+    expect((await getSidebarState()).main.tierLabel).toBeUndefined()
+
     const warnings = records.filter(
       (record) =>
         record.level === 'warn' &&
