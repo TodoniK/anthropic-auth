@@ -130,12 +130,11 @@ describe('Fable 5.1 mid-conversation output configuration', () => {
 })
 
 const PER_TURN_CONTROL_MODELS = [
-  'claude-mythos-5-1',
   'claude-opus-5-5',
   'claude-opus-5-5[1m]',
-  'claude-opus-5',
+  'claude-opus-5-5-20260918',
   'claude-sonnet-5-5',
-  'claude-haiku-5-5',
+  'claude-sonnet-5-5[1m]',
 ] as const
 
 function adaptiveBody(model: string) {
@@ -202,11 +201,9 @@ describe('per-message effort beyond Fable 5.1', () => {
     })
   }
 
-  test('requires adaptive thinking on models other than Fable 5.1', () => {
+  test('requires adaptive thinking on Opus 5.5 and Sonnet 5.5', () => {
     for (const [model, thinking] of [
       ['claude-sonnet-5-5', { type: 'between_tools' }],
-      ['claude-haiku-5-5', { type: 'disabled' }],
-      ['claude-opus-5', { type: 'disabled' }],
       ['claude-opus-5-5', undefined],
     ] as const) {
       const request = body(model)
@@ -236,9 +233,44 @@ describe('per-message effort beyond Fable 5.1', () => {
     )
   })
 
+  test('leaves Opus 5, Haiku 5.5 and Mythos 5.1 requests unchanged, headers included', () => {
+    for (const model of [
+      'claude-opus-5',
+      'claude-haiku-5-5',
+      'claude-mythos-5-1',
+    ]) {
+      const request = adaptiveBody(model)
+      const before = JSON.stringify(request)
+      // Apart from the per-turn control beta, the selected list does not
+      // depend on the model id, so Opus 4.8 gives the list these keep.
+      const betasBefore = selectClaudeCodeBetas({
+        ...structuredClone(request),
+        model: 'claude-opus-4-8',
+      })
+      expect(supportsPerMessageEffort(request)).toBe(false)
+      expect(
+        applyMidConversationOutputConfig(request, [
+          { afterAssistantMessages: 0, effort: 'low' },
+          { afterAssistantMessages: 1, effort: 'high' },
+        ]),
+      ).toEqual({ applied: false, inserted: 0 })
+      expect(JSON.stringify(request)).toBe(before)
+      const betas = selectClaudeCodeBetas(request)
+      expect(betas).toBe(betasBefore)
+      expect(betas.split(',')).not.toContain(PER_TURN_CONTROL_BETA)
+      expect(betas.split(',')).not.toContain(
+        MID_CONVERSATION_OUTPUT_CONFIG_BETA,
+      )
+    }
+  })
+
   test('does not treat other model families as per-turn control models', () => {
     for (const model of [
       'claude-fable-5-1',
+      'claude-mythos-5-1',
+      'claude-opus-5',
+      'claude-opus-5-20260601',
+      'claude-haiku-5-5',
       'claude-fable-5',
       'claude-mythos-5',
       'claude-sonnet-5',

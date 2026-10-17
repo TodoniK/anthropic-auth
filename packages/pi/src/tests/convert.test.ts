@@ -713,13 +713,7 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
     })
   })
 
-  for (const model of [
-    'claude-mythos-5-1',
-    'claude-opus-5-5',
-    'claude-opus-5',
-    'claude-sonnet-5-5',
-    'claude-haiku-5-5',
-  ]) {
+  for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5']) {
     test(`injects Pi effort changes before their user turns for ${model}`, async () => {
       const context = {
         messages: [
@@ -766,6 +760,50 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
       expect(JSON.parse(untouched).output_config).toEqual({ effort: 'high' })
     })
   }
+
+  test('leaves Opus 5, Haiku 5.5 and Mythos 5.1 requests unchanged by effort history', async () => {
+    for (const model of [
+      'claude-opus-5',
+      'claude-haiku-5-5',
+      'claude-mythos-5-1',
+    ]) {
+      const build = (
+        effortTransitions: {
+          afterAssistantMessages: number
+          effort: 'low' | 'high'
+        }[],
+      ) =>
+        buildAnthropicRequest(
+          model,
+          {
+            messages: [
+              userMsg('first'),
+              assistantMsg('first answer'),
+              userMsg('second'),
+            ],
+            systemPrompt: 'test',
+            tools: [],
+          } as any,
+          { sessionId: `pi-${model}-steady`, reasoning: 'high' } as any,
+          defaultCache,
+          false,
+          undefined,
+          { effortTransitions },
+        )
+      const withoutHistory = (await build([])).bodyText
+      expect(
+        (
+          await build([
+            { afterAssistantMessages: 0, effort: 'low' },
+            { afterAssistantMessages: 1, effort: 'high' },
+          ])
+        ).bodyText,
+      ).toBe(withoutHistory)
+      expect(JSON.parse(withoutHistory).output_config).toEqual({
+        effort: 'high',
+      })
+    }
+  })
 
   test('does not add Fable 5.1 binding controls to an API-key request', async () => {
     const { body } = await buildAnthropicRequest(

@@ -120,7 +120,7 @@ anthropic-auth/
 - `packages/core/src/dump.ts`: Request/response dump capture logic, response metadata artifacts, same-session on-disk byte-diff baseline recovery after restart, CacheKeep/Prime prewarm tagging, and commands
 - `packages/core/src/models.ts`: Supported Claude models and specs, including Fable/Mythos 5.1 release metadata and pricing, Haiku 5.5 metadata and its 100K request-wide pricing tier, context-window qualifier normalization (`[1m]`) for model-family checks, and the Haiku 4.5 prime model
 - `packages/core/src/thinking-binding.ts`: Shared replay detection and configurable `account-default`/`error`/`drop_block` controls for Fable 5.1, Opus 5.5, Sonnet 5.5, and Haiku 5.5 signed/redacted thinking
-- `packages/core/src/mid-conversation-output-config.ts`: Shared per-message effort eligibility (Fable 5.1, Mythos 5.1, Opus 5/5.5, Sonnet 5.5, Haiku 5.5), effort normalization and empty-system-marker insertion while keeping the cached top-level effort stable
+- `packages/core/src/mid-conversation-output-config.ts`: Shared per-message effort eligibility (Fable 5.1, Opus 5.5, Sonnet 5.5), effort normalization and empty-system-marker insertion while keeping the cached top-level effort stable
 - `packages/core/src/logger.ts`: Shared structured logger
 - `packages/core/src/json.ts`: Shared JSON parsing helpers that redact parser source context while preserving path, line, and column diagnostics
 - `packages/core/src/network-errors.ts`: Shared transient DNS and transport error classification for OAuth refresh and quota recovery

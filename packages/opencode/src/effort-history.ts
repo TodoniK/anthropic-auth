@@ -3,9 +3,6 @@ import {
   type AdaptiveEffort,
   defaultAdaptiveEffort,
   isClaudeFable51Model,
-  isClaudeHaiku55Model,
-  isClaudeMythos51Model,
-  isClaudeOpus5Model,
   isClaudeOpus55Model,
   isClaudeSonnet55Model,
   normalizeAdaptiveEffort,
@@ -121,11 +118,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 function perMessageEffortFamily(model: unknown): string | undefined {
   if (isClaudeFable51Model(model)) return 'fable-5-1'
-  if (isClaudeMythos51Model(model)) return 'mythos-5-1'
   if (isClaudeOpus55Model(model)) return 'opus-5-5'
-  if (isClaudeOpus5Model(model)) return 'opus-5'
   if (isClaudeSonnet55Model(model)) return 'sonnet-5-5'
-  if (isClaudeHaiku55Model(model)) return 'haiku-5-5'
   return undefined
 }
 

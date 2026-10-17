@@ -1,8 +1,6 @@
 import {
   isClaudeFable51Model,
   isClaudeHaiku55Model,
-  isClaudeMythos51Model,
-  isClaudeOpus5Model,
   isClaudeOpus55Model,
   isClaudeSonnet55Model,
 } from './models.ts'
@@ -14,7 +12,7 @@ export const MID_CONVERSATION_OUTPUT_CONFIG_BETA =
 /**
  * Per-turn control beta that Claude Code sends on every Opus 5.5 and Sonnet
  * 5.5 request. It enables effort changes carried by an empty `role: "system"`
- * message, and is used for every per-message-effort model except Fable 5.1.
+ * message on those two models.
  */
 export const PER_TURN_CONTROL_BETA = 'per-turn-control-2026-07-01'
 
@@ -48,8 +46,8 @@ export function normalizeAdaptiveEffort(
 
 /**
  * Whether an OAuth request for this model carries the Fable 5.1 per-message
- * effort beta (`MID_CONVERSATION_OUTPUT_CONFIG_BETA`). Other models that
- * support per-message effort use `PER_TURN_CONTROL_BETA` instead.
+ * effort beta (`MID_CONVERSATION_OUTPUT_CONFIG_BETA`). Opus 5.5 and Sonnet
+ * 5.5 use `PER_TURN_CONTROL_BETA` instead.
  */
 export function usesMidConversationOutputConfig(
   body: Record<string, unknown>,
@@ -58,28 +56,23 @@ export function usesMidConversationOutputConfig(
 }
 
 /**
- * Models other than Fable 5.1 that accept per-message effort on the Claude
- * API: Mythos 5.1, Opus 5.5, Opus 5, Sonnet 5.5 and Haiku 5.5, including
- * dated and `[1m]` context-window ids. Their OAuth requests always carry
- * `PER_TURN_CONTROL_BETA`.
+ * Opus 5.5 and Sonnet 5.5, including dated and `[1m]` context-window ids.
+ * Their OAuth requests always carry `PER_TURN_CONTROL_BETA`, as Claude Code's
+ * do. Anthropic also documents per-message effort for Mythos 5.1, Opus 5 and
+ * Haiku 5.5, but without a Claude Code capture to match, those models keep
+ * sending requests without the beta or effort markers.
  */
 export function usesPerTurnControl(model: unknown): boolean {
-  return (
-    isClaudeMythos51Model(model) ||
-    isClaudeOpus55Model(model) ||
-    isClaudeOpus5Model(model) ||
-    isClaudeSonnet55Model(model) ||
-    isClaudeHaiku55Model(model)
-  )
+  return isClaudeOpus55Model(model) || isClaudeSonnet55Model(model)
 }
 
 /**
  * Whether a request may move effort changes into empty system messages.
  *
- * Fable 5.1 is always eligible, whatever its thinking field says. The other
- * models qualify only with adaptive thinking: Anthropic rejects a differing
- * per-message effort with HTTP 400 on Sonnet 5.5 `between_tools` and Haiku
- * 5.5 `disabled`, and asks callers to use adaptive thinking to vary effort.
+ * Fable 5.1 is always eligible, whatever its thinking field says. Opus 5.5
+ * and Sonnet 5.5 qualify only with adaptive thinking: Anthropic rejects a
+ * differing per-message effort with HTTP 400 on Sonnet 5.5 `between_tools`,
+ * and asks callers to use adaptive thinking to vary effort.
  */
 export function supportsPerMessageEffort(
   body: Record<string, unknown>,

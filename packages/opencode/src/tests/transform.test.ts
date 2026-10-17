@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import {
+  CLAUDE_CODE_FULL_AGENT_BETAS,
   CLAUDE_CODE_IDENTITY,
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
@@ -823,6 +824,65 @@ describe('setOAuthHeaders', () => {
       },
     ])
     expect(JSON.stringify(apiBody)).not.toContain('cortexkit-internal-effort')
+  })
+
+  test('leaves Opus 5, Haiku 5.5 and Mythos 5.1 OAuth requests unchanged after an effort change', async () => {
+    for (const model of [
+      'claude-opus-5',
+      'claude-haiku-5-5',
+      'claude-mythos-5-1',
+    ]) {
+      const sourceMessages = ['low', 'high'].flatMap((variant, index) => [
+        ...(index > 0
+          ? [
+              {
+                info: { id: 'msg_step', role: 'assistant', sessionID: 'ses_x' },
+                parts: [],
+              },
+            ]
+          : []),
+        {
+          info: {
+            id: `msg_${variant}`,
+            role: 'user',
+            sessionID: 'ses_x',
+            model: { providerID: 'anthropic', modelID: model, variant },
+          },
+          parts: [{ type: 'text', text: variant }],
+        },
+      ])
+      expect(markOpenCodeEffortTransitions(sourceMessages)).toBeNull()
+      const body = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model,
+            system: [{ type: 'text', text: 'system' }],
+            tools: [{ name: 'Read', input_schema: { type: 'object' } }],
+            thinking: { type: 'adaptive' },
+            context_management: { edits: [] },
+            output_config: { effort: 'high' },
+            diagnostics: { enabled: true },
+            messages: [
+              { role: 'user', content: 'low' },
+              { role: 'assistant', content: 'one' },
+              { role: 'user', content: 'high' },
+            ],
+          }),
+          { midConversationEffortEnabled: true },
+        ),
+      )
+      expect(body.output_config).toEqual({ effort: 'high' })
+      expect(body.messages).toEqual([
+        { role: 'user', content: 'low' },
+        { role: 'assistant', content: 'one' },
+        { role: 'user', content: 'high' },
+      ])
+      const headers = new Headers()
+      setOAuthHeaders(headers, 'token', { body })
+      expect(headers.get('anthropic-beta')).toBe(
+        CLAUDE_CODE_FULL_AGENT_BETAS.join(','),
+      )
+    }
   })
 
   test('rewrites Opus 5.5 effort history into a system marker and sends the per-turn control beta', async () => {

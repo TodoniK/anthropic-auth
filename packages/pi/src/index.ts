@@ -86,12 +86,11 @@ export default async function cortexKitPiAnthropicAuth(
     const sessionId = ctx.sessionManager.getSessionId()
     if (!sessionId) return
     // This hook collects effort history for the per-message effort markers
-    // that core adds to Fable 5.1, Mythos 5.1, Opus 5/5.5, Sonnet 5.5 and
-    // Haiku 5.5 requests. A host whose session entries do not match what this
-    // reads must cost the session its transitions and nothing else: the
-    // handler runs before every turn, and an exception here surfaced as a
-    // per-turn extension error while collecting no effort history at all
-    // (issue #200).
+    // that core adds to Fable 5.1, Opus 5.5 and Sonnet 5.5 requests. A host
+    // whose session entries do not match what this reads must cost the
+    // session its transitions and nothing else: the handler runs before every
+    // turn, and an exception here surfaced as a per-turn extension error while
+    // collecting no effort history at all (issue #200).
     //
     // The catch stays quiet: `ExtensionAPI` carries no log surface on either
     // host, and writing to stdout from a per-turn hook corrupts the host's

@@ -800,7 +800,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(tracker.resolveHeader(secondHeader)?.messageId).toBe('msg_current_b')
   })
 
-  test('defaults absent variants to high and does not mark models without per-message effort', () => {
+  test('defaults absent variants to high and does not mark non-Fable requests', () => {
     const defaulted = [user('msg_default', 'ses_default', 'claude-fable-5-1')]
     const defaultPlan = markOpenCodeEffortTransitions(defaulted)
     expect(defaultPlan).toMatchObject({ baseline: 'high', markerCount: 0 })
@@ -822,11 +822,11 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     ).toEqual({ found: 0, inserted: 0 })
     expect(body.output_config).toEqual({ effort: 'high' })
 
-    for (const model of ['claude-fable-5', 'claude-sonnet-5']) {
-      const otherModel = [user('msg_other', 'ses_other', model, 'max')]
-      expect(markOpenCodeEffortTransitions(otherModel)).toBeNull()
-      expect(markerTexts(otherModel)).toEqual([])
-    }
+    const otherModel = [
+      user('msg_other', 'ses_other', 'claude-mythos-5-1', 'max'),
+    ]
+    expect(markOpenCodeEffortTransitions(otherModel)).toBeNull()
+    expect(markerTexts(otherModel)).toEqual([])
   })
 
   test('accepts a merged boundary whose transitions are a correctly-ordered run and emits the last effort', () => {
@@ -1248,12 +1248,9 @@ const ADAPTIVE = { type: 'adaptive', display: 'summarized' }
 
 describe('OpenCode per-message effort beyond Fable 5.1', () => {
   for (const model of [
-    'claude-mythos-5-1',
     'claude-opus-5-5',
     'claude-opus-5-5[1m]',
-    'claude-opus-5',
     'claude-sonnet-5-5',
-    'claude-haiku-5-5',
   ]) {
     test(`${model} keeps the earliest top-level effort and inserts a system marker`, () => {
       const session = `ses_${model}`
@@ -1319,6 +1316,34 @@ describe('OpenCode per-message effort beyond Fable 5.1', () => {
           plan,
         ),
       ).toEqual({ found: 0, inserted: 0 })
+      expect(JSON.stringify(body)).toBe(before)
+    }
+  })
+
+  test('adds no markers or effort messages for Opus 5, Haiku 5.5 and Mythos 5.1', () => {
+    for (const model of [
+      'claude-opus-5',
+      'claude-haiku-5-5',
+      'claude-mythos-5-1',
+    ]) {
+      const messages: HostMessage[] = [
+        user('msg_low', `ses_${model}`, model, 'low'),
+        assistant('msg_step', `ses_${model}`),
+        user('msg_high', `ses_${model}`, model, 'high'),
+      ]
+      expect(markOpenCodeEffortTransitions(messages)).toBeNull()
+      expect(markerTexts(messages)).toEqual([])
+      const body: Record<string, unknown> = {
+        model,
+        thinking: { ...ADAPTIVE },
+        output_config: { effort: 'high' },
+        messages: lower(messages),
+      }
+      const before = JSON.stringify(body)
+      expect(applyOpenCodeEffortMarkers(body, true)).toEqual({
+        found: 0,
+        inserted: 0,
+      })
       expect(JSON.stringify(body)).toBe(before)
     }
   })
