@@ -11,6 +11,7 @@ import {
   getLogLevel,
   type LogTestRecord,
   type NativeCustodyClient,
+  NativeCustodyError,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
   setLogLevel,
@@ -18,7 +19,7 @@ import {
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
-import { drainSidebarWrites } from '../sidebar-state'
+import { drainSidebarWrites, getSidebarState } from '../sidebar-state'
 import { migrateNativeOpencodeFixture } from './native-fixture'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
 
@@ -209,6 +210,9 @@ async function createFixture(
     profile?: boolean
     captureIntervals?: boolean
     mainFirst?: boolean
+    secondFallback?: boolean
+    fallbackState?: 'active' | 'needs_reauth'
+    fallbackEnabled?: boolean
   } = {},
 ) {
   const now = options.now ?? Date.now()
@@ -219,6 +223,8 @@ async function createFixture(
   const accountId = `fallback-${site}`
   const credentialId = `oauth:anthropic:${accountId}`
   const mainCredentialId = 'oauth:anthropic'
+  const nextId = `${accountId}-next`
+  const nextCredentialId = `oauth:anthropic:${nextId}`
   const intervals: IntervalRecord[] = []
   const records: OutboundRecord[] = []
   const credentialGets: Array<{ credentialId: string; isMain: boolean }> = []
@@ -296,10 +302,10 @@ async function createFixture(
         id: accountId,
         label: accountId,
         type: 'oauth',
-        enabled: true,
+        enabled: options.fallbackEnabled ?? true,
         refresh: '',
         claustrumScopedCredentialId: credentialId,
-        claustrumScopedState: 'active',
+        claustrumScopedState: options.fallbackState ?? 'active',
         anthropicAccountUuid: accountId as never,
         // A legacy quota reading names the account it was read for in
         // accountIdentity; the migration imports a reading only when that
@@ -308,6 +314,20 @@ async function createFixture(
           ? { quota: { ...options.quotaSnapshot, accountIdentity: accountId } }
           : {}),
       },
+      ...(options.secondFallback
+        ? [
+            {
+              id: nextId,
+              type: 'oauth' as const,
+              enabled: true,
+              refresh: '',
+              claustrumScopedCredentialId: nextCredentialId,
+              claustrumScopedState: 'active' as const,
+              anthropicAccountUuid: nextId as never,
+              quota: { ...quota(now), accountIdentity: nextId },
+            },
+          ]
+        : []),
     ],
   }
 
@@ -339,10 +359,27 @@ async function createFixture(
           credentialType: 'oauth',
           refreshAdapter: 'anthropic',
           operations: ['read'],
-          state: 'active' as const,
+          state: options.fallbackState ?? 'active',
           recordVersion: 103,
           createdAtMs: null,
         },
+        ...(options.secondFallback
+          ? [
+              {
+                id: nextCredentialId,
+                accountId: nextId,
+                categories: ['anthropic-native'],
+                serves: ['anthropic'],
+                providerIds: [],
+                credentialType: 'oauth' as const,
+                refreshAdapter: 'anthropic',
+                operations: ['read'],
+                state: 'active' as const,
+                recordVersion: 103,
+                createdAtMs: null,
+              },
+            ]
+          : []),
       ],
     }),
     getScoped: async (input) => {
@@ -350,8 +387,16 @@ async function createFixture(
       credentialGets.push({ credentialId: input.credentialId, isMain })
       return {
         credentialId: input.credentialId,
-        accountId: isMain ? mainProviderAccountId : accountId,
-        material: isMain ? mainVault : vault,
+        accountId: isMain
+          ? mainProviderAccountId
+          : input.credentialId === nextCredentialId
+            ? nextId
+            : accountId,
+        material: isMain
+          ? mainVault
+          : input.credentialId === nextCredentialId
+            ? `${vault}-next`
+            : vault,
         expiresAtMs: Date.now() + 12 * 60 * 60_000,
         recordVersion: 103,
       }
@@ -407,16 +452,26 @@ async function createFixture(
     ).toEqual([
       {
         id: 'main',
-        source: 'vault',
+        source: 'vault' as const,
         credentialId: mainCredentialId,
         accountIdentity: mainProviderAccountId,
       },
       {
         id: accountId,
-        source: 'vault',
+        source: 'vault' as const,
         credentialId,
         accountIdentity: accountId,
       },
+      ...(options.secondFallback
+        ? [
+            {
+              id: nextId,
+              source: 'vault' as const,
+              credentialId: nextCredentialId,
+              accountIdentity: nextId,
+            },
+          ]
+        : []),
     ])
     const byId = new Map(snapshot.accounts.map((a) => [a.id, a]))
     if (options.quotaSnapshot)
@@ -580,6 +635,8 @@ async function createFixture(
 
   return {
     accountId,
+    nextId,
+    paths: fixture.paths,
     credentialGets,
     scopedClient,
     intervals,
@@ -1166,3 +1223,191 @@ test.serial(
     expect(reports).toEqual([104])
   },
 )
+
+async function serveOrdered(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+  model = 'claude-opus-4-8',
+) {
+  fixture.records.length = 0
+  const response = await fixture.result.fetch(MESSAGES_URL, {
+    method: 'POST',
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: 'hello' }],
+    }),
+  })
+  await response.text()
+  return fixture.records.filter((record) => record.url.includes('/v1/messages'))
+}
+
+describe('vault fallback eligibility', () => {
+  test.serial(
+    'ordered routing skips a vault fallback below minimumRemaining',
+    async () => {
+      const now = Date.now()
+      const low = quota(now)
+      low.five_hour.remainingPercent = 0.5
+      low.five_hour.usedPercent = 99.5
+      const fixture = await createFixture('request', {
+        now,
+        quotaEnabled: true,
+        quotaSnapshot: low,
+        secondFallback: true,
+      })
+      const sent = await serveOrdered(fixture)
+      expect(sent.map((record) => record.authorization)).toEqual([
+        `Bearer ${vaultToken('request')}-next`,
+      ])
+    },
+  )
+
+  test.serial(
+    'ordered routing skips a scoped-exhausted vault fallback and serves the next',
+    async () => {
+      const now = Date.now()
+      const fixture = await createFixture('request', {
+        now,
+        quotaEnabled: true,
+        quotaSnapshot: quota(now, 0),
+        secondFallback: true,
+      })
+      const sent = await serveOrdered(fixture, 'claude-fable-5')
+      expect(sent.map((record) => record.authorization)).toEqual([
+        `Bearer ${vaultToken('request')}-next`,
+      ])
+    },
+  )
+
+  test.serial(
+    'model quota exhausted during vault authorization skips to next fallback',
+    async () => {
+      const now = Date.now()
+      const fixture = await createFixture('request', {
+        now,
+        quotaEnabled: true,
+        quotaSnapshot: quota(now),
+        secondFallback: true,
+      })
+      const runtime = createNativeAccountRuntime({
+        paths: fixture.paths,
+        host: 'opencode',
+        vault: { connect: async () => fixture.scopedClient },
+      })
+      lifetimes.deferCleanup(() => runtime.close())
+      const getScoped = fixture.scopedClient.getScoped
+      let changed = false
+      fixture.scopedClient.getScoped = async (input) => {
+        if (
+          !changed &&
+          input.credentialId === `oauth:anthropic:${fixture.accountId}`
+        ) {
+          changed = true
+          await runtime.fetchQuota(fixture.accountId, (async () =>
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+              limits: [
+                {
+                  kind: 'weekly_scoped',
+                  group: 'weekly',
+                  percent: 100,
+                  scope: { model: { display_name: 'Fable' } },
+                },
+              ],
+            })) as unknown as typeof fetch)
+          await runtime.drainQuotaPublications()
+        }
+        return getScoped(input)
+      }
+      const sent = await serveOrdered(fixture, 'claude-fable-5')
+      expect(changed).toBe(true)
+      expect(sent.map((record) => record.authorization)).toEqual([
+        `Bearer ${vaultToken('request')}-next`,
+      ])
+    },
+  )
+
+  test.serial(
+    'ordered routing propagates vault authorization failure',
+    async () => {
+      const now = Date.now()
+      const fixture = await createFixture('request', {
+        now,
+        quotaEnabled: true,
+        quotaSnapshot: quota(now),
+        secondFallback: true,
+      })
+      fixture.scopedClient.getScoped = async () => {
+        throw new NativeCustodyError('invalid-token')
+      }
+      await expect(serveOrdered(fixture)).rejects.toMatchObject({
+        code: 'unavailable',
+      })
+      expect(
+        fixture.records.filter((record) => record.url.includes('/v1/messages')),
+      ).toEqual([])
+    },
+  )
+
+  test.serial(
+    'enabled needs-sign-in vault fallback stays in sidebar but is not routed',
+    async () => {
+      const now = Date.now()
+      const fixture = await createFixture('request', {
+        now,
+        quotaEnabled: true,
+        quotaSnapshot: quota(now),
+        secondFallback: true,
+        fallbackState: 'needs_reauth',
+      })
+      const sent = await serveOrdered(fixture)
+      expect(sent.map((record) => record.authorization)).toEqual([
+        `Bearer ${vaultToken('request')}-next`,
+      ])
+      await drainSidebarWrites()
+      expect(
+        fixture.credentialGets.some(
+          (get) => get.credentialId === `oauth:anthropic:${fixture.accountId}`,
+        ),
+      ).toBe(false)
+      const state = await getSidebarState()
+      expect(
+        state.fallbacks.find((row) => row.id === fixture.accountId),
+      ).toMatchObject({
+        enabled: true,
+        stateLine: 'needs sign-in in the vault',
+        quotaDated: true,
+        quota: { five_hour: { remainingPercent: 90 } },
+      })
+    },
+  )
+
+  test.serial(
+    'user-disabled vault fallback shows turned off with dated quota',
+    async () => {
+      const now = Date.now()
+      const fixture = await createFixture('request', {
+        now,
+        quotaEnabled: true,
+        quotaSnapshot: quota(now),
+        secondFallback: true,
+        fallbackEnabled: false,
+      })
+      const sent = await serveOrdered(fixture)
+      expect(sent.map((record) => record.authorization)).toEqual([
+        `Bearer ${vaultToken('request')}-next`,
+      ])
+      await drainSidebarWrites()
+      expect(
+        (await getSidebarState()).fallbacks.find(
+          (row) => row.id === fixture.accountId,
+        ),
+      ).toMatchObject({
+        enabled: false,
+        stateLine: 'turned off',
+        quotaDated: true,
+        quota: { five_hour: { remainingPercent: 90 } },
+      })
+    },
+  )
+})

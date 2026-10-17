@@ -1357,6 +1357,7 @@ const anthropicAuthPlugin = async (
                 credentialId: primary.credentialId,
                 accountId: primaryUuid,
                 state: primary.state ?? 'cold',
+                enabled: primary.enabled,
               }
             : undefined,
       },
@@ -2253,6 +2254,7 @@ const anthropicAuthPlugin = async (
       if (
         account.type !== 'oauth' ||
         !account.enabled ||
+        (account.source === 'vault' && account.state !== 'active') ||
         storedProfileIsFresh(account, now)
       )
         continue
@@ -2302,7 +2304,11 @@ const anthropicAuthPlugin = async (
     const current = await nativeAccounts.read()
     const later = Date.now()
     for (const account of current.accounts) {
-      if (account.type !== 'oauth') continue
+      if (
+        account.type !== 'oauth' ||
+        (account.source === 'vault' && account.state !== 'active')
+      )
+        continue
       const key = profileHydrationKey(account.id, account.accountIdentity)
       // Authorizing a route records its account identity, so a route that
       // was unidentified when its attempt began is usually identified now.
@@ -2718,7 +2724,10 @@ const anthropicAuthPlugin = async (
       return unavailable
     for (const account of snapshot.accounts) {
       if (account.id === 'main' || account.type !== 'oauth') continue
-      if (!account.enabled) {
+      if (
+        !account.enabled ||
+        (account.source === 'vault' && account.state !== 'active')
+      ) {
         if (requiredByPolicy) unavailable.add(account.id)
         continue
       }
@@ -2841,6 +2850,15 @@ const anthropicAuthPlugin = async (
             ))
         )
           continue
+        if (isScopedCustodyActive(storage)) {
+          // Collect vault candidates using roster and quota metadata only.
+          // Authorize them at dispatch, outside the local-account catch below,
+          // so vault access and integrity failures reject the request instead
+          // of silently removing a candidate.
+          if (isFallbackAccountVaultServed(account.id, storage))
+            usable.push(account)
+          continue
+        }
         try {
           const credential = await authorizeOAuth(
             account.id,
@@ -4009,9 +4027,20 @@ const anthropicAuthPlugin = async (
     const mainEntry = quotaManager.getMain(mainQuotaAccountId)
     const lastApiError = quotaManager.getLastApiError()
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
+    const primary = storage?.claustrum?.primaryAccount
+    const mainStateLine =
+      isScopedCustodyActive(storage) &&
+      (!primary || primary.enabled === false || primary.state !== 'active')
+        ? formatNativeAccountState({
+            source: 'vault',
+            enabled: primary?.enabled,
+            state: primary?.state,
+          })
+        : undefined
     return {
       main: {
         quota: mainEntry?.quota ?? null,
+        enabled: primary?.enabled,
         tierLabel: formatOAuthAccountTier(storage?.main?.profile),
         quotaBackedOff: quotaManager.isBackedOff(),
         quotaBackoffUntil: lastApiError?.nextRetryAt,
@@ -4026,15 +4055,27 @@ const anthropicAuthPlugin = async (
             )
           : false,
         refreshBackoffUntil: mainRefreshError?.nextRetryAt,
+        stateLine: mainStateLine,
+        quotaDated: Boolean(mainStateLine),
       },
       fallbacks: (storage?.accounts ?? [])
         .filter(
           (account): account is OAuthAccount =>
-            account.enabled !== false && isOAuthAccount(account),
+            isOAuthAccount(account) &&
+            (account.enabled !== false ||
+              Boolean(account.claustrumScopedCredentialId)),
         )
         .map((account) => {
           const vaultServed = isFallbackAccountVaultServed(account.id, storage)
           const custodyState = fallbackCustodyStateFor(account.id, storage)
+          const stateLine =
+            account.claustrumScopedCredentialId && !vaultServed
+              ? formatNativeAccountState({
+                  source: 'vault',
+                  enabled: account.enabled !== false,
+                  state: account.claustrumScopedState,
+                })
+              : undefined
           return {
             id: account.id,
             label: account.label,
@@ -4064,6 +4105,8 @@ const anthropicAuthPlugin = async (
             vaultServed,
             custodyState,
             enabled: account.enabled !== false,
+            stateLine,
+            quotaDated: Boolean(stateLine),
           }
         }),
       activeId: options.activeId,
@@ -7588,8 +7631,8 @@ const anthropicAuthPlugin = async (
             for (const account of storageArg?.accounts ?? []) {
               if (storageArg && isOAuthAccount(account)) {
                 if (isScopedCustodyActive(storageArg)) {
-                  if (isFallbackAccountVaultServed(account.id, storageArg))
-                    usable.push(account)
+                  const usableAccount = usableOAuthById.get(account.id)
+                  if (usableAccount) usable.push(usableAccount)
                   continue
                 }
                 if (getClaustrumMode(storageArg) !== 'local') continue
@@ -7986,12 +8029,18 @@ const anthropicAuthPlugin = async (
                 isScopedCustodyActive(storage) &&
                 account.claustrumScopedCredentialId
               ) {
-                const credential = await authorizeOAuth(
-                  account.id,
-                  init?.signal ?? undefined,
-                  undefined,
-                  parseRequestModel(await fetchBody(input, init)),
-                )
+                let credential: NativeOAuthAuthorization
+                try {
+                  credential = await authorizeOAuth(
+                    account.id,
+                    init?.signal ?? undefined,
+                    undefined,
+                    parseRequestModel(await fetchBody(input, init)),
+                  )
+                } catch (error) {
+                  if (error instanceof NativeModelPolicyError) continue
+                  throw error
+                }
                 const scopedAttempt = credential.scopedAttempt
                 if (!scopedAttempt)
                   throw new Error(

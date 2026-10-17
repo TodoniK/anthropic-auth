@@ -29,7 +29,12 @@ export function startNativeAnthropicLifecycle(
     const interval = getQuotaCheckIntervalMs(current.policyStorage)
     for (const account of current.accounts) {
       if (abort.signal.aborted) return
-      if (!account.enabled || account.type !== 'oauth') continue
+      if (
+        !account.enabled ||
+        account.type !== 'oauth' ||
+        (account.source === 'vault' && account.state !== 'active')
+      )
+        continue
       if (
         current.policyStorage.quota?.enabled !== false &&
         Date.now() - quotaSnapshotCheckedAt(account.quota) >= interval

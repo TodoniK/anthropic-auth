@@ -335,7 +335,11 @@ export function nativeAccountPolicy(
   snapshot: NativeAccountSnapshot,
   modelId?: string,
 ): NativeLocalExternalPolicy {
-  if (!account.enabled) return { status: 'blocked', reason: 'account-disabled' }
+  if (
+    !account.enabled ||
+    (account.source === 'vault' && account.state !== 'active')
+  )
+    return { status: 'blocked', reason: 'account-disabled' }
   if (
     !quotaSnapshotPassesPolicy(account.quota, snapshot.policyStorage) ||
     !quotaSnapshotPassesModelScope(account.quota, modelId) ||

@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
 import { fingerprintOf, type PoolRow } from '@cortexkit/common-auth/store'
+import { nativeAccountPolicy } from '../native-account-runtime.ts'
 import {
   applyNativeMetadataPatch,
   formatNativeAccountState,
@@ -469,3 +470,51 @@ test('native quota clear floors and generations cannot move backward or clear a 
   expect(cleared.quotaErrorClearedAt).toBe(350)
   expect(cleared.lastQuotaRefreshError).toBeUndefined()
 })
+
+for (const state of ['active', 'needs_reauth', 'revoked', 'expired'] as const) {
+  for (const enabled of [true, false]) {
+    test(`vault ${state} user-enabled=${enabled} preserves inventory separately from serving eligibility`, () => {
+      const snapshot = projectNativeAccountViews({
+        paths: { ...paths },
+        rows: [],
+        settings: {
+          claustrum: { mode: 'claustrum' },
+          quota: { enabled: false },
+        },
+        roster: {
+          version: 1,
+          complete: true,
+          declined: [],
+          rows: [
+            {
+              routeId: 'fallback',
+              label: 'fallback',
+              credentialId: 'oauth:anthropic:fallback',
+              credentialType: 'oauth',
+              accountIdentity: uuid,
+              state,
+              enabled,
+              addedAt: 0,
+            },
+          ],
+        },
+      })
+      expect(snapshot.accounts).toHaveLength(1)
+      const account = snapshot.accounts[0]!
+      expect(account.enabled).toBe(enabled)
+      expect(snapshot.policyStorage.accounts[0]?.enabled).toBe(enabled)
+      expect(nativeAccountPolicy(account, snapshot).status).toBe(
+        enabled && state === 'active' ? 'allowed' : 'blocked',
+      )
+      expect(formatNativeAccountState(account)).toBe(
+        !enabled
+          ? 'turned off'
+          : state === 'needs_reauth'
+            ? 'needs sign-in in the vault'
+            : state === 'active'
+              ? 'active'
+              : 'unavailable in the vault',
+      )
+    })
+  }
+}

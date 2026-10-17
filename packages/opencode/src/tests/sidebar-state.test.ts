@@ -1796,3 +1796,37 @@ describe('setSidebarState cross-process writes', () => {
     }
   })
 })
+
+test('vault account state lines and dated quota survive sidebar normalization', () => {
+  const state = normalizeSidebarState({
+    main: { quota: null, stateLine: 'turned off', quotaDated: true },
+    fallbacks: [
+      {
+        id: 'vault-sign-in',
+        enabled: true,
+        custodyState: 'on-vault-reauth',
+        stateLine: 'needs sign-in in the vault',
+        quotaDated: true,
+        quota: { five_hour: { usedPercent: 10, remainingPercent: 90 } },
+      },
+    ],
+  })
+  expect(state.main).toMatchObject({
+    stateLine: 'turned off',
+    quotaDated: true,
+  })
+  expect(
+    resolveActiveAccount({ ...state, activeId: 'vault-sign-in' }),
+  ).toMatchObject({
+    id: 'vault-sign-in',
+    stateLine: 'needs sign-in in the vault',
+    quotaDated: true,
+  })
+  expect(state.fallbacks[0]).toMatchObject({
+    enabled: true,
+    custodyState: 'on-vault-reauth',
+    stateLine: 'needs sign-in in the vault',
+    quotaDated: true,
+    quota: { five_hour: { remainingPercent: 90 } },
+  })
+})

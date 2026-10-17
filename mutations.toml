@@ -815,3 +815,19 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "vault-fallback-quota-floor"
+guards = "Ordered vault fallbacks obey the same minimumRemaining floors as local accounts."
+file = "packages/opencode/src/index.ts"
+old = "!quotaSnapshotPassesPolicy(quota, storage) ||"
+new = "false /* NON-VACUITY BREAK: bypass the standard fallback quota floor */ ||"
+test_file = "packages/opencode/src/tests/fallback-token-use-sites.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/fallback-token-use-sites.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["vault fallback eligibility > ordered routing skips a vault fallback below minimumRemaining"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"

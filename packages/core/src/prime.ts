@@ -8,6 +8,7 @@ import {
   type AccountQuotaWindow,
   type AccountStorage,
   type FallbackAccount,
+  getClaustrumMode,
   isOAuthAccount,
   isPermanentRefreshError,
   killswitchPassesPolicy,
@@ -466,7 +467,10 @@ function evaluateAccounts(storage: AccountStorage): AccountEvaluation[] {
     id: 'main',
     label: 'main',
     isOAuth: true,
-    isEnabled: true,
+    isEnabled:
+      getClaustrumMode(storage) !== 'claustrum' ||
+      (storage.claustrum?.primaryAccount?.enabled !== false &&
+        storage.claustrum?.primaryAccount?.state === 'active'),
     hasPermanentRefreshError: isPermanentRefreshError(mainRefreshError),
     storedQuota: storage.quota?.mainQuota,
     storedFiveHour: storage.quota?.mainQuota?.five_hour,
@@ -496,7 +500,10 @@ function evaluateAccounts(storage: AccountStorage): AccountEvaluation[] {
       id: account.id,
       label: primeAccountLabel(account.id, account),
       isOAuth: true,
-      isEnabled: account.enabled !== false,
+      isEnabled:
+        account.enabled !== false &&
+        (getClaustrumMode(storage) !== 'claustrum' ||
+          account.claustrumScopedState === 'active'),
       hasPermanentRefreshError: isPermanentRefreshError(
         account.lastRefreshError,
       ),

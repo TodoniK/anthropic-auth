@@ -60,13 +60,20 @@ export interface NativeAccountView {
  * One-line status text for an account's state, shared by host status
  * displays. A local account in 'unsupported-access' holds a saved access value
  * that is not a Claude OAuth access token; it is never sent to Claude or
- * refreshed, so the text names the remedy. Other states, such as vault
- * credential states, are shown as recorded. Returns '' when there is no state.
+ * refreshed, so the text names the remedy. Vault states describe why an
+ * account cannot serve without changing the user's enabled setting.
+ * Returns '' when there is no state.
  */
 export function formatNativeAccountState(
-  view: Pick<NativeAccountView, 'state'>,
+  view: Pick<NativeAccountView, 'state'> &
+    Partial<Pick<NativeAccountView, 'source' | 'enabled'>>,
 ): string {
   const state = view.state
+  if (view.source === 'vault') {
+    if (view.enabled === false) return 'turned off'
+    if (state === 'needs_reauth') return 'needs sign-in in the vault'
+    if (state !== 'active') return 'unavailable in the vault'
+  }
   if (state === undefined || state === '') return ''
   if (state === 'unsupported-access')
     return 'unsupported credential: the saved access token is not a Claude OAuth token; sign in to this account again'
@@ -675,7 +682,7 @@ export function projectNativeAccountViews(input: {
         id: row === primary ? 'main' : row.routeId,
         type: 'oauth',
         source: 'vault',
-        enabled: row.enabled && row.state === 'active',
+        enabled: row.enabled,
         label: row.label,
         addedAt: row.addedAt,
         accountIdentity: row.accountIdentity,
@@ -767,6 +774,17 @@ export function projectNativeAccountViews(input: {
       ? undefined
       : candidateMainEntry
   if (main) {
+    if (main.source === 'vault' && main.credentialId && main.accountIdentity) {
+      policyStorage.claustrum = {
+        ...policyStorage.claustrum,
+        primaryAccount: {
+          credentialId: main.credentialId,
+          accountId: main.accountIdentity as ProviderAccountUuid,
+          state: main.state ?? 'cold',
+          enabled: main.enabled,
+        },
+      }
+    }
     policyStorage.mainAccountId = main.accountIdentity ?? main.binding?.rowId
     policyStorage.main = {
       type: 'opencode',

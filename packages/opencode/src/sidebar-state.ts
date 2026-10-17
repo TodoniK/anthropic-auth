@@ -31,10 +31,12 @@ export interface SidebarAccountState {
   label: string | undefined
   quota: AccountQuota | null
   enabled: boolean
+  stateLine?: string
+  quotaDated?: boolean
   // True when the account's refresh token is permanently dead (400
   // invalid_grant) and it needs a re-login — distinct from a transient backoff.
   needsReauth: boolean
-  // True when the vault copy needs re-importing while the sidecar remains usable.
+  // True when the vault credential needs a new sign-in.
   vaultReauth?: boolean
   // A gate alone does not prove the sidecar can serve a request.
   vaultServed?: boolean
@@ -77,7 +79,10 @@ export interface PrimeSidebarAccountState {
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
+    enabled?: boolean
     tierLabel?: string
+    stateLine?: string
+    quotaDated?: boolean
     quotaBackedOff?: boolean
     quotaBackoffUntil?: number
     refreshBackedOff?: boolean
@@ -327,6 +332,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
   if (isRecord(raw.main)) {
     const m = raw.main
     main.quota = normalizeAccountQuota(m.quota)
+    if (typeof m.enabled === 'boolean') main.enabled = m.enabled
+    if (typeof m.stateLine === 'string') main.stateLine = m.stateLine
+    if (m.quotaDated === true) main.quotaDated = true
     if (typeof m.tierLabel === 'string' && m.tierLabel.trim()) {
       main.tierLabel = m.tierLabel.trim()
     }
@@ -349,6 +357,10 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
           label: typeof entry.label === 'string' ? entry.label : undefined,
           quota: normalizeAccountQuota(entry.quota),
           enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
+          ...(typeof entry.stateLine === 'string' && {
+            stateLine: entry.stateLine,
+          }),
+          ...(entry.quotaDated === true && { quotaDated: true }),
           needsReauth:
             typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
           ...(entry.vaultReauth === true && { vaultReauth: true }),
@@ -792,13 +804,13 @@ export function resolveActiveAccount(state: SidebarState): {
   id: string
   name: string
   quota: AccountQuota | null
+  stateLine?: string
+  quotaDated?: boolean
 } {
   const activeId = state.activeId
   if (activeId && activeId !== 'main') {
-    // `account.enabled` is defensive: writeSidebarState already filters disabled
-    // accounts out of state.fallbacks, so in normal operation every entry is
-    // enabled. Kept so this pure helper stays correct for any caller and is
-    // exercised directly by the unit tests.
+    // A disabled fallback cannot remain the active route, even though vault
+    // accounts stay visible in the expanded inventory while turned off.
     const fallback = state.fallbacks?.find(
       (account) => account.enabled && account.id === activeId,
     )
@@ -807,10 +819,22 @@ export function resolveActiveAccount(state: SidebarState): {
         id: fallback.id,
         name: fallback.label ?? fallback.id,
         quota: fallback.quota,
+        ...(fallback.stateLine && {
+          stateLine: fallback.stateLine,
+          quotaDated: fallback.quotaDated,
+        }),
       }
     }
   }
-  return { id: 'main', name: 'main', quota: state.main?.quota ?? null }
+  return {
+    id: 'main',
+    name: 'main',
+    quota: state.main?.quota ?? null,
+    ...(state.main?.stateLine && {
+      stateLine: state.main.stateLine,
+      quotaDated: state.main.quotaDated,
+    }),
+  }
 }
 
 export function formatScopedQuotaLabel(title: string) {

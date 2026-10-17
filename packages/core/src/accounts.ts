@@ -104,6 +104,7 @@ export type ClaustrumConfig = {
     credentialId: string
     accountId: ProviderAccountUuid
     state: string
+    enabled?: boolean
   }
   /** Preserve explicit exclusions when a vaulted account disappears and returns. */
   disabledAccountIdentities?: string[]

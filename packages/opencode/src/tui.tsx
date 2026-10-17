@@ -317,19 +317,23 @@ function AccountBlock(props: {
   pacingEnabled: boolean
   needsReauth?: boolean
   vaultReauth?: boolean
+  stateLine?: string
+  quotaDated?: boolean
   tierLabel?: string
   marginTop?: number
 }) {
   const statusWord = () =>
-    props.needsReauth
-      ? 're-login'
-      : props.vaultReauth
-        ? 'vault reauth'
-        : props.active
-          ? 'active'
-          : 'idle'
+    props.quotaDated && props.quota
+      ? 'dated'
+      : props.needsReauth
+        ? 're-login'
+        : props.vaultReauth
+          ? 'needs sign-in in the vault'
+          : props.active
+            ? 'active'
+            : 'idle'
   const statusTone = (): Tone =>
-    props.needsReauth || props.vaultReauth
+    props.needsReauth || props.vaultReauth || props.stateLine
       ? 'warn'
       : props.active
         ? 'ok'
@@ -340,7 +344,7 @@ function AccountBlock(props: {
       | undefined,
     windowMs: number,
   ) =>
-    props.pacingEnabled && window
+    props.pacingEnabled && !props.quotaDated && window
       ? computeQuotaPacing(window, windowMs, Date.now())
       : null
   return (
@@ -353,6 +357,9 @@ function AccountBlock(props: {
           <b>{statusWord()}</b>
         </text>
       </box>
+      <Show when={props.stateLine}>
+        <text fg={props.theme.textMuted}>{props.stateLine}</text>
+      </Show>
       <Show
         when={props.quota}
         fallback={<text fg={props.theme.textMuted}>{'checking\u2026'}</text>}
@@ -437,7 +444,9 @@ function QuotaDialogContent(props: {
   setTimeout(refresh, 0)
   const theme = () => props.api.theme.current
   const enabledFallbacks = () =>
-    (state().fallbacks ?? []).filter((f) => f.enabled)
+    (state().fallbacks ?? []).filter(
+      (f) => f.enabled || (f.custodyState && f.custodyState !== 'off'),
+    )
   return (
     <box flexDirection='column' padding={2} width='100%' alignItems='center'>
       <box flexDirection='column' width={58}>
@@ -454,6 +463,8 @@ function QuotaDialogContent(props: {
           active={state().activeId === 'main'}
           pacingEnabled={prefs().sections.pacing}
           tierLabel={state().main?.tierLabel}
+          stateLine={state().main?.stateLine}
+          quotaDated={state().main?.quotaDated}
         />
         <Show when={prefs().sections.fallbackAccounts}>
           <For each={enabledFallbacks()}>
@@ -467,6 +478,9 @@ function QuotaDialogContent(props: {
                 pacingEnabled={prefs().sections.pacing}
                 tierLabel={fb.tierLabel}
                 needsReauth={fb.needsReauth}
+                vaultReauth={fb.vaultReauth}
+                stateLine={fb.stateLine}
+                quotaDated={fb.quotaDated}
                 marginTop={1}
               />
             )}
@@ -594,9 +608,13 @@ function QuotaSidebar(props: {
 
   const theme = () => props.api.theme.current
   const enabledFallbacks = () =>
-    (state().fallbacks ?? []).filter((f) => f.enabled)
+    (state().fallbacks ?? []).filter(
+      (f) => f.enabled || (f.custodyState && f.custodyState !== 'off'),
+    )
   const hasData = () =>
-    state().main?.quota != null || enabledFallbacks().length > 0
+    state().main?.quota != null ||
+    state().main?.stateLine != null ||
+    enabledFallbacks().length > 0
 
   const headerLabel = () => {
     const name = prefs().header.label
@@ -607,6 +625,7 @@ function QuotaSidebar(props: {
     getCollapsedQuotaSummary(activeAccount().quota)
   const activePacingDeficit = () => {
     if (!prefs().sections.pacing) return false
+    if (activeAccount().quotaDated) return null
     const quota = activeAccount().quota
     if (!quota) return false
     const now = Date.now()
@@ -732,10 +751,13 @@ function QuotaSidebar(props: {
             fallback={<text fg={theme().textMuted}>{'\u2014'}</text>}
           >
             <text fg={toneColor(theme(), activeQuotaTone())}>
-              <b>{activeQuotaSummary().text}</b>
+              <b>{`${activeQuotaSummary().text}${activeAccount().quotaDated ? ' · dated' : ''}`}</b>
             </text>
           </Show>
         </CollapsedRow>
+        <Show when={activeAccount().stateLine}>
+          <text fg={theme().textMuted}>{activeAccount().stateLine}</text>
+        </Show>
         <Show when={state().fastMode}>
           <CollapsedRow theme={theme()} label='Mode'>
             <text fg={toneColor(theme(), 'accent')}>
@@ -776,6 +798,8 @@ function QuotaSidebar(props: {
               active={state().activeId === 'main'}
               pacingEnabled={prefs().sections.pacing}
               tierLabel={state().main?.tierLabel}
+              stateLine={state().main?.stateLine}
+              quotaDated={state().main?.quotaDated}
             />
             <Show when={prefs().sections.fallbackAccounts}>
               <For each={enabledFallbacks()}>
@@ -790,6 +814,8 @@ function QuotaSidebar(props: {
                     tierLabel={fb.tierLabel}
                     needsReauth={fb.needsReauth}
                     vaultReauth={fb.vaultReauth}
+                    stateLine={fb.stateLine}
+                    quotaDated={fb.quotaDated}
                     marginTop={1}
                   />
                 )}
