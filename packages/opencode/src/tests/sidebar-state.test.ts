@@ -24,6 +24,7 @@ import {
   formatPrimeCost,
   formatPrimeTime,
   formatQuotaRowLabel,
+  getCollapsedAccounts,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   getSidebarState,
@@ -442,12 +443,12 @@ describe('getCollapsedQuotaSummary', () => {
         bindingWindow: 'five_hour',
         fallbackAdvised: true,
       }).text,
-    ).toBe('5h 22% left · 7d 60% left · credits spent')
+    ).toBe('5h 22% · 7d 60% · cr 0% left')
   })
 
   test('formats both active-account quota windows', () => {
     expect(getCollapsedQuotaSummary(quota(13)).text).toBe(
-      '5h 87% left · 7d 87% left',
+      '5h 87% · 7d 87% left',
     )
   })
 
@@ -457,15 +458,15 @@ describe('getCollapsedQuotaSummary', () => {
         five_hour: { usedPercent: 13.4, remainingPercent: 86.6 },
         seven_day: { usedPercent: 7.2, remainingPercent: 92.8 },
       }).text,
-    ).toBe('5h 87% left · 7d 93% left')
+    ).toBe('5h 87% · 7d 93% left')
   })
 
-  test('omits an unreported collapsed quota window', () => {
+  test('keeps both account-wide names when a reading is missing', () => {
     expect(
       getCollapsedQuotaSummary({
         five_hour: { usedPercent: 13, remainingPercent: 87 },
       }).text,
-    ).toBe('5h 87% left')
+    ).toBe('5h 87% · 7d — left')
   })
 
   test('formats scoped model quota windows in collapsed quota text', () => {
@@ -483,7 +484,7 @@ describe('getCollapsedQuotaSummary', () => {
           },
         ],
       }).text,
-    ).toBe('5h 87% left · 7d 93% left · Fable only 58% left')
+    ).toBe('5h 87% · 7d 93% · Fa 58% left')
   })
 
   test('returns no collapsed quota text when no windows are available', () => {
@@ -491,7 +492,7 @@ describe('getCollapsedQuotaSummary', () => {
     expect(getCollapsedQuotaSummary({}).text).toBeNull()
   })
 
-  test('omits 5h/7d placeholders when only scoped windows are visible', () => {
+  test('keeps 5h/7d placeholders when only a scoped reading is available', () => {
     const summary = getCollapsedQuotaSummary({
       scoped: [
         {
@@ -503,13 +504,10 @@ describe('getCollapsedQuotaSummary', () => {
         },
       ],
     })
-    expect(summary.text).toBe('Fable only 0% left')
-    expect(summary.text).not.toContain('5h')
-    expect(summary.text).not.toContain('7d')
-    expect(summary.text).not.toContain('—')
+    expect(summary.text).toBe('5h — · 7d — · Fa 0% left')
   })
 
-  test('omits unreported primary windows alongside scoped windows', () => {
+  test('keeps an unreported account-wide name alongside a scoped reading', () => {
     const summary = getCollapsedQuotaSummary({
       five_hour: { usedPercent: 23, remainingPercent: 77 },
       scoped: [
@@ -522,10 +520,10 @@ describe('getCollapsedQuotaSummary', () => {
         },
       ],
     })
-    expect(summary.text).toBe('5h 77% left · Fable only 58% left')
+    expect(summary.text).toBe('5h 77% · 7d — · Fa 58% left')
   })
 
-  test('keeps reading times through normalization and shows stale age in collapsed text', () => {
+  test('keeps reading times through normalization and flags staleness without age text', () => {
     const now = Date.parse('2026-04-28T12:00:00Z')
     const checkedAt = now - 2 * 86400000
     const normalized = normalizeSidebarState({
@@ -541,8 +539,148 @@ describe('getCollapsedQuotaSummary', () => {
     expect(normalized.main.quota?.five_hour?.checkedAt).toBe(checkedAt)
     expect(normalized.main.quota?.scoped).toEqual([])
     expect(getCollapsedQuotaSummary(normalized.main.quota, now).text).toBe(
-      '5h 40% left · checked 2d ago',
+      '5h 40% · 7d — left',
     )
+    expect(getCollapsedQuotaSummary(normalized.main.quota, now).stale).toBe(
+      true,
+    )
+  })
+
+  test('shows only the tightest of two model windows after both account-wide windows', () => {
+    const scoped = (modelName: string, remainingPercent: number) => ({
+      id: modelName,
+      title: `${modelName} only`,
+      modelName,
+      usedPercent: 100 - remainingPercent,
+      remainingPercent,
+    })
+    expect(
+      getCollapsedQuotaSummary({
+        ...quota(10),
+        scoped: [scoped('Fable', 98), scoped('Opus', 12)],
+      }).text,
+    ).toBe('5h 90% · 7d 90% · Op 12% left')
+    expect(
+      getCollapsedQuotaSummary({
+        ...quota(10),
+        scoped: [scoped('Fable', 12), scoped('Opus', 12)],
+      }).text,
+    ).toBe('5h 90% · 7d 90% · Fa 12% left')
+  })
+
+  test('extends colliding model names letter by letter even if only the tightest is shown', () => {
+    const scoped = (modelName: string, remainingPercent: number) => ({
+      id: modelName,
+      title: `${modelName} only`,
+      modelName,
+      usedPercent: 100 - remainingPercent,
+      remainingPercent,
+    })
+    expect(
+      getCollapsedQuotaSummary({
+        ...quota(10),
+        scoped: [scoped('Fable', 12), scoped('Fabric', 80)],
+      }).text,
+    ).toBe('5h 90% · 7d 90% · Fabl 12% left')
+    expect(
+      getCollapsedQuotaSummary({
+        ...quota(10),
+        scoped: [scoped('Fable', 80), scoped('Fabric', 12)],
+      }).text,
+    ).toBe('5h 90% · 7d 90% · Fabr 12% left')
+  })
+
+  test('marks only stale readings and omits reset and age wording from narrow text', () => {
+    const now = 10 * 86400000
+    const fresh = getCollapsedQuotaSummary(
+      { five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt: now } },
+      now,
+    )
+    expect(fresh.stale).toBe(false)
+    const stale = getCollapsedQuotaSummary(
+      {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          checkedAt: now - 30 * 3600000,
+        },
+      },
+      now,
+    )
+    expect(stale.stale).toBe(true)
+    expect(stale.text).toBe('5h 100% · 7d — left')
+  })
+})
+
+describe('getCollapsedAccounts', () => {
+  test('keeps placement order rather than moving the active fallback first', () => {
+    const state = make({
+      main: { quota: quota(10) },
+      activeId: 'second',
+      fallbacks: [
+        {
+          id: 'first',
+          label: 'first',
+          enabled: true,
+          quota: quota(20),
+          needsReauth: false,
+        },
+        {
+          id: 'second',
+          label: 'second',
+          enabled: true,
+          quota: quota(30),
+          needsReauth: false,
+        },
+        {
+          id: 'disabled',
+          label: 'disabled',
+          enabled: false,
+          quota: quota(40),
+          needsReauth: false,
+        },
+      ],
+    })
+    expect(
+      getCollapsedAccounts(state).map(({ id, active }) => ({ id, active })),
+    ).toEqual([
+      { id: 'main', active: false },
+      { id: 'first', active: false },
+      { id: 'second', active: true },
+    ])
+    expect(getCollapsedAccounts(state, false).map(({ id }) => id)).toEqual([
+      'main',
+    ])
+  })
+
+  test('uses the custody-selected inventory and keeps visible disabled vault accounts', () => {
+    const state = make({
+      main: { quota: quota(10) },
+      activeId: 'main',
+      fallbacks: [
+        {
+          id: 'vault-on',
+          label: 'vault-on',
+          enabled: true,
+          quota: quota(20),
+          needsReauth: false,
+          custodyState: 'on-vault-served',
+        },
+        {
+          id: 'vault-off',
+          label: 'vault-off',
+          enabled: false,
+          quota: quota(30),
+          needsReauth: false,
+          custodyState: 'on-cold',
+        },
+      ],
+    })
+    expect(getCollapsedAccounts(state).map(({ id }) => id)).toEqual([
+      'main',
+      'vault-on',
+      'vault-off',
+    ])
   })
 })
 

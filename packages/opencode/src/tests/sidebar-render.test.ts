@@ -14,15 +14,26 @@ afterEach(async () => {
   fixture = undefined
 })
 
-async function renderSidebar(state: unknown, wanted: string[]) {
+async function renderSidebar(
+  state: unknown,
+  wanted: string[],
+  collapsed = false,
+) {
   fixture = await mkdtemp(join(tmpdir(), 'anthropic-quota-render-'))
   const stateFile = join(fixture, 'sidebar.json')
   await writeFile(stateFile, JSON.stringify(state))
+  await writeFile(
+    join(fixture, 'preferences.jsonc'),
+    JSON.stringify({
+      'anthropic-auth': { startCollapsed: collapsed, rememberCollapsed: false },
+    }),
+  )
   // Render the compiled sidebar with installed OpenTUI libraries, without a package install.
   const probe = `
 import { createTestRenderer } from '@opentui/core/testing';
 import { render } from '@opentui/solid';
 import { ensureRuntimePluginSupport } from '@opentui/solid/runtime-plugin-support/configure';
+import { TextAttributes } from '@opentui/core';
 ensureRuntimePluginSupport();
 const { default: plugin } = await import(${JSON.stringify(new URL('../tui-compiled/tui.tsx', import.meta.url).href)});
 const registered = [];
@@ -54,6 +65,14 @@ try {
   setup.renderer.requestRender();
   const text = await frame;
   console.log(text);
+  if (${collapsed}) {
+    console.log('STYLES:' + JSON.stringify(setup.captureSpans().lines.map((line) => {
+      const spans = line.spans.filter((span) => span.text.trim());
+      return { text: line.spans.map((span) => span.text).join(''),
+        dim: spans.length > 0 && spans.every((span) => (span.attributes & TextAttributes.DIM) !== 0),
+        bold: spans.length > 0 && spans.every((span) => (span.attributes & TextAttributes.BOLD) !== 0) };
+    })));
+  }
 } finally {
   setup.renderer.off('frame', observe);
   setup.renderer.destroy();
@@ -111,6 +130,125 @@ test('compiled sidebar renders the shared quota figure reset and stale reading a
   expect(stdout).toContain('3d23h')
   expect(stdout).toContain('checked 2d ago')
   expect(stdout).not.toContain('Fable')
+})
+
+test('collapsed sidebar keeps every account on one line with intact narrow quotas and dim stale rows', async () => {
+  const now = Date.now()
+  const window = (used: number, checkedAt = now) => ({
+    usedPercent: used,
+    remainingPercent: 100 - used,
+    checkedAt,
+  })
+  const stdout = await renderSidebar(
+    {
+      main: {
+        quota: {
+          five_hour: window(62),
+          seven_day: window(41),
+          scoped: [
+            {
+              id: 'fable',
+              title: 'Fable only',
+              modelName: 'Fable',
+              ...window(78),
+            },
+          ],
+          extraUsage: {
+            used: { amountMinor: 1250, currency: 'USD', exponent: 2 },
+            limit: { amountMinor: 5000, currency: 'USD', exponent: 2 },
+            exhausted: false,
+          },
+        },
+      },
+      fallbacks: [
+        {
+          id: 'work',
+          label: 'work',
+          enabled: true,
+          needsReauth: false,
+          quota: {
+            five_hour: window(8, now - 30 * 3600000),
+            seven_day: window(93, now - 30 * 3600000),
+          },
+        },
+      ],
+      activeId: 'main',
+      route: 'main',
+      lastUpdated: now,
+    },
+    ['5h 38% · 7d 59% · Fa 22% · cr 75% left', 'work', '5h 92% · 7d 7% left'],
+    true,
+  )
+  const [frame, styleText] = stdout.split('STYLES:')
+  expect(frame).toContain('… 5h 38% · 7d 59% · Fa 22% · cr 75% left')
+  expect(frame).toContain('work')
+  expect(frame).toContain('5h 92% · 7d 7% left')
+  expect(frame).not.toContain('checked')
+  const rows = frame!.split('\n').filter((line) => line.includes('5h'))
+  expect(rows).toHaveLength(2)
+  expect(rows[0]).toContain('38%')
+  expect(rows[1]).toContain('92%')
+  const styles = JSON.parse(styleText!) as {
+    text: string
+    dim: boolean
+    bold: boolean
+  }[]
+  expect(styles.find((line) => line.text.includes('5h 38%'))).toMatchObject({
+    dim: false,
+    bold: true,
+  })
+  expect(styles.find((line) => line.text.includes('5h 92%'))).toMatchObject({
+    dim: true,
+    bold: false,
+  })
+})
+
+test('collapsed sidebar dims a stale active row and a fresh inactive row without reordering accounts', async () => {
+  const now = Date.now()
+  const window = (used: number, checkedAt: number) => ({
+    usedPercent: used,
+    remainingPercent: 100 - used,
+    checkedAt,
+  })
+  const stdout = await renderSidebar(
+    {
+      main: {
+        quota: { five_hour: window(10, now), seven_day: window(20, now) },
+      },
+      fallbacks: [
+        {
+          id: 'work',
+          label: 'work',
+          enabled: true,
+          needsReauth: false,
+          quota: {
+            five_hour: window(8, now - 30 * 3600000),
+            seven_day: window(93, now - 30 * 3600000),
+          },
+        },
+      ],
+      activeId: 'work',
+      route: 'work',
+      lastUpdated: now,
+    },
+    ['main', '5h 90% · 7d 80% left', 'work', '5h 92% · 7d 7% left'],
+    true,
+  )
+  const [frame, styleText] = stdout.split('STYLES:')
+  expect(frame!.indexOf('main')).toBeLessThan(frame!.indexOf('work'))
+  const styles = JSON.parse(styleText!) as {
+    text: string
+    dim: boolean
+    bold: boolean
+  }[]
+  expect(styles.find((line) => line.text.includes('5h 90%'))).toMatchObject({
+    dim: true,
+    bold: false,
+  })
+  expect(styles.find((line) => line.text.includes('5h 92%'))).toMatchObject({
+    dim: true,
+    bold: false,
+  })
 })
 
 test('42-column sidebar renders full scoped names credits and stale fallback rows in aligned columns', async () => {

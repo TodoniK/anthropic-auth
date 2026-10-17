@@ -38,6 +38,8 @@ Change mode in `/claude` → **Routing**. **Reset routing session** clears the c
 
 Quota shows five-hour, seven-day and model-scoped windows when available. OpenCode's **Refresh quota** action requests fresh readings; Pi shows the summary without a refresh action. Passive response headers and quota API polling have different coverage: headers can update standard windows without supplying model-scoped limits.
 
+Quota figures use the shared wording, such as `5h 40% left, resets 2h29m` and `7d 70% left, resets 3d23h`. Readings older than fifteen minutes include their age, such as `checked 1d6h ago`. Extra usage is shown as `credits 40% left` or `credits spent`.
+
 `quota.minimumRemaining.five_hour` and `.seven_day` are minimum **remaining** percentages, not usage percentages (`5h` and `1w` are menu aliases). `quota.failClosedOnUnknownQuota` controls unknown readings where no positive killswitch floor applies. Killswitch thresholds are separate hard blocks:
 
 - A positive five-hour or seven-day floor blocks missing readings for that window regardless of `failClosedOnUnknownQuota`.

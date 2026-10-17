@@ -13,6 +13,7 @@ import type {
   TuiPluginApi,
   TuiPluginModule,
 } from '@opencode-ai/plugin/tui'
+import { type BoxRenderable, TextAttributes } from '@opentui/core'
 import {
   createEffect,
   createSignal,
@@ -30,6 +31,7 @@ import {
   FIVE_HOUR_MS,
   formatPrimeAccountValue,
   formatQuotaRowLabel,
+  getCollapsedAccounts,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   getSidebarState,
@@ -232,6 +234,59 @@ function CollapsedRow(props: {
     <box width='100%' flexDirection='row' justifyContent='space-between'>
       <text fg={props.theme.textMuted}>{props.label}</text>
       {props.children}
+    </box>
+  )
+}
+
+function CollapsedAccountRow(props: {
+  theme: ThemeCurrent
+  account: ReturnType<typeof getCollapsedAccounts>[number]
+  tone: Tone
+}) {
+  const [width, setWidth] = createSignal(40)
+  let row: BoxRenderable | undefined
+  const summary = () => getCollapsedQuotaSummary(props.account.quota)
+  const value = () => summary().text ?? '—'
+  const labelWidth = () => Math.max(0, width() - Bun.stringWidth(value()) - 1)
+  const dim = () =>
+    !props.account.active || props.account.quotaDated || summary().stale
+  const attributes = () => (dim() ? TextAttributes.DIM : TextAttributes.BOLD)
+  const color = () =>
+    dim() ? props.theme.textMuted : toneColor(props.theme, props.tone)
+  return (
+    <box
+      width='100%'
+      height={1}
+      flexDirection='row'
+      ref={(element: BoxRenderable) => {
+        row = element
+        setWidth(element.width || 40)
+      }}
+      onSizeChange={() => setWidth(row?.width || 40)}
+    >
+      <Show when={labelWidth() > 0}>
+        <text
+          width={labelWidth()}
+          flexShrink={0}
+          wrapMode='none'
+          fg={color()}
+          attributes={attributes()}
+        >
+          {formatQuotaRowLabel(props.account.name, labelWidth())}
+        </text>
+        <text width={1} flexShrink={0}>
+          {' '}
+        </text>
+      </Show>
+      <text
+        width={Bun.stringWidth(value())}
+        flexShrink={0}
+        wrapMode='none'
+        fg={color()}
+        attributes={attributes()}
+      >
+        {value()}
+      </text>
     </box>
   )
 }
@@ -762,21 +817,22 @@ function QuotaSidebar(props: {
         </Show>
       </box>
 
-      {/* Collapsed: active account 5h + 7d quota, plus fast-mode when on */}
+      {/* Collapsed accounts keep placement order; only a fresh active row is emphasized. */}
       <Show when={collapsed() && hasData()}>
-        <CollapsedRow theme={theme()} label={activeAccount().name}>
-          <Show
-            when={activeQuotaSummary().text != null}
-            fallback={<text fg={theme().textMuted}>{'\u2014'}</text>}
-          >
-            <text fg={toneColor(theme(), activeQuotaTone())}>
-              <b>{`${activeQuotaSummary().text}${activeAccount().quotaDated ? ' · dated' : ''}`}</b>
-            </text>
-          </Show>
-        </CollapsedRow>
-        <Show when={activeAccount().stateLine}>
-          <text fg={theme().textMuted}>{activeAccount().stateLine}</text>
-        </Show>
+        <For
+          each={getCollapsedAccounts(
+            state(),
+            prefs().sections.fallbackAccounts,
+          )}
+        >
+          {(account) => (
+            <CollapsedAccountRow
+              theme={theme()}
+              account={account}
+              tone={activeQuotaTone()}
+            />
+          )}
+        </For>
         <Show when={state().fastMode}>
           <CollapsedRow theme={theme()} label='Mode'>
             <text fg={toneColor(theme(), 'accent')}>

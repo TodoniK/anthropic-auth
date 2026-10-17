@@ -128,9 +128,9 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { PrimeUsageCounters } from '@cortexkit/anthropic-auth-core'
 import {
-  formatQuota,
   logger,
   quotaDisplayProjection,
+  quotaWindowParts,
 } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
@@ -932,6 +932,7 @@ export function getFableRecoverySummary(
 
 /** Keep full shared names when they fit; truncate only to preserve row columns. */
 export function formatQuotaRowLabel(name: string, width = 10): string {
+  if (width <= 0) return ''
   let label = name
   if (Bun.stringWidth(label) > width) {
     label = ''
@@ -944,6 +945,64 @@ export function formatQuotaRowLabel(name: string, width = 10): string {
   return label + ' '.repeat(Math.max(0, width - Bun.stringWidth(label)))
 }
 
+// common-auth 0.18.0 has no narrow form, so keep its one-line quota wording here.
+// Once supported, replace this body with formatQuota(quotaDisplayProjection(quota, now),
+// { now, form: 'narrow' }) from common-auth.
+function formatNarrowQuota(quota: AccountQuota, now: number): string {
+  const parts = quotaWindowParts(quotaDisplayProjection(quota, now), { now })
+  const percent = (remaining: number | undefined) =>
+    remaining === undefined ? '—' : `${Math.round(remaining)}%`
+  const values = ['5h', '7d'].map((name) => {
+    const part = parts.windows.find(
+      (part) => part.name === name && part.kind === 'window',
+    )
+    return `${name} ${percent(part?.remainingPercent)}`
+  })
+  const scoped = quota.scoped ?? []
+  const names = [...new Set(scoped.map((window) => window.modelName))]
+  const lengths = names.map(() => 2)
+  while (true) {
+    const aliases = names.map((name, index) =>
+      [...name].slice(0, lengths[index]).join(''),
+    )
+    let extended = false
+    for (const [index, alias] of aliases.entries()) {
+      const length = lengths[index] ?? 2
+      if (
+        aliases.some(
+          (other, otherIndex) => otherIndex !== index && other === alias,
+        ) &&
+        length < [...(names[index] ?? '')].length
+      ) {
+        lengths[index] = length + 1
+        extended = true
+      }
+    }
+    if (!extended) break
+  }
+  const tightest = scoped.reduce<ScopedQuotaWindow | undefined>(
+    (lowest, window) =>
+      !lowest || window.remainingPercent < lowest.remainingPercent
+        ? window
+        : lowest,
+    undefined,
+  )
+  if (tightest) {
+    const index = names.indexOf(tightest.modelName)
+    const name = [...tightest.modelName].slice(0, lengths[index]).join('')
+    const part = parts.windows.find(
+      (part) => part.kind === 'window' && part.name === tightest.title,
+    )
+    values.push(`${name} ${percent(part?.remainingPercent)}`)
+  }
+  const budget = parts.windows.find((part) => part.kind === 'budget')
+  if (budget)
+    values.push(
+      `cr ${percent(quota.extraUsage?.exhausted ? 0 : budget.remainingPercent)}`,
+    )
+  return `${values.join(' · ')} left`
+}
+
 export function getCollapsedQuotaSummary(
   quota: AccountQuota | null,
   now = Date.now(),
@@ -952,22 +1011,25 @@ export function getCollapsedQuotaSummary(
   sevenDayUsedPercent: number | null
   scopedUsedPercents: number[]
   text: string | null
+  stale: boolean
 } {
   const fiveHourUsedPercent = quota?.five_hour?.usedPercent ?? null
   const sevenDayUsedPercent = quota?.seven_day?.usedPercent ?? null
   const scoped = quota?.scoped ?? []
   const scopedUsedPercents = scoped.map((window) => window.usedPercent)
   if (
-    fiveHourUsedPercent == null &&
-    sevenDayUsedPercent == null &&
-    scoped.length === 0 &&
-    !quota?.extraUsage
+    !quota ||
+    (fiveHourUsedPercent == null &&
+      sevenDayUsedPercent == null &&
+      scoped.length === 0 &&
+      !quota.extraUsage)
   ) {
     return {
       fiveHourUsedPercent,
       sevenDayUsedPercent,
       scopedUsedPercents,
       text: null,
+      stale: false,
     }
   }
 
@@ -975,11 +1037,42 @@ export function getCollapsedQuotaSummary(
     fiveHourUsedPercent,
     sevenDayUsedPercent,
     scopedUsedPercents,
-    text: formatQuota(quotaDisplayProjection(quota, now), {
-      now,
-      form: 'compact',
-    }),
+    text: formatNarrowQuota(quota, now),
+    stale:
+      quotaWindowParts(quotaDisplayProjection(quota, now), { now }).age !==
+      undefined,
   }
+}
+
+export function getCollapsedAccounts(
+  state: SidebarState,
+  showFallbacks = true,
+) {
+  const activeId = resolveActiveAccount(state).id
+  return [
+    {
+      id: 'main',
+      name: 'main',
+      quota: state.main?.quota ?? null,
+      quotaDated: state.main?.quotaDated,
+      active: activeId === 'main',
+    },
+    ...(showFallbacks
+      ? (state.fallbacks ?? [])
+          .filter(
+            (account) =>
+              account.enabled ||
+              (account.custodyState && account.custodyState !== 'off'),
+          )
+          .map((account) => ({
+            id: account.id,
+            name: account.label ?? account.id,
+            quota: account.quota,
+            quotaDated: account.quotaDated,
+            active: activeId === account.id,
+          }))
+      : []),
+  ]
 }
 
 export const FIVE_HOUR_MS = 5 * 60 * 60 * 1000
