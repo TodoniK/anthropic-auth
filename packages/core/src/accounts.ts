@@ -680,7 +680,6 @@ export async function acquireRefreshFileLock(options: {
   name: string
   ttlMs: number
   path?: string
-  now?: () => number
   renew?: boolean
   renewIntervalMs?: number
   onStep?: (
@@ -698,7 +697,7 @@ export async function acquireRefreshFileLock(options: {
   const lockPath = `${accountPath}.${options.name}.lock`
   const legacyOwnerPath = join(lockPath, 'owner.json')
   const ownerId = randomUUID()
-  const now = options.now ?? Date.now
+  const now = Date.now
   let renewTimer: ReturnType<typeof setTimeout> | null = null
   let released = false
 

@@ -61,6 +61,8 @@ export interface CommandRunnerResult {
   exitCode: number
   stdout: string
   stderr: string
+  signal?: NodeJS.Signals | null
+  spawnError?: boolean
 }
 
 export interface CommandRunner {

@@ -503,11 +503,8 @@ test('without AbortSignal.any the wait still ends on abort and still joins', asy
   expect(abortedResult).toEqual({ status: 'rejected', reason })
   // Direct lock joining works with an individual signal even without AbortSignal.any.
   const direct = new AbortController()
-  const joining = joinNativePoolWrite(
-    f.paths,
-    [direct.signal],
-    () => direct.signal.throwIfAborted(),
-    () => now,
+  const joining = joinNativePoolWrite(f.paths, [direct.signal], () =>
+    direct.signal.throwIfAborted(),
   )
   trackDetached(joining.then(noop, noop))
   held.release()
@@ -653,18 +650,14 @@ test('a join that gets the config lock but not the state lock within the budget 
     name: 'pool-state',
     ttlMs: 10_000,
     renew: false,
-    now: () => now,
   })
   if (!stateLock) throw new Error('the state lock was not free')
   deferCleanup(() => stateLock.release())
   const controller = new AbortController()
   const started = performance.now()
   const [joined] = await Promise.allSettled([
-    joinNativePoolWrite(
-      f.paths,
-      [controller.signal],
-      () => controller.signal.throwIfAborted(),
-      () => now,
+    joinNativePoolWrite(f.paths, [controller.signal], () =>
+      controller.signal.throwIfAborted(),
     ),
   ])
   expect(joined).toEqual({ status: 'fulfilled', value: 'deadline' })

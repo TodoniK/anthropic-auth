@@ -373,6 +373,32 @@ test('unknown setup failures keep thrown paths and stacks off screen', async () 
   expect(screen).not.toContain('at migrate')
 })
 
+test('structural setup command fields are redacted as diagnostic detail, not trusted header fields', async () => {
+  const root = await stateRoot()
+  const env = { XDG_STATE_HOME: root, SYNTHETIC_API_TOKEN: OPAQUE }
+  const directory = cliDiagnosticsDirectory(env)
+  if (directory === undefined) throw new Error('No diagnostics directory')
+  const screen = await reportThrownFailure(
+    'cli-setup',
+    {
+      step: `other-command-${OPAQUE}`,
+      exitCode: 9,
+      signal: `signal-${OPAQUE}`,
+      stderrTail: `command failed ${OPAQUE}`,
+    },
+    env,
+  )
+  const record = await diagnosticFile(screen, directory)
+  expect(record.payload.step).toBeUndefined()
+  expect(record.payload.signal).toBeUndefined()
+  expect(record.detail).toContain('exitCode: 9')
+  expect(record.text).toContain('step: other-command-')
+  expect(record.text).toContain('signal: signal-')
+  expect(record.text).toContain('stderrTail:\ncommand failed ')
+  expect(screen).not.toContain('command failed')
+  expectNoPieceOf(OPAQUE, record.text + screen)
+})
+
 test('known secrets include short submitted and secret-named environment values', () => {
   expect(
     collectKnownSecrets(

@@ -646,7 +646,6 @@ export function createNativeRefreshCoordinator(
         path: spec.path,
         ttlMs: POOL_LOCK_DEFAULTS.ttlMs,
         renew: true,
-        now,
         onContended: onLockEvent
           ? () =>
               onLockEvent({

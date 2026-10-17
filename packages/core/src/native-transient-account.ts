@@ -83,18 +83,15 @@ const NATIVE_POOL_WRITE_JOIN_BUDGET_MS = 2_000
  * budget. Each wait between attempts ends early when any of `signals`
  * aborts; `check` is then called after the leases are released and is
  * expected to throw the caller's cancellation error. `check` runs before
- * every attempt too, so a cancelled caller never takes a lock. `now` must be
- * the clock the pool's writers stamp their lock expiry with, or a live
- * writer's lock could be judged expired and taken over.
+ * every attempt too, so a cancelled caller never takes a lock. All pool
+ * leases use wall time, independently of logical observation timestamps.
  */
 export async function joinNativePoolWrite(
   paths: NativePoolStorePaths,
   signals: readonly AbortSignal[],
   check: () => void,
-  now: () => number = Date.now,
 ): Promise<'joined' | 'deadline'> {
-  // The budget is measured on the monotonic clock; `now` is only the clock
-  // lock expiry is stamped with.
+  // Wall-clock adjustments must not change the total wait budget.
   const started = performance.now()
   const remaining = () =>
     NATIVE_POOL_WRITE_JOIN_BUDGET_MS - (performance.now() - started)
@@ -116,7 +113,6 @@ export async function joinNativePoolWrite(
           name: lock.name,
           ttlMs: POOL_LOCK_DEFAULTS.ttlMs,
           renew: false,
-          now,
         })
         if (lease) held.push(lease)
         // An acquisition that finished after the budget ran out does not

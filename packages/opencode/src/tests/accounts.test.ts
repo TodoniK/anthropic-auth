@@ -241,12 +241,10 @@ describe('isCostZeroingEnabled', () => {
 
 describe('account storage', () => {
   test('refresh file lock allows only one holder', async () => {
-    let now = 1_000
     const first = await acquireRefreshFileLock({
       name: 'test-refresh',
       ttlMs: 60_000,
       path: accountPath,
-      now: () => now,
     })
     expect(first).not.toBeNull()
 
@@ -255,7 +253,6 @@ describe('account storage', () => {
         name: 'test-refresh',
         ttlMs: 60_000,
         path: accountPath,
-        now: () => now,
       }),
     ).resolves.toBeNull()
 
@@ -264,7 +261,6 @@ describe('account storage', () => {
       name: 'test-refresh',
       ttlMs: 60_000,
       path: accountPath,
-      now: () => now,
     })
     expect(second).not.toBeNull()
     await second?.release()
@@ -273,15 +269,19 @@ describe('account storage', () => {
       name: 'test-refresh',
       ttlMs: 60_000,
       path: accountPath,
-      now: () => now,
     })
     expect(stale).not.toBeNull()
-    now += 60_001
+    const lockPath = `${accountPath}.test-refresh.lock`
+    const owner = JSON.parse(await readFile(lockPath, 'utf8'))
+    await writeFile(
+      lockPath,
+      `${JSON.stringify({ ...owner, expiresAt: Date.now() - 1 })}\n`,
+      'utf8',
+    )
     const afterStale = await acquireRefreshFileLock({
       name: 'test-refresh',
       ttlMs: 60_000,
       path: accountPath,
-      now: () => now,
     })
     expect(afterStale).not.toBeNull()
     await afterStale?.release()
@@ -289,7 +289,7 @@ describe('account storage', () => {
 
   test('refresh file lock stale-marker steal has a single winner under forced recreate race', async () => {
     const name = 'test-refresh-forced-stale-steal'
-    const now = 100_000
+    const now = Date.now()
     const ttlMs = 1_000
     await seedStaleRefreshLock(name, now, ttlMs)
 
@@ -306,7 +306,6 @@ describe('account storage', () => {
       name,
       ttlMs,
       path: accountPath,
-      now: () => now,
       onStep: async (step) => {
         if (step === 'stale-marker-stat') {
           cSawStaleMarker.resolve()
@@ -329,7 +328,6 @@ describe('account storage', () => {
       name,
       ttlMs,
       path: accountPath,
-      now: () => now,
       onStep: (step) => {
         if (step === 'eviction-marker-acquired') {
           aAcquiredMarker.resolve()
@@ -363,7 +361,7 @@ describe('account storage', () => {
     const rounds = 1_000
 
     for (let round = 0; round < rounds; round++) {
-      const now = 1_000_000 + round * 20_000
+      const now = Date.now()
       await seedStaleRefreshLock(name, now, ttlMs)
 
       const locks = await Promise.all(
@@ -372,7 +370,6 @@ describe('account storage', () => {
             name,
             ttlMs,
             path: accountPath,
-            now: () => now,
           }),
         ),
       )
@@ -475,7 +472,7 @@ describe('account storage', () => {
     })
 
     test('fresh lock is never stolen by contenders', async () => {
-      const now = 1_000
+      const now = Date.now()
       const lockPath = `${accountPath}.fresh-lock.lock`
 
       await writeFile(
@@ -490,7 +487,6 @@ describe('account storage', () => {
             name: 'fresh-lock',
             ttlMs: 60_000,
             path: accountPath,
-            now: () => now,
           }),
         ),
       )

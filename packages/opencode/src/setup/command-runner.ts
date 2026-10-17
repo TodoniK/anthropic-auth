@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+import { type ExecFileException, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import type { CommandRunner } from './types.ts'
 
@@ -21,9 +21,17 @@ export const defaultCommandRunner: CommandRunner = {
         stderr: typeof stderr === 'string' ? stderr : String(stderr),
       }
     } catch (error: unknown) {
-      const err = error as Record<string, unknown>
+      const err = error as ExecFileException & {
+        stdout?: unknown
+        stderr?: unknown
+      }
       return {
         exitCode: typeof err?.code === 'number' ? err.code : 1,
+        signal: typeof err?.signal === 'string' ? err.signal : null,
+        ...(typeof err?.syscall === 'string' &&
+        (err.syscall === 'spawn' || err.syscall.startsWith('spawn '))
+          ? { spawnError: true }
+          : {}),
         stdout:
           typeof err?.stdout === 'string'
             ? err.stdout

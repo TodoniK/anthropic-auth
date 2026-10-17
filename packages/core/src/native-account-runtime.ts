@@ -909,7 +909,6 @@ export function createNativeAccountRuntime(
             ? [shutdown.signal, request.signal]
             : [shutdown.signal],
           () => check(request.signal),
-          now,
         )
         if (joined === 'deadline') {
           logger.warn('native-auth', 'account write did not finish in time', {

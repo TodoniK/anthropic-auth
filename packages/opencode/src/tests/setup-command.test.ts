@@ -65,6 +65,7 @@ import { getOpenCodeAuthPath, getPiAuthPath } from '../setup/paths.ts'
 import { ProcessFenceViolationError } from '../setup/process-fence.ts'
 import {
   type CommandRunner,
+  type CommandRunnerResult,
   type ProcessFence,
   SetupRefusal,
 } from '../setup/types.ts'
@@ -93,10 +94,7 @@ function createTestFence(
 }
 
 function createMockRunner(
-  handlers: Record<
-    string,
-    (args: string[]) => { exitCode: number; stdout: string; stderr: string }
-  > = {},
+  handlers: Record<string, (args: string[]) => CommandRunnerResult> = {},
 ): CommandRunner {
   return {
     async run(command, args) {
@@ -1001,7 +999,7 @@ describe('setup failure diagnostics', () => {
   )
 
   lifetimes.test(
-    'shared Pi installer failure discards stdout and stderr before diagnostics',
+    'shared Pi installer failure keeps only safe command details in private diagnostics',
     async () => {
       const fixture = await setupFailureFixture()
       const noise = Array.from(
@@ -1037,7 +1035,7 @@ describe('setup failure diagnostics', () => {
             if (args.includes('--version'))
               return { exitCode: 0, stdout: '1.0.0', stderr: '' }
             installs.push(args)
-            return { exitCode: 7, stdout: '', stderr }
+            return { exitCode: 7, stdout: 'private install stdout', stderr }
           },
         }),
       })
@@ -1047,19 +1045,118 @@ describe('setup failure diagnostics', () => {
 
       const screen = fixture.screen()
       expectNoSecretFragments(screen)
+      expect(screen).not.toContain('npm error final line')
+      expect(screen).not.toContain('trailing 85')
+      expect(screen).not.toContain('private install stdout')
       const record = await screenDiagnostic(
         fixture,
         'Setup failed (cli-setup/unexpected-error).',
       )
       expectNoSecretFragments(record.text)
       expect(record.payload.code).toBe('cli-setup/unexpected-error')
+      expect(record.detail).toContain('step: pi-install')
+      expect(record.detail).toContain('exitCode: 7')
+      expect(record.detail).toContain('signal: null')
       expect(record.text).toContain(
         'Pi install failed; run pi install after checking your npm connection.',
       )
-      expect(record.text).not.toContain('npm error final line')
-      expect(record.text).not.toContain('trailing 85')
+      expect(record.text).toContain('stderrTail:\n')
+      expect(record.text).toContain('npm error final line ✓')
+      expect(record.text).toContain('trailing 85')
+      expect(record.text).not.toContain('npm notice line 0')
+      expect(record.text).not.toContain('private install stdout')
+      const tail = record.text.split('stderrTail:\n')[1] ?? ''
+      expect(new TextEncoder().encode(tail).length).toBeLessThanOrEqual(4097)
     },
   )
+
+  lifetimes.test(
+    'shared Pi installer command that never starts reports ENOENT without hanging',
+    async () => {
+      const fixture = await setupFailureFixture()
+      const installs: string[][] = []
+      const code = await runSetupCommand(['--yes', '--no-claustrum'], {
+        ...detectionIO(fixture.env, {
+          opencode: false,
+          pi: true,
+          claustrum: false,
+        }),
+        fence: createTestFence(),
+        terminal: { input: process.stdin, output: fixture.output },
+        runner: createMockRunner({
+          pi: (args) => {
+            if (args.includes('--version'))
+              return { exitCode: 0, stdout: '1.0.0', stderr: '' }
+            installs.push(args)
+            return {
+              exitCode: 1,
+              spawnError: true,
+              signal: null,
+              stdout: '',
+              stderr: 'spawn pi ENOENT',
+            }
+          },
+        }),
+      })
+      expect(code).toBe(1)
+      expect(installs).toHaveLength(1)
+      expect(installs[0]?.[0]).toBe('install')
+      const record = await screenDiagnostic(
+        fixture,
+        'Setup failed (cli-setup/unexpected-error).',
+      )
+      expect(record.detail).toContain('step: pi-install')
+      expect(record.detail).toContain('exitCode: null')
+      expect(record.detail).toContain('signal: null')
+      expect(record.text).toContain('stderrTail:\nspawn pi ENOENT')
+      expect(fixture.screen()).not.toContain('ENOENT')
+      expect(fixture.screen()).not.toContain('spawn pi')
+    },
+  )
+
+  for (const failure of [
+    { name: 'termination', signal: 'SIGTERM', spawnError: false, exitCode: 1 },
+    { name: 'spawn failure', signal: null, spawnError: true, exitCode: null },
+  ] as const) {
+    lifetimes.test(
+      `shared Pi installer ${failure.name} records process metadata privately`,
+      async () => {
+        const fixture = await setupFailureFixture()
+        const code = await runSetupCommand(['--yes', '--no-claustrum'], {
+          ...detectionIO(fixture.env, {
+            opencode: false,
+            pi: true,
+            claustrum: false,
+          }),
+          fence: createTestFence(),
+          terminal: { input: process.stdin, output: fixture.output },
+          runner: createMockRunner({
+            pi: (args) =>
+              args.includes('--version')
+                ? { exitCode: 0, stdout: '1.0.0', stderr: '' }
+                : {
+                    exitCode: 1,
+                    signal: failure.signal,
+                    spawnError: failure.spawnError,
+                    stdout: '',
+                    stderr: 'npm install terminated',
+                  },
+          }),
+        })
+        expect(code).toBe(1)
+        const record = await screenDiagnostic(
+          fixture,
+          'Setup failed (cli-setup/unexpected-error).',
+        )
+        expect(record.detail).toContain('step: pi-install')
+        expect(record.detail).toContain(`exitCode: ${failure.exitCode}`)
+        expect(record.detail).toContain(`signal: ${failure.signal}`)
+        expect(record.text).toContain('stderrTail:\nnpm install terminated')
+        expect(fixture.screen()).not.toContain('npm install terminated')
+        expect(fixture.screen()).not.toContain('SIGTERM')
+      },
+    )
+  }
 })
 
 const SETUP_UUID = '11111111-2222-4333-8444-555555555555' as ProviderAccountUuid

@@ -26,6 +26,7 @@ import {
   NativePiAuthSlotError,
   type ProviderErrorRedactor,
 } from '@cortexkit/anthropic-auth-core'
+import type { SetupCommandError } from '@cortexkit/common-auth/setup'
 import { NativeVaultActivationError } from './setup/native-activation.ts'
 import { NativeVaultEnrollmentError } from './setup/native-enrollment.ts'
 import { ProcessFenceViolationError } from './setup/process-fence.ts'
@@ -427,6 +428,35 @@ function errorKind(value: object): string {
   return 'object'
 }
 
+/**
+ * Core's bundle contains its own SetupCommandError constructor, so instanceof
+ * against a separately imported constructor would reject the runner's errors.
+ * Read own data fields instead.
+ */
+function setupCommandDetails(error: unknown):
+  | (Pick<SetupCommandError, 'exitCode' | 'signal' | 'stderrTail'> & {
+      step: string
+    })
+  | undefined {
+  if (!isInspectable(error)) return undefined
+  const step = ownData(error, 'step')
+  const exitCode = ownData(error, 'exitCode')
+  const signal = ownData(error, 'signal')
+  const stderrTail = ownData(error, 'stderrTail')
+  if (
+    typeof step !== 'string' ||
+    step.length === 0 ||
+    !(
+      exitCode === null ||
+      (typeof exitCode === 'number' && Number.isInteger(exitCode))
+    ) ||
+    !(signal === null || typeof signal === 'string') ||
+    typeof stderrTail !== 'string'
+  )
+    return undefined
+  return { step, exitCode, signal, stderrTail }
+}
+
 /** Own data fields of a thrown value as text, without running its code. */
 function describeThrown(value: unknown, depth: number): string[] {
   if (
@@ -584,13 +614,27 @@ export async function reportThrownFailure(
 ): Promise<string> {
   const known = knownFailureMessage(error)
   if (known !== undefined) return known
+  const command = setupCommandDetails(error)
   return recordFailure(
     stage,
     `${stage}/unexpected-error`,
     env,
     submitted,
     {},
-    () => ({ text: describeThrown(error, 0).join('\n'), keep: 'head' }),
+    () => ({
+      text: [
+        ...(command
+          ? [
+              `step: ${command.step}`,
+              `exitCode: ${command.exitCode}`,
+              `signal: ${command.signal}`,
+            ]
+          : []),
+        ...describeThrown(error, 0),
+        ...(command ? [`stderrTail:\n${command.stderrTail}`] : []),
+      ].join('\n'),
+      keep: 'head',
+    }),
   )
 }
 
