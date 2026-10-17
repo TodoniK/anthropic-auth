@@ -136,6 +136,7 @@ import {
   type NativeQuotaObservation,
   type NativeUiOptions,
   NativeVaultNoAccountError,
+  nativeAccountCanServe,
   nativeLocalQuotaLineage,
   nativeMigrationAuthorityPhase,
   normalizeQuotaHeaders,
@@ -377,7 +378,7 @@ function hasEnabledOAuthAccount(
   return (storage?.accounts ?? []).some(
     (account) =>
       account.id === activeId &&
-      account.enabled !== false &&
+      nativeAccountCanServe(account) &&
       isOAuthAccount(account),
   )
 }
@@ -387,7 +388,7 @@ function deriveSidebarRouting(
 ): Pick<SidebarState, 'activeId' | 'route'> {
   const firstFallback = (storage?.accounts ?? []).find(
     (account): account is OAuthAccount =>
-      account.enabled !== false && isOAuthAccount(account),
+      nativeAccountCanServe(account) && isOAuthAccount(account),
   )
   if (getRoutingMode(storage) === 'fallback-first' && firstFallback) {
     return { activeId: firstFallback.id, route: 'fallback-first' }
@@ -1559,12 +1560,9 @@ const anthropicAuthPlugin = async (
     )
     if (account?.state === 'unsupported-access')
       throw new NativeUnsupportedCredentialError()
-    if (
-      account?.source === 'vault' &&
-      (!account.enabled || account.state !== 'active')
-    )
+    if (account?.source === 'vault' && !nativeAccountCanServe(account))
       throw new NativeCredentialUnavailableError(account, 'not-active')
-    if (account?.type !== 'oauth' || !account.enabled) {
+    if (account?.type !== 'oauth' || !nativeAccountCanServe(account)) {
       throw new Error('Native OAuth account is unavailable')
     }
     const checkModelPolicy = (
@@ -1650,7 +1648,8 @@ const anthropicAuthPlugin = async (
     )
     if (signal?.aborted) throw signal.reason ?? new Error('Request aborted')
     if (
-      !selected?.enabled ||
+      !selected ||
+      !nativeAccountCanServe(selected) ||
       selected.source !== account.source ||
       selected.accountIdentity !== result.accountIdentity
     )
@@ -2253,8 +2252,7 @@ const anthropicAuthPlugin = async (
     for (const account of snapshot.accounts) {
       if (
         account.type !== 'oauth' ||
-        !account.enabled ||
-        (account.source === 'vault' && account.state !== 'active') ||
+        !nativeAccountCanServe(account) ||
         storedProfileIsFresh(account, now)
       )
         continue
@@ -2304,11 +2302,7 @@ const anthropicAuthPlugin = async (
     const current = await nativeAccounts.read()
     const later = Date.now()
     for (const account of current.accounts) {
-      if (
-        account.type !== 'oauth' ||
-        (account.source === 'vault' && account.state !== 'active')
-      )
-        continue
+      if (account.type !== 'oauth' || !nativeAccountCanServe(account)) continue
       const key = profileHydrationKey(account.id, account.accountIdentity)
       // Authorizing a route records its account identity, so a route that
       // was unidentified when its attempt began is usually identified now.
@@ -2724,10 +2718,7 @@ const anthropicAuthPlugin = async (
       return unavailable
     for (const account of snapshot.accounts) {
       if (account.id === 'main' || account.type !== 'oauth') continue
-      if (
-        !account.enabled ||
-        (account.source === 'vault' && account.state !== 'active')
-      ) {
+      if (!nativeAccountCanServe(account)) {
         if (requiredByPolicy) unavailable.add(account.id)
         continue
       }
@@ -2818,7 +2809,8 @@ const anthropicAuthPlugin = async (
         ? (await nativeAccounts.read()).accounts
         : []
       for (const account of storage?.accounts ?? []) {
-        if (!isOAuthAccount(account) || account.enabled === false) continue
+        if (!isOAuthAccount(account) || !nativeAccountCanServe(account))
+          continue
         const currentAccount = currentAccounts.find(
           (view) => view.id === account.id,
         )
@@ -2894,7 +2886,7 @@ const anthropicAuthPlugin = async (
         if (
           account.id === 'main' ||
           account.type !== 'oauth' ||
-          !account.enabled
+          !nativeAccountCanServe(account)
         )
           continue
         try {
@@ -3515,7 +3507,7 @@ const anthropicAuthPlugin = async (
     const account = storage?.accounts.find(
       (candidate): candidate is OAuthAccount =>
         candidate.id === accountId &&
-        candidate.enabled !== false &&
+        nativeAccountCanServe(candidate) &&
         isOAuthAccount(candidate),
     )
     if (!account || !storage) {
@@ -4029,8 +4021,7 @@ const anthropicAuthPlugin = async (
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
     const primary = storage?.claustrum?.primaryAccount
     const mainStateLine =
-      isScopedCustodyActive(storage) &&
-      (!primary || primary.enabled === false || primary.state !== 'active')
+      isScopedCustodyActive(storage) && !nativeAccountCanServe(primary)
         ? formatNativeAccountState({
             source: 'vault',
             enabled: primary?.enabled,
@@ -5575,7 +5566,7 @@ const anthropicAuthPlugin = async (
                 (account) =>
                   account.id === 'main' &&
                   account.source === 'vault' &&
-                  account.enabled,
+                  nativeAccountCanServe(account),
               ),
             )
           : []),
@@ -6127,9 +6118,7 @@ const anthropicAuthPlugin = async (
             mode === 'claustrum' &&
             !primarySnapshot.accounts.some(
               (account) =>
-                account.type === 'oauth' &&
-                account.enabled &&
-                account.state === 'active',
+                account.type === 'oauth' && nativeAccountCanServe(account),
             )
           )
             throw new NativeVaultNoAccountError()
@@ -7659,7 +7648,7 @@ const anthropicAuthPlugin = async (
               if (
                 options.includeApiRoutes === true &&
                 isApiKeyAccount(account) &&
-                account.enabled !== false &&
+                nativeAccountCanServe(account) &&
                 isValidApiBaseURL(account.baseURL)
               ) {
                 usable.push(account)
@@ -7716,7 +7705,8 @@ const anthropicAuthPlugin = async (
             if (isScoped) {
               const primary = latestStorage?.claustrum?.primaryAccount
               const primaryAvailable =
-                primary?.state === 'active' &&
+                primary !== undefined &&
+                nativeAccountCanServe(primary) &&
                 !latestStorage?.claustrum?.disabledAccountIdentities?.includes(
                   primary.accountId,
                 )
@@ -7752,12 +7742,9 @@ const anthropicAuthPlugin = async (
               for (const [index, stored] of (
                 latestStorage?.accounts ?? []
               ).entries()) {
-                if (stored.enabled === false || !isOAuthAccount(stored))
+                if (!nativeAccountCanServe(stored) || !isOAuthAccount(stored))
                   continue
-                if (
-                  stored.claustrumScopedCredentialId &&
-                  stored.claustrumScopedState === 'active'
-                ) {
+                if (stored.claustrumScopedCredentialId) {
                   let accountQuota = getFallbackQuota(stored)
                   if (
                     !stickyQuotaSnapshotIsFresh(
@@ -7793,7 +7780,7 @@ const anthropicAuthPlugin = async (
               for (const [index, stored] of (
                 latestStorage?.accounts ?? []
               ).entries()) {
-                if (stored.enabled === false || !isOAuthAccount(stored))
+                if (!nativeAccountCanServe(stored) || !isOAuthAccount(stored))
                   continue
                 const account = usableFallbacksById.get(stored.id) ?? stored
                 // Retain temporarily unavailable account metadata so sticky
@@ -8156,7 +8143,7 @@ const anthropicAuthPlugin = async (
             })
             const hasPotentialFallbackRoute = (storage?.accounts ?? []).some(
               (account) =>
-                account.enabled !== false &&
+                nativeAccountCanServe(account) &&
                 (isOAuthAccount(account) ||
                   (isApiKeyAccount(account) &&
                     isValidApiBaseURL(account.baseURL))),
@@ -9674,7 +9661,7 @@ const anthropicAuthPlugin = async (
                 const fallbackAccounts = (storage?.accounts ?? [])
                   .filter(
                     (a): a is OAuthAccount =>
-                      a.enabled !== false && isOAuthAccount(a),
+                      nativeAccountCanServe(a) && isOAuthAccount(a),
                   )
                   .map((a) => ({ ...a, quota: getFallbackQuota(a) }))
                 // Decide whether the block is scoped-driven (request's

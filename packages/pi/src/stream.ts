@@ -40,6 +40,7 @@ import {
   type NativeAccountView,
   type NativeApiSubject,
   NativeVaultNoAccountError,
+  nativeAccountCanServe,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
@@ -166,9 +167,12 @@ function getPiRoutingServices(
     const usable: OAuthAccount[] = []
     for (const account of current.accounts) {
       const view = accounts.get(account.id)
-      if (!isOAuthAccount(account) || !view?.enabled || view.type !== 'oauth')
+      if (
+        !isOAuthAccount(account) ||
+        !nativeAccountCanServe(view) ||
+        view?.type !== 'oauth'
+      )
         continue
-      if (view.source === 'vault' && view.state !== 'active') continue
       if (
         isPermanentRefreshError(view.lastRefreshError) ||
         (view.source === 'local' &&
@@ -972,8 +976,7 @@ async function executeWithFallback(options: {
     const account = accountView(id)
     return Boolean(
       account?.type === 'oauth' &&
-        account.enabled &&
-        (account.source !== 'vault' || account.state === 'active') &&
+        nativeAccountCanServe(account) &&
         !isPermanentRefreshError(account.lastRefreshError) &&
         (account.source !== 'local' ||
           (account.lastRefreshError?.nextRetryAt ?? 0) <= Date.now()),
@@ -1069,7 +1072,8 @@ async function executeWithFallback(options: {
       })
     }
     for (const [index, configured] of (storage?.accounts ?? []).entries()) {
-      if (configured.enabled === false || !isOAuthAccount(configured)) continue
+      if (!nativeAccountCanServe(configured) || !isOAuthAccount(configured))
+        continue
       const account = usableById.get(configured.id) ?? configured
       if (!nativeReady(account.id)) continue
       let accountQuota =
@@ -1224,7 +1228,7 @@ async function executeWithFallback(options: {
       usableOAuth.map((account) => [account.id, account]),
     )
     for (const configured of storage.accounts) {
-      if (configured.enabled === false) continue
+      if (!nativeAccountCanServe(configured)) continue
       let response: Response | undefined
       if (isOAuthAccount(configured)) {
         if (routeOptions.apiOnly || !nativeReady(configured.id)) continue
@@ -1248,8 +1252,8 @@ async function executeWithFallback(options: {
       } else if (routeOptions.includeApiRoutes) {
         const account = accountView(configured.id)
         if (
-          !account?.enabled ||
-          account.type !== 'api' ||
+          !nativeAccountCanServe(account) ||
+          account?.type !== 'api' ||
           !isValidApiBaseURL(account.baseURL)
         )
           continue

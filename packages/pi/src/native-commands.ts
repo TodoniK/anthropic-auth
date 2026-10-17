@@ -24,6 +24,7 @@ import {
   isPrimePersistentlyEnabled,
   type NativeMenuDispatch,
   type NativeMenuKillswitchEntry,
+  nativeAccountCanServe,
   setDumpEnabled,
 } from '@cortexkit/anthropic-auth-core'
 import type { PiNativeCommands } from './commands.ts'
@@ -217,7 +218,8 @@ export function createPiNativeCommands(
       case 'quota-refresh': {
         const snapshot = await native.view()
         for (const account of snapshot.accounts) {
-          if (!account.enabled || account.type !== 'oauth') continue
+          if (!nativeAccountCanServe(account) || account.type !== 'oauth')
+            continue
           await runtime.fetchQuota(account.id, fetchPiOAuth, options.signal)
           await runtime.fetchProfile(account.id, fetchPiOAuth, options.signal)
         }

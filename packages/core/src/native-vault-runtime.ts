@@ -26,6 +26,7 @@ import {
   captureNativePlainData,
   NATIVE_PRIMARY_CREDENTIAL_ID,
   type NativeAccountMetadataPatch,
+  nativeAccountCanServe,
   nativeAccountReadError,
   nativeQuotaFailure,
   nativeVaultPrimaryPin,
@@ -602,7 +603,8 @@ export function createNativeVaultRuntime(
       if (row?.credentialType !== 'oauth' || !row.accountIdentity)
         throw new NativeCustodyError('route-unavailable')
       if (!row.enabled) throw new NativeCustodyError('route-declined')
-      if (row.state !== 'active') throw new NativeCustodyError('not-active')
+      if (!nativeAccountCanServe(row))
+        throw new NativeCustodyError('not-active')
       const receipt = await custody.authorize(
         {
           credentialId: row.credentialId,
@@ -625,7 +627,8 @@ export function createNativeVaultRuntime(
         throw new NativeCustodyError('identity-changed')
       // A fresh GET does not override a roster revocation observed while it was
       // pending. The selected row must still be active before its receipt exits.
-      if (current.state !== 'active') throw new NativeCustodyError('not-active')
+      if (!nativeAccountCanServe(current))
+        throw new NativeCustodyError('not-active')
       check(combined)
       issued.set(receipt, { routeId: row.routeId, logicalId })
       const key = JSON.stringify([
@@ -916,8 +919,8 @@ export function createNativeVaultRuntime(
         subject.logicalId,
       )
       if (
-        !row?.enabled ||
-        row.state !== 'active' ||
+        !row ||
+        !nativeAccountCanServe(row) ||
         row.routeId !== subject.routeId ||
         row.accountIdentity !== subject.accountIdentity ||
         (row.credentialId !== subject.credentialId &&
@@ -1071,8 +1074,8 @@ export function createNativeVaultRuntime(
           served.assertedAccountIdentity,
         ])
         if (
-          !current?.enabled ||
-          current.state !== 'active' ||
+          !current ||
+          !nativeAccountCanServe(current) ||
           current.routeId !== route.routeId ||
           current.accountIdentity !== served.assertedAccountIdentity ||
           (current.credentialId !== served.credentialId &&

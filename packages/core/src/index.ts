@@ -58,7 +58,10 @@ export type {
   NativeAccountSnapshot,
   NativeAccountView,
 } from './native-account-view.ts'
-export { formatNativeAccountState } from './native-account-view.ts'
+export {
+  formatNativeAccountState,
+  nativeAccountCanServe,
+} from './native-account-view.ts'
 export * from './native-credential-validation.ts'
 export type {
   NativeCustody,
@@ -159,6 +162,7 @@ export {
   runNativeMigration,
   snapshotHasServableLocalOAuth,
 } from './native-migration.ts'
+export * from './native-quota-observations.ts'
 export type {
   NativeCommittedMaterial,
   NativeIdentityBootstrap,
@@ -207,7 +211,6 @@ export {
   runPiCommandMenu,
 } from './native-ui.ts'
 export * from './native-usage-publication.ts'
-export * from './native-quota-observations.ts'
 export {
   NATIVE_VAULT_NO_ACCOUNT_MESSAGE,
   NativeVaultNoAccountError,

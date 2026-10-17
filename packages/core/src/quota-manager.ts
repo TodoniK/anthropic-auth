@@ -27,6 +27,7 @@ import {
   quotaSnapshotCheckedAt,
 } from './accounts.ts'
 import { logger } from './logger.ts'
+import { nativeAccountCanServe } from './native-account-view.ts'
 import { mergeHeaderQuotaSnapshot } from './quota-headers.ts'
 
 export { tokenFingerprint } from './token-fingerprint.ts'
@@ -506,7 +507,7 @@ export class QuotaManager {
     const now = this.now()
 
     for (const account of accounts) {
-      if (account.enabled === false) continue
+      if (!nativeAccountCanServe(account)) continue
       const accessToken =
         resolveAccessToken !== undefined
           ? resolveAccessToken(account)
@@ -782,7 +783,7 @@ export class QuotaManager {
     for (const account of accounts) {
       const lineageChanged = this.bindFallbackLineage(account.id, account)
       if (lineageChanged) continue
-      if (account.enabled === false) continue
+      if (!nativeAccountCanServe(account)) continue
       const persistedError = account.lastQuotaRefreshError
       const persistedClearAt = quotaSnapshotCheckedAt(account.quota)
       const currentError = this.fallbackApiErrors.get(account.id)

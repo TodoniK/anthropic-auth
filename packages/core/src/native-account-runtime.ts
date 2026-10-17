@@ -27,6 +27,7 @@ import {
   type NativeAccountMetadataPatch,
   type NativeAccountSnapshot,
   type NativeAccountView,
+  nativeAccountCanServe,
   nativeAccountReadError,
   nativeLocalRouteAwaitsTornWrite,
   nativeQuotaFailure,
@@ -335,10 +336,7 @@ export function nativeAccountPolicy(
   snapshot: NativeAccountSnapshot,
   modelId?: string,
 ): NativeLocalExternalPolicy {
-  if (
-    !account.enabled ||
-    (account.source === 'vault' && account.state !== 'active')
-  )
+  if (!nativeAccountCanServe(account))
     return { status: 'blocked', reason: 'account-disabled' }
   if (
     !quotaSnapshotPassesPolicy(account.quota, snapshot.policyStorage) ||
@@ -973,7 +971,7 @@ export function createNativeAccountRuntime(
       ): NativeLocalExternalPolicy => {
         if (current.mode !== 'local')
           return { status: 'blocked', reason: 'local-mode-unavailable' }
-        if (!row?.enabled)
+        if (!row || !nativeAccountCanServe(row))
           return { status: 'blocked', reason: 'account-disabled' }
         return { status: 'allowed' }
       }
@@ -1104,7 +1102,8 @@ export function createNativeAccountRuntime(
       const row = await poolRow(await physicalId(routeId))
       check(signal)
       if (
-        !row?.enabled ||
+        !row ||
+        !nativeAccountCanServe(row) ||
         !row.candidate ||
         row.stamp !== 'bound' ||
         row.credential?.type !== 'api'
@@ -1610,7 +1609,7 @@ export function createNativeAccountRuntime(
           const row = await poolRow(subject.binding.rowId)
           return (
             row?.stamp === 'bound' &&
-            row.enabled !== false &&
+            nativeAccountCanServe(row) &&
             row.credential?.type === 'oauth' &&
             nativeLocalPoolBindingMatches(subject.binding, paths, row) &&
             nativeLocalCredentialValidationMatches(
@@ -1676,7 +1675,8 @@ export function createNativeAccountRuntime(
         await localAuthority(combined)
         const row = await poolRow(served.binding.rowId)
         if (
-          !row?.enabled ||
+          !row ||
+          !nativeAccountCanServe(row) ||
           row.stamp !== 'bound' ||
           row.credential?.type !== 'oauth' ||
           !nativeLocalPoolBindingMatches(served.binding, paths, row) ||

@@ -20,6 +20,7 @@ import {
   CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_HAIKU_4_5_PRICING,
 } from './models.ts'
+import { nativeAccountCanServe } from './native-account-view.ts'
 
 // Re-export pricing for downstream packages that import it through core's
 // public surface (the test suite verifies exact per-million-token values).
@@ -154,7 +155,7 @@ export function buildPrimeAccountStatuses(
   const fallbacks: PrimeAccountStatus[] = (storage?.accounts ?? [])
     .filter(isOAuthAccount)
     .filter((account) => account.id !== 'main')
-    .filter((account) => account.enabled !== false)
+    .filter(nativeAccountCanServe)
     .map((account) => ({
       id: account.id,
       label: accountLabel(account.id, storage, account),
@@ -469,8 +470,7 @@ function evaluateAccounts(storage: AccountStorage): AccountEvaluation[] {
     isOAuth: true,
     isEnabled:
       getClaustrumMode(storage) !== 'claustrum' ||
-      (storage.claustrum?.primaryAccount?.enabled !== false &&
-        storage.claustrum?.primaryAccount?.state === 'active'),
+      nativeAccountCanServe(storage.claustrum?.primaryAccount),
     hasPermanentRefreshError: isPermanentRefreshError(mainRefreshError),
     storedQuota: storage.quota?.mainQuota,
     storedFiveHour: storage.quota?.mainQuota?.five_hour,
@@ -491,7 +491,7 @@ function evaluateAccounts(storage: AccountStorage): AccountEvaluation[] {
         id: account.id,
         label: primeAccountLabel(account.id, account),
         isOAuth: false,
-        isEnabled: account.enabled !== false,
+        isEnabled: nativeAccountCanServe(account),
         hasPermanentRefreshError: false,
       })
       continue
@@ -500,10 +500,7 @@ function evaluateAccounts(storage: AccountStorage): AccountEvaluation[] {
       id: account.id,
       label: primeAccountLabel(account.id, account),
       isOAuth: true,
-      isEnabled:
-        account.enabled !== false &&
-        (getClaustrumMode(storage) !== 'claustrum' ||
-          account.claustrumScopedState === 'active'),
+      isEnabled: nativeAccountCanServe(account),
       hasPermanentRefreshError: isPermanentRefreshError(
         account.lastRefreshError,
       ),

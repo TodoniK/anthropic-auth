@@ -421,6 +421,29 @@ test('a revoked scoped credential never falls back to local auth or a paid API r
   expect(sends).toBe(1)
 })
 
+test('Pi fallback routing never selects an enabled vault account needing sign-in', async () => {
+  const f = await fixture('fallback-first')
+  f.rows.push({
+    ...row(
+      'oauth:anthropic:needs-sign-in',
+      fixtureAccountIdentity('needs-sign-in'),
+    ),
+    state: 'needs_reauth',
+  })
+  await (await f.native.service()).vault.refresh()
+  const unavailable = (await f.native.view()).accounts.find(
+    (account) => account.credentialId === 'oauth:anthropic:needs-sign-in',
+  )
+  expect(unavailable).toMatchObject({ enabled: true, state: 'needs_reauth' })
+  globalThis.fetch = Object.assign(async () => success(), {
+    preconnect: originalFetch.preconnect,
+  })
+  expect(
+    (await streamCortexKitAnthropic(model, context).result()).stopReason,
+  ).toBe('stop')
+  expect(f.gets.map((get) => get.credentialId)).toEqual(['oauth:anthropic'])
+})
+
 test('fallback-first adopts a newly published account on the next turn and honors a live disable', async () => {
   const f = await fixture('fallback-first')
   globalThis.fetch = Object.assign(async () => success(), {

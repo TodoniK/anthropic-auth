@@ -4,6 +4,7 @@ import { nativeAccountPolicy } from '../native-account-runtime.ts'
 import {
   applyNativeMetadataPatch,
   formatNativeAccountState,
+  nativeAccountCanServe,
   nativeAccountReadError,
   nativeQuotaFailure,
   projectNativeAccountViews,
@@ -518,3 +519,34 @@ for (const state of ['active', 'needs_reauth', 'revoked', 'expired'] as const) {
     })
   }
 }
+
+test('serving predicate separates user permission from vault state for native and policy views', () => {
+  for (const state of [
+    'active',
+    'needs_reauth',
+    'expired',
+    'revoked',
+    undefined,
+  ]) {
+    for (const enabled of [true, false]) {
+      const expected = enabled && state === 'active'
+      expect(
+        nativeAccountCanServe({ credentialId: 'oauth:roster', enabled, state }),
+      ).toBe(expected)
+      expect(nativeAccountCanServe({ source: 'vault', enabled, state })).toBe(
+        expected,
+      )
+      expect(
+        nativeAccountCanServe({
+          enabled,
+          claustrumScopedCredentialId: 'oauth:vault',
+          claustrumScopedState: state,
+        }),
+      ).toBe(expected)
+    }
+  }
+  expect(nativeAccountCanServe({ source: 'local', enabled: true })).toBe(true)
+  expect(nativeAccountCanServe({ source: 'local', enabled: false })).toBe(false)
+  expect(nativeAccountCanServe({})).toBe(true)
+  expect(nativeAccountCanServe(undefined)).toBe(false)
+})

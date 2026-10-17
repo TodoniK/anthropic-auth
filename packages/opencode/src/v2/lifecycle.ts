@@ -2,6 +2,7 @@ import {
   getQuotaCheckIntervalMs,
   logger,
   type NativeAccountRuntime,
+  nativeAccountCanServe,
   oauthProfileIsFresh,
   quotaSnapshotCheckedAt,
 } from '@cortexkit/anthropic-auth-core'
@@ -29,12 +30,7 @@ export function startNativeAnthropicLifecycle(
     const interval = getQuotaCheckIntervalMs(current.policyStorage)
     for (const account of current.accounts) {
       if (abort.signal.aborted) return
-      if (
-        !account.enabled ||
-        account.type !== 'oauth' ||
-        (account.source === 'vault' && account.state !== 'active')
-      )
-        continue
+      if (!nativeAccountCanServe(account) || account.type !== 'oauth') continue
       if (
         current.policyStorage.quota?.enabled !== false &&
         Date.now() - quotaSnapshotCheckedAt(account.quota) >= interval

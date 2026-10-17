@@ -13,6 +13,7 @@ import {
   type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
   type NativePoolPaths,
   NativeVaultNoAccountError,
+  nativeAccountCanServe,
   nativeAccountPolicy,
   normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
@@ -173,7 +174,7 @@ export function createNativeAnthropicSource(
     snapshot: NativeAccountSnapshot,
     modelID: string,
   ) =>
-    account.enabled &&
+    nativeAccountCanServe(account) &&
     (account.type === 'api' ||
       nativeAccountPolicy(account, snapshot, remapModelId(modelID)).status ===
         'allowed')
@@ -269,7 +270,8 @@ export function createNativeAnthropicSource(
       if (snapshot.policyStorage.quota?.enabled !== false) {
         let refreshed = false
         for (const account of snapshot.accounts) {
-          if (!account.enabled || account.type !== 'oauth') continue
+          if (!nativeAccountCanServe(account) || account.type !== 'oauth')
+            continue
           const fresh = quotaSnapshotHasStandardWindows(account.quota)
             ? stickyQuotaSnapshotIsFresh(
                 account.quota,
@@ -410,7 +412,7 @@ export function createNativeAnthropicSource(
       return snapshot.accounts.find(
         (account) =>
           account.type === 'api' &&
-          account.enabled &&
+          nativeAccountCanServe(account) &&
           account.id !== input.rerouteFrom?.accountId,
       )?.id
     },

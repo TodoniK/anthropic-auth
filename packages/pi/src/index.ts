@@ -18,6 +18,7 @@ import {
   type MidConversationEffortTransition,
   type NativeAccountSnapshot,
   type NativeCustodyClient,
+  nativeAccountCanServe,
   readNativeEnrollmentMode,
 } from '@cortexkit/anthropic-auth-core'
 import type { Provider, SimpleStreamOptions } from '@earendil-works/pi-ai'
@@ -294,10 +295,7 @@ export default async function cortexKitPiAnthropicAuth(
         throw error
       }
       return snapshot.accounts.some(
-        (account) =>
-          account.type === 'oauth' &&
-          account.enabled &&
-          (account.source !== 'vault' || account.state === 'active'),
+        (account) => account.type === 'oauth' && nativeAccountCanServe(account),
       )
     }
     const provider: Provider = {

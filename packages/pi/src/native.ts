@@ -16,6 +16,7 @@ import {
   type NativePoolPaths,
   type NativeRefreshResult,
   type NativeVaultWatch,
+  nativeAccountCanServe,
   nativeMigrationAuthorityPhase,
   nativeRuntimeOptionIdentity,
   quotaSnapshotHasStandardWindows,
@@ -57,7 +58,7 @@ function requestPolicy(routeId: string, modelId?: string) {
     account: NativeAccountSnapshot['accounts'][number],
     current: NativeAccountSnapshot,
   ): NativeLocalExternalPolicy => {
-    if (!account.enabled)
+    if (!nativeAccountCanServe(account))
       return { status: 'blocked', reason: 'account-disabled' }
     if (account.source === 'local' && current.mode !== 'local')
       return { status: 'blocked', reason: 'local-mode-unavailable' }
@@ -265,7 +266,7 @@ export class PiNativeRuntime {
     const account = snapshot.accounts.find(
       (candidate) => candidate.id === routeId,
     )
-    if (!account?.enabled || account.type !== 'oauth')
+    if (!nativeAccountCanServe(account) || account?.type !== 'oauth')
       throw new Error('Pi native OAuth route is unavailable')
     const policy = requestPolicy(routeId, modelId)
     if (policy(account, snapshot).status === 'blocked')

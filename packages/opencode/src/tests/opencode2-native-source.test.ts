@@ -509,6 +509,41 @@ function rawPin(text: string, sessionID: string) {
 
 describe('OC2 source over actual native services', () => {
   usageTests.test(
+    'OC2 quota preflight skips an enabled vault account needing sign-in',
+    async () => {
+      const f = await vaultWithFallback()
+      f.setState('oauth:anthropic:work', 'needs_reauth')
+      await f.runtime.vault.refresh()
+      await f.runtime.updateSettings((settings) => ({
+        ...settings,
+        quota: { enabled: true, failClosedOnUnknownQuota: false },
+        routing: { mode: 'fallback-first' },
+      }))
+      expect(
+        (await f.runtime.read()).accounts.find(
+          (account) => account.credentialId === 'oauth:anthropic:work',
+        ),
+      ).toMatchObject({ enabled: true, state: 'needs_reauth' })
+      const poll = spyOn(f.runtime, 'fetchQuota').mockResolvedValue({
+        checkedAt: Date.now(),
+        five_hour: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          checkedAt: Date.now(),
+        },
+        seven_day: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          checkedAt: Date.now(),
+        },
+      })
+      cleanups.push(() => poll.mockRestore())
+      expect(await source(f.runtime, f.paths).chooseAccount(scope)).toBe('main')
+      expect(poll.mock.calls.map(([id]) => id)).toEqual(['main'])
+    },
+  )
+
+  usageTests.test(
     'healthy native vault requests do not refresh or discover the ready roster',
     async () => {
       const f = await vaultWithFallback()

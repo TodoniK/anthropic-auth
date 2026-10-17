@@ -1,5 +1,6 @@
 import type { NativeAccountRuntime } from './native-account-runtime.ts'
 import type { NativeAccountSnapshot } from './native-account-view.ts'
+import { nativeAccountCanServe } from './native-account-view.ts'
 
 export const NATIVE_VAULT_NO_ACCOUNT_MESSAGE =
   'No vault account can serve this request. Open /claude to see which account needs signing in again.'
@@ -21,8 +22,7 @@ function hasActiveVaultAccount(snapshot: NativeAccountSnapshot): boolean {
     (account) =>
       account.source === 'vault' &&
       account.type === 'oauth' &&
-      account.enabled &&
-      account.state === 'active',
+      nativeAccountCanServe(account),
   )
 }
 

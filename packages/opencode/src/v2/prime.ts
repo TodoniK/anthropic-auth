@@ -2,6 +2,7 @@ import {
   buildPrimeRequestBody,
   type NativeAccountRuntime,
   type NativePoolPaths,
+  nativeAccountCanServe,
   PrimeManager,
   type PrimeSendResult,
 } from '@cortexkit/anthropic-auth-core'
@@ -215,11 +216,7 @@ export function createNativePrime(options: {
     async getAccountFingerprint(accountId) {
       const snapshot = await runtime.read()
       const account = snapshot.accounts.find((row) => row.id === accountId)
-      if (
-        !account?.enabled ||
-        account.type !== 'oauth' ||
-        (account.source === 'vault' && account.state !== 'active')
-      )
+      if (!nativeAccountCanServe(account) || account?.type !== 'oauth')
         return undefined
       if (
         snapshot.policyStorage.relay?.enabled === true &&

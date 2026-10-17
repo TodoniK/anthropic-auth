@@ -35,6 +35,7 @@ export interface NativeAccountView {
   id: string
   type: 'oauth' | 'api'
   source: 'local' | 'vault'
+  /** User setting, not serving eligibility; use nativeAccountCanServe for runtime work. */
   enabled: boolean
   label?: string
   addedAt?: number
@@ -54,6 +55,33 @@ export interface NativeAccountView {
   refreshErrorClearedAt?: number
   baseURL?: string
   authHeader?: 'authorization-bearer' | 'x-api-key'
+}
+
+/**
+ * Serving requires the user's permission and an active vault credential.
+ * Native views name their source; roster rows use credentialId and token-free
+ * policy rows use claustrumScopedCredentialId. Local policy rows default to on
+ * when the optional enabled setting is absent.
+ */
+export function nativeAccountCanServe(
+  account:
+    | {
+        enabled?: boolean
+        source?: NativeAccountView['source']
+        state?: string
+        credentialId?: string
+        claustrumScopedCredentialId?: string
+        claustrumScopedState?: string
+      }
+    | null
+    | undefined,
+): boolean {
+  if (!account || account.enabled === false) return false
+  if (account.source === 'vault' || account.credentialId)
+    return account.state === 'active'
+  if (account.claustrumScopedCredentialId)
+    return account.claustrumScopedState === 'active'
+  return true
 }
 
 /**
@@ -537,7 +565,7 @@ export function nativeLocalRowAwaitsTornWrite(
       previous.credentialEpoch !== row.credentialEpoch) ||
     row.type !== 'oauth' ||
     row.torn !== true ||
-    row.enabled !== true ||
+    !nativeAccountCanServe(row) ||
     row.disabledReason !== undefined ||
     row.credential === undefined ||
     row.staged !== undefined ||

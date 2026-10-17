@@ -26,6 +26,7 @@ import {
   CustodyTombstoneRefreshError,
   isCustodyTombstoneValue,
 } from './claustrum.ts'
+import { nativeAccountCanServe } from './native-account-view.ts'
 import {
   type NativeLocalCredentialValidation,
   type NativeLocalCredentialVersion,
@@ -580,7 +581,7 @@ export function createNativeRefreshCoordinator(
     if (
       !row ||
       !nativeLocalPoolBindingMatches(expected, options.paths, row) ||
-      !row.enabled ||
+      !nativeAccountCanServe(row) ||
       !row.candidate
     )
       return refuse('row-ineligible')
@@ -800,7 +801,7 @@ export function createNativeRefreshCoordinator(
             ? 'binding-changed'
             : request.signal?.aborted
               ? 'cancelled'
-              : !seen.candidate || !seen.enabled
+              : !seen.candidate || !nativeAccountCanServe(seen)
                 ? 'row-ineligible'
                 : undefined
         if (initialReason) {
@@ -1082,7 +1083,8 @@ export function createNativeRefreshCoordinator(
                 // duplicate or cancelling the caller cannot undo an exchange.
                 if (consumed) return undefined
                 if (request.signal?.aborted) return 'cancelled'
-                if (!row.candidate || !row.enabled) return 'row-ineligible'
+                if (!row.candidate || !nativeAccountCanServe(row))
+                  return 'row-ineligible'
                 return policy
                   ? restrictionReason(policy.restriction, row.fingerprint)
                   : undefined

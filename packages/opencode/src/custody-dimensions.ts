@@ -5,6 +5,7 @@ import {
   hasNoLocalCredential,
   isCustodyTombstoneOAuth,
   isOAuthAccount,
+  nativeAccountCanServe,
   type OAuthAccount,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -24,10 +25,9 @@ export function isFallbackAccountVaultServed(
   return Boolean(
     account &&
       isOAuthAccount(account) &&
-      account.enabled !== false &&
+      nativeAccountCanServe(account) &&
       account.claustrumScopedCredentialId &&
       account.anthropicAccountUuid &&
-      account.claustrumScopedState === 'active' &&
       hasNoLocalCredential(account),
   )
 }
@@ -39,7 +39,7 @@ export function fallbackCustodyDimensions(storage: AccountStorage | null) {
     return { fallbacks: 'M' as const, evidence: 'N' as const }
   const accounts = storage.accounts.filter(
     (account): account is OAuthAccount =>
-      account.enabled !== false && isOAuthAccount(account),
+      nativeAccountCanServe(account) && isOAuthAccount(account),
   )
   return {
     fallbacks: accounts.every((account) =>
@@ -76,7 +76,7 @@ export function custodyStateFor(
       : undefined
     if (!primary) return 'unknown-identity'
     if (primary.state === 'needs_reauth') return 'on-vault-reauth'
-    return primary.state === 'active' ? 'on-vault-served' : 'on-cold'
+    return nativeAccountCanServe(primary) ? 'on-vault-served' : 'on-cold'
   }
   if (getClaustrumMode(storage) !== 'claustrum') return 'off'
   const fallback = storage?.accounts.find(

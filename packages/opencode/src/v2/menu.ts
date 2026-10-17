@@ -17,6 +17,7 @@ import {
   isCacheKeepPersistentlyEnabled,
   type NativeAccountRuntime,
   type NativeMenuDispatch,
+  nativeAccountCanServe,
   resetClaustrumEnrollmentState,
 } from '@cortexkit/anthropic-auth-core'
 import { LANE_START_TEXT } from '../lane-start'
@@ -161,7 +162,8 @@ export function createNativeMenuCapabilities(options: {
       case 'quota-refresh': {
         const snapshot = await runtime.read()
         const accounts = snapshot.accounts.filter(
-          (account) => account.type === 'oauth' && account.enabled,
+          (account) =>
+            account.type === 'oauth' && nativeAccountCanServe(account),
         )
         const results = await Promise.allSettled(
           accounts.map((account) =>

@@ -16,6 +16,7 @@ import {
   requireUnchangedNativeMigrationSource,
 } from './migration-source.ts'
 import type { NativeAccountSnapshot } from './native-account-view.ts'
+import { nativeAccountCanServe } from './native-account-view.ts'
 import type { NativeCustodyInventory } from './native-custody.ts'
 import {
   inspectNativeHostAuthEntry,
@@ -209,7 +210,7 @@ export function snapshotHasServableLocalOAuth(
     (account) =>
       account.source === 'local' &&
       account.type === 'oauth' &&
-      account.enabled &&
+      nativeAccountCanServe(account) &&
       account.state !== 'unsupported-access',
   )
 }

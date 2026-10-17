@@ -192,3 +192,47 @@ test('an absent local fallback token is rejected before HTTP dispatch', async ()
   ).rejects.toThrow('access token is unavailable')
   expect(fetches).toBe(0)
 })
+
+test('fallback quota poller skips enabled vault accounts needing sign-in before resolving credentials', async () => {
+  const resolved: string[] = []
+  const polled: Array<string | undefined> = []
+  const manager = new QuotaManager({
+    storage: null,
+    now: () => 1000,
+    fetchQuotaSnapshot: async ({ accountId }) => {
+      polled.push(accountId)
+      return { checkedAt: 1000 }
+    },
+  })
+  const accounts = ['needs_reauth', 'active'].map((state) => ({
+    id: state,
+    type: 'oauth' as const,
+    refresh: '',
+    enabled: true,
+    claustrumScopedCredentialId: `oauth:${state}`,
+    claustrumScopedState: state,
+  }))
+  await manager.refreshAllFallbacks(accounts, (account) => {
+    resolved.push(account.id)
+    return 'synthetic-poll-access'
+  })
+  expect(resolved).toEqual(['active'])
+  expect(polled).toEqual(['active'])
+})
+
+test('fallback quota routing cache does not seed a needs-sign-in vault account', () => {
+  const manager = new QuotaManager({ storage: null, now: () => 1000 })
+  manager.seedFallbacksFromAccounts(
+    ['needs_reauth', 'active'].map((state) => ({
+      id: state,
+      type: 'oauth',
+      refresh: '',
+      enabled: true,
+      claustrumScopedCredentialId: `oauth:${state}`,
+      claustrumScopedState: state,
+      quota: { checkedAt: 1000, accountIdentity: state },
+    })),
+  )
+  expect(manager.getFallback('needs_reauth')).toBeNull()
+  expect(manager.getFallback('active')?.quota.checkedAt).toBe(1000)
+})
