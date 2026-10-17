@@ -231,6 +231,38 @@ describe('quota display adapter', () => {
     expect(projection?.budget?.checkedAt).toBe(now)
   })
 
+  test('a monetary budget percent is exact, so a model window that reads the same keeps the narrow slot', () => {
+    const projection = quotaDisplayProjection(
+      {
+        five_hour: { usedPercent: 62, remainingPercent: 38, checkedAt: now },
+        seven_day: { usedPercent: 41, remainingPercent: 59, checkedAt: now },
+        scoped: [
+          {
+            id: 'fable',
+            title: 'Fable only',
+            modelName: 'Fable',
+            usedPercent: 78,
+            remainingPercent: 22,
+            checkedAt: now,
+          },
+        ],
+        extraUsage: {
+          used: { amountMinor: 7800, currency: 'USD', exponent: 2 },
+          limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+          exhausted: false,
+        },
+      },
+      now,
+    )
+    expect(projection?.budget?.remainingPercent).toBe(22)
+    expect(formatQuota(projection, { now, form: 'compact' })).toBe(
+      '5h 38% left · 7d 59% left · Fable only 22% left · credits 22% left',
+    )
+    expect(formatQuota(projection, { now, form: 'narrow' })).toBe(
+      '5h 38% · 7d 59% · Fa 22% left',
+    )
+  })
+
   test('zero extra-usage limits have no percentage unless the provider reports utilization', () => {
     const extraUsage = {
       used: { amountMinor: 0, currency: 'USD', exponent: 2 },

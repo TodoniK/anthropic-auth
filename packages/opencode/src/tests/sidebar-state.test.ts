@@ -461,12 +461,12 @@ describe('getCollapsedQuotaSummary', () => {
     ).toBe('5h 87% · 7d 93% left')
   })
 
-  test('keeps both account-wide names when a reading is missing', () => {
+  test('leaves out an account-wide window that has no reading', () => {
     expect(
       getCollapsedQuotaSummary({
         five_hour: { usedPercent: 13, remainingPercent: 87 },
       }).text,
-    ).toBe('5h 87% · 7d — left')
+    ).toBe('5h 87% left')
   })
 
   test('formats scoped model quota windows in collapsed quota text', () => {
@@ -492,7 +492,7 @@ describe('getCollapsedQuotaSummary', () => {
     expect(getCollapsedQuotaSummary({}).text).toBeNull()
   })
 
-  test('keeps 5h/7d placeholders when only a scoped reading is available', () => {
+  test('shows only the scoped reading when no account-wide window has one', () => {
     const summary = getCollapsedQuotaSummary({
       scoped: [
         {
@@ -504,10 +504,10 @@ describe('getCollapsedQuotaSummary', () => {
         },
       ],
     })
-    expect(summary.text).toBe('5h — · 7d — · Fa 0% left')
+    expect(summary.text).toBe('Fa 0% left')
   })
 
-  test('keeps an unreported account-wide name alongside a scoped reading', () => {
+  test('leaves out an unreported account-wide window beside a scoped reading', () => {
     const summary = getCollapsedQuotaSummary({
       five_hour: { usedPercent: 23, remainingPercent: 77 },
       scoped: [
@@ -520,7 +520,7 @@ describe('getCollapsedQuotaSummary', () => {
         },
       ],
     })
-    expect(summary.text).toBe('5h 77% · 7d — · Fa 58% left')
+    expect(summary.text).toBe('5h 77% · Fa 58% left')
   })
 
   test('keeps reading times through normalization and flags staleness without age text', () => {
@@ -539,7 +539,7 @@ describe('getCollapsedQuotaSummary', () => {
     expect(normalized.main.quota?.five_hour?.checkedAt).toBe(checkedAt)
     expect(normalized.main.quota?.scoped).toEqual([])
     expect(getCollapsedQuotaSummary(normalized.main.quota, now).text).toBe(
-      '5h 40% · 7d — left',
+      '5h 40% left',
     )
     expect(getCollapsedQuotaSummary(normalized.main.quota, now).stale).toBe(
       true,
@@ -663,7 +663,7 @@ describe('getCollapsedQuotaSummary', () => {
       now,
     )
     expect(stale.stale).toBe(true)
-    expect(stale.text).toBe('5h 100% · 7d — left')
+    expect(stale.text).toBe('5h 100% left')
   })
 })
 

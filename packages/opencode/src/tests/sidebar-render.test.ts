@@ -253,6 +253,46 @@ test('collapsed sidebar dims a stale active row and a fresh inactive row without
   })
 })
 
+test('collapsed sidebar leaves out a window without a reading and keeps the muted dash for an account with none', async () => {
+  const now = Date.now()
+  const stdout = await renderSidebar(
+    {
+      main: {
+        quota: {
+          five_hour: { usedPercent: 13, remainingPercent: 87, checkedAt: now },
+        },
+      },
+      fallbacks: [
+        {
+          id: 'work',
+          label: 'work',
+          enabled: true,
+          needsReauth: false,
+          quota: null,
+        },
+      ],
+      activeId: 'main',
+      route: 'main',
+      lastUpdated: now,
+    },
+    ['main', '5h 87% left', 'work'],
+    true,
+  )
+  const [frame, styleText] = stdout.split('STYLES:')
+  expect(frame).not.toContain('7d')
+  const styles = JSON.parse(styleText!) as {
+    text: string
+    dim: boolean
+    bold: boolean
+  }[]
+  const main = styles.find((line) => line.text.includes('main'))
+  expect(main?.text.trimEnd().endsWith('5h 87% left')).toBe(true)
+  expect(main).toMatchObject({ dim: false, bold: true })
+  const work = styles.find((line) => line.text.includes('work'))
+  expect(work?.text.trimEnd().endsWith('—')).toBe(true)
+  expect(work).toMatchObject({ dim: true, bold: false })
+})
+
 test('42-column sidebar renders full scoped names credits and stale fallback rows in aligned columns', async () => {
   const now = Date.now()
   const window = (used: number, checkedAt = now, resetMinutes?: number) => ({

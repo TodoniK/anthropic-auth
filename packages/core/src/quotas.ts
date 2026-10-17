@@ -1,6 +1,7 @@
 import {
   ALL_SCOPE,
   formatQuota,
+  isQuotaStale,
   type ProjectedLimit,
   type ProjectedQuota,
   quotaTextParts,
@@ -19,7 +20,7 @@ import { formatOAuthAccountTier } from './oauth-profile.ts'
 export const CLAUDE_QUOTAS_COMMAND_NAME = 'claude-quota'
 
 export type { QuotaWindowPart } from '@cortexkit/common-auth/quota'
-export { formatQuota, quotaTextParts, quotaWindowParts }
+export { formatQuota, isQuotaStale, quotaTextParts, quotaWindowParts }
 
 type DisplayWindow = Omit<AccountQuotaWindow, 'checkedAt'> & {
   checkedAt?: number
@@ -79,11 +80,16 @@ export function quotaDisplayProjection(
         checkedAt,
         reached: extra.exhausted,
         // Older snapshots have monetary totals but no utilization percentage.
+        // Subtract the integer minor units before dividing: `1 - used / limit`
+        // lands a few floating-point bits off (7800 of 10000 gives
+        // 21.999999999999996), which makes the narrow form pick the budget
+        // over a model window that reads the same 22%.
         remainingPercent:
           extra.utilizationPercent !== undefined
             ? 100 - extra.utilizationPercent
             : extra.limit.amountMinor > 0
-              ? 100 * (1 - extra.used.amountMinor / extra.limit.amountMinor)
+              ? ((extra.limit.amountMinor - extra.used.amountMinor) * 100) /
+                extra.limit.amountMinor
               : undefined,
       },
     }),

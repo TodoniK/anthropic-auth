@@ -128,9 +128,10 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { PrimeUsageCounters } from '@cortexkit/anthropic-auth-core'
 import {
+  formatQuota,
+  isQuotaStale,
   logger,
   quotaDisplayProjection,
-  quotaWindowParts,
 } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
@@ -945,71 +946,6 @@ export function formatQuotaRowLabel(name: string, width = 10): string {
   return label + ' '.repeat(Math.max(0, width - Bun.stringWidth(label)))
 }
 
-// common-auth 0.18.0 has no narrow form, so keep its one-line quota wording here.
-// Once supported, replace this body with formatQuota(quotaDisplayProjection(quota, now),
-// { now, form: 'narrow' }) from common-auth.
-function formatNarrowQuota(quota: AccountQuota, now: number): string {
-  const parts = quotaWindowParts(quotaDisplayProjection(quota, now), { now })
-  const percent = (remaining: number | undefined) =>
-    remaining === undefined ? '—' : `${Math.round(remaining)}%`
-  const values = ['5h', '7d'].map((name) => {
-    const part = parts.windows.find(
-      (part) => part.name === name && part.kind === 'window',
-    )
-    return `${name} ${percent(part?.remainingPercent)}`
-  })
-  const scoped = quota.scoped ?? []
-  const names = [...new Set(scoped.map((window) => window.modelName))]
-  const lengths = names.map(() => 2)
-  while (true) {
-    const aliases = names.map((name, index) =>
-      [...name].slice(0, lengths[index]).join(''),
-    )
-    let extended = false
-    for (const [index, alias] of aliases.entries()) {
-      const length = lengths[index] ?? 2
-      if (
-        aliases.some(
-          (other, otherIndex) => otherIndex !== index && other === alias,
-        ) &&
-        length < [...(names[index] ?? '')].length
-      ) {
-        lengths[index] = length + 1
-        extended = true
-      }
-    }
-    if (!extended) break
-  }
-  const tightest = scoped.reduce<ScopedQuotaWindow | undefined>(
-    (lowest, window) =>
-      !lowest || window.remainingPercent < lowest.remainingPercent
-        ? window
-        : lowest,
-    undefined,
-  )
-  const budget = parts.windows.find((part) => part.kind === 'budget')
-  const budgetRemaining = quota.extraUsage?.exhausted
-    ? 0
-    : budget?.remainingPercent
-  // Monetary ratios can land a few floating-point bits below an equal model reading.
-  const budgetTighter =
-    budget &&
-    (!tightest ||
-      (budgetRemaining !== undefined &&
-        tightest.remainingPercent - budgetRemaining > 1e-9))
-  if (budgetTighter) {
-    values.push(`cr ${percent(budgetRemaining)}`)
-  } else if (tightest) {
-    const index = names.indexOf(tightest.modelName)
-    const name = [...tightest.modelName].slice(0, lengths[index]).join('')
-    const part = parts.windows.find(
-      (part) => part.kind === 'window' && part.name === tightest.title,
-    )
-    values.push(`${name} ${percent(part?.remainingPercent)}`)
-  }
-  return `${values.join(' · ')} left`
-}
-
 export function getCollapsedQuotaSummary(
   quota: AccountQuota | null,
   now = Date.now(),
@@ -1040,14 +976,15 @@ export function getCollapsedQuotaSummary(
     }
   }
 
+  const projection = quotaDisplayProjection(quota, now)
   return {
     fiveHourUsedPercent,
     sevenDayUsedPercent,
     scopedUsedPercents,
-    text: formatNarrowQuota(quota, now),
-    stale:
-      quotaWindowParts(quotaDisplayProjection(quota, now), { now }).age !==
-      undefined,
+    // The narrow form leaves out the reading's age to stay on one line, so
+    // a stale reading is dimmed instead of labelled.
+    text: formatQuota(projection, { now, form: 'narrow' }),
+    stale: isQuotaStale(projection, { now }),
   }
 }
 
