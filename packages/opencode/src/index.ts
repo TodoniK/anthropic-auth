@@ -2097,6 +2097,56 @@ const anthropicAuthPlugin = async (
     return hydration.persistence === 'refused' ? undefined : hydration.profile
   }
 
+  async function overlayCurrentHydratedProfile(
+    storage: AccountStorage | null,
+    accountId: string,
+    hydration: ProfileHydration,
+  ) {
+    // A failed save may still supply a sidebar tier, but only if the reloaded
+    // account has the same identity and current credentials that fetched it.
+    // Local accounts also match their pool row and credential epoch; vault
+    // accounts are checked against their current record version.
+    if (!storage) return storage
+    const profile = await displayableProfile(hydration, Date.now())
+    if (!profile) return storage
+
+    const current = await nativeAccounts.read()
+    const account = current.accounts.find(
+      (candidate) => candidate.id === accountId,
+    )
+    const sameLineage =
+      account?.source === 'local'
+        ? canIdentifyProfileHydration(hydration, account)
+        : account?.source === 'vault' &&
+          account.accountIdentity === profile.accountIdentity
+    if (
+      account?.type !== 'oauth' ||
+      !nativeAccountCanServe(account) ||
+      account.accountIdentity !== profile.accountIdentity ||
+      !sameLineage ||
+      (await displayableProfile(hydration, Date.now())) !== profile
+    )
+      return storage
+
+    if (accountId === 'main') {
+      return storage.main
+        ? { ...storage, main: { ...storage.main, profile } }
+        : storage
+    }
+    const stored = storage.accounts?.find(
+      (candidate) => candidate.id === accountId,
+    )
+    if (!stored || !isOAuthAccount(stored)) return storage
+    return {
+      ...storage,
+      accounts: storage.accounts.map((candidate) =>
+        candidate.id === accountId && isOAuthAccount(candidate)
+          ? { ...candidate, profile }
+          : candidate,
+      ),
+    }
+  }
+
   function startProfileHydration(
     account: NativeAccountView,
     key: string,
@@ -2158,26 +2208,38 @@ const anthropicAuthPlugin = async (
                 account: account.id,
               })
             if (
-              outcome === 'saved' &&
+              (outcome === 'saved' || outcome === 'failed') &&
               !profileHydrationShutdown.signal.aborted
             ) {
-              // Display-only writes reread native state. Refresh after the
-              // profile commits so that reread can include the new tier.
-              try {
-                const current = await nativeAccounts.read()
-                if (!profileHydrationShutdown.signal.aborted)
-                  await writeSidebarState(current.policyStorage, {
-                    ...lastSidebarRouting,
-                    routingAuthoritative: false,
-                  })
-              } catch {
-                logger.debug(
-                  'quota',
-                  'failed to publish account profile to sidebar',
-                  {
-                    account: account.id,
-                  },
-                )
+              const displayProfile =
+                outcome === 'failed' &&
+                (await displayableProfile(hydration, Date.now()))
+                  ? { accountId: account.id, hydration }
+                  : undefined
+              if (outcome === 'saved' || displayProfile) {
+                // Sidebar refreshes reload account storage. Reread native state
+                // after a saved profile or a displayable failed save so the
+                // fresh view can include the fetched tier.
+                try {
+                  const current = await nativeAccounts.read()
+                  if (!profileHydrationShutdown.signal.aborted)
+                    await writeSidebarState(
+                      current.policyStorage,
+                      {
+                        ...lastSidebarRouting,
+                        routingAuthoritative: false,
+                      },
+                      displayProfile,
+                    )
+                } catch {
+                  logger.debug(
+                    'quota',
+                    'failed to publish account profile to sidebar',
+                    {
+                      account: account.id,
+                    },
+                  )
+                }
               }
             }
           })
@@ -4174,6 +4236,7 @@ const anthropicAuthPlugin = async (
   function writeSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
     options: SidebarStateInput,
+    displayProfile?: { accountId: string; hydration: ProfileHydration },
   ) {
     const routingAuthoritative = options.routingAuthoritative !== false
     if (routingAuthoritative) {
@@ -4190,10 +4253,13 @@ const anthropicAuthPlugin = async (
               () => loadAccounts(accountStoragePath),
               { activeId: state.activeId, route: state.route },
             )
-            // Display the profile from current storage. A route may have been
-            // replaced while polling, so the earlier fetched profile could
-            // describe a different account.
-            const displayStorage = preservedRouting.freshStorage
+            const displayStorage = displayProfile
+              ? await overlayCurrentHydratedProfile(
+                  preservedRouting.freshStorage,
+                  displayProfile.accountId,
+                  displayProfile.hydration,
+                )
+              : preservedRouting.freshStorage
             return {
               activeId: preservedRouting.activeId,
               route: preservedRouting.route,

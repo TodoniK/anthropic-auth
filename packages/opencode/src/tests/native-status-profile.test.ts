@@ -1,7 +1,7 @@
 import { expect } from 'bun:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   __setLogTestSink,
   createNativeAccountRuntime,
@@ -19,8 +19,10 @@ import { withLock } from '@cortexkit/common-auth/fs'
 import { POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
 import { createOpencodeClient } from '@opencode-ai/sdk'
 import { $ } from 'bun'
+
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
+import { drainSidebarWrites, getSidebarState } from '../sidebar-state.ts'
 import {
   migrateNativeOpencodeFixture,
   type NativeOpencodeFixtureInput,
@@ -317,6 +319,35 @@ async function start(
       await plugin.dispose?.()
     },
   }
+}
+
+// The first host-credential request starts OpenCode's background profile
+// display; the loader returns without waiting for the profile fetch or save.
+async function startStartupProfileDisplay(s: Started) {
+  const loader = s.plugin.auth?.loader
+  if (!loader) throw new Error('The plugin has no auth loader')
+  await Promise.resolve(
+    loader(
+      async () =>
+        custodyTombstoneOAuth('anthropic') as Awaited<
+          ReturnType<Parameters<typeof loader>[0]>
+        >,
+      { models: {} } as unknown as Parameters<typeof loader>[1],
+    ),
+  )
+}
+
+async function waitForSidebarMainTier(tier: string) {
+  let state = await getSidebarState()
+  for (let attempt = 0; attempt < 300; attempt++) {
+    if (state.main.tierLabel === tier) return state
+    await drainSidebarWrites()
+    await Bun.sleep(10)
+    state = await getSidebarState()
+  }
+  throw new Error(
+    `Sidebar main tier did not become ${tier}: ${JSON.stringify(state)}`,
+  )
 }
 
 /** The /claude menu's own section headings, in order. */
@@ -903,6 +934,169 @@ test('missing native authority refuses status without any profile request', asyn
   const text = await s.readMenu()
   expect(section(text, 'Accounts')).not.toContain('Max')
   expect(s.network.profileBearers).toEqual([])
+})
+
+test('sidebar shows a fetched main tier after profile persistence fails', async () => {
+  const savedLevel = getLogLevel()
+  const s = await start({
+    legacyConfig: { ...localLegacyConfig(), accounts: [] },
+    hostAuth: localHostAuth(),
+  })
+  const records: Array<{
+    level: string
+    channel: string
+    message: string
+    payload?: unknown
+  }> = []
+  const runtimeDirectory = dirname(s.paths.runtime)
+  const originalDirectoryMode = (await stat(runtimeDirectory)).mode & 0o777
+  let warningLogged!: () => void
+  const warning = new Promise<void>((resolve) => {
+    warningLogged = resolve
+  })
+  __setLogTestSink((record) => {
+    records.push(record)
+    if (
+      record.level === 'warn' &&
+      record.channel === 'quota' &&
+      record.message === 'failed to persist account profile'
+    )
+      warningLogged()
+  })
+  try {
+    setLogLevel('debug')
+    s.network.respond = async () => {
+      // The runtime metadata file is atomically renamed in this directory.
+      // Removing write permission makes that save fail while leaving reads open.
+      await chmod(runtimeDirectory, originalDirectoryMode & ~0o222)
+      return undefined
+    }
+    await startStartupProfileDisplay(s)
+    await warning
+    await chmod(runtimeDirectory, originalDirectoryMode)
+
+    const state = await waitForSidebarMainTier('Max 20x')
+    expect(state.main.tierLabel).toBe('Max 20x')
+    const warnings = records.filter(
+      (record) =>
+        record.level === 'warn' &&
+        record.channel === 'quota' &&
+        record.message === 'failed to persist account profile',
+    )
+    expect(warnings).toHaveLength(1)
+    expect(JSON.stringify(warnings)).not.toContain(
+      accountTier[mainIdentity] ?? '',
+    )
+    expect(JSON.stringify(warnings)).not.toContain(mainIdentity)
+
+    await s.dispose()
+    await drainSidebarWrites()
+  } finally {
+    await chmod(runtimeDirectory, originalDirectoryMode)
+    __setLogTestSink(null)
+    setLogLevel(savedLevel)
+  }
+})
+
+test('sidebar does not show a profile whose save was refused', async () => {
+  const savedLevel = getLogLevel()
+  const refused = gate()
+  const s = await start({
+    legacyConfig: { ...localLegacyConfig(), accounts: [] },
+    hostAuth: localHostAuth(),
+  })
+  __setLogTestSink((record) => {
+    if (
+      record.message === 'refused account profile publication' &&
+      record.payload?.account === 'main'
+    )
+      refused.open()
+  })
+  try {
+    setLogLevel('debug')
+    s.network.respond = async () => {
+      const runtime = createNativeAccountRuntime({
+        paths: s.paths,
+        host: 'opencode',
+        local: nativeLocal(),
+      })
+      try {
+        await runtime.loginOAuth({
+          routeId: 'main',
+          credential: {
+            access: 'sk-ant-oat01-synthetic-main-rotated',
+            refresh: 'synthetic-main-refresh',
+            expires: Date.now() + 8 * 60 * 60_000,
+          },
+          replace: true,
+        })
+        expect((await runtime.authorizeLocal('main')).status).toBe('usable')
+      } finally {
+        runtime.close()
+      }
+      return undefined
+    }
+    await startStartupProfileDisplay(s)
+    await refused.wait
+    await s.dispose()
+    await drainSidebarWrites()
+
+    expect((await getSidebarState()).main.tierLabel).toBeUndefined()
+  } finally {
+    __setLogTestSink(null)
+    setLogLevel(savedLevel)
+  }
+})
+
+test('sidebar does not show a fetched profile after account replacement', async () => {
+  const savedLevel = getLogLevel()
+  const refused = gate()
+  const s = await start({
+    legacyConfig: { ...localLegacyConfig(), accounts: [] },
+    hostAuth: localHostAuth(),
+  })
+  __setLogTestSink((record) => {
+    if (
+      record.message === 'refused account profile publication' &&
+      record.payload?.account === 'main'
+    )
+      refused.open()
+  })
+  try {
+    setLogLevel('debug')
+    s.network.respond = async () => {
+      const runtime = createNativeAccountRuntime({
+        paths: s.paths,
+        host: 'opencode',
+        local: nativeLocal(),
+      })
+      try {
+        await runtime.loginOAuth({
+          routeId: 'main',
+          credential: {
+            access: 'sk-ant-oat01-synthetic-other-access',
+            refresh: 'synthetic-other-refresh',
+            expires: Date.now() + 8 * 60 * 60_000,
+          },
+          replace: true,
+        })
+        expect((await runtime.authorizeLocal('main')).status).toBe('usable')
+      } finally {
+        runtime.close()
+      }
+      return undefined
+    }
+    await startStartupProfileDisplay(s)
+    await refused.wait
+    await s.dispose()
+    await drainSidebarWrites()
+
+    expect((await getSidebarState()).main.tierLabel).toBeUndefined()
+    expect(s.network.profileAccounts).toEqual([mainIdentity])
+  } finally {
+    __setLogTestSink(null)
+    setLogLevel(savedLevel)
+  }
 })
 
 test('a profile whose save was refused is not shown once the refusal is known', async () => {
