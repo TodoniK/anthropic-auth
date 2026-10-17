@@ -11,6 +11,7 @@ import {
   type AccountStorage,
   getScopedQuotaWindowForModel,
   killswitchPassesPolicy,
+  type ProviderAccountUuid,
   QUOTA_URL,
   quotaSnapshotModelScopeIsExhausted,
 } from '../accounts.ts'
@@ -358,6 +359,8 @@ test('admission reads only the insula cache: never refreshes it, polls on a miss
   expect(cached).toHaveBeenCalledTimes(1)
   expect(f.counts.insula).toBe(0)
   expect(f.counts.usage).toEqual([bearer(workRow.id)])
+  // Let the poll's reading reach stored quota before insula's is merged in.
+  await f.runtime.drainQuotaPublications()
   // A background tick warms the cache; admission then answers from it.
   await f.runtime.fetchQuota(
     f.routeOf(uuid),
@@ -438,7 +441,7 @@ test('local mode never touches insula', async () => {
       resolveIdentity: async () => ({
         deviceId: 'synthetic-device',
         sessionId: 'synthetic-session',
-        accountUuid: uuid,
+        accountUuid: uuid as ProviderAccountUuid,
       }),
       refreshToken: async () => {
         throw new Error('no refresh expected')
