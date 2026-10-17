@@ -1,9 +1,8 @@
-import { expect, spyOn } from 'bun:test'
+import { expect } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  ClaustrumConsumer,
   type InsulaUsageEntry,
   projectVaultRoster,
 } from '@cortexkit/common-auth/claustrum'
@@ -196,18 +195,23 @@ async function fixture(entries: () => unknown[]) {
     },
     { preconnect: fetch.preconnect },
   )
-  const runtime = createNativeVaultRuntime({
-    paths,
-    host: 'opencode',
-    env,
-    now: () => clock.now,
-    connect: async () => client,
-    readToken: async () => ({ token: '01'.repeat(32), token_generation: 1 }),
-  })
-  deferCleanup(async () => {
-    await runtime.drainQuotaPublications()
-    runtime.close()
-  })
+  // Further runtimes share the paths, enrollment and daemon connection file.
+  const make = () => {
+    const runtime = createNativeVaultRuntime({
+      paths,
+      host: 'opencode',
+      env,
+      now: () => clock.now,
+      connect: async () => client,
+      readToken: async () => ({ token: '01'.repeat(32), token_generation: 1 }),
+    })
+    deferCleanup(async () => {
+      await runtime.drainQuotaPublications()
+      runtime.close()
+    })
+    return runtime
+  }
+  const runtime = make()
   await runtime.refresh()
   const roster = await runtime.read()
   const routeOf = (account: string) => {
@@ -215,7 +219,7 @@ async function fixture(entries: () => unknown[]) {
     if (!id) throw new Error('Missing fixture route')
     return id
   }
-  return { runtime, counts, usage, vaultPaths, routeOf, clock }
+  return { runtime, make, counts, usage, vaultPaths, routeOf, clock }
 }
 
 const bearer = (credentialId: string) =>
@@ -279,7 +283,7 @@ test('background sweep takes a fresh insula reading and sends no usage GET', asy
   expect(stored?.quotaCheckedAt).toBe(fetchedAt)
 })
 
-test('the primary account is looked up in insula by its roster route, not its logical id', async () => {
+test('the primary account is looked up in insula by its roster row account id, not its logical id', async () => {
   const f = await fixture(() => [entry(uuid)])
   const quota = await f.runtime.fetchQuota(
     'main',
@@ -340,12 +344,6 @@ test('an insula entry for a different account never applies', async () => {
 })
 
 test('admission reads only the insula cache: never refreshes it, polls on a miss', async () => {
-  const refresh = spyOn(ClaustrumConsumer.prototype, 'refreshInsulaQuota')
-  const cached = spyOn(ClaustrumConsumer.prototype, 'cachedInsulaQuota')
-  deferCleanup(() => {
-    refresh.mockRestore()
-    cached.mockRestore()
-  })
   const f = await fixture(() => [entry(uuid2)])
   // Cold cache: no insula fetch on the request path, so the usage poll runs.
   await f.runtime.fetchQuota(
@@ -355,8 +353,6 @@ test('admission reads only the insula cache: never refreshes it, polls on a miss
     undefined,
     'admission',
   )
-  expect(refresh).toHaveBeenCalledTimes(0)
-  expect(cached).toHaveBeenCalledTimes(1)
   expect(f.counts.insula).toBe(0)
   expect(f.counts.usage).toEqual([bearer(workRow.id)])
   // Let the poll's reading reach stored quota before insula's is merged in.
@@ -369,9 +365,10 @@ test('admission reads only the insula cache: never refreshes it, polls on a miss
     undefined,
     'background',
   )
-  expect(refresh).toHaveBeenCalledTimes(1)
   expect(f.counts.insula).toBe(1)
-  const callsBefore = refresh.mock.calls.length
+  // Past the one-minute refresh budget, admission still only reads the cache:
+  // a refresh here would fetch again.
+  f.clock.now = now + 61_000
   const quota = await f.runtime.fetchQuota(
     f.routeOf(uuid2),
     f.usage,
@@ -379,14 +376,48 @@ test('admission reads only the insula cache: never refreshes it, polls on a miss
     undefined,
     'admission',
   )
-  expect(refresh.mock.calls.length).toBe(callsBefore)
-  expect(cached).toHaveBeenCalledTimes(2)
   expect(f.counts.insula).toBe(1)
   expect(f.counts.usage).toEqual([bearer(workRow.id), bearer(mainRow.id)])
   // The cold poll above is newer than insula's fetch, so its standard windows
   // stay; the Fable window only insula reported is added.
   expect(quota.five_hour).toMatchObject({ usedPercent: 10, checkedAt: now })
   expect(quota.scoped?.map((window) => window.checkedAt)).toEqual([fetchedAt])
+})
+
+test('runtimes on one connection file and token path share one insula source until all release it', async () => {
+  const f = await fixture(() => [entry(uuid2)])
+  const second = f.make()
+  const sweep = (runtime: typeof f.runtime) =>
+    runtime.fetchQuota(
+      f.routeOf(uuid2),
+      f.usage,
+      undefined,
+      undefined,
+      'background',
+    )
+  await sweep(f.runtime)
+  // The second runtime's tick falls within the shared minute: no new fetch,
+  // and it still sees the first runtime's entries.
+  expect((await sweep(second)).five_hour?.checkedAt).toBe(fetchedAt)
+  expect(f.counts.insula).toBe(1)
+  expect(f.counts.usage).toEqual([])
+  // Closing one runtime releases only its reference.
+  await f.runtime.drainQuotaPublications()
+  f.runtime.close()
+  const third = f.make()
+  expect((await sweep(third)).five_hour?.checkedAt).toBe(fetchedAt)
+  expect(f.counts.usage).toEqual([])
+  // Once every holder has closed, the source is dropped. A new runtime gets an
+  // empty source, and the minute budget, which outlives it, blocks a fetch,
+  // so its account falls back to the usage poll.
+  for (const runtime of [second, third]) {
+    await runtime.drainQuotaPublications()
+    runtime.close()
+  }
+  const fresh = f.make()
+  expect((await sweep(fresh)).five_hour?.checkedAt).toBe(now)
+  expect(f.counts.insula).toBe(1)
+  expect(f.counts.usage).toEqual([bearer(workRow.id)])
 })
 
 test('a quota read without a purpose polls Anthropic and leaves insula alone', async () => {
@@ -420,7 +451,7 @@ test('local mode never touches insula', async () => {
   await store.updateSettings((settings) => {
     settings.mainAccountId = 'imported-main'
   })
-  const counts = { insula: 0, connects: 0, usage: 0 }
+  const counts = { connects: 0, usage: 0 }
   const runtime = createNativeAccountRuntime({
     paths,
     host: 'opencode',
@@ -452,17 +483,6 @@ test('local mode never touches insula', async () => {
     await runtime.drainQuotaPublications()
     runtime.close()
   })
-  const refresh = spyOn(ClaustrumConsumer.prototype, 'refreshInsulaQuota')
-  const forRoute = spyOn(
-    ClaustrumConsumer.prototype,
-    'cachedInsulaQuotaForRoute',
-  )
-  const cached = spyOn(ClaustrumConsumer.prototype, 'cachedInsulaQuota')
-  deferCleanup(() => {
-    refresh.mockRestore()
-    forRoute.mockRestore()
-    cached.mockRestore()
-  })
   const usage: typeof fetch = Object.assign(
     async () => {
       counts.usage++
@@ -474,10 +494,8 @@ test('local mode never touches insula', async () => {
     await runtime.fetchQuota('main', usage, undefined, undefined, purpose)
   }
   expect(counts.usage).toBe(2)
+  // No vault connection, so no insula transport was ever obtained.
   expect(counts.connects).toBe(0)
-  expect(refresh).toHaveBeenCalledTimes(0)
-  expect(forRoute).toHaveBeenCalledTimes(0)
-  expect(cached).toHaveBeenCalledTimes(0)
 })
 
 test('the Fable window from extraRateWindows drives scoped routing and the scoped killswitch floor', async () => {
@@ -603,12 +621,6 @@ test('normalizer: unknown shapes return undefined so the poll stays in charge', 
       }),
       { fetchedAt },
     ),
-  ).toBeUndefined()
-  expect(
-    normalizeInsulaClaudeQuota(entry(uuid, { stale: 'old' }), { fetchedAt }),
-  ).toBeUndefined()
-  expect(
-    normalizeInsulaClaudeQuota(entry(uuid), { fetchedAt: Number.NaN }),
   ).toBeUndefined()
 })
 

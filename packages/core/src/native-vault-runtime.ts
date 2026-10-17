@@ -5,12 +5,13 @@ import {
 } from '@cortexkit/claustrum-client'
 import {
   acceptAccount,
-  ClaustrumConsumer,
+  acquireInsulaQuotaSource,
   ClaustrumConsumerError,
-  type ClaustrumScopedClient,
   connectClaustrumScopedClient,
   declineAccount,
+  type InsulaQuotaSource,
   mutateVaultRoster,
+  readClaustrumEnrollmentToken,
   readVaultRoster,
   refreshVaultRoster,
 } from '@cortexkit/common-auth/claustrum'
@@ -384,40 +385,47 @@ export function createNativeVaultRuntime(
         })),
     env,
   })
-  // Used only for insula's background quota cache: this runtime's own custody
-  // lists, authorizes and reports. Common-auth shares one insula source per
-  // resolved connection file and enrollment token path, and the consumer
-  // never reads it unless the enrollment selects vault custody and its token
-  // file is readable.
-  const insula = new ClaustrumConsumer<InsulaClaudeQuota>({
-    rosterPath: paths.roster,
-    tokenPath: getHostClaustrumEnrollmentPaths(options.host, env).tokenPath,
-    family: {
-      refreshAdapter: 'anthropic',
-      category: 'anthropic-native',
-      apiKeys: false,
-    },
-    connect: async (): Promise<ClaustrumScopedClient> => {
-      const transport = await custody.insulaTransport()
-      const unused = () => Promise.reject(new NativeCustodyError('unavailable'))
-      return {
-        listScoped: unused,
-        getScoped: unused,
-        reportAuthFailureScoped: unused,
-        // Nothing to close here: the connection belongs to this runtime's
-        // custody, which closes it when the runtime closes.
-        close: () => {},
-        ...(transport && { insula: transport }),
+  // Insula's background quota cache, shared by common-auth across runtimes
+  // with the same resolved connection file and enrollment token path (one
+  // fetch a minute between them). Acquired on the first background tick that
+  // finds vault custody, released when this runtime closes.
+  const tokenPath = getHostClaustrumEnrollmentPaths(options.host, env).tokenPath
+  const clock = options.now ?? Date.now
+  let insula: { source: InsulaQuotaSource; release(): void } | undefined
+  /**
+   * Refresh insula's cache for one background tick. Enrollment is read fresh
+   * each time: outside vault custody, or with a missing or unreadable token,
+   * insula is not used at all. An optional source never fails the tick.
+   */
+  async function refreshInsula(): Promise<void> {
+    try {
+      if (!(await active())) return
+      await readClaustrumEnrollmentToken(tokenPath)
+      if (!insula) {
+        const transport = await custody.insulaTransport()
+        check()
+        if (!transport) return
+        insula ??= acquireInsulaQuotaSource(transport, tokenPath)
       }
-    },
-    isCustodyActive: () => active().catch(() => false),
-    insula: { provider: 'claude', normalize: normalizeInsulaClaudeQuota },
-    ...(options.now && { now: options.now }),
-    logger: {
-      warn: () => {},
-      debug: () => {},
-    },
-  })
+      await insula.source.refresh(clock())
+    } catch {
+      // Insula is optional: without it every account keeps its own poll.
+    }
+  }
+  /**
+   * Cache-only lookup by the vault's account id for this account (the
+   * list_scoped or get_scoped account_id), never an email or label.
+   * common-auth returns only a current entry; anything we cannot map is a miss.
+   */
+  function insulaReading(
+    accountId: string | undefined,
+  ): InsulaClaudeQuota | undefined {
+    if (!insula || !accountId || shutdown.signal.aborted) return undefined
+    const current = insula.source.current('claude', accountId, clock())
+    return current
+      ? normalizeInsulaClaudeQuota(current.entry, current.context)
+      : undefined
+  }
   // The last source each route's guided quota reading came from, so a change
   // is logged once rather than on every sweep.
   const quotaSources = new Map<string, 'insula' | 'fallback'>()
@@ -486,7 +494,7 @@ export function createNativeVaultRuntime(
       if (shutdown.signal.aborted) return
       // Keep insula's cache warm for admission lookups, which only read it.
       // It refreshes at most once a minute and never throws.
-      await insula.refreshInsulaQuota()
+      await refreshInsula()
       if (shutdown.signal.aborted) return
       // Notifications belong to their observers. A slow or disposing host must
       // not hold discovery for the other leases; hosts drain their own writes.
@@ -848,10 +856,9 @@ export function createNativeVaultRuntime(
       // list_scoped account_id) before any credential is fetched.
       let swept: InsulaClaudeQuota | undefined
       if (purpose === 'background' && row) {
-        await insula.refreshInsulaQuota()
+        await refreshInsula()
         check(signal)
-        swept = await insula.cachedInsulaQuotaForRoute(row.routeId)
-        check(signal)
+        swept = insulaReading(row.accountIdentity)
       }
       const state = await readNativeRuntime(paths.runtime, paths.storageId)
       const before =
@@ -892,7 +899,8 @@ export function createNativeVaultRuntime(
               reading = swept
             else if (swept) miss = 'account-changed'
           } else if (purpose === 'admission') {
-            reading = await insula.cachedInsulaQuota(receipt)
+            // Only the account id the vault asserted for this credential.
+            reading = insulaReading(receipt.assertedAccountIdentity)
           }
           if (purpose)
             noteQuotaSource(
@@ -1018,7 +1026,8 @@ export function createNativeVaultRuntime(
       schedulePoll()
       if (shutdown.signal.aborted) return
       shutdown.abort(new NativeCustodyError('closed'))
-      insula.close()
+      insula?.release()
+      insula = undefined
       custody.close()
     },
   }

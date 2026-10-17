@@ -179,26 +179,21 @@ export function normalizeInsulaClaudeQuota(
   entry: InsulaUsageEntry,
   context: InsulaQuotaContext,
 ): InsulaClaudeQuota | undefined {
+  // common-auth's InsulaQuotaSource.current only returns an entry with usage,
+  // no stale or errorClass field, and a fetchedAt under four minutes old.
   const checkedAt = context.fetchedAt
-  if (
-    !Number.isFinite(checkedAt) ||
-    entry.stale !== undefined ||
-    entry.errorClass !== undefined
-  )
-    return undefined
   const usage = entry.usage
-  if (!record(usage)) return undefined
-  const five_hour = windowReading(usage.primary, checkedAt, {
+  const five_hour = windowReading(usage?.primary, checkedAt, {
     kind: 'five_hour',
     minutes: 300,
   })
-  const seven_day = windowReading(usage.secondary, checkedAt, {
+  const seven_day = windowReading(usage?.secondary, checkedAt, {
     kind: 'weekly',
     minutes: 10_080,
   })
   if (!five_hour || !seven_day) return undefined
-  const scoped = scopedReadings(usage.extraRateWindows, checkedAt)
-  const extraUsage = extraUsageReading(entry.pools ?? usage.pools)
+  const scoped = scopedReadings(usage?.extraRateWindows, checkedAt)
+  const extraUsage = extraUsageReading(entry.pools ?? usage?.pools)
   return {
     five_hour,
     seven_day,
