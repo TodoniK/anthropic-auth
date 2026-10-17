@@ -280,10 +280,12 @@ broad_id = "{name}"
 id = "fallback-killswitch-polls-before-selection"
 guards = "Fallback-first routing must poll a due fallback's quota, and wait for that reading, before choosing a route under an enabled killswitch."
 file = "packages/opencode/src/index.ts"
-old = '''              const unavailable = await refreshFallbackQuotas(false, true)
-              // Polling can also bind'''
-new = '''              const unavailable = new Set<string>() // NON-VACUITY BREAK: choose a route without polling due fallbacks
-              // Polling can also bind'''
+old = '''            const unavailable = await refreshFallbackQuotas(
+              false,
+              requiredByPolicy,
+              options.modelId,
+            )'''
+new = '''            const unavailable = new Set<string>() // NON-VACUITY BREAK: choose a route without polling due fallbacks'''
 test_file = "packages/opencode/src/tests/quota-sweep.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/quota-sweep.test.ts", "{test}"]
@@ -299,9 +301,9 @@ id = "fallback-quota-sweeps-do-not-overlap"
 guards = "A fallback quota sweep started while another sweep's poll is outstanding must read the pool after that reading is stored, not poll the same account again from an older snapshot."
 file = "packages/opencode/src/index.ts"
 old = '''    const operation = fallbackQuotaRefreshQueue.then(() =>
-      pollFallbackQuotas(force, requiredByPolicy),
+      pollFallbackQuotas(force, requiredByPolicy, modelId),
     )'''
-new = '''    const operation = pollFallbackQuotas(force, requiredByPolicy) // NON-VACUITY BREAK: start sweeps without waiting for the previous one'''
+new = '''    const operation = pollFallbackQuotas(force, requiredByPolicy, modelId) // NON-VACUITY BREAK: start sweeps without waiting for the previous one'''
 test_file = "packages/opencode/src/tests/quota-sweep.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/quota-sweep.test.ts", "{test}"]
@@ -812,6 +814,22 @@ command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/qu
 test_count_pattern = "CKDEV executed {count} tests"
 expect_red = ["quota poll serves its reading while runtime sync is held and dispose drains publication"]
 expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "ordered-quota-refresh-without-killswitch"
+guards = "Ordered routing refreshes due fallback quota before eligibility even when the killswitch is disabled."
+file = "packages/opencode/src/index.ts"
+old = "const unavailable = await refreshFallbackQuotas("
+new = "const unavailable = !requiredByPolicy ? new Set<string>() : await refreshFallbackQuotas( /* NON-VACUITY BREAK: gate freshness on the killswitch */"
+test_file = "packages/opencode/src/tests/quota-sweep.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/quota-sweep.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["ordered routing refreshes stale fallback quota with killswitch off before choosing"]
+expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"

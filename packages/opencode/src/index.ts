@@ -2694,12 +2694,16 @@ const anthropicAuthPlugin = async (
   }
 
   let fallbackQuotaRefreshQueue: Promise<void> = Promise.resolve()
-  function refreshFallbackQuotas(force = false, requiredByPolicy = false) {
+  function refreshFallbackQuotas(
+    force = false,
+    requiredByPolicy = false,
+    modelId?: string,
+  ) {
     // Startup and request preflight can both observe missing quota before
     // either poll finishes. Serialize the read/check/poll sequence so the
     // next sweep sees the preceding result. Explicit refresh still polls.
     const operation = fallbackQuotaRefreshQueue.then(() =>
-      pollFallbackQuotas(force, requiredByPolicy),
+      pollFallbackQuotas(force, requiredByPolicy, modelId),
     )
     fallbackQuotaRefreshQueue = operation.then(
       () => {},
@@ -2707,7 +2711,11 @@ const anthropicAuthPlugin = async (
     )
     return operation
   }
-  async function pollFallbackQuotas(force: boolean, requiredByPolicy: boolean) {
+  async function pollFallbackQuotas(
+    force: boolean,
+    requiredByPolicy: boolean,
+    modelId?: string,
+  ) {
     const snapshot = await nativeAccounts.read()
     const unavailable = new Set<string>()
     if (
@@ -2728,7 +2736,14 @@ const anthropicAuthPlugin = async (
           account.quota,
           snapshot.policyStorage,
           quotaSnapshotCheckedAt(account.quota),
-        ) > Date.now()
+        ) > Date.now() &&
+        (!modelId ||
+          stickyQuotaSnapshotIsFresh(
+            account.quota,
+            snapshot.policyStorage,
+            Date.now(),
+            modelId,
+          ))
       )
         continue
       try {
@@ -2928,12 +2943,33 @@ const anthropicAuthPlugin = async (
   }
   const canStartNativeServices =
     initialStorage !== null && process.env.OPENCODE_AUTH_CONTENT === undefined
+  let knownVaultFallbacks = new Set<string>()
+  async function refreshDiscoveredVaultFallbacks() {
+    const snapshot = await nativeAccounts.read()
+    const current = new Set(
+      snapshot.accounts
+        .filter(
+          (account) =>
+            account.id !== 'main' &&
+            account.source === 'vault' &&
+            account.type === 'oauth' &&
+            nativeAccountCanServe(account),
+        )
+        .map((account) => account.id),
+    )
+    const discovered = [...current].some((id) => !knownVaultFallbacks.has(id))
+    knownVaultFallbacks = current
+    // Discovery and request preflight share the due sweep, so an arriving
+    // account gets its first reading without duplicating an in-flight poll.
+    if (discovered) await refreshFallbackQuotas()
+    await refreshSidebarQuota()
+  }
   const vaultWatch =
     canStartNativeServices && isScopedCustodyActive(initialStorage)
       ? nativeAccounts.vault.watch({
           intervalMs: runtimeOverrides.scopedRosterPollIntervalMs ?? 2000,
           shouldRefresh: () => process.env.OPENCODE_AUTH_CONTENT === undefined,
-          onRefresh: () => refreshSidebarQuota(),
+          onRefresh: refreshDiscoveredVaultFallbacks,
           setInterval: runtimeTimers.setInterval,
           clearInterval: runtimeTimers.clearInterval,
         })
@@ -7586,14 +7622,19 @@ const anthropicAuthPlugin = async (
             storageArg: Awaited<ReturnType<typeof loadAccounts>>,
             options: { includeApiRoutes?: boolean; modelId?: string } = {},
           ): Promise<Array<OAuthAccount | ApiKeyAccount>> {
-            // Fallback-first can return before the main quota gate. Learn due
-            // fallback quotas before applying hard limits, without acquiring
-            // main credentials or polling accounts whose quotas are fresh.
-            if (isKillswitchEnabled(storageArg)) {
-              const unavailable = await refreshFallbackQuotas(false, true)
-              // Polling can also bind a newly discovered account UUID. Filter
-              // the fresh native overlay, not the request's earlier account view.
-              storageArg = await loadAccounts(accountStoragePath)
+            // Ordered eligibility needs current quota even when hard-limit
+            // enforcement (the killswitch) is off. The serialized sweep reuses
+            // fresh readings without waiting for their persistence to disk.
+            const requiredByPolicy = isKillswitchEnabled(storageArg)
+            const unavailable = await refreshFallbackQuotas(
+              false,
+              requiredByPolicy,
+              options.modelId,
+            )
+            // Polling can also bind a newly discovered account UUID. Filter
+            // the fresh native overlay, not the request's earlier account view.
+            storageArg = await loadAccounts(accountStoragePath)
+            if (requiredByPolicy) {
               if (storageArg && unavailable.size)
                 storageArg = {
                   ...storageArg,

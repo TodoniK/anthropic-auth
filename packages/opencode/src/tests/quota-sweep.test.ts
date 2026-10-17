@@ -116,8 +116,10 @@ type BodyOptions = {
    * only the killswitch's own preflight polls the fallback.
    */
   quotaEnabled: boolean
+  killswitchEnabled?: boolean
   /** Percent used that each fallback usage GET reports on both windows. */
   fallbackUsed: number
+  fallbackScopedUsed?: number
   /** Zero-based indexes of the fallback usage GETs the test holds open. */
   holdFallbackUsage?: number[]
 }
@@ -159,7 +161,7 @@ function signal() {
  * remaining. Disable proactive token refresh so the background sweep reaches
  * its quota poll without first exchanging credentials.
  */
-async function migratePool(quotaEnabled: boolean) {
+async function migratePool(options: BodyOptions) {
   const root = await mkdtemp(join(tmpdir(), 'quota-sweep-'))
   // The fixture removes the root once it accepts it; this covers a body that
   // fails before that.
@@ -186,8 +188,11 @@ async function migratePool(quotaEnabled: boolean) {
       fallbackOn: [401, 403, 429],
       routing: { mode: 'fallback-first' },
       refresh: { enabled: false },
-      quota: { enabled: quotaEnabled, failClosedOnUnknownQuota: false },
-      killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
+      quota: { enabled: options.quotaEnabled, failClosedOnUnknownQuota: false },
+      killswitch: {
+        enabled: options.killswitchEnabled ?? true,
+        main: { five_hour: 5, seven_day: 10 },
+      },
       claudeCache: { enabled: false },
       accounts: [
         {
@@ -260,7 +265,7 @@ async function startBody(options: BodyOptions) {
       }
     }
   })
-  const { fixture, now } = await migratePool(options.quotaEnabled)
+  const { fixture, now } = await migratePool(options)
   for (const [key, value] of Object.entries(fixture.env))
     process.env[key] = value
   process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
@@ -314,9 +319,21 @@ async function startBody(options: BodyOptions) {
             arrivalFor(index).resolve()
             await gate.wait
           } else arrivalFor(index).resolve()
-          return Response.json(
-            usageReading(options.fallbackUsed, options.fallbackUsed),
-          )
+          return Response.json({
+            ...usageReading(options.fallbackUsed, options.fallbackUsed),
+            ...(options.fallbackScopedUsed !== undefined
+              ? {
+                  limits: [
+                    {
+                      kind: 'weekly_scoped',
+                      group: 'weekly',
+                      percent: options.fallbackScopedUsed,
+                      scope: { model: { display_name: 'Fable' } },
+                    },
+                  ],
+                }
+              : {}),
+          })
         }
         return Response.json(MAIN_READING())
       }
@@ -477,6 +494,25 @@ async function startBody(options: BodyOptions) {
     },
     startupSweep,
     backgroundSweep,
+    async seedQuota(quota: Core.OAuthQuotaSnapshot) {
+      const admitted = await observer.authorizeLocal(FALLBACK_ID)
+      if (admitted.status !== 'usable')
+        throw new Error(
+          `Fixture credential was not admitted: ${admitted.status}`,
+        )
+      const saved = await observer.publishLocal(admitted.subject, {
+        quota: { ...quota, accountIdentity: FALLBACK_UUID },
+      })
+      if (!saved) throw new Error('Fixture quota publication was refused')
+      await observer.updateSettings((settings) => ({
+        ...settings,
+        quota: {
+          enabled: true,
+          minimumRemaining: { five_hour: 5, seven_day: 10 },
+          failClosedOnUnknownQuota: false,
+        },
+      }))
+    },
     /** Resolves when the given fallback usage GET reaches the transport. */
     fallbackUsageArrived: (index: number) => arrivalFor(index).promise,
     /** Let a held fallback usage GET return its reading. */
@@ -492,13 +528,13 @@ async function startBody(options: BodyOptions) {
      * running until the plugin is stopped, and that late refusal is not a
      * second test failure.
      */
-    request() {
+    request(model = 'claude-sonnet-4-6') {
       const result = (async () => {
         const response = await send(MESSAGES_URL, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            model: 'claude-sonnet-4-6',
+            model,
             max_tokens: 1,
             messages: [{ role: 'user', content: 'hello' }],
           }),
@@ -541,6 +577,124 @@ const usage = (authorization: string): Dispatch => ({
 const messages = (authorization: string): Dispatch => ({
   kind: 'messages',
   authorization,
+})
+
+function storedQuota(remainingPercent: number, checkedAt: number) {
+  const window = {
+    checkedAt,
+    usedPercent: 100 - remainingPercent,
+    remainingPercent,
+    resetsAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
+  }
+  return { checkedAt, five_hour: { ...window }, seven_day: { ...window } }
+}
+
+test('ordered routing refreshes stale fallback quota with killswitch off before choosing', async () => {
+  const body = await startBody({
+    quotaEnabled: false,
+    killswitchEnabled: false,
+    fallbackUsed: 10,
+  })
+  await body.startupSweep
+  await body.seedQuota(storedQuota(0, Date.now() - 24 * 60 * 60_000))
+
+  expect((await body.request()).status).toBe(200)
+  expect(body.dispatches).toEqual([
+    usage(FALLBACK_BEARER),
+    messages(FALLBACK_BEARER),
+  ])
+})
+
+test('ordered routing skips a stale healthy fallback after its refreshed quota falls below the floor with killswitch off', async () => {
+  const body = await startBody({
+    quotaEnabled: false,
+    killswitchEnabled: false,
+    fallbackUsed: 100,
+  })
+  await body.startupSweep
+  await body.seedQuota(storedQuota(90, Date.now() - 24 * 60 * 60_000))
+
+  expect((await body.request()).status).toBe(200)
+  expect(mainRouteSummary(body.dispatches)).toEqual({
+    fallbackUsageGets: 1,
+    firstDispatch: usage(FALLBACK_BEARER),
+    modelDispatches: [MAIN_BEARER],
+    mainPolled: true,
+  })
+})
+
+test('ordered routing reuses fresh fallback quota with killswitch off without polling', async () => {
+  const body = await startBody({
+    quotaEnabled: false,
+    killswitchEnabled: false,
+    fallbackUsed: 10,
+  })
+  await body.startupSweep
+  await body.seedQuota(storedQuota(90, Date.now()))
+
+  expect((await body.request()).status).toBe(200)
+  expect(body.dispatches).toEqual([messages(FALLBACK_BEARER)])
+})
+
+test('ordered routing refreshes the requested model scoped window with killswitch off', async () => {
+  const body = await startBody({
+    quotaEnabled: false,
+    killswitchEnabled: false,
+    fallbackUsed: 10,
+    fallbackScopedUsed: 10,
+  })
+  await body.startupSweep
+  const now = Date.now()
+  await body.seedQuota({
+    ...storedQuota(90, now),
+    scoped: [
+      {
+        id: 'claude-weekly-scoped-fable',
+        title: 'Fable only',
+        modelName: 'Fable',
+        usedPercent: 100,
+        remainingPercent: 0,
+        checkedAt: now - 24 * 60 * 60_000,
+      },
+    ],
+  })
+
+  expect((await body.request('claude-fable-5-1')).status).toBe(200)
+  expect(body.dispatches).toEqual([
+    usage(FALLBACK_BEARER),
+    messages(FALLBACK_BEARER),
+  ])
+  const snapshot = await body.servingView()
+  expect(
+    snapshot.accounts.find((account) => account.id === FALLBACK_ID)?.quota
+      ?.scoped?.[0]?.remainingPercent,
+  ).toBe(90)
+})
+
+test('concurrent ordered requests share one due fallback poll with killswitch off', async () => {
+  const body = await startBody({
+    quotaEnabled: false,
+    killswitchEnabled: false,
+    fallbackUsed: 10,
+    holdFallbackUsage: [0],
+  })
+  await body.startupSweep
+  await body.seedQuota(storedQuota(0, Date.now() - 24 * 60 * 60_000))
+
+  const requests = Promise.all([body.request(), body.request()])
+  // A missing preflight must fail the dispatch assertion rather than hang
+  // waiting for a usage GET that never starts.
+  await Promise.race([body.fallbackUsageArrived(0), requests])
+  expect(body.dispatches).toEqual([usage(FALLBACK_BEARER)])
+  body.releaseFallbackUsage(0)
+  expect((await requests).map((response) => response.status)).toEqual([
+    200, 200,
+  ])
+  expect(body.dispatches).toEqual([
+    usage(FALLBACK_BEARER),
+    messages(FALLBACK_BEARER),
+    messages(FALLBACK_BEARER),
+  ])
 })
 
 test('fallback-first holds dispatch until the due fallback usage GET returns, then serves the fallback from that reading', async () => {

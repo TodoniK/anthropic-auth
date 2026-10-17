@@ -225,6 +225,7 @@ async function createFixture(
   const mainCredentialId = 'oauth:anthropic'
   const nextId = `${accountId}-next`
   const nextCredentialId = `oauth:anthropic:${nextId}`
+  let includeNextInRoster = options.secondFallback === true
   const intervals: IntervalRecord[] = []
   const records: OutboundRecord[] = []
   const credentialGets: Array<{ credentialId: string; isMain: boolean }> = []
@@ -363,7 +364,7 @@ async function createFixture(
           recordVersion: 103,
           createdAtMs: null,
         },
-        ...(options.secondFallback
+        ...(includeNextInRoster
           ? [
               {
                 id: nextCredentialId,
@@ -644,8 +645,37 @@ async function createFixture(
     records,
     result,
     storage,
+    discoverNextFallback() {
+      includeNextInRoster = true
+    },
   }
 }
+
+test.serial(
+  'vault discovery polls a new fallback without a periodic quota tick',
+  async () => {
+    const fixture = await createFixture('request', {
+      quotaEnabled: true,
+      quotaSnapshot: quota(Date.now()),
+      captureIntervals: true,
+    })
+    const usage = () =>
+      fixture.records.filter((record) =>
+        record.url.includes('/api/oauth/usage'),
+      )
+    expect(usage()).toEqual([])
+    const rosterTick = fixture.intervals.find(
+      (interval) => interval.ms === 2000,
+    )
+    expect(rosterTick).toBeDefined()
+    fixture.discoverNextFallback()
+    rosterTick?.callback()
+    await waitFor(() => usage().length > 0, 'New vault fallback was not polled')
+    expect(usage().map((record) => record.authorization)).toEqual([
+      `Bearer ${vaultToken('request')}-next`,
+    ])
+  },
+)
 
 describe('vault-served fallback outbound token census', () => {
   test.serial('request and lane-start sends', async () => {
