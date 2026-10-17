@@ -382,6 +382,8 @@ async function createFixture(
             ]
           : []),
       ],
+      grants: undefined,
+      grantTuples: undefined,
     }),
     getScoped: async (input) => {
       const isMain = input.credentialId === mainCredentialId

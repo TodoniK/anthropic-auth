@@ -48,6 +48,8 @@ test('OpenCode 2 lifecycles share discovery and retain the surviving account lea
             createdAtMs: null,
           },
         ],
+        grants: undefined,
+        grantTuples: undefined,
       }
     },
     async getScoped(input) {

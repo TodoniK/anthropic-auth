@@ -24,6 +24,18 @@ export interface NativeCustodyClient {
       readonly email?: string
       readonly orgName?: string
     }[]
+    /**
+     * How many grants this enrollment holds, and which. Undefined when the
+     * vault is too old to send them: unknown, never zero.
+     */
+    readonly grants: number | undefined
+    readonly grantTuples:
+      | readonly {
+          readonly selectorKind: string
+          readonly selector: string
+          readonly operation: string
+        }[]
+      | undefined
   }>
   getScoped: (input: {
     credentialId: string

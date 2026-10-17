@@ -775,6 +775,8 @@ test('vault accounts show fetched profiles through vault-issued credentials', as
           row('oauth:anthropic', mainIdentity),
           row('oauth:secondary', fallbackIdentity),
         ],
+        grants: undefined,
+        grantTuples: undefined,
       }
     },
     async getScoped(input) {

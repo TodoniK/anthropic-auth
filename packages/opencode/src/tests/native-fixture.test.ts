@@ -214,6 +214,8 @@ function syntheticVault() {
           row('oauth:anthropic', mainIdentity),
           row('oauth:secondary', fallbackIdentity),
         ],
+        grants: undefined,
+        grantTuples: undefined,
       }
     },
     async getScoped() {

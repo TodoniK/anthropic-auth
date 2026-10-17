@@ -99,6 +99,8 @@ function mainOnlyVault(): NativeCustodyClient {
             createdAtMs: 1,
           },
         ],
+        grants: undefined,
+        grantTuples: undefined,
       }
     },
     async getScoped() {

@@ -111,7 +111,12 @@ async function fixture() {
   const client: NativeCustodyClient = {
     listScoped: async () => {
       counts.lists++
-      return { view: `view-${rows.length}-${rows[0]?.accountId}`, rows }
+      return {
+        view: `view-${rows.length}-${rows[0]?.accountId}`,
+        rows,
+        grants: undefined,
+        grantTuples: undefined,
+      }
     },
     getScoped: async (input) => {
       counts.gets++
@@ -471,7 +476,12 @@ test('closing a pending vault list cannot publish its late result', async () => 
         entered.open()
         await release.wait
         settled.open()
-        return { view: 'late', rows: [listed] }
+        return {
+          view: 'late',
+          rows: [listed],
+          grants: undefined,
+          grantTuples: undefined,
+        }
       },
     }),
   })

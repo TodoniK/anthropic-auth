@@ -148,7 +148,12 @@ async function readNativeAccounts(fixture: NativeOpencodeFixture) {
  */
 async function setupScopedSeat(root: string, rows: () => ScopedInventoryRow[]) {
   const discovery: NativeCustodyClient = {
-    listScoped: async () => ({ view: 'migration-discovery', rows: rows() }),
+    listScoped: async () => ({
+      view: 'migration-discovery',
+      rows: rows(),
+      grants: undefined,
+      grantTuples: undefined,
+    }),
     getScoped: async () => {
       throw new Error('Migration discovery must not read credential material')
     },
@@ -216,7 +221,12 @@ async function createPlugin(
 
 function mainClient(): NativeCustodyClient {
   return {
-    listScoped: async () => ({ view: 'view-1', rows: [mainRow] }),
+    listScoped: async () => ({
+      view: 'view-1',
+      rows: [mainRow],
+      grants: undefined,
+      grantTuples: undefined,
+    }),
     getScoped: async (input) => ({
       credentialId: input.credentialId,
       accountId: PRIMARY_ACCOUNT_ID,
@@ -367,6 +377,8 @@ test('a scoped main receipt never binds its quota to a roster primary that chang
     listScoped: async () => ({
       view: `view-${getScopedCalls}`,
       rows: [...rows],
+      grants: undefined,
+      grantTuples: undefined,
     }),
     getScoped: async (input) => {
       getScopedCalls += 1

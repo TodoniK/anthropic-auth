@@ -98,7 +98,12 @@ async function fixture() {
   let version = 1
   let rows: readonly Row[] = [listing(version)]
   const client: NativeCustodyClient = {
-    listScoped: async () => ({ view: `view-${rows[0]?.recordVersion}`, rows }),
+    listScoped: async () => ({
+      view: `view-${rows[0]?.recordVersion}`,
+      rows,
+      grants: undefined,
+      grantTuples: undefined,
+    }),
     getScoped: async (input) => ({
       credentialId: input.credentialId,
       accountId: rows.find((row) => row.id === input.credentialId)?.accountId,

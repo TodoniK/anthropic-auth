@@ -354,6 +354,8 @@ async function vault(
             createdAtMs: null,
           },
         ],
+        grants: undefined,
+        grantTuples: undefined,
       }
     },
     async getScoped(input) {
@@ -444,6 +446,8 @@ async function vaultWithFallback() {
       return {
         view: `oc2-view-${[...identities.values()].join('-')}-${[...states.values()].join('-')}`,
         rows: [...identities.keys()].map(row),
+        grants: undefined,
+        grantTuples: undefined,
       }
     },
     async getScoped(input) {

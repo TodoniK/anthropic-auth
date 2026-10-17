@@ -247,7 +247,12 @@ async function prepareVaultPool(
     custody: {
       connect: async () => ({
         async listScoped() {
-          return { view: 'custody-tombstone-migration', rows }
+          return {
+            view: 'custody-tombstone-migration',
+            rows,
+            grants: undefined,
+            grantTuples: undefined,
+          }
         },
         async getScoped() {
           throw new Error('Migration discovery must not read credentials')
@@ -527,6 +532,8 @@ describe('Claustrum custody tombstones', () => {
         return {
           view: 'custody-tombstone',
           rows: [vaultMainRow(MAIN_IDENTITY)],
+          grants: undefined,
+          grantTuples: undefined,
         }
       },
       async getScoped({ credentialId }) {
@@ -708,6 +715,8 @@ describe('Claustrum custody tombstones', () => {
           return {
             view: 'custody-tombstone',
             rows: [vaultMainRow(vaultIdentity)],
+            grants: undefined,
+            grantTuples: undefined,
           }
         },
         async getScoped({ credentialId }) {

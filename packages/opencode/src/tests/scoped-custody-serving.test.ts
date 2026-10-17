@@ -119,7 +119,12 @@ async function migrateScopedSeat(
   const discovery: NativeCustodyClient = {
     async listScoped() {
       listed++
-      return { view: 'migration-discovery', rows: options.rows() }
+      return {
+        view: 'migration-discovery',
+        rows: options.rows(),
+        grants: undefined,
+        grantTuples: undefined,
+      }
     },
     async getScoped() {
       throw new Error('Migration discovery must not read credential material')
@@ -297,7 +302,12 @@ describe('OpenCode scoped custody serving', () => {
       async listScoped() {
         counts.lists++
         arrivals.shift()?.()
-        return { view: 'shared-consumer', rows: [mainRow] }
+        return {
+          view: 'shared-consumer',
+          rows: [mainRow],
+          grants: undefined,
+          grantTuples: undefined,
+        }
       },
       async getScoped(input) {
         counts.gets++
@@ -454,7 +464,12 @@ describe('OpenCode scoped custody serving', () => {
       (await readNativeAccounts(fixture)).policyStorage.claustrum?.scopedRoster,
     ).toBeUndefined()
     const client: NativeCustodyClient = {
-      listScoped: async () => ({ view: 'identity', rows: [mainRow] }),
+      listScoped: async () => ({
+        view: 'identity',
+        rows: [mainRow],
+        grants: undefined,
+        grantTuples: undefined,
+      }),
       getScoped: async () => {
         throw new Error('no credential read expected')
       },
@@ -486,7 +501,12 @@ describe('OpenCode scoped custody serving', () => {
       legacyConfig: scopedLegacyConfig(),
     })
     const client: NativeCustodyClient = {
-      listScoped: async () => ({ view: 'live', rows: [mainRow] }),
+      listScoped: async () => ({
+        view: 'live',
+        rows: [mainRow],
+        grants: undefined,
+        grantTuples: undefined,
+      }),
       getScoped: async ({ credentialId }) => ({
         credentialId,
         accountId: mainRow.accountId!,
@@ -547,7 +567,12 @@ describe('OpenCode scoped custody serving', () => {
         listScoped: async () => {
           entered.open()
           await discovery.wait
-          return { view: 'ready', rows: [mainRow] }
+          return {
+            view: 'ready',
+            rows: [mainRow],
+            grants: undefined,
+            grantTuples: undefined,
+          }
         },
         getScoped: async ({ credentialId }) => ({
           credentialId,
@@ -656,7 +681,12 @@ describe('OpenCode scoped custody serving', () => {
         }),
       })
       const client: NativeCustodyClient = {
-        listScoped: async () => ({ view: 'admission', rows }),
+        listScoped: async () => ({
+          view: 'admission',
+          rows,
+          grants: undefined,
+          grantTuples: undefined,
+        }),
         getScoped: async ({ credentialId }) => {
           const row = rows.find((row) => row.id === credentialId)
           if (row?.state !== 'active') throw new Error('not-active')
@@ -774,6 +804,8 @@ describe('OpenCode scoped custody serving', () => {
       listScoped: async () => ({
         view: `view-${rows.length}`,
         rows: [...rows],
+        grants: undefined,
+        grantTuples: undefined,
       }),
       getScoped: async (input) => {
         gets.push(input)
@@ -935,7 +967,12 @@ describe('OpenCode scoped custody serving', () => {
       providerStatus: number
     }> = []
     const scopedClient: NativeCustodyClient = {
-      listScoped: async () => ({ view: 'v1', rows: [mainRow] }),
+      listScoped: async () => ({
+        view: 'v1',
+        rows: [mainRow],
+        grants: undefined,
+        grantTuples: undefined,
+      }),
       getScoped: async (input) => ({
         credentialId: input.credentialId,
         accountId: mainRow.accountId,
@@ -1142,7 +1179,12 @@ test('provider initialization does not wait for a stalled scoped discovery conne
     releaseConnect = resolve
   })
   const client: NativeCustodyClient = {
-    listScoped: async () => ({ rows: [mainRow], view: 'v' }),
+    listScoped: async () => ({
+      rows: [mainRow],
+      view: 'v',
+      grants: undefined,
+      grantTuples: undefined,
+    }),
     getScoped: async () => {
       throw new Error('no dispatch expected')
     },
@@ -1198,7 +1240,12 @@ for (const { outcome, finalStatus } of [
     const reports: number[] = []
     const wireTokens: string[] = []
     const scopedClient: NativeCustodyClient = {
-      listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
+      listScoped: async () => ({
+        view: 'main-only',
+        rows: [mainRow],
+        grants: undefined,
+        grantTuples: undefined,
+      }),
       getScoped: async ({ credentialId }) => ({
         credentialId,
         accountId: mainRow.accountId,
@@ -1274,7 +1321,12 @@ for (const mode of ['transport-error', 'relay-auth-401'] as const) {
     const reports: number[] = [],
       direct: string[] = []
     const scopedClient: NativeCustodyClient = {
-      listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
+      listScoped: async () => ({
+        view: 'main-only',
+        rows: [mainRow],
+        grants: undefined,
+        grantTuples: undefined,
+      }),
       getScoped: async ({ credentialId }) => {
         events.push(`vault read v${version}`)
         return {
@@ -1361,7 +1413,12 @@ for (const finalStatus of [200, 401]) {
     const reports: number[] = [],
       relayTokens: string[] = []
     const scopedClient: NativeCustodyClient = {
-      listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
+      listScoped: async () => ({
+        view: 'main-only',
+        rows: [mainRow],
+        grants: undefined,
+        grantTuples: undefined,
+      }),
       getScoped: async ({ credentialId }) => ({
         credentialId,
         accountId: mainRow.accountId,
@@ -1482,7 +1539,12 @@ test('optimistic WebSocket reports only the scoped version used by its real upst
     const reports: number[] = []
     const reported = lifetimes.gate()
     const scopedClient: NativeCustodyClient = {
-      listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
+      listScoped: async () => ({
+        view: 'main-only',
+        rows: [mainRow],
+        grants: undefined,
+        grantTuples: undefined,
+      }),
       getScoped: async ({ credentialId }) => {
         const version = Math.min(++gets, 2)
         return {

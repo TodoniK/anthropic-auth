@@ -108,7 +108,7 @@ function fixture(options: Partial<NativeCustodyOptions> = {}) {
   const client: NativeCustodyClient = {
     listScoped: async (token) => {
       lists.push(token)
-      return { view: 'view-1', rows }
+      return { view: 'view-1', rows, grants: undefined, grantTuples: undefined }
     },
     getScoped: async (input) => {
       gets.push(input)

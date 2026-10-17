@@ -290,6 +290,8 @@ test('published Claustrum client decodes scoped and enrollment replies', async (
       },
     ],
     view: 'synthetic-view-1',
+    grants: undefined,
+    grantTuples: undefined,
   })
 
   const status = await client.statusCredential(credentialId)

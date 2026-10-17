@@ -567,7 +567,12 @@ describe('vault custody controls through the Pi /claude menu', () => {
         quota: nativeQuotaCodec,
       }).initialize()
       const client: NativeCustodyClient = {
-        listScoped: async () => ({ view: 'synthetic', rows: [listedVaultRow] }),
+        listScoped: async () => ({
+          view: 'synthetic',
+          rows: [listedVaultRow],
+          grants: undefined,
+          grantTuples: undefined,
+        }),
         getScoped: async (input) => ({
           credentialId: input.credentialId,
           accountId: listedVaultRow.accountId,

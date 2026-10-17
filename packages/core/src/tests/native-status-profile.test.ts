@@ -149,6 +149,8 @@ async function vaultFixture() {
           createdAtMs: null,
         },
       ],
+      grants: undefined,
+      grantTuples: undefined,
     }),
     getScoped: async (input) => ({
       credentialId: input.credentialId,

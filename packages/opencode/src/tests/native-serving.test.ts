@@ -682,6 +682,8 @@ async function migrateServingFixture(
               ]
             : []),
         ],
+        grants: undefined,
+        grantTuples: undefined,
       }
     },
     async getScoped({ credentialId }) {

@@ -185,6 +185,8 @@ async function fixture(
     listScoped: async () => ({
       rows,
       view: createHash('sha256').update(JSON.stringify(rows)).digest('hex'),
+      grants: undefined,
+      grantTuples: undefined,
     }),
     getScoped: async (input) => {
       gets.push(input)
