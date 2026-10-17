@@ -24,6 +24,7 @@ import {
   CLAUDE_POOL_LOGIN_METHOD_LABEL,
   CLAUDE_VAULT_ACTIVATION_METHOD_ID,
 } from './activation'
+import { createNativeCacheKeep, type NativeCacheKeepOptions } from './cachekeep'
 import { installNativeAnthropic } from './install'
 import { startNativeAnthropicLifecycle } from './lifecycle'
 import { createNativeMenuCapabilities } from './menu'
@@ -48,6 +49,7 @@ export interface AnthropicAuthV2Options {
   readonly local?: NativeAccountRuntimeOptions['local']
   readonly vault?: NativeAccountRuntimeOptions['vault']
   readonly fetch?: typeof fetch
+  readonly cacheKeep?: NativeCacheKeepOptions
 }
 
 /** The OAuth result a completed Claude Pro / Max sign-in hands to the pool. */
@@ -223,6 +225,7 @@ export async function setupAnthropicAuth(
   const models = createNativeClaudeModelRules()
   let lifecycle: ReturnType<typeof startNativeAnthropicLifecycle> | undefined
   let prime: ReturnType<typeof createNativePrime> | undefined
+  let cacheKeep: ReturnType<typeof createNativeCacheKeep> | undefined
   const source: NativeSource = createNativeAnthropicSource({
     runtime,
     paths,
@@ -231,6 +234,13 @@ export async function setupAnthropicAuth(
     responseOptions: wire.responseOptions,
     onRequestId: wire.onRequestId,
     onForgetSession: wire.forgetSession,
+    onRequestPrepared: async (input) => {
+      try {
+        await cacheKeep?.track(input)
+      } catch {
+        logger.warn('cachekeep', 'live request tracking failed')
+      }
+    },
     resolveModelId: async (scope) => models.modelId(scope.modelID),
     onOwnedRequest: () => {
       lifecycle ??= startNativeAnthropicLifecycle(runtime, options.fetch)
@@ -242,9 +252,26 @@ export async function setupAnthropicAuth(
       })
     },
   })
+  cacheKeep = createNativeCacheKeep({
+    ...options.cacheKeep,
+    runtime,
+    source,
+    fetch: options.fetch,
+    isSubagent: async (sessionID) =>
+      Boolean(
+        (
+          await ctx.session.get({
+            sessionID: sessionID as Parameters<
+              Plugin.Context['session']['get']
+            >[0]['sessionID'],
+          })
+        ).parentID,
+      ),
+  })
   const capabilities = createNativeMenuCapabilities({
     runtime,
     source,
+    cacheKeepRegistry: cacheKeep.registry,
     start: async (sessionID, text) => {
       await ctx.session.synthetic({
         sessionID,
@@ -262,9 +289,10 @@ export async function setupAnthropicAuth(
       log: { warn: (message, data) => logger.warn('opencode2', message, data) },
     },
     { credential: preparedAnthropicCredential },
-  ).catch((error: unknown) => {
+  ).catch(async (error: unknown) => {
     capabilities.close()
-    source.close()
+    await cacheKeep?.dispose()
+    await source.close()
     runtime.close()
     throw error
   })
@@ -279,6 +307,7 @@ export async function setupAnthropicAuth(
         installation.dispose(),
         lifecycle?.dispose(),
         prime?.dispose(),
+        cacheKeep?.dispose(),
         ...registrations.map((registration) => registration.dispose()),
       ])
       // Prime and transport teardown can finish attempts after source shutdown

@@ -1,14 +1,20 @@
 import {
   type AuthorizationResult,
   authorize,
+  buildCacheKeepStatusSummary,
   buildClaudeQuotaSummary,
   buildPrimeAccountStatuses,
   buildPrimeStatusSummary,
+  type CacheKeepSessionRegistry,
   CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
   exchange,
   formatNativeAccountState,
   formatOAuthAccountTier,
+  getCacheKeepWindow,
   getHostClaustrumEnrollmentPaths,
+  isCacheKeepAlways,
+  isCacheKeepHybridActive,
+  isCacheKeepPersistentlyEnabled,
   type NativeAccountRuntime,
   type NativeMenuDispatch,
   resetClaustrumEnrollmentState,
@@ -28,6 +34,7 @@ const record = (value: unknown): Record<string, unknown> =>
 export function createNativeMenuCapabilities(options: {
   readonly runtime: NativeAccountRuntime
   readonly source: NativeSource
+  readonly cacheKeepRegistry?: CacheKeepSessionRegistry
   readonly start: (sessionID: string, text: string) => Promise<void>
 }): NativeMenuCapabilities {
   const { runtime, source } = options
@@ -285,6 +292,20 @@ export function createNativeMenuCapabilities(options: {
           enabled: snapshot.policyStorage.prime?.enabled === true,
           accounts: buildPrimeAccountStatuses(snapshot.policyStorage),
         }).replace(/Usage:[^\n]*/, 'Use /claude to change Prime settings.')
+      if (command === 'cachekeep') {
+        const sessions = (await options.cacheKeepRegistry?.list()) ?? []
+        return buildCacheKeepStatusSummary({
+          enabled: isCacheKeepPersistentlyEnabled(snapshot.policyStorage),
+          always: isCacheKeepAlways(snapshot.policyStorage),
+          hybridActive: isCacheKeepHybridActive(snapshot.policyStorage),
+          trackedSessionDetails: sessions,
+          window: getCacheKeepWindow(snapshot.policyStorage),
+          trackedSessions: sessions.length,
+          nextPrewarmAt: sessions.length
+            ? Math.min(...sessions.map((session) => session.nextPrewarmAt))
+            : undefined,
+        })
+      }
       const fields = {
         routing: 'routing',
         killswitch: 'killswitch',

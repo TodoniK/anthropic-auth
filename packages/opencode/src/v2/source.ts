@@ -98,6 +98,7 @@ export interface NativeSourceOptions {
   ) => void
   readonly onForgetSession?: (sessionID: string) => void
   readonly onOwnedRequest?: () => void
+  readonly onRequestPrepared?: NativeSource['onRequestPrepared']
   readonly fetch?: typeof fetch
   /** Resolve a host model alias to the upstream ID before request-local policy. */
   readonly resolveModelId?: (scope: RequestScope) => Promise<string>
@@ -579,6 +580,7 @@ export function createNativeAnthropicSource(
         scope: { ...state.scope, modelID: input.modelID },
       })
     },
+    onRequestPrepared: (input) => options.onRequestPrepared?.(input),
     responseOptions(input) {
       return options.responseOptions?.({
         ...input,

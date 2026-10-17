@@ -295,6 +295,13 @@ export interface NativeAnthropicSource<Q, P> {
   readonly admitRequest?: (
     input: NativeAnthropicAttemptContext<P>,
   ) => Promise<void> | void
+  /** Observe the admitted OAuth wire body before any relay envelope is added. */
+  readonly onRequestPrepared?: (
+    input: NativeAnthropicAttemptContext<P> & {
+      readonly url: string
+      readonly bodyText: string
+    },
+  ) => Promise<void> | void
   /** Response observers for an OAuth response. */
   readonly responseOptions?: (
     input: NativeAnthropicResponseContext<P>,
@@ -1034,6 +1041,14 @@ export function createNativeAnthropicAdapter<Q, P>(
         request.url,
         send.baseURL !== undefined ? { baseURL: send.baseURL } : {},
       ).url?.toString() ?? request.url
+    if (data.route === 'oauth' && messages && body !== undefined) {
+      await source.onRequestPrepared?.({
+        ...contextOf(attempt, data),
+        url,
+        bodyText: body,
+      })
+      ensureLive()
+    }
     if (send.dispatch?.kind === 'http-relay') {
       // Each HTTP relay attempt sends the complete upstream body, not a patch.
       // A host retry authorizes credentials again and builds a new envelope;
