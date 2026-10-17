@@ -2841,9 +2841,11 @@ const anthropicAuthPlugin = async (
   }
 
   let fallbackQuotaRefreshQueue: Promise<void> = Promise.resolve()
-  // `purpose` tells vault custody whether this sweep is the background tick
-  // or a request's admission, which decides how insula's quota cache is used.
-  // Explicit refreshes leave it unset and always poll Anthropic.
+  // `purpose` tells the vault runtime whether this sweep is the background
+  // tick or a request's admission. That decides how it uses insula (the
+  // vault daemon's quota monitor) instead of a usage GET; see
+  // NativeVaultQuotaPurpose. Explicit refreshes leave it unset and always
+  // poll Anthropic.
   function refreshFallbackQuotas(
     force = false,
     requiredByPolicy = false,

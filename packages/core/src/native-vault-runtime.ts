@@ -404,7 +404,8 @@ export function createNativeVaultRuntime(
         listScoped: unused,
         getScoped: unused,
         reportAuthFailureScoped: unused,
-        // The connection belongs to this runtime's custody, which closes it.
+        // Nothing to close here: the connection belongs to this runtime's
+        // custody, which closes it when the runtime closes.
         close: () => {},
         ...(transport && { insula: transport }),
       }

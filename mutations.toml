@@ -1058,6 +1058,18 @@ command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/quota-
 test_count_pattern = "CKDEV executed {count} tests"
 expect_red = ["physical quota GET starts stay one second apart when the first GET fails"]
 expect_message = "error: expect(received).toBeGreaterThanOrEqual(expected)"
+[[control]]
+id = "vault-insula-joins-roster-route-account"
+guards = "A background insula lookup must join the account of the roster row the route resolves to; the primary account's logical id names no roster row and would never join."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "swept = await insula.cachedInsulaQuotaForRoute(row.routeId)"
+new = "swept = await insula.cachedInsulaQuotaForRoute(routeId) // NON-VACUITY BREAK: join on the logical id"
+test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["the primary account is looked up in insula by its roster route, not its logical id"]
+expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
@@ -1074,6 +1086,20 @@ command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/quota-
 test_count_pattern = "CKDEV executed {count} tests"
 expect_red = ["physical quota GET starts stay one second apart when the first GET fails", "the second physical quota GET first requests the rest of the one-second gap"]
 expect_message = '/error: expect\(received\)\.(toBeGreaterThanOrEqual|toEqual)\(expected\)/'
+[[control]]
+id = "vault-insula-reading-skips-usage-poll"
+guards = "A current insula reading for a vault account must replace that account's usage GET; only a miss polls Anthropic."
+file = "packages/core/src/native-vault-runtime.ts"
+old = '''          if (reading) {
+            const stored'''
+new = '''          if (reading && false) { // NON-VACUITY BREAK: always poll
+            const stored'''
+test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["background sweep takes a fresh insula reading and sends no usage GET", "the primary account is looked up in insula by its roster route, not its logical id", "a stale, missing or failed insula entry falls back to one usage GET for that account only", "admission reads only the insula cache: never refreshes it, polls on a miss", "the Fable window from extraRateWindows drives scoped routing and the scoped killswitch floor", "the source switch is logged once per change with fixed codes and no identity"]
+expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"

@@ -287,7 +287,8 @@ export function createNativeAnthropicSource(
               getQuotaCheckIntervalMs(snapshot.policyStorage)
           if (fresh) continue
           try {
-            // Admission: vault custody may answer from insula's cache, then
+            // Admission: for a vault account the runtime may answer from its
+            // cached insula reading (the vault daemon's quota monitor), then
             // polls on a miss; it never refreshes that cache here.
             await runtime.fetchQuota(
               account.id,

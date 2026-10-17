@@ -278,6 +278,20 @@ test('background sweep takes a fresh insula reading and sends no usage GET', asy
   expect(stored?.quotaCheckedAt).toBe(fetchedAt)
 })
 
+test('the primary account is looked up in insula by its roster route, not its logical id', async () => {
+  const f = await fixture(() => [entry(uuid)])
+  const quota = await f.runtime.fetchQuota(
+    'main',
+    f.usage,
+    undefined,
+    undefined,
+    'background',
+  )
+  expect(f.counts.usage).toEqual([])
+  expect(quota.accountIdentity).toBe(uuid)
+  expect(quota.five_hour?.checkedAt).toBe(fetchedAt)
+})
+
 test('a stale, missing or failed insula entry falls back to one usage GET for that account only', async () => {
   for (const work of [
     entry(uuid2, { stale: true }),
@@ -366,7 +380,10 @@ test('admission reads only the insula cache: never refreshes it, polls on a miss
   expect(cached).toHaveBeenCalledTimes(2)
   expect(f.counts.insula).toBe(1)
   expect(f.counts.usage).toEqual([bearer(workRow.id), bearer(mainRow.id)])
-  expect(quota.five_hour?.checkedAt).toBe(fetchedAt)
+  // The cold poll above is newer than insula's fetch, so its standard windows
+  // stay; the Fable window only insula reported is added.
+  expect(quota.five_hour).toMatchObject({ usedPercent: 10, checkedAt: now })
+  expect(quota.scoped?.map((window) => window.checkedAt)).toEqual([fetchedAt])
 })
 
 test('a quota read without a purpose polls Anthropic and leaves insula alone', async () => {

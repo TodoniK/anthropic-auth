@@ -28,7 +28,7 @@ function text(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
-// Same bounds as the usage poll's mapping in accounts.ts.
+// Keep percentages within 0-100, as the usage poll's mapping in accounts.ts does.
 function clampPercent(value: number) {
   return Math.min(100, Math.max(0, value))
 }

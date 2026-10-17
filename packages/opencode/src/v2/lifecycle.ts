@@ -41,8 +41,9 @@ export function startNativeAnthropicLifecycle(
       ) {
         // Each quota reading or failure is bound to the credential version
         // used for its request, so a late result cannot affect a newer login.
-        // The background tick: vault custody takes a current insula
-        // reading instead of a usage GET when one exists for this account.
+        // This is the background tick: for a vault account the runtime uses
+        // a current reading from insula (the vault daemon's quota monitor)
+        // instead of a usage GET when one exists; see NativeVaultQuotaPurpose.
         await runtime
           .fetchQuota(
             account.id,
