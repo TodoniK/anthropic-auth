@@ -5,7 +5,6 @@ import {
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
   FAST_MODE_BETA,
-  MID_CONVERSATION_OUTPUT_CONFIG_BETA,
   OPENCODE_IDENTITY_PREFIX,
   PER_TURN_CONTROL_BETA,
   REQUIRED_BETAS,
@@ -514,7 +513,7 @@ describe('setOAuthHeaders', () => {
     })
     const firstTurnHeaders = new Headers()
     setOAuthHeaders(firstTurnHeaders, 'token', { body: firstTurnBody })
-    expect(firstTurnHeaders.get('anthropic-beta')).not.toContain(
+    expect(firstTurnHeaders.get('anthropic-beta')).toContain(
       'thinking-binding-controls-2026-08-01',
     )
 
@@ -564,7 +563,7 @@ describe('setOAuthHeaders', () => {
       expect(body.thinking.block_binding).toBeUndefined()
       const headers = new Headers()
       setOAuthHeaders(headers, 'token', { body })
-      expect(headers.get('anthropic-beta')).not.toContain(
+      expect(headers.get('anthropic-beta')).toContain(
         'thinking-binding-controls-2026-08-01',
       )
     }
@@ -663,7 +662,7 @@ describe('setOAuthHeaders', () => {
     expect(betweenTools.thinking).toEqual({ type: 'between_tools' })
     const headers = new Headers()
     setOAuthHeaders(headers, 'token', { body: betweenTools })
-    expect(headers.get('anthropic-beta')).not.toContain(
+    expect(headers.get('anthropic-beta')).toContain(
       'thinking-binding-controls-2026-08-01',
     )
   })
@@ -693,18 +692,24 @@ describe('setOAuthHeaders', () => {
     setOAuthHeaders(headers, 'token', { body })
 
     expect(body.thinking.block_binding).toBeUndefined()
-    expect(headers.get('anthropic-beta')).not.toContain(
+    expect(headers.get('anthropic-beta')).toContain(
       THINKING_BINDING_CONTROLS_BETA,
     )
   })
 
-  test('always adds the mid-conversation output-config beta for OAuth Fable 5.1', () => {
+  test('always adds per-turn control without obsolete betas for OAuth Fable 5.1', () => {
     const fable51 = new Headers()
     setOAuthHeaders(fable51, 'token', {
       body: { model: 'claude-fable-5-1', messages: [] },
     })
     expect(fable51.get('anthropic-beta')?.split(',')).toContain(
-      MID_CONVERSATION_OUTPUT_CONFIG_BETA,
+      PER_TURN_CONTROL_BETA,
+    )
+    expect(fable51.get('anthropic-beta')?.split(',')).not.toContain(
+      'mid-conversation-output-config-2026-07-01',
+    )
+    expect(fable51.get('anthropic-beta')?.split(',')).not.toContain(
+      'mid-conversation-system-2026-04-07',
     )
 
     for (const model of [
@@ -715,7 +720,7 @@ describe('setOAuthHeaders', () => {
       const headers = new Headers()
       setOAuthHeaders(headers, 'token', { body: { model, messages: [] } })
       expect(headers.get('anthropic-beta')?.split(',')).not.toContain(
-        MID_CONVERSATION_OUTPUT_CONFIG_BETA,
+        PER_TURN_CONTROL_BETA,
       )
     }
   })
@@ -1024,7 +1029,7 @@ describe('setOAuthHeaders', () => {
     setOAuthHeaders(headers, 'token', { body })
     const betas = headers.get('anthropic-beta')?.split(',')
     expect(betas).toContain(PER_TURN_CONTROL_BETA)
-    expect(betas).not.toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+    expect(betas).not.toContain('mid-conversation-output-config-2026-07-01')
 
     // Sonnet 5.5's thinking opt-out becomes between_tools, which rejects a
     // changed per-message effort, so the host's top-level effort stays.

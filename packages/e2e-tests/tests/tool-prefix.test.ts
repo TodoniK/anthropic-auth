@@ -170,7 +170,7 @@ describe('OpenCode Anthropic auth e2e', () => {
       const serialized = JSON.stringify(request.body)
       expect(serialized).not.toContain('cortexkit-internal-effort')
       expect(request.headers['anthropic-beta']?.split(',')).toContain(
-        'mid-conversation-output-config-2026-07-01',
+        'per-turn-control-2026-07-01',
       )
     }
   }, 90_000)

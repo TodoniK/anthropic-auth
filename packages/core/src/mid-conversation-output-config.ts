@@ -5,14 +5,10 @@ import {
   isClaudeSonnet55Model,
 } from './models.ts'
 
-/** Per-message effort beta sent with every OAuth Fable 5.1 request. */
-export const MID_CONVERSATION_OUTPUT_CONFIG_BETA =
-  'mid-conversation-output-config-2026-07-01'
-
 /**
- * Per-turn control beta that Claude Code sends on every Opus 5.5 and Sonnet
- * 5.5 request. It enables effort changes carried by an empty `role: "system"`
- * message on those two models.
+ * Per-turn control beta that Claude Code sends on Opus 5.5, Sonnet 5.5,
+ * Fable 5.1 and Haiku 5.5. It enables effort changes carried by empty
+ * `role: "system"` messages on the eligible models below.
  */
 export const PER_TURN_CONTROL_BETA = 'per-turn-control-2026-07-01'
 
@@ -45,22 +41,9 @@ export function normalizeAdaptiveEffort(
 }
 
 /**
- * Whether an OAuth request for this model carries the Fable 5.1 per-message
- * effort beta (`MID_CONVERSATION_OUTPUT_CONFIG_BETA`). Opus 5.5 and Sonnet
- * 5.5 use `PER_TURN_CONTROL_BETA` instead.
- */
-export function usesMidConversationOutputConfig(
-  body: Record<string, unknown>,
-): boolean {
-  return isClaudeFable51Model(body.model)
-}
-
-/**
- * Opus 5.5 and Sonnet 5.5, including dated and `[1m]` context-window ids.
- * Their OAuth requests always carry `PER_TURN_CONTROL_BETA`, as Claude Code's
- * do. Anthropic also documents per-message effort for Mythos 5.1, Opus 5 and
- * Haiku 5.5, but without a Claude Code capture to match, those models keep
- * sending requests without the beta or effort markers.
+ * Models that require adaptive thinking for per-message effort: Opus 5.5
+ * and Sonnet 5.5, including dated and `[1m]` context-window ids. Header
+ * eligibility is separate; `sendsPerTurnControlBeta` follows Claude Code.
  */
 export function usesPerTurnControl(model: unknown): boolean {
   return isClaudeOpus55Model(model) || isClaudeSonnet55Model(model)

@@ -22,7 +22,6 @@ import {
   countUserPrompts,
   createSseFramer,
   FAST_MODE_BETA,
-  hasThinkingBindingControls,
   isClaudeFableOrMythos5Model,
   isClaudeFableOrMythos51Model,
   isClaudeHaiku55Model,
@@ -32,7 +31,6 @@ import {
   isClaudeSonnet55Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
-  MID_CONVERSATION_OUTPUT_CONFIG_BETA,
   mergeAnthropicBetas,
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
@@ -46,11 +44,9 @@ import {
   stripBillingLineageFromBody,
   stripEmptyTrailingAssistantMessages,
   TEXT_REPLACEMENTS,
-  THINKING_BINDING_CONTROLS_BETA,
   type ThinkingPrefixMismatchBehavior,
   TOOL_PREFIX,
   TrailingAssistantHistoryError,
-  usesMidConversationOutputConfig,
 } from '@cortexkit/anthropic-auth-core'
 import {
   applyEdits,
@@ -281,12 +277,6 @@ export function setOAuthHeaders(
     extraBetas: [
       ...(options.body?.fallbacks === 'default'
         ? [SERVER_SIDE_FALLBACK_BETA]
-        : []),
-      ...(options.body && hasThinkingBindingControls(options.body)
-        ? [THINKING_BINDING_CONTROLS_BETA]
-        : []),
-      ...(options.body && usesMidConversationOutputConfig(options.body)
-        ? [MID_CONVERSATION_OUTPUT_CONFIG_BETA]
         : []),
     ],
   })

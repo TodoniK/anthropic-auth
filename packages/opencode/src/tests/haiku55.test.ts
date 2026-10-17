@@ -161,7 +161,7 @@ test.each(['error', 'drop_block'] as const)(
   },
 )
 
-test('OpenCode Haiku first turns, account-default replay and disabled thinking do not opt in', async () => {
+test('OpenCode Haiku advertises binding support without opting first turns, account-default replay or disabled thinking into a binding field', async () => {
   const bodies = [
     await rewrite({}, { thinkingPrefixMismatchBehavior: 'drop_block' }),
     await rewrite(
@@ -178,7 +178,7 @@ test('OpenCode Haiku first turns, account-default replay and disabled thinking d
     const headers = setOAuthHeaders(new Headers(), 'synthetic-access-token', {
       body,
     })
-    expect(headers.get('anthropic-beta')?.split(',')).not.toContain(
+    expect(headers.get('anthropic-beta')?.split(',')).toContain(
       THINKING_BINDING_CONTROLS_BETA,
     )
   }

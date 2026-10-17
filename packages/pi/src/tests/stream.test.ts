@@ -296,6 +296,9 @@ describe('Pi API fallback routing helpers', () => {
       'thinking-binding-controls-2026-08-01',
     )
     expect(requestHeaders?.get('anthropic-beta')).toContain(
+      'per-turn-control-2026-07-01',
+    )
+    expect(requestHeaders?.get('anthropic-beta')?.split(',')).not.toContain(
       'mid-conversation-output-config-2026-07-01',
     )
   })

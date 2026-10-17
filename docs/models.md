@@ -33,7 +33,7 @@ OpenCode's OAuth model costs are zeroed by default because subscription use is q
 
 Fable/Mythos reasoning uses `thinking: { type: "adaptive", display: "summarized" }` with `output_config.effort`, not manual `budget_tokens`. Opus 5/5.5 and Sonnet 5/5.5 also request summarized adaptive thinking so the host can display reasoning.
 
-OpenCode exposes native `low`, `medium`, `high`, `xhigh` and `max` effort variants for Fable 5.1, Opus 5/5.5, Sonnet 5.5 and Haiku 5.5. On OAuth routes, effort changes for Fable 5.1, Opus 5.5 and Sonnet 5.5 are carried as mid-conversation system messages rather than rewriting the cached prefix. Opus 5.5 and Sonnet 5.5 need adaptive thinking for this; Sonnet 5.5 `between_tools` keeps the host's top-level effort. Opus 5, Haiku 5.5 and Mythos 5.1 still change the top-level effort. OpenCode 2 supplies its own system messages recording each effort change at that point in the conversation; the plugin does not insert a second copy of those effort-change system messages or alter earlier cached history.
+OpenCode exposes native `low`, `medium`, `high`, `xhigh` and `max` effort variants for Fable 5.1, Opus 5/5.5, Sonnet 5.5 and Haiku 5.5. On OAuth routes, effort changes for Fable 5.1, Opus 5.5 and Sonnet 5.5 are carried as empty mid-conversation system messages with `output_config.effort`, under `per-turn-control-2026-07-01`, rather than rewriting the cached prefix. Opus 5.5 and Sonnet 5.5 need adaptive thinking for this; Sonnet 5.5 `between_tools` keeps the host's top-level effort. Opus 5, Haiku 5.5 and Mythos 5.1 still change the top-level effort; Haiku 5.5 carries the per-turn-control beta to match Claude Code but does not receive effort markers. OpenCode 2 supplies its own system messages recording each effort change at that point in the conversation; the plugin does not insert a second copy of those effort-change system messages or alter earlier cached history.
 
 - **Opus 5.5:** adaptive thinking is always on. Disabled thinking and manual budgets are replaced with summarized adaptive thinking. Forced tool choice is removed.
 - **Opus 5:** an explicit disabled-thinking request is preserved; incompatible `xhigh`/`max` effort is capped to `high`.
@@ -50,7 +50,15 @@ Anthropic associates replayed reasoning blocks with the messages, instructions a
 | `error` | Ask Anthropic to reject a prefix mismatch |
 | `drop_block` | Ask Anthropic to discard mismatched thinking blocks |
 
-For an explicit `error` or `drop_block` value, the plugin sends the selected server policy as `thinking.block_binding` and enables the thinking-binding beta, but only when adaptive thinking replays a signed `thinking` or nonempty `redacted_thinking` block. It does not apply to Sonnet's `between_tools` mode or a first turn without replayed thinking. See [settings ownership](configuration.md#settings).
+For an explicit `error` or `drop_block` value, the plugin sends the selected server policy as `thinking.block_binding`, but only when adaptive thinking replays a signed `thinking` or nonempty `redacted_thinking` block. The field does not apply to Sonnet's `between_tools` mode or a first turn without replayed thinking. OAuth main requests advertise the thinking-binding beta even without a binding field, matching Claude Code 2.1.302; advertising support alone does not select a server policy. See [settings ownership](configuration.md#settings).
+
+## OAuth beta lists
+
+Beta selection follows the request class, not the presence of tools or companion body fields. Conversation turns use Claude Code 2.1.302's main list, including `thinking-binding-controls-2026-08-01`. Auxiliary one-token, non-streaming quota probes without thinking, tools or structured output use the smaller quota list; other auxiliary requests use the title/summary list, including `redact-thinking-2026-02-12`. JSON-schema requests additionally advertise structured output; fast mode, server-side fallback and context-window feature betas retain their existing request-dependent selection.
+
+The main list sends `per-turn-control-2026-07-01` for Sonnet 5.5, Opus 5.5, Fable 5.1 and Haiku 5.5, but not Opus 4.8. Haiku 5.5 places `claude-code-20250219` after the prompt-caching-scope beta. The obsolete mid-conversation-system and mid-conversation-output-config betas are absent. Advisor-tool and fallback-credit are also absent because the plugin neither enables an advisor nor supplies a fallback credit code. `server-side-fallback` is a separate request feature and is unchanged.
+
+The beta lists match the capture, including `thinking-display-updates-2026-08-18` on main requests. Our bodies keep `thinking.display: "summarized"` where Claude Code sends `"updates"`, because `"updates"` streams no thinking text. The beta alone does not suppress summarized thinking. The binding fields and effort-marker bodies are unchanged.
 
 ## Claude fast mode
 

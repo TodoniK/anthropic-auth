@@ -24,7 +24,6 @@ import {
   getRoutingMode,
   getScopedQuotaWindowForModel,
   getThinkingPrefixMismatchBehavior,
-  hasThinkingBindingControls,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
   isDumpPersistentlyEnabled,
@@ -36,7 +35,6 @@ import {
   isValidApiBaseURL,
   killswitchPassesPolicy,
   logger,
-  MID_CONVERSATION_OUTPUT_CONFIG_BETA,
   type MidConversationEffortTransition,
   mergeAnthropicBetas,
   type NativeAccountSnapshot,
@@ -67,8 +65,6 @@ import {
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
-  THINKING_BINDING_CONTROLS_BETA,
-  usesMidConversationOutputConfig,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Api,
@@ -270,8 +266,8 @@ function getPiCacheKeepRegistry() {
  * betas this body needs. Model requests and CacheKeep prewarms both call it:
  * a prewarm replays a model request's body, and Anthropic needs the same
  * betas to accept it (for example, the effort beta for the empty
- * `role: "system"` effort markers in a Fable 5.1 body). `leadingBetas` are
- * placed before the body's betas.
+ * `role: "system"` effort markers in a Fable 5.1 body). `leadingBetas` appends
+ * adapter-requested feature betas without changing Core's model-beta selection.
  */
 function applyPiOAuthRequestHeaders(
   headers: Headers,
@@ -286,15 +282,7 @@ function applyPiOAuthRequestHeaders(
   applyClaudeCodeHeaders(headers, accessToken, {
     body,
     identity: options.identity,
-    extraBetas: [
-      ...(options.leadingBetas ?? []),
-      ...(hasThinkingBindingControls(body)
-        ? [THINKING_BINDING_CONTROLS_BETA]
-        : []),
-      ...(usesMidConversationOutputConfig(body)
-        ? [MID_CONVERSATION_OUTPUT_CONFIG_BETA]
-        : []),
-    ],
+    extraBetas: options.leadingBetas,
   })
   if (body.speed === 'fast')
     headers.set(

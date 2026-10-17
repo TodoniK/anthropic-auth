@@ -384,15 +384,10 @@ export function applyClaudeCodeMetadata(
   return true
 }
 
-// Claude Code sends redact-thinking-2026-02-12 (2.1.258 to 2.1.302), but it
-// suppresses thinking-block content that OpenCode displays; deliberately
-// omitted after A/B proof on 2026-09-01.
-//
-// The lists follow Claude Code 2.1.302's order. Some betas Claude Code adds
-// only when a feature flag or entitlement is on (advisor-tool, fallback-credit,
-// mid-conversation-system): they are kept because real users' requests carry
-// them. thinking-display-updates-2026-08-18 is omitted because it goes with
-// `thinking.display: "updates"`, and these requests keep `"summarized"`.
+// The lists follow Claude Code 2.1.302's main, title and quota requests.
+// Advisor and fallback-credit betas require features these requests do not use.
+// The display-updates beta does not change the body: summarized thinking still
+// streams text, unlike Claude Code's `thinking.display: "updates"`.
 export const CLAUDE_CODE_FULL_AGENT_BETAS = [
   'claude-code-20250219',
   'oauth-2025-04-20',
@@ -401,41 +396,35 @@ export const CLAUDE_CODE_FULL_AGENT_BETAS = [
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
   'mid-conversation-tool-changes-2026-07-01',
-  'advisor-tool-2026-03-01',
   'advanced-tool-use-2025-11-20',
-  'mid-conversation-system-2026-04-07',
   'mid-conversation-system-clear-at-2026-08-21',
   'effort-2025-11-24',
-  'fallback-credit-2026-06-01',
   'thinking-binding-controls-2026-08-01',
+  'thinking-display-updates-2026-08-18',
   'extended-cache-ttl-2025-04-11',
   'cache-diagnosis-2026-04-07',
 ] as const
 
-const CLAUDE_CODE_STRUCTURED_OUTPUT_BETAS = [
+const CLAUDE_CODE_TITLE_BETAS = [
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
+  'redact-thinking-2026-02-12',
   'thinking-token-count-2026-05-13',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
   'mid-conversation-tool-changes-2026-07-01',
-  'advisor-tool-2026-03-01',
   'mid-conversation-system-clear-at-2026-08-21',
   'effort-2025-11-24',
-  'structured-outputs-2025-12-15',
   'cache-diagnosis-2026-04-07',
 ] as const
 
-const CLAUDE_CODE_BASE_BETAS = [
+const CLAUDE_CODE_QUOTA_BETAS = [
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
+  'redact-thinking-2026-02-12',
   'thinking-token-count-2026-05-13',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'advisor-tool-2026-03-01',
-  'advanced-tool-use-2025-11-20',
-  'extended-cache-ttl-2025-04-11',
-  'cache-diagnosis-2026-04-07',
 ] as const
 
 const CLAUDE_CODE_BETA = 'claude-code-20250219'
@@ -447,29 +436,29 @@ function hasStructuredOutput(body: Record<string, unknown>) {
   return format?.type === 'json_schema'
 }
 
-function hasFullAgentShape(body: Record<string, unknown>) {
+function isQuotaProbe(body: Record<string, unknown>) {
   return (
-    Array.isArray(body.tools) &&
-    body.tools.length > 0 &&
-    Array.isArray(body.system) &&
-    isRecord(body.thinking) &&
-    isRecord(body.context_management) &&
-    isRecord(body.output_config) &&
-    isRecord(body.diagnostics)
+    body.max_tokens === 1 &&
+    !body.stream &&
+    !body.thinking &&
+    (!Array.isArray(body.tools) || body.tools.length === 0) &&
+    !hasStructuredOutput(body)
   )
 }
 
 export function selectClaudeCodeBetas(
   body?: Record<string, unknown> | null,
   extraBetas: string[] = [],
+  requestClass: ClaudeCodeRequestClass = 'main',
 ) {
-  const selected: string[] = body
-    ? hasFullAgentShape(body)
+  // A conversation turn uses the main list even without tools or companion
+  // fields. Only auxiliary one-token probes use the smaller quota list.
+  const selected: string[] =
+    requestClass === 'main'
       ? [...CLAUDE_CODE_FULL_AGENT_BETAS]
-      : hasStructuredOutput(body)
-        ? [...CLAUDE_CODE_STRUCTURED_OUTPUT_BETAS]
-        : [...CLAUDE_CODE_BASE_BETAS]
-    : [...CLAUDE_CODE_BASE_BETAS]
+      : body && isQuotaProbe(body)
+        ? [...CLAUDE_CODE_QUOTA_BETAS]
+        : [...CLAUDE_CODE_TITLE_BETAS]
 
   // Claude Code 2.1.302 puts claude-code-20250219 after the prompt-caching
   // scope beta on Haiku 5.5 requests instead of first.
@@ -495,6 +484,14 @@ export function selectClaudeCodeBetas(
     else selected.push(PER_TURN_CONTROL_BETA)
   }
 
+  if (body && hasStructuredOutput(body)) {
+    const index = selected.indexOf('cache-diagnosis-2026-04-07')
+    selected.splice(
+      index < 0 ? selected.length : index,
+      0,
+      'structured-outputs-2025-12-15',
+    )
+  }
   if (body?.speed === 'fast') selected.push(FAST_MODE_BETA)
   for (const beta of extraBetas) {
     const trimmed = beta.trim()
@@ -558,7 +555,10 @@ export function applyClaudeCodeHeaders(
   headers.set('authorization', `Bearer ${accessToken}`)
   headers.set('content-type', 'application/json')
   headers.set('user-agent', USER_AGENT)
-  headers.set('anthropic-beta', selectClaudeCodeBetas(options.body, extraBetas))
+  headers.set(
+    'anthropic-beta',
+    selectClaudeCodeBetas(options.body, extraBetas, options.requestClass),
+  )
   headers.set('anthropic-dangerous-direct-browser-access', 'true')
   headers.set('anthropic-version', '2023-06-01')
   headers.set('x-app', 'cli')

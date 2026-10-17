@@ -9,7 +9,6 @@ import {
   type NativeCustodyClient as ClaustrumScopedClient,
   getLogLevel,
   type LogTestRecord,
-  MID_CONVERSATION_OUTPUT_CONFIG_BETA,
   PER_TURN_CONTROL_BETA,
   resolveNativePoolPaths,
   setLogLevel,
@@ -1322,7 +1321,7 @@ function expectPrewarmHeadersMatchModelRequest(
   expect(others(warm.headers)).toEqual(others(main.headers))
 }
 
-test('Pi CacheKeep prewarm of a Fable 5.1 body with effort markers sends the mid-conversation output config beta', async () => {
+test('Pi CacheKeep prewarm of a Fable 5.1 body with effort markers sends the per-turn control beta', async () => {
   const f = await fixture()
   const { main, warm } = await sendAndPrewarm(f, 'claude-fable-5-1', [
     { afterAssistantMessages: 0, effort: 'low' },
@@ -1330,8 +1329,11 @@ test('Pi CacheKeep prewarm of a Fable 5.1 body with effort markers sends the mid
   ])
   expect(hasEffortMarker(main.json)).toBe(true)
   expect(hasEffortMarker(warm.json)).toBe(true)
-  expect(main.betas).toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
-  expect(warm.betas).toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+  expect(main.betas).toContain(PER_TURN_CONTROL_BETA)
+  expect(warm.betas).toContain(PER_TURN_CONTROL_BETA)
+  expect(main.betas).not.toContain('mid-conversation-output-config-2026-07-01')
+  expect(warm.betas).not.toContain('mid-conversation-output-config-2026-07-01')
+  expect(warm.betas).not.toContain('mid-conversation-system-2026-04-07')
   expectPrewarmHeadersMatchModelRequest(main, warm)
 })
 
@@ -1341,8 +1343,8 @@ test('Pi CacheKeep prewarm of a Fable 5.1 body without effort markers sends the 
   expect(hasEffortMarker(main.json)).toBe(false)
   expect(hasEffortMarker(warm.json)).toBe(false)
   // Every OAuth Fable 5.1 model request carries this beta, markers or not.
-  expect(main.betas).toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
-  expect(warm.betas).toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+  expect(main.betas).toContain(PER_TURN_CONTROL_BETA)
+  expect(warm.betas).toContain(PER_TURN_CONTROL_BETA)
   expectPrewarmHeadersMatchModelRequest(main, warm)
 })
 
@@ -1355,7 +1357,7 @@ test('Pi CacheKeep prewarm of an Opus 5.5 body with effort markers keeps the per
   expect(hasEffortMarker(main.json)).toBe(true)
   expect(hasEffortMarker(warm.json)).toBe(true)
   expect(warm.betas).toContain(PER_TURN_CONTROL_BETA)
-  expect(warm.betas).not.toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+  expect(warm.betas).not.toContain('mid-conversation-output-config-2026-07-01')
   expectPrewarmHeadersMatchModelRequest(main, warm)
 })
 

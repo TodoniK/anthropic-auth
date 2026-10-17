@@ -6081,7 +6081,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
       prefix_mismatch_behavior: 'error',
     })
     expect(sentHeaders?.get('anthropic-beta')).toContain(
-      'mid-conversation-output-config-2026-07-01',
+      'per-turn-control-2026-07-01',
     )
     expect(sentHeaders?.get('anthropic-beta')).toContain(
       'thinking-binding-controls-2026-08-01',

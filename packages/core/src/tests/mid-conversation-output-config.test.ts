@@ -3,11 +3,10 @@ import { selectClaudeCodeBetas } from '../claude-code.ts'
 import {
   applyMidConversationOutputConfig,
   defaultAdaptiveEffort,
-  MID_CONVERSATION_OUTPUT_CONFIG_BETA,
   normalizeAdaptiveEffort,
   PER_TURN_CONTROL_BETA,
+  sendsPerTurnControlBeta,
   supportsPerMessageEffort,
-  usesMidConversationOutputConfig,
   usesPerTurnControl,
 } from '../mid-conversation-output-config.ts'
 
@@ -110,15 +109,34 @@ describe('Fable 5.1 mid-conversation output configuration', () => {
         ]),
       ).toEqual({ applied: false, inserted: 0 })
       expect(request).toEqual(before)
-      expect(usesMidConversationOutputConfig(request)).toBe(false)
+      expect(sendsPerTurnControlBeta(model)).toBe(false)
     }
   })
 
-  test('always identifies Fable 5.1 requests for the beta header', () => {
-    expect(usesMidConversationOutputConfig(body())).toBe(true)
-    expect(MID_CONVERSATION_OUTPUT_CONFIG_BETA).toBe(
-      'mid-conversation-output-config-2026-07-01',
-    )
+  test('carries Fable 5.1 effort changes under per-turn control without obsolete betas', () => {
+    for (const model of [
+      'claude-fable-5-1',
+      'claude-fable-5-1[1m]',
+      'claude-fable-5-1-20260918',
+    ]) {
+      const request = body(model)
+      expect(
+        applyMidConversationOutputConfig(request, [
+          { afterAssistantMessages: 0, effort: 'low' },
+          { afterAssistantMessages: 1, effort: 'high' },
+        ]),
+      ).toEqual({ applied: true, inserted: 1 })
+      expect(request.messages).toContainEqual({
+        role: 'system',
+        content: [],
+        output_config: { effort: 'high' },
+      })
+      expect(request.output_config).toMatchObject({ effort: 'low' })
+      const betas = selectClaudeCodeBetas(request).split(',')
+      expect(betas).toContain(PER_TURN_CONTROL_BETA)
+      expect(betas).not.toContain('mid-conversation-output-config-2026-07-01')
+      expect(betas).not.toContain('mid-conversation-system-2026-04-07')
+    }
   })
 
   test('normalizes host effort names', () => {
@@ -190,14 +208,14 @@ describe('per-message effort beyond Fable 5.1', () => {
       }
     })
 
-    test(`${model} carries the per-turn control beta, not the Fable 5.1 beta`, () => {
+    test(`${model} carries the per-turn control beta without obsolete betas`, () => {
       const request = adaptiveBody(model)
       expect(supportsPerMessageEffort(request)).toBe(true)
       expect(usesPerTurnControl(model)).toBe(true)
-      expect(usesMidConversationOutputConfig(request)).toBe(false)
       const betas = selectClaudeCodeBetas(request).split(',')
       expect(betas).toContain(PER_TURN_CONTROL_BETA)
-      expect(betas).not.toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+      expect(betas).not.toContain('mid-conversation-output-config-2026-07-01')
+      expect(betas).not.toContain('mid-conversation-system-2026-04-07')
     })
   }
 
@@ -224,14 +242,11 @@ describe('per-message effort beyond Fable 5.1', () => {
     }
   })
 
-  test('keeps Fable 5.1 eligible without inspecting thinking and on its own beta', () => {
+  test('keeps Fable 5.1 eligible without inspecting thinking', () => {
     const request = body()
     expect(supportsPerMessageEffort(request)).toBe(true)
     expect(usesPerTurnControl(request.model)).toBe(false)
-    // Claude Code 2.1.302 also sends per-turn control on Fable 5.1; its
-    // effort markers still rely on the mid-conversation output-config beta,
-    // which the OAuth header helpers add for every Fable 5.1 request.
-    expect(usesMidConversationOutputConfig(request)).toBe(true)
+    expect(sendsPerTurnControlBeta(request.model)).toBe(true)
     expect(selectClaudeCodeBetas(request).split(',')).toContain(
       PER_TURN_CONTROL_BETA,
     )
@@ -273,7 +288,7 @@ describe('per-message effort beyond Fable 5.1', () => {
         model === 'claude-haiku-5-5',
       )
       expect(betas.split(',')).not.toContain(
-        MID_CONVERSATION_OUTPUT_CONFIG_BETA,
+        'mid-conversation-output-config-2026-07-01',
       )
     }
   })

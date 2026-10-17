@@ -8,6 +8,86 @@ prebuild = [
 ]
 
 [[control]]
+id = "gzip-resets-cch-before-compression"
+guards = "The compressed body must carry cch=00000 rather than the identity body's signature."
+file = "packages/core/src/request-gzip.ts"
+old = "const text = resetBillingHeaderCCH(identityBody) + requestGzipPadding(random)"
+new = "const text = identityBody + requestGzipPadding(random) // NON-VACUITY BREAK: compress the signed cch"
+test_file = "packages/core/src/tests/request-gzip.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/request-gzip.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["request-body gzip as Claude Code 2.1.302 sends it > a large OAuth body goes out gzipped with cch=00000 and valid padding"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "gzip-classifies-non-anthropic-rejection"
+guards = "A 400, 403 or 415 without an Anthropic request-id or cf-ray must trigger an identity resend."
+file = "packages/core/src/request-gzip.ts"
+old = "if (!hasAnthropicEdgeHeader(response.headers))"
+new = "if (false && !hasAnthropicEdgeHeader(response.headers)) // NON-VACUITY BREAK: ignore proxy gzip rejections"
+test_file = "packages/core/src/tests/request-gzip.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/request-gzip.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a rejected gzipped body > 400 without request-id or cf-ray: one identity resend with the same request id, then latched"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "gzip-classifies-json-parse-400"
+guards = "An Anthropic JSON-parse 400 must trigger an identity resend even with a valid request-id."
+file = "packages/core/src/request-gzip.ts"
+old = "if (status === 400 && isInvalidJsonBody(await readStart(response)))"
+new = "if (status === 400 && false && isInvalidJsonBody(await readStart(response))) // NON-VACUITY BREAK: ignore JSON-parse gzip rejections"
+test_file = "packages/core/src/tests/request-gzip.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/request-gzip.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a rejected gzipped body > 400 from Anthropic: request body is not valid JSON: one identity resend with the same request id, then latched"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "gzip-rejection-latches-process"
+guards = "After a gzip rejection, the next request must be identity even when no latch is persisted."
+file = "packages/core/src/request-gzip.ts"
+old = "  options.latch.latchProcess()"
+new = "  void options.latch // NON-VACUITY BREAK: retry gzip after an origin rejection"
+test_file = "packages/core/src/tests/request-gzip.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/request-gzip.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a rejected gzipped body > 400 behind Cloudflare: plain bad json text: one identity resend with the same request id, then latched"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "fable-51-effort-uses-per-turn-control"
+guards = "Fable 5.1 effort markers need per-turn-control, without either obsolete mid-conversation beta."
+file = "packages/core/src/mid-conversation-output-config.ts"
+old = "    isClaudeFable51Model(model) ||"
+new = "    false || // NON-VACUITY BREAK: omit Fable 5.1 per-turn control"
+test_file = "packages/core/src/tests/mid-conversation-output-config.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/mid-conversation-output-config.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["Fable 5.1 mid-conversation output configuration > carries Fable 5.1 effort changes under per-turn control without obsolete betas"]
+expect_message = "error: expect(received).toContain(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
 id = "history-refuses-meaningful-assistant"
 guards = "Meaningful assistant trailers must be refused without deleting history or replaying the preceding question."
 file = "packages/core/src/request-history.ts"
@@ -903,7 +983,7 @@ broad_id = "{name}"
 
 [[control]]
 id = "pi-cachekeep-prewarm-body-betas"
-guards = "Pi's CacheKeep prewarm must send the betas the model request sends for the same body, including the Fable 5.1 effort beta its system effort markers need."
+guards = "Pi's CacheKeep prewarm must send the betas the model request sends for the same body, including per-turn control for Fable 5.1 system effort markers."
 file = "packages/pi/src/stream.ts"
 old = "    applyPiOAuthRequestHeaders(headers, piAttemptAccessToken(served), {"
 new = "    applyClaudeCodeHeaders(headers, piAttemptAccessToken(served), { extraBetas: [CACHE_KEEP_EXTENDED_TTL_BETA], // NON-VACUITY BREAK: rebuild prewarm betas without the body's betas"
@@ -911,7 +991,7 @@ test_file = "packages/pi/src/tests/scoped-stream.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/pi/src/tests/scoped-stream.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["Pi CacheKeep prewarm of a Fable 5.1 body with effort markers sends the mid-conversation output config beta", "Pi CacheKeep prewarm of a Fable 5.1 body without effort markers sends the model request betas"]
+expect_red = ["Pi CacheKeep prewarm of a Fable 5.1 body with effort markers sends the per-turn control beta", "Pi CacheKeep prewarm of a Fable 5.1 body without effort markers sends the model request betas"]
 expect_message = "error: expect(received).toContain(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
 broad_report = "tmp/mutations/pi.xml"
