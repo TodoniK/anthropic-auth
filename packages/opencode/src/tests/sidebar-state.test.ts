@@ -590,6 +590,61 @@ describe('getCollapsedQuotaSummary', () => {
     ).toBe('5h 90% · 7d 90% · Fabr 12% left')
   })
 
+  test.each([
+    ['credit tighter than Fable', 9000, 'cr 10%'],
+    ['Fable tighter than credit', 2500, 'Fa 22%'],
+    ['equal credit and Fable', 7800, 'Fa 22%'],
+  ] as const)('shows one extra item when %s', (_name, usedMinor, expected) => {
+    const summary = getCollapsedQuotaSummary({
+      five_hour: { usedPercent: 62, remainingPercent: 38 },
+      seven_day: { usedPercent: 41, remainingPercent: 59 },
+      scoped: [
+        {
+          id: 'fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 78,
+          remainingPercent: 22,
+        },
+      ],
+      extraUsage: {
+        used: { amountMinor: usedMinor, currency: 'USD', exponent: 2 },
+        limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+        exhausted: false,
+      },
+    })
+    expect(summary.text).toBe(`5h 38% · 7d 59% · ${expected} left`)
+    expect(summary.text?.split(' · ')).toHaveLength(3)
+  })
+
+  test('an exhausted credit budget loses a tie to the first exhausted scoped window', () => {
+    const summary = getCollapsedQuotaSummary({
+      ...quota(10),
+      scoped: [
+        {
+          id: 'fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 100,
+          remainingPercent: 0,
+        },
+        {
+          id: 'opus',
+          title: 'Opus only',
+          modelName: 'Opus',
+          usedPercent: 100,
+          remainingPercent: 0,
+        },
+      ],
+      extraUsage: {
+        used: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+        limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+        exhausted: true,
+      },
+    })
+    expect(summary.text).toBe('5h 90% · 7d 90% · Fa 0% left')
+  })
+
   test('marks only stale readings and omits reset and age wording from narrow text', () => {
     const now = 10 * 86400000
     const fresh = getCollapsedQuotaSummary(

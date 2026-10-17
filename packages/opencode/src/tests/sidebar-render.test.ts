@@ -176,11 +176,13 @@ test('collapsed sidebar keeps every account on one line with intact narrow quota
       route: 'main',
       lastUpdated: now,
     },
-    ['5h 38% · 7d 59% · Fa 22% · cr 75% left', 'work', '5h 92% · 7d 7% left'],
+    ['5h 38% · 7d 59% · Fa 22% left', 'work', '5h 92% · 7d 7% left'],
     true,
   )
   const [frame, styleText] = stdout.split('STYLES:')
-  expect(frame).toContain('… 5h 38% · 7d 59% · Fa 22% · cr 75% left')
+  expect(frame).toContain('main')
+  expect(frame).toContain('5h 38% · 7d 59% · Fa 22% left')
+  expect(frame).not.toContain('cr 75%')
   expect(frame).toContain('work')
   expect(frame).toContain('5h 92% · 7d 7% left')
   expect(frame).not.toContain('checked')

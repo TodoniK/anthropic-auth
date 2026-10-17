@@ -987,7 +987,19 @@ function formatNarrowQuota(quota: AccountQuota, now: number): string {
         : lowest,
     undefined,
   )
-  if (tightest) {
+  const budget = parts.windows.find((part) => part.kind === 'budget')
+  const budgetRemaining = quota.extraUsage?.exhausted
+    ? 0
+    : budget?.remainingPercent
+  // Monetary ratios can land a few floating-point bits below an equal model reading.
+  const budgetTighter =
+    budget &&
+    (!tightest ||
+      (budgetRemaining !== undefined &&
+        tightest.remainingPercent - budgetRemaining > 1e-9))
+  if (budgetTighter) {
+    values.push(`cr ${percent(budgetRemaining)}`)
+  } else if (tightest) {
     const index = names.indexOf(tightest.modelName)
     const name = [...tightest.modelName].slice(0, lengths[index]).join('')
     const part = parts.windows.find(
@@ -995,11 +1007,6 @@ function formatNarrowQuota(quota: AccountQuota, now: number): string {
     )
     values.push(`${name} ${percent(part?.remainingPercent)}`)
   }
-  const budget = parts.windows.find((part) => part.kind === 'budget')
-  if (budget)
-    values.push(
-      `cr ${percent(quota.extraUsage?.exhausted ? 0 : budget.remainingPercent)}`,
-    )
   return `${values.join(' · ')} left`
 }
 
