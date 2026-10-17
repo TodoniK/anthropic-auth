@@ -465,6 +465,7 @@ async function localFixture(paid: boolean, paidKey = PAID_KEY) {
 async function createPlugin(
   owner: BodyOwner,
   client?: NativeCustodyClient | undefined,
+  quotaCallPause?: (ms: number) => Promise<void>,
 ) {
   const creation = AnthropicAuthPlugin(
     {
@@ -486,6 +487,7 @@ async function createPlugin(
     {
       scopedRosterPollIntervalMs: 0,
       cacheKeepAggregateRefreshIntervalMs: 0,
+      ...(quotaCallPause ? { quotaCallPause } : {}),
       ...(client ? { claustrumScopedConnect: async () => client } : {}),
     },
   )
@@ -494,6 +496,34 @@ async function createPlugin(
   owner.plugins.push(plugin)
   if (owner.controller.signal.aborted) await plugin.dispose?.()
   return plugin
+}
+
+/**
+ * Stands in for the plugin's wait between quota usage polls. A route that hits
+ * a rate limit polls usage again soon after the startup poll, and the plugin
+ * spaces those polls one second apart. This records each requested wait and
+ * returns at once, so the test spends no real time on that spacing.
+ */
+function recordedQuotaPause() {
+  const requested: number[] = []
+  return {
+    requested,
+    pause: async (ms: number) => {
+      requested.push(ms)
+    },
+  }
+}
+
+/**
+ * Each requested wait is what remains of the one-second gap since the previous
+ * poll, so it is positive and never longer than that gap. Whether a wait is
+ * requested at all depends on how long setup took, so none may be requested.
+ */
+function expectQuotaPollGaps(requested: readonly number[]) {
+  for (const ms of requested) {
+    expect(ms).toBeGreaterThan(0)
+    expect(ms).toBeLessThanOrEqual(1_000)
+  }
 }
 
 /** Sends one model request through the plugin's own request handler. */
@@ -940,9 +970,11 @@ test('OC1 usage-limit echo still reaches the paid route, whose error omits the p
       ? jsonError(400, 'invalid_request_error', key)
       : jsonError(429, 'rate_limit_error', key)
   }
-  const plugin = await createPlugin(owner)
+  const quotaPause = recordedQuotaPause()
+  const plugin = await createPlugin(owner, undefined, quotaPause.pause)
   const seen = await visible(sendNative(owner, plugin, 'oc1-paid-error'))
   expect(modelRequests).toEqual([LOCAL_ROTATED, PAID_KEY])
+  expectQuotaPollGaps(quotaPause.requested)
   expect(seen.status, seen.text).toBe(400)
   expectScrubbed(seen.text, [PAID_KEY, LOCAL_ROTATED])
   expect(seen.text).toContain('invalid_request_error')
@@ -1409,10 +1441,12 @@ async function streamedLimitRoute(primary: (key: string) => Response) {
       ? eventStream(healthy('paid route answered'))
       : primary(key)
   }
-  const plugin = await createPlugin(owner)
+  const quotaPause = recordedQuotaPause()
+  const plugin = await createPlugin(owner, undefined, quotaPause.pause)
   const seen = await visible(
     sendNative(owner, plugin, `oc1-limit-${Date.now()}`),
   )
+  expectQuotaPollGaps(quotaPause.requested)
   return { routes, usagePolls, seen }
 }
 
@@ -2006,10 +2040,12 @@ test('OC1 API lastUsed storage failure is detached, drained and warns without ch
     armed = true
     return eventStream(body)
   }
-  const plugin = await createPlugin(owner)
+  const quotaPause = recordedQuotaPause()
+  const plugin = await createPlugin(owner, undefined, quotaPause.pause)
   const response = await sendNative(owner, plugin, 'oc1-api-lastused-io')
   expect(response.status).toBe(200)
   expect(await response.text()).toBe(body)
+  expectQuotaPollGaps(quotaPause.requested)
   await entered.wait
   let disposed = false
   const disposing = Promise.resolve(plugin.dispose?.()).then(() => {

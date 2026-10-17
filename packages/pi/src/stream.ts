@@ -50,6 +50,7 @@ import {
   type ProviderErrorResponseScope,
   parseSseFrame,
   QuotaManager,
+  type QuotaManagerOptions,
   type QuotaState,
   quotaBackoffActive,
   quotaSnapshotHasStandardWindows,
@@ -108,6 +109,18 @@ const quotaManagers = new Map<
   { identityKey: string; manager: QuotaManager }
 >()
 const PI_SERVICE_CACHE_LIMIT = 16
+/**
+ * Tests only: replaces the real-time wait between quota usage polls in quota
+ * managers created after it is set. Unset, managers keep Core's real timer.
+ */
+let quotaCallPauseForTest: QuotaManagerOptions['pauseBetweenQuotaCalls']
+
+/** Set or clear the test replacement for the wait between quota usage polls. */
+export function __setPiQuotaCallPauseForTest(
+  pause: QuotaManagerOptions['pauseBetweenQuotaCalls'],
+) {
+  quotaCallPauseForTest = pause
+}
 
 function setBoundedService<T>(map: Map<string, T>, key: string, value: T) {
   map.delete(key)
@@ -141,6 +154,7 @@ function getPiRoutingServices(
   if (!quotaManager) {
     quotaManager = new QuotaManager({
       storage,
+      pauseBetweenQuotaCalls: quotaCallPauseForTest,
       fetchQuotaSnapshot: async (request, dispatch) => {
         const id = request.kind === 'main' ? 'main' : request.accountId
         if (!id) throw new Error('Native quota request has no account identity')

@@ -171,6 +171,7 @@ import {
   type QuotaHeaderFeedPublishEntry,
   QuotaHeaderFeedRegistry,
   QuotaManager,
+  type QuotaManagerOptions,
   type QuotaState,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
@@ -1142,6 +1143,8 @@ type PluginRuntimeOverrides = Partial<{
   claustrumScopedConnect: () => Promise<NativeCustodyClient>
   nativeLocal: NativeAccountRuntimeOptions['local']
   cacheKeepAggregateRefreshIntervalMs: number
+  /** Replaces the real-time wait between physical quota usage calls. */
+  quotaCallPause: QuotaManagerOptions['pauseBetweenQuotaCalls']
 }>
 
 function getConfiguredClaustrumConnectionFile(): string | undefined {
@@ -1809,6 +1812,7 @@ const anthropicAuthPlugin = async (
   // rejected refresh token became usable, so it must not clear refresh errors.
   const quotaManager = new QuotaManager({
     storage: initialStorage,
+    pauseBetweenQuotaCalls: runtimeOverrides.quotaCallPause,
     fetchQuotaSnapshot: (request, dispatch) => {
       assertNativeEnvironment()
       const routeId = request.kind === 'main' ? 'main' : request.accountId

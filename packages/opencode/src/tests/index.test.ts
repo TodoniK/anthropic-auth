@@ -12035,9 +12035,15 @@ describe('auth.loader', () => {
       (storage) =>
         storage?.main?.profile?.accountIdentity === storage?.mainAccountId,
     )
-    // Each generation is a refresh of the same account in another process,
-    // which rotates the pool's main access token.
-    for (let generation = 1; generation <= 66; generation++) {
+    // Each iteration simulates another process refreshing the same main
+    // account, which only rotates its access token. Profile hydration does
+    // not look at tokens: once the stored profile is fresh for this account
+    // identity the display skips the account, and a completed check is
+    // remembered under the route ID and account identity (storage row and
+    // login epoch are only consulted while a route's identity is unknown).
+    // Nothing there counts or caps rotations, so three rotations in a row
+    // cover what more would: none may cause a further profile fetch.
+    for (let generation = 1; generation <= 3; generation++) {
       await refreshPoolMainElsewhere({
         access: `sk-ant-oat01-token-${generation}`,
         refresh: `refresh-sk-ant-oat01-token-${generation}`,

@@ -37,6 +37,18 @@ import { tokenFingerprint } from './token-fingerprint.ts'
 // Capture real setTimeout before tests can mock globalThis.setTimeout
 const nativeSetTimeout = globalThis.setTimeout
 
+/**
+ * The default pause between physical quota calls: a real timer that does not
+ * keep the process alive. It returns the timer's promise directly, without an
+ * async wrapper, so awaiting it takes the same turns as an inline timer.
+ */
+function pauseOnRealTimer(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const id = nativeSetTimeout(resolve, ms)
+    if (typeof id === 'object' && 'unref' in id) id.unref()
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -81,6 +93,14 @@ export type QuotaManagerOptions = {
     dispatch: QuotaRequestDispatch,
   ) => Promise<OAuthQuotaSnapshot>
   now?: () => number
+  /**
+   * Waits before a physical usage GET until the minimum gap since the previous
+   * one has passed. It receives the milliseconds still to wait, measured with
+   * `now`, and is called only when that remainder is positive. Defaults to a
+   * real timer that does not keep the process alive. Tests pass one that
+   * records the requested wait and resolves at once.
+   */
+  pauseBetweenQuotaCalls?: (ms: number) => Promise<void>
   onMainQuotaFetched?: (
     quota: OAuthQuotaSnapshot,
     checkedAt: number,
@@ -180,6 +200,7 @@ export class QuotaManager {
   private readonly fetchImpl: typeof fetch
   private readonly fetchQuotaSnapshot: QuotaManagerOptions['fetchQuotaSnapshot']
   private readonly now: () => number
+  private readonly pauseBetweenQuotaCalls: (ms: number) => Promise<void>
   private readonly onMainQuotaFetched: QuotaManagerOptions['onMainQuotaFetched']
   private readonly onApiError: QuotaManagerOptions['onApiError']
   private readonly onFallbackQuotaFetched: QuotaManagerOptions['onFallbackQuotaFetched']
@@ -190,6 +211,8 @@ export class QuotaManager {
     this.fetchImpl = opts.fetchImpl ?? fetch
     this.fetchQuotaSnapshot = opts.fetchQuotaSnapshot
     this.now = opts.now ?? Date.now
+    this.pauseBetweenQuotaCalls =
+      opts.pauseBetweenQuotaCalls ?? pauseOnRealTimer
     this.onMainQuotaFetched = opts.onMainQuotaFetched
     this.onApiError = opts.onApiError
     this.onFallbackQuotaFetched = opts.onFallbackQuotaFetched
@@ -945,11 +968,7 @@ export class QuotaManager {
       if (this.lastApiCallAt !== undefined) {
         const remaining =
           QuotaManager.API_CALL_GAP_MS - (this.now() - this.lastApiCallAt)
-        if (remaining > 0)
-          await new Promise<void>((resolve) => {
-            const id = nativeSetTimeout(resolve, remaining)
-            if (typeof id === 'object' && 'unref' in id) id.unref()
-          })
+        if (remaining > 0) await this.pauseBetweenQuotaCalls(remaining)
       }
       if (this.isClosed) throw new Error('QuotaManager is closed')
       // Authorization can precede the pacing wait. If custody changed or the

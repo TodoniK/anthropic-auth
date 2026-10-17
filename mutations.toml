@@ -981,3 +981,35 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "quota-call-pause-default-waits"
+guards = "Without an injected pause, QuotaManager waits on a real timer so physical quota GETs start at least one second apart."
+file = "packages/core/src/quota-manager.ts"
+old = "opts.pauseBetweenQuotaCalls ?? pauseOnRealTimer"
+new = "opts.pauseBetweenQuotaCalls ?? (async () => {}) // NON-VACUITY BREAK: the default pause skips the wait"
+test_file = "packages/core/src/tests/quota-dispatch.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/quota-dispatch.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["physical quota GET starts stay one second apart when the first GET fails"]
+expect_message = "error: expect(received).toBeGreaterThanOrEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "quota-call-gap-one-second"
+guards = "Physical quota GETs from one QuotaManager start at least one second apart; a call inside that gap first waits out the rest of it."
+file = "packages/core/src/quota-manager.ts"
+old = "private static readonly API_CALL_GAP_MS = 1_000"
+new = "private static readonly API_CALL_GAP_MS = 0 // NON-VACUITY BREAK: no spacing between quota calls"
+test_file = "packages/core/src/tests/quota-dispatch.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/quota-dispatch.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["physical quota GET starts stay one second apart when the first GET fails", "the second physical quota GET first requests the rest of the one-second gap"]
+expect_message = '/error: expect\(received\)\.(toBeGreaterThanOrEqual|toEqual)\(expected\)/'
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

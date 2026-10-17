@@ -22,7 +22,10 @@ import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import type { TestGate } from '../../../core/src/tests/test-lifetime.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
-import { streamCortexKitAnthropic } from '../stream.ts'
+import {
+  __setPiQuotaCallPauseForTest,
+  streamCortexKitAnthropic,
+} from '../stream.ts'
 import {
   fixtureAccountIdentity,
   saveNativePiFixture,
@@ -458,8 +461,37 @@ test('Pi thrown relay error omits the private relay token and the credential', a
   )
 })
 
+/**
+ * Stands in for Pi's wait between quota usage polls in this test. A route that
+ * hits a rate limit polls usage again soon after the first poll, and Pi spaces
+ * those polls one second apart. This records each requested wait and returns
+ * at once, so the test spends no real time on that spacing. Set it before the
+ * first request: Pi reads it when it creates the storage's quota manager.
+ */
+function recordQuotaPauses() {
+  const requested: number[] = []
+  __setPiQuotaCallPauseForTest(async (ms) => {
+    requested.push(ms)
+  })
+  deferCleanup(() => __setPiQuotaCallPauseForTest(undefined))
+  return requested
+}
+
+/**
+ * Each requested wait is what remains of the one-second gap since the previous
+ * poll, so it is positive and never longer than that gap. Whether a wait is
+ * requested at all depends on how long setup took, so none may be requested.
+ */
+function expectQuotaPollGaps(requested: readonly number[]) {
+  for (const ms of requested) {
+    expect(ms).toBeGreaterThan(0)
+    expect(ms).toBeLessThanOrEqual(1_000)
+  }
+}
+
 /** Create a local OAuth account with a paid API fallback for general quota exhaustion. */
 async function paidFixture(apiKey = PAID_KEY) {
+  const quotaPauses = recordQuotaPauses()
   const { directory, storagePath } = await ownDirectory(
     'pi-provider-error-paid-',
   )
@@ -478,11 +510,11 @@ async function paidFixture(apiKey = PAID_KEY) {
     storagePath,
     { mainAccess: MAIN_ACCESS },
   )
-  return { directory }
+  return { directory, quotaPauses }
 }
 
 test('Pi usage-limit echo still reaches the paid route, whose error omits the paid key', async () => {
-  await paidFixture()
+  const { quotaPauses } = await paidFixture()
   const modelRequests: string[] = []
   useFetch(async (url, init) => {
     if (url.includes('/api/oauth/usage'))
@@ -503,10 +535,11 @@ test('Pi usage-limit echo still reaches the paid route, whose error omits the pa
     ['HTTP 400', 'invalid_request_error'],
   )
   expect(modelRequests).toEqual([`Bearer ${MAIN_ACCESS}`, `Bearer ${PAID_KEY}`])
+  expectQuotaPollGaps(quotaPauses)
 })
 
 test('Pi usage-limit echo without exhaustion keeps the primary 429 and scrubs it', async () => {
-  await paidFixture()
+  const { quotaPauses } = await paidFixture()
   const modelRequests: string[] = []
   useFetch(async (url, init) => {
     if (url.includes('/api/oauth/usage'))
@@ -525,6 +558,7 @@ test('Pi usage-limit echo without exhaustion keeps the primary 429 and scrubs it
     ['HTTP 429', 'rate_limit_error'],
   )
   expect(modelRequests).toEqual([`Bearer ${MAIN_ACCESS}`])
+  expectQuotaPollGaps(quotaPauses)
 })
 
 // A streamed rate limit arrives as an `error` event whose `error.type` is
@@ -537,6 +571,7 @@ const BACKUP_ACCESS = 'sk-ant-oat01-synthetic-pi-backup-access'
 const FABLE = 'claude-fable-5-1'
 
 async function routingFixture(backup: boolean) {
+  const quotaPauses = recordQuotaPauses()
   const { storagePath } = await ownDirectory('pi-streamed-limit-')
   const paid: AccountStorage['accounts'][number] = {
     type: 'api',
@@ -555,6 +590,7 @@ async function routingFixture(backup: boolean) {
     storagePath,
     { mainAccess: MAIN_ACCESS },
   )
+  return { quotaPauses }
 }
 
 const usageReading = (general: number, fable: number) =>
@@ -606,7 +642,7 @@ async function runModel(id: string, sessionId: string) {
 }
 
 test('Pi streamed rate_limit_error with the primary generally exhausted reaches the paid route', async () => {
-  await routingFixture(false)
+  const { quotaPauses } = await routingFixture(false)
   const record = routingFetch(
     () => eventStream(sse(errorEnvelope('rate_limit_error', MAIN_ACCESS))),
     () => usageReading(100, 100),
@@ -618,10 +654,11 @@ test('Pi streamed rate_limit_error with the primary generally exhausted reaches 
   expect(result.content).toEqual([
     { type: 'text', text: 'another route answered' },
   ])
+  expectQuotaPollGaps(quotaPauses)
 })
 
 test('Pi streamed rate_limit_error with only a model-scoped limit moves to OAuth, never the paid route', async () => {
-  await routingFixture(true)
+  const { quotaPauses } = await routingFixture(true)
   const record = routingFetch(
     () => eventStream(sse(errorEnvelope('rate_limit_error', MAIN_ACCESS))),
     () => usageReading(10, 100),
@@ -634,10 +671,11 @@ test('Pi streamed rate_limit_error with only a model-scoped limit moves to OAuth
   expect(record.models).not.toContain(`Bearer ${PAID_KEY}`)
   expect(record.usagePolls).toBeGreaterThan(0)
   expect(result.stopReason).toBe('stop')
+  expectQuotaPollGaps(quotaPauses)
 })
 
 test('Pi reply text that mentions rate limits neither refreshes quota nor reroutes', async () => {
-  await routingFixture(true)
+  const { quotaPauses } = await routingFixture(true)
   const text =
     "Notes: a rate_limit_error means you exceed your account's rate limit."
   const record = routingFetch(
@@ -649,6 +687,7 @@ test('Pi reply text that mentions rate limits neither refreshes quota nor rerout
   expect(record.usagePolls).toBe(0)
   expect(result.stopReason).toBe('stop')
   expect(result.content).toEqual([{ type: 'text', text }])
+  expectQuotaPollGaps(quotaPauses)
 })
 
 for (const contentType of ['text/plain', undefined] as const) {
@@ -875,7 +914,7 @@ const rateLimitFrame = (wire: Wire) =>
 const manyComments = `: ${'k'.repeat(1_020)}\n\n`.repeat(80)
 
 test('Pi streamed rate limit on a kept-open primary cancels its provider body before the paid route answers', async () => {
-  await routingFixture(false)
+  const { quotaPauses } = await routingFixture(false)
   const cancelled = gate()
   const record = loopbackRouting((wire) =>
     keptOpen(`: keepalive\n\n${rateLimitFrame(wire)}`, cancelled),
@@ -887,10 +926,11 @@ test('Pi streamed rate limit on a kept-open primary cancels its provider body be
     { type: 'text', text: 'another route answered' },
   ])
   expect(await within(cancelled.wait)).toBe(true)
+  expectQuotaPollGaps(quotaPauses)
 })
 
 test('Pi streamed rate limit on a kept-open fallback route is cancelled and the next route answers', async () => {
-  await routingFixture(true)
+  const { quotaPauses } = await routingFixture(true)
   const cancelled = gate()
   const record = loopbackRouting(
     (wire) => jsonError(429, 'rate_limit_error', wire.bearer),
@@ -928,10 +968,11 @@ test('Pi streamed rate limit on a kept-open fallback route is cancelled and the 
     await within(cancelled.wait),
     `phase: backup cancellation\n${trace()}`,
   ).toBe(true)
+  expectQuotaPollGaps(quotaPauses)
 })
 
 test('Pi passes a stream through unclassified once comments exhaust the first-event budget', async () => {
-  await routingFixture(false)
+  const { quotaPauses } = await routingFixture(false)
   const record = loopbackRouting(
     (wire) =>
       new Response(manyComments + rateLimitFrame(wire), {
@@ -952,10 +993,11 @@ test('Pi passes a stream through unclassified once comments exhaust the first-ev
   expect(result.stopReason).toBe('error')
   expect(result.errorMessage).toContain('rate_limit_error')
   expectScrubbed(result.errorMessage ?? '', [MAIN_ACCESS])
+  expectQuotaPollGaps(quotaPauses)
 })
 
 test('Pi keeps a successful reply that follows comments past the first-event budget byte for byte', async () => {
-  await routingFixture(false)
+  const { quotaPauses } = await routingFixture(false)
   const text = `début 🧪 ${echoOf(MAIN_ACCESS)}`
   const record = loopbackRouting(
     () =>
@@ -968,6 +1010,7 @@ test('Pi keeps a successful reply that follows comments past the first-event bud
   expect(record.usagePolls).toBe(0)
   expect(result.stopReason).toBe('stop')
   expect(result.content).toEqual([{ type: 'text', text }])
+  expectQuotaPollGaps(quotaPauses)
 })
 
 function captureUsageLogs() {
@@ -1153,7 +1196,7 @@ test('Pi serves first delta and full reply while the roster lock is held, then d
 })
 
 test('Pi API lastUsed storage failure is detached, drained and warns without changing reply content', async () => {
-  await routingFixture(false)
+  const { quotaPauses } = await routingFixture(false)
   const native = getPiNativeRuntime()
   const service = await native.service()
   const logs = captureUsageLogs()
@@ -1200,6 +1243,7 @@ test('Pi API lastUsed storage failure is detached, drained and warns without cha
       payload: { name: 'NativeRuntimeError', code: 'runtime-io' },
     },
   ])
+  expectQuotaPollGaps(quotaPauses)
 })
 
 test('Pi runtime eviction drains the evicted instance before closing its native service', async () => {
@@ -1333,7 +1377,7 @@ test('Pi refuses to store a paid key with surrounding whitespace', async () => {
 })
 
 test('Pi never sends a hand-padded stored paid key', async () => {
-  const { directory } = await paidFixture()
+  const { directory, quotaPauses } = await paidFixture()
   expect(await padStoredKey(directory)).toBeGreaterThan(0)
   const paidRequests: string[] = []
   const models: string[] = []
@@ -1359,4 +1403,5 @@ test('Pi never sends a hand-padded stored paid key', async () => {
   )
   expect(models).toEqual(['api.anthropic.com'])
   expect(paidRequests).toEqual([])
+  expectQuotaPollGaps(quotaPauses)
 })

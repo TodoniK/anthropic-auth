@@ -118,6 +118,45 @@ test('physical quota GET starts stay one second apart when the first GET fails',
   expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(1_000)
 })
 
+test('the second physical quota GET first requests the rest of the one-second gap', async () => {
+  let clock = 5_000
+  const pauses: number[] = []
+  const starts: number[] = []
+  const manager = ownManager(
+    new QuotaManager({
+      storage: null,
+      now: () => clock,
+      // Record the requested wait and let the clock pass it, so no real
+      // time elapses and the gap is read from the request itself.
+      pauseBetweenQuotaCalls: async (ms) => {
+        pauses.push(ms)
+        clock += ms
+      },
+      fetchImpl: Object.assign(
+        async () => {
+          starts.push(clock)
+          return Response.json(quotaResponse)
+        },
+        { preconnect: fetch.preconnect },
+      ),
+    }),
+  )
+  await manager.refreshFallbackWithMetadata(
+    'paced-first',
+    'OAT-synthetic-paced-first',
+    undefined,
+  )
+  expect(pauses).toEqual([])
+  clock += 300
+  await manager.refreshFallbackWithMetadata(
+    'paced-second',
+    'OAT-synthetic-paced-second',
+    undefined,
+  )
+  expect(pauses).toEqual([700])
+  expect(starts).toEqual([5_000, 6_000])
+})
+
 test('a quota lock loser neither sends a GET nor advances physical dispatch spacing', async () => {
   const held = await acquireRefreshFileLock({
     name: 'opencode-fallback-quota-refresh-held',
