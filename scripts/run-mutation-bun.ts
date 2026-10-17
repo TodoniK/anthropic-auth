@@ -120,7 +120,10 @@ export type Transcript = {
   stdout: string
   stderr: string
   exitCode: number
-  signal: string | null
+  // Bun's own type: a signal name, or the bare number of a signal that has
+  // no name (such as a Linux real-time signal). Kept as Bun reports it, so
+  // the audit invocation.json records the same value Bun gave.
+  signal: Bun.Subprocess['signalCode']
 }
 
 export type ExecutionEvent = {
@@ -612,7 +615,7 @@ export type OwnedChild = {
   stdout: ReadableStream<Uint8Array>
   stderr: ReadableStream<Uint8Array>
   exited: Promise<number>
-  readonly signalCode: string | null
+  readonly signalCode: Bun.Subprocess['signalCode']
   kill: () => void
 }
 type Dependencies = {

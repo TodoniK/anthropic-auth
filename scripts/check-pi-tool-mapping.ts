@@ -33,7 +33,7 @@ interface ChildOutcome {
   stdout: string
   stderr: string
   code: number | null
-  signal: string | null
+  signal: Bun.Subprocess['signalCode']
   timedOut: boolean
   joinFailures: string[]
 }
