@@ -172,6 +172,7 @@ import {
   QuotaHeaderFeedRegistry,
   QuotaManager,
   type QuotaManagerOptions,
+  type QuotaReadingPurpose,
   type QuotaState,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
@@ -1817,7 +1818,13 @@ const anthropicAuthPlugin = async (
       assertNativeEnvironment()
       const routeId = request.kind === 'main' ? 'main' : request.accountId
       if (!routeId) throw new Error('Quota request has no account identity')
-      return nativeAccounts.fetchQuota(routeId, undefined, undefined, dispatch)
+      return nativeAccounts.fetchQuota(
+        routeId,
+        undefined,
+        undefined,
+        dispatch,
+        request.purpose,
+      )
     },
   })
   function quotaSnapshotIsExhausted(
@@ -2834,16 +2841,20 @@ const anthropicAuthPlugin = async (
   }
 
   let fallbackQuotaRefreshQueue: Promise<void> = Promise.resolve()
+  // `purpose` tells vault custody whether this sweep is the background tick
+  // or a request's admission, which decides how insula's quota cache is used.
+  // Explicit refreshes leave it unset and always poll Anthropic.
   function refreshFallbackQuotas(
     force = false,
     requiredByPolicy = false,
     modelId?: string,
+    purpose?: QuotaReadingPurpose,
   ) {
     // Startup and request preflight can both observe missing quota before
     // either poll finishes. Serialize the read/check/poll sequence so the
     // next sweep sees the preceding result. Explicit refresh still polls.
     const operation = fallbackQuotaRefreshQueue.then(() =>
-      pollFallbackQuotas(force, requiredByPolicy, modelId),
+      pollFallbackQuotas(force, requiredByPolicy, modelId, purpose),
     )
     fallbackQuotaRefreshQueue = operation.then(
       () => {},
@@ -2855,6 +2866,7 @@ const anthropicAuthPlugin = async (
     force: boolean,
     requiredByPolicy: boolean,
     modelId?: string,
+    purpose?: QuotaReadingPurpose,
   ) {
     const snapshot = await nativeAccounts.read()
     const unavailable = new Set<string>()
@@ -2894,6 +2906,7 @@ const anthropicAuthPlugin = async (
             (candidate) =>
               candidate.id === account.id && isOAuthAccount(candidate),
           ) as OAuthAccount | undefined,
+          force ? undefined : purpose,
         )
         if (!reading) {
           unavailable.add(account.id)
@@ -3079,7 +3092,7 @@ const anthropicAuthPlugin = async (
         }
       }
     }
-    await refreshFallbackQuotas()
+    await refreshFallbackQuotas(false, false, undefined, 'background')
   }
   const canStartNativeServices =
     initialStorage !== null && process.env.OPENCODE_AUTH_CONTENT === undefined
@@ -3101,7 +3114,8 @@ const anthropicAuthPlugin = async (
     knownVaultFallbacks = current
     // Discovery and request preflight share the due sweep, so an arriving
     // account gets its first reading without duplicating an in-flight poll.
-    if (discovered) await refreshFallbackQuotas()
+    if (discovered)
+      await refreshFallbackQuotas(false, false, undefined, 'background')
     await refreshSidebarQuota()
   }
   const vaultWatch =
@@ -7830,6 +7844,7 @@ const anthropicAuthPlugin = async (
               false,
               requiredByPolicy,
               options.modelId,
+              'admission',
             )
             // Polling can also bind a newly discovered account UUID. Filter
             // the fresh native overlay, not the request's earlier account view.
@@ -7932,6 +7947,7 @@ const anthropicAuthPlugin = async (
                   mainQuotaIdentity,
                   input.mainAccessToken,
                   input.mainQuotaIdentity?.generation,
+                  'admission',
                 )
               } catch {}
             }
@@ -9631,6 +9647,7 @@ const anthropicAuthPlugin = async (
                       requestMainQuotaIdentity?.quotaKey,
                       auth.access,
                       requestMainQuotaIdentity?.generation,
+                      'admission',
                     )
                     routingQuotaEntry = routingMainQuotaEntry(
                       requestMainQuotaIdentity,
@@ -9810,7 +9827,12 @@ const anthropicAuthPlugin = async (
                       ),
                       // Fallback-first may have just polled these accounts.
                       // Keep those fresh readings rather than polling twice.
-                      refreshFallbackQuotas(false, true),
+                      refreshFallbackQuotas(
+                        false,
+                        true,
+                        undefined,
+                        'admission',
+                      ),
                     ])
                   } catch (error) {
                     log('[quota] killswitch refresh failed', {

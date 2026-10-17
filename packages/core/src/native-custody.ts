@@ -1,6 +1,7 @@
 import {
   ClaustrumConsumerError,
   ClaustrumScopedCustody,
+  type InsulaUsageTransport,
 } from '@cortexkit/common-auth/claustrum'
 import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
 
@@ -59,6 +60,12 @@ export interface NativeCustodyClient {
     reporterSource: NativeCustodyReporterSource
   }) => Promise<void>
   close: () => void
+  /**
+   * How to read insula's background quota cache on the same daemon. Present
+   * when the connection was made with connectClaustrumScopedClient; reading
+   * it opens a separate short-lived socket and never uses this connection.
+   */
+  insula?: InsulaUsageTransport
 }
 
 export type NativeCustodyReporterSource =
@@ -219,6 +226,8 @@ export interface NativeCustody {
     served: NativeCustodyReceipt,
     signal?: AbortSignal,
   ) => Promise<NativeCustodyRetry>
+  /** The shared connection's insula transport, connecting first if needed; undefined when the client has none. */
+  insulaTransport: () => Promise<InsulaUsageTransport | undefined>
   close: () => void
 }
 
@@ -414,6 +423,7 @@ export function createNativeCustody(
       }
       return { retry: true, receipt: current }
     },
+    insulaTransport: () => scoped(async (owned) => owned.insula),
     close: () => {
       if (closed) return
       closed = true

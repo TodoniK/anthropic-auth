@@ -5,7 +5,10 @@ import {
 } from '@cortexkit/claustrum-client'
 import {
   acceptAccount,
+  ClaustrumConsumer,
   ClaustrumConsumerError,
+  type ClaustrumScopedClient,
+  connectClaustrumScopedClient,
   declineAccount,
   mutateVaultRoster,
   readVaultRoster,
@@ -19,6 +22,12 @@ import {
   type PrimeUsageDelta,
   quotaSnapshotCheckedAt,
 } from './accounts.ts'
+import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
+import {
+  type InsulaClaudeQuota,
+  mergeInsulaQuota,
+  normalizeInsulaClaudeQuota,
+} from './insula-quota.ts'
 import { logger } from './logger.ts'
 import {
   applyNativeMetadataPatch,
@@ -76,7 +85,10 @@ import { fetchOAuthAccountProfile } from './oauth-profile.ts'
 import { NativeAuthorityError } from './pool-authority.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 import { createNativePoolStore } from './pool-store.ts'
-import type { QuotaRequestDispatch } from './quota-manager.ts'
+import type {
+  QuotaReadingPurpose,
+  QuotaRequestDispatch,
+} from './quota-manager.ts'
 
 export interface NativeVaultRuntimeOptions {
   paths: NativePoolPaths
@@ -89,6 +101,20 @@ export interface NativeVaultRuntimeOptions {
   env?: NodeJS.ProcessEnv
   now?: () => number
 }
+
+/**
+ * Why a vault quota reading is wanted, which decides whether insula's
+ * background quota cache may answer instead of Anthropic's usage endpoint.
+ * - 'background': a periodic sweep. Refresh insula's cache (at most once a
+ *   minute per daemon and enrollment), look the route's account up in it,
+ *   and skip the usage GET when it holds a current reading.
+ * - 'admission': a request needs a reading. Look the served credential's
+ *   account up in insula's cache only, never refreshing it, then poll on a
+ *   miss.
+ * Omitted: poll Anthropic directly (explicit user refreshes and other
+ *   callers that must see the provider's own reading).
+ */
+export type NativeVaultQuotaPurpose = QuotaReadingPurpose
 
 export interface NativeVaultWatchOptions {
   intervalMs: number
@@ -218,6 +244,7 @@ export interface NativeVaultRuntime {
     fetchImpl?: typeof fetch,
     signal?: AbortSignal,
     dispatch?: QuotaRequestDispatch,
+    purpose?: NativeVaultQuotaPurpose,
   ): Promise<OAuthQuotaSnapshot>
   fetchProfile(
     routeId: string,
@@ -348,13 +375,65 @@ export function createNativeVaultRuntime(
     now: options.now,
     connect:
       options.connect ??
+      // The scoped client is a plain ClaustrumClient that also carries the
+      // insula transport for the same connection file and identity.
       (() =>
-        ClaustrumClient.connect({
+        connectClaustrumScopedClient({
           connectionFile,
           identity,
         })),
     env,
   })
+  // Used only for insula's background quota cache: this runtime's own custody
+  // lists, authorizes and reports. Common-auth shares one insula source per
+  // resolved connection file and enrollment token path, and the consumer
+  // never reads it unless the enrollment selects vault custody and its token
+  // file is readable.
+  const insula = new ClaustrumConsumer<InsulaClaudeQuota>({
+    rosterPath: paths.roster,
+    tokenPath: getHostClaustrumEnrollmentPaths(options.host, env).tokenPath,
+    family: {
+      refreshAdapter: 'anthropic',
+      category: 'anthropic-native',
+      apiKeys: false,
+    },
+    connect: async (): Promise<ClaustrumScopedClient> => {
+      const transport = await custody.insulaTransport()
+      const unused = () => Promise.reject(new NativeCustodyError('unavailable'))
+      return {
+        listScoped: unused,
+        getScoped: unused,
+        reportAuthFailureScoped: unused,
+        // The connection belongs to this runtime's custody, which closes it.
+        close: () => {},
+        ...(transport && { insula: transport }),
+      }
+    },
+    isCustodyActive: () => active().catch(() => false),
+    insula: { provider: 'claude', normalize: normalizeInsulaClaudeQuota },
+    ...(options.now && { now: options.now }),
+    logger: {
+      warn: () => {},
+      debug: () => {},
+    },
+  })
+  // The last source each route's guided quota reading came from, so a change
+  // is logged once rather than on every sweep.
+  const quotaSources = new Map<string, 'insula' | 'fallback'>()
+  function noteQuotaSource(
+    routeId: string,
+    source: 'insula' | 'fallback',
+    reason: 'insula-reading' | 'no-insula-reading' | 'account-changed',
+  ) {
+    if (quotaSources.get(routeId) === source) return
+    quotaSources.set(routeId, source)
+    if (quotaSources.size > 1000) {
+      const oldest = quotaSources.keys().next().value
+      if (oldest !== undefined) quotaSources.delete(oldest)
+    }
+    // Fixed codes only: no route, credential or account identity.
+    logger.info('quota', 'vault quota source changed', { source, reason })
+  }
   const issued = new WeakMap<
     NativeCustodyReceipt,
     { routeId: string; logicalId: string }
@@ -403,6 +482,10 @@ export function createNativeVaultRuntime(
       )
       if (shutdown.signal.aborted || !allowed.some(Boolean)) return
       await runtime.refresh(shutdown.signal)
+      if (shutdown.signal.aborted) return
+      // Keep insula's cache warm for admission lookups, which only read it.
+      // It refreshes at most once a minute and never throws.
+      await insula.refreshInsulaQuota()
       if (shutdown.signal.aborted) return
       // Notifications belong to their observers. A slow or disposing host must
       // not hold discovery for the other leases; hosts drain their own writes.
@@ -758,8 +841,17 @@ export function createNativeVaultRuntime(
         },
       }))
     },
-    async fetchQuota(routeId, fetchImpl = fetch, signal, dispatch) {
+    async fetchQuota(routeId, fetchImpl = fetch, signal, dispatch, purpose) {
       const row = await rowFor(await runtime.read(), routeId)
+      // A background sweep asks insula about the roster row's account (its
+      // list_scoped account_id) before any credential is fetched.
+      let swept: InsulaClaudeQuota | undefined
+      if (purpose === 'background' && row) {
+        await insula.refreshInsulaQuota()
+        check(signal)
+        swept = await insula.cachedInsulaQuotaForRoute(row.routeId)
+        check(signal)
+      }
       const state = await readNativeRuntime(paths.runtime, paths.storageId)
       const before =
         state.status === 'ready'
@@ -782,12 +874,44 @@ export function createNativeVaultRuntime(
         routeId,
         fetchImpl,
         signal,
-        (receipt, transport) =>
-          fetchOAuthQuotaSnapshot({
+        async (receipt, transport) => {
+          // A served receipt is still needed with an insula reading: the
+          // reading is published bound to this credential version.
+          let reading: InsulaClaudeQuota | undefined
+          let miss: 'no-insula-reading' | 'account-changed' =
+            'no-insula-reading'
+          if (purpose === 'background') {
+            // The sweep joined the roster row's account; publish it only for
+            // a credential served for that same account.
+            if (
+              swept &&
+              row?.accountIdentity &&
+              receipt.assertedAccountIdentity === row.accountIdentity
+            )
+              reading = swept
+            else if (swept) miss = 'account-changed'
+          } else if (purpose === 'admission') {
+            reading = await insula.cachedInsulaQuota(receipt)
+          }
+          if (purpose)
+            noteQuotaSource(
+              routeId,
+              reading ? 'insula' : 'fallback',
+              reading ? 'insula-reading' : miss,
+            )
+          if (reading) {
+            const stored = matchingBefore(receipt)?.quota
+            return mergeInsulaQuota(
+              reading,
+              stored ? fromNativeQuotaMap(stored) : undefined,
+            )
+          }
+          return fetchOAuthQuotaSnapshot({
             accessToken: receipt.accessToken,
             fetchImpl: transport,
             now: options.now,
-          }),
+          })
+        },
         async (error, receipt) => {
           const matched = matchingBefore(receipt)
           const failure = nativeQuotaFailure(
@@ -893,6 +1017,7 @@ export function createNativeVaultRuntime(
       schedulePoll()
       if (shutdown.signal.aborted) return
       shutdown.abort(new NativeCustodyError('closed'))
+      insula.close()
       custody.close()
     },
   }
@@ -1266,8 +1391,8 @@ export function leaseNativeVaultRuntime(
     prepareRetry: (receipt, signal, site) =>
       use().prepareRetry(receipt, signal, site),
     publish: (receipt, patch) => use().publish(receipt, patch),
-    fetchQuota: (id, transport, signal, dispatch) =>
-      use().fetchQuota(id, transport, signal, dispatch),
+    fetchQuota: (id, transport, signal, dispatch, purpose) =>
+      use().fetchQuota(id, transport, signal, dispatch, purpose),
     fetchProfile: (id, transport, signal) =>
       use().fetchProfile(id, transport, signal),
     fetchProfileForDisplay: (id, transport, signal) =>

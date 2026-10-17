@@ -159,6 +159,7 @@ function getPiRoutingServices(
           fetchPiOAuth,
           undefined,
           dispatch,
+          request.purpose,
         )
       },
     })
@@ -208,7 +209,7 @@ function getPiRoutingServices(
         !quotaBackoffActive(account.lastQuotaRefreshError, Date.now())
       ) {
         try {
-          await quotas.refreshFallback(account.id, '', account)
+          await quotas.refreshFallback(account.id, '', account, 'admission')
         } catch (error) {
           // A transient account error means another writer is still saving
           // this fallback. Rethrow it: swallowing it would leave the fallback
@@ -1113,7 +1114,12 @@ async function executeWithFallback(options: {
       )
     ) {
       try {
-        mainQuota = await quotaManager.refreshMain(mainAccountId, '')
+        mainQuota = await quotaManager.refreshMain(
+          mainAccountId,
+          '',
+          undefined,
+          'admission',
+        )
       } catch {}
     }
     const usableFallbacks = await getUsableFallbackAccounts(storage, {
@@ -1145,6 +1151,7 @@ async function executeWithFallback(options: {
             account.id,
             '',
             account,
+            'admission',
           )
         } catch {}
       }
@@ -1601,7 +1608,12 @@ async function executeWithFallback(options: {
     let mainQuota = quotaManager.getMain(mainAccountId)?.quota
     if (!mainQuota || quotaManager.isMainStale(options.model.id)) {
       try {
-        mainQuota = await quotaManager.refreshMain(mainAccountId, '')
+        mainQuota = await quotaManager.refreshMain(
+          mainAccountId,
+          '',
+          undefined,
+          'admission',
+        )
       } catch {}
     }
     if (

@@ -41,8 +41,16 @@ export function startNativeAnthropicLifecycle(
       ) {
         // Each quota reading or failure is bound to the credential version
         // used for its request, so a late result cannot affect a newer login.
+        // The background tick: vault custody takes a current insula
+        // reading instead of a usage GET when one exists for this account.
         await runtime
-          .fetchQuota(account.id, fetchImpl, abort.signal)
+          .fetchQuota(
+            account.id,
+            fetchImpl,
+            abort.signal,
+            undefined,
+            'background',
+          )
           .catch(() => {})
       }
       if (!oauthProfileIsFresh(account.profile) && !abort.signal.aborted)

@@ -234,6 +234,7 @@ export {
   openNativePiAuthSlot,
 } from './native-vault-connection.ts'
 export type {
+  NativeVaultQuotaPurpose,
   NativeVaultRuntime,
   NativeVaultRuntimeOptions,
   NativeVaultWatch,

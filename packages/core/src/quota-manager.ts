@@ -67,6 +67,14 @@ export type QuotaRefreshResult = {
   fetched: boolean
 }
 
+/**
+ * Why a quota reading is wanted, passed to fetchQuotaSnapshot unchanged.
+ * Vault custody uses it to decide whether insula's background quota cache
+ * may answer instead of a usage GET (see NativeVaultQuotaPurpose); omitted
+ * means poll the provider directly.
+ */
+export type QuotaReadingPurpose = 'background' | 'admission'
+
 /** Pace a physical usage GET and verify the selected credential is still eligible before sending. */
 export type QuotaRequestDispatch = (
   send: () => Promise<Response>,
@@ -89,6 +97,7 @@ export type QuotaManagerOptions = {
       kind: 'main' | 'fallback'
       accountId: string | undefined
       accessToken: string
+      purpose?: QuotaReadingPurpose
     },
     dispatch: QuotaRequestDispatch,
   ) => Promise<OAuthQuotaSnapshot>
@@ -406,6 +415,7 @@ export class QuotaManager {
     mainAccountIdOrAccessToken: string | undefined,
     accessToken?: string,
     expectedIdentityGeneration?: number,
+    purpose?: QuotaReadingPurpose,
   ): Promise<OAuthQuotaSnapshot> {
     const mainAccountId = mainAccountIdOrAccessToken
     const credential = accessToken ?? mainAccountIdOrAccessToken
@@ -416,6 +426,7 @@ export class QuotaManager {
         mainAccountId,
         credential,
         expectedIdentityGeneration,
+        purpose,
       )
     ).quota
   }
@@ -424,6 +435,7 @@ export class QuotaManager {
     mainAccountIdOrAccessToken: string | undefined,
     accessToken?: string,
     expectedIdentityGeneration?: number,
+    purpose?: QuotaReadingPurpose,
   ): Promise<QuotaRefreshResult> {
     const effectiveAccountId = mainAccountIdOrAccessToken
     const credential = accessToken ?? mainAccountIdOrAccessToken
@@ -466,6 +478,7 @@ export class QuotaManager {
       credential ?? '',
       generation,
       inflightToken,
+      purpose,
     )
     return this.inflightMain
   }
@@ -474,9 +487,15 @@ export class QuotaManager {
     accountId: string,
     accessToken: string,
     account: Pick<OAuthAccount, 'authLineageId'> | undefined,
+    purpose?: QuotaReadingPurpose,
   ): Promise<OAuthQuotaSnapshot> {
     return (
-      await this.refreshFallbackWithMetadata(accountId, accessToken, account)
+      await this.refreshFallbackWithMetadata(
+        accountId,
+        accessToken,
+        account,
+        purpose,
+      )
     ).quota
   }
 
@@ -484,6 +503,7 @@ export class QuotaManager {
     accountId: string,
     accessToken: string,
     account: Pick<OAuthAccount, 'authLineageId'> | undefined,
+    purpose?: QuotaReadingPurpose,
   ): Promise<QuotaRefreshResult> {
     if (!accessToken && !this.canFetchWithoutAccessToken()) {
       throw new Error('Fallback OAuth access token is unavailable')
@@ -506,6 +526,7 @@ export class QuotaManager {
       accessToken,
       generation,
       account,
+      purpose,
     )
     this.inflightFallbacks.set(inflightKey, promise)
     void promise.then(
@@ -1008,6 +1029,7 @@ export class QuotaManager {
     accessToken: string,
     generation: number,
     inflightToken: number,
+    purpose?: QuotaReadingPurpose,
   ): Promise<QuotaRefreshResult> {
     return this._enqueueApiFetch(async () => {
       try {
@@ -1064,7 +1086,12 @@ export class QuotaManager {
           )
           const quota = this.fetchQuotaSnapshot
             ? await this.fetchQuotaSnapshot(
-                { kind: 'main', accountId: mainAccountId, accessToken },
+                {
+                  kind: 'main',
+                  accountId: mainAccountId,
+                  accessToken,
+                  ...(purpose && { purpose }),
+                },
                 dispatch,
               )
             : await fetchOAuthQuotaSnapshot({
@@ -1163,6 +1190,7 @@ export class QuotaManager {
     accessToken: string,
     generation: number,
     account: Pick<OAuthAccount, 'authLineageId'> | undefined,
+    purpose?: QuotaReadingPurpose,
   ): Promise<QuotaRefreshResult> {
     return this._enqueueApiFetch(async () => {
       try {
@@ -1204,7 +1232,12 @@ export class QuotaManager {
           )
           const quota = this.fetchQuotaSnapshot
             ? await this.fetchQuotaSnapshot(
-                { kind: 'fallback', accountId, accessToken },
+                {
+                  kind: 'fallback',
+                  accountId,
+                  accessToken,
+                  ...(purpose && { purpose }),
+                },
                 dispatch,
               )
             : await fetchOAuthQuotaSnapshot({

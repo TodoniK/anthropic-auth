@@ -88,6 +88,7 @@ import {
   acquireNativeVaultRuntime,
   leaseNativeVaultRuntime,
   type NativeDisplayProfile,
+  type NativeVaultQuotaPurpose,
   type NativeVaultRuntime,
   type NativeVaultRuntimeOptions,
   nativeDisplayProfile,
@@ -247,11 +248,13 @@ export interface NativeAccountRuntime {
     fence: NativeKnownCredentialSubject | NativeCustodyReceipt,
     delta?: PrimeUsageDelta,
   ): Promise<boolean>
+  /** `purpose` applies to vault accounts only; local accounts always poll. */
   fetchQuota(
     routeId: string,
     fetchImpl?: typeof fetch,
     signal?: AbortSignal,
     dispatch?: QuotaRequestDispatch,
+    purpose?: NativeVaultQuotaPurpose,
   ): Promise<OAuthQuotaSnapshot>
   fetchProfile(
     routeId: string,
@@ -320,8 +323,8 @@ export function acquireNativeAccountRuntime(
       use().getOrCreateAuthLineage(id, fence),
     incrementPrimeUsage: (id, fence, delta) =>
       use().incrementPrimeUsage(id, fence, delta),
-    fetchQuota: (id, transport, signal, dispatch) =>
-      use().fetchQuota(id, transport, signal, dispatch),
+    fetchQuota: (id, transport, signal, dispatch, purpose) =>
+      use().fetchQuota(id, transport, signal, dispatch, purpose),
     fetchProfile: (id, transport, signal) =>
       use().fetchProfile(id, transport, signal),
     fetchProfileForDisplay: (id, transport, signal) =>
@@ -1506,10 +1509,10 @@ export function createNativeAccountRuntime(
         },
       }))
     },
-    async fetchQuota(routeId, fetchImpl = fetch, signal, dispatch) {
+    async fetchQuota(routeId, fetchImpl = fetch, signal, dispatch, purpose) {
       const snapshot = await runtime.read()
       if (snapshot.mode === 'claustrum')
-        return vault.fetchQuota(routeId, fetchImpl, signal, dispatch)
+        return vault.fetchQuota(routeId, fetchImpl, signal, dispatch, purpose)
       const before = snapshot.accounts.find((row) => row.id === routeId)
       const result = await fetchReading(
         routeId,
