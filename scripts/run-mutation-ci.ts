@@ -7,9 +7,9 @@ import {
 } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
-export const MUTATION_RUNNER_VERSION = 'ckdev-mutate 0.9.2'
+export const MUTATION_RUNNER_VERSION = 'ckdev-mutate 0.12.5'
 export const MUTATION_RUNNER_REVISION =
-  'b491012199d98b09fd167e00783df297d35a62b8'
+  'bd31bef35db3bd7b1c3f91b11409f927dd95283d'
 
 const forceAllPaths = new Set([
   'scripts/run-mutation-bun.ts',
@@ -116,9 +116,11 @@ function compareUtf8(left: string, right: string) {
 }
 
 /**
- * The catalogue IDs that ckdev-mutate 0.9.2 assigns to `run --all --shard i/n`:
- * it sorts rows by ID and takes every n-th row starting at position i - 1.
- * Any row added to the catalogue therefore lands in exactly one shard.
+ * The catalogue IDs that ckdev-mutate 0.12.5 assigns to `run --all --shard i/n`
+ * when no `--shard-weights` report is given: it sorts rows by ID and takes
+ * every n-th row starting at position i - 1. Any row added to the catalogue
+ * therefore lands in exactly one shard. The workflow never passes
+ * `--shard-weights`, whose cost-based assignment this function cannot predict.
  */
 export function shardRowIds(
   ids: readonly string[],

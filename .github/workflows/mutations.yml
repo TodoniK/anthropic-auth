@@ -25,7 +25,7 @@ jobs:
     env:
       MUTATION_EVENT: ${{ github.event_name }}
       MUTATION_BASE: ${{ github.event.pull_request.base.sha }}
-      MUTATION_HOME: ${{ github.workspace }}/node_modules/.cache/ckdev-mutate-0.9.2
+      MUTATION_HOME: ${{ github.workspace }}/node_modules/.cache/ckdev-mutate-0.12.5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
         with:
@@ -45,7 +45,7 @@ jobs:
           CARGO_HOME="$MUTATION_HOME/cargo-home" \
           CARGO_TARGET_DIR="$MUTATION_HOME/target" \
           cargo install --locked --git https://github.com/cortexkit/commons \
-            --rev b491012199d98b09fd167e00783df297d35a62b8 \
+            --rev bd31bef35db3bd7b1c3f91b11409f927dd95283d \
             --root "$MUTATION_HOME/install" cortexkit-mutate
           echo "$MUTATION_HOME/install/bin" >> "$GITHUB_PATH"
       - name: Verify CI selection and report guards
@@ -96,7 +96,7 @@ jobs:
     env:
       MUTATION_EVENT: ${{ github.event_name }}
       MUTATION_SHARD: ${{ matrix.shard }}/${{ needs.audit-plan.outputs.count }}
-      MUTATION_HOME: ${{ github.workspace }}/node_modules/.cache/ckdev-mutate-0.9.2
+      MUTATION_HOME: ${{ github.workspace }}/node_modules/.cache/ckdev-mutate-0.12.5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
         with:
@@ -116,7 +116,7 @@ jobs:
           CARGO_HOME="$MUTATION_HOME/cargo-home" \
           CARGO_TARGET_DIR="$MUTATION_HOME/target" \
           cargo install --locked --git https://github.com/cortexkit/commons \
-            --rev b491012199d98b09fd167e00783df297d35a62b8 \
+            --rev bd31bef35db3bd7b1c3f91b11409f927dd95283d \
             --root "$MUTATION_HOME/install" cortexkit-mutate
           echo "$MUTATION_HOME/install/bin" >> "$GITHUB_PATH"
       - name: Verify CI selection and report guards

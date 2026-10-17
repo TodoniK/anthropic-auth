@@ -1,4 +1,7 @@
 # Commands select exact expect_red tests; --broad runs the full owning package.
+# OpenCode rows set junit_class = "suites": their collateral targets come from
+# the JUnit <testsuite> nesting (outer > inner describe), because Bun 1.3.14
+# writes a nested describe's classname innermost first and escaped twice.
 prebuild = [
   { name = "core-current-source", command = ["bun", "run", "--cwd", "packages/core", "build"] },
   { name = "opencode-current-source", command = ["bun", "run", "--cwd", "packages/opencode", "build"] },
@@ -71,6 +74,7 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "header-routing-raw-exhaustion-proof"
@@ -87,6 +91,7 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "runtime-read-no-follow"
@@ -151,6 +156,7 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "local-metadata-requires-token-version"
@@ -167,6 +173,7 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "profile-publication-refusal-is-not-io"
@@ -199,6 +206,7 @@ expect_message = "error: expect(received).not.toContain(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "runtime-owner-loss-is-publication-refusal"
@@ -254,6 +262,7 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "native-activation-after-authorization"
@@ -275,6 +284,7 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "fallback-killswitch-polls-before-selection"
@@ -295,6 +305,7 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "fallback-quota-sweeps-do-not-overlap"
@@ -313,6 +324,7 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "vault-affinity-fast-uuid-fence"
@@ -377,6 +389,7 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "pi-vault-routing-passes-account-uuid"
@@ -553,6 +566,7 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "local-authority-rechecks-enrollment-after-journal"
@@ -743,6 +757,7 @@ expect_message = "Expected promise that resolves"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "migration-capture-refuses-populated-pool"
@@ -783,6 +798,7 @@ expect_message = "Expected promise that resolves"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "pi-cache-marker-text-only-latest-user"
@@ -817,6 +833,7 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "ordered-quota-refresh-without-killswitch"
@@ -833,6 +850,7 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "vault-fallback-quota-floor"
@@ -849,6 +867,7 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "cachekeep-sweep-preserves-fresh-records"
@@ -913,6 +932,7 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+junit_class = "suites"
 
 [[control]]
 id = "pi-cancelled-401-never-reaches-routing"
