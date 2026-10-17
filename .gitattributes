@@ -1,1 +1,2 @@
 packages/opencode/src/tests/fixtures/claustrum-golden/* -text
+packages/opencode/src/tests/fixtures/claude-oauth-wire/* -text

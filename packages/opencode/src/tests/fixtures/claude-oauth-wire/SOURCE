@@ -1,0 +1,6 @@
+# Vendored byte for byte from cortexkit/commons. To bump: change commit below and
+# copy README.md, vectors.json and SHA256SUMS from that commit into this folder.
+# CI (.github/workflows/ci.yml) reads these three keys and fails on any drift.
+repository=https://github.com/cortexkit/commons.git
+commit=0348eafcefa774c7575b6001cd1bcd34e55111c9
+path=crates/cortexkit-anthropic-policy/test-vectors/claude-oauth-wire

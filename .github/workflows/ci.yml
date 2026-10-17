@@ -36,6 +36,35 @@ jobs:
       - run: bun run check:claustrum-golden
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      # The vendored Claude OAuth wire vectors must stay byte-identical to
+      # cortexkit/commons at the commit pinned in their SOURCE file, the only
+      # place the pin lives.
+      - name: Verify vendored Claude OAuth wire vectors match commons
+        run: |
+          set -euo pipefail
+          dir=packages/opencode/src/tests/fixtures/claude-oauth-wire
+          read_key() { sed -n "s/^$1=//p" "$dir/SOURCE"; }
+          repo="$(read_key repository)"
+          commit="$(read_key commit)"
+          path="$(read_key path)"
+          if [[ -z "$repo" || -z "$path" || ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error file=$dir/SOURCE::SOURCE must set repository, path and a 40-hex commit"
+            exit 1
+          fi
+          commons="$(mktemp -d)"
+          git -C "$commons" init -q
+          git -C "$commons" fetch -q --depth 1 "$repo" "$commit"
+          status=0
+          for file in README.md vectors.json SHA256SUMS; do
+            if ! git -C "$commons" show "FETCH_HEAD:$path/$file" | cmp -s - "$dir/$file"; then
+              echo "::error file=$dir/$file::$dir/$file differs from $repo at $commit ($path/$file). Copy it byte for byte with git show $commit:$path/$file, or bump the commit in $dir/SOURCE together with all three files."
+              status=1
+            fi
+          done
+          if [ "$status" = 0 ]; then
+            echo "claude-oauth-wire: README.md, vectors.json and SHA256SUMS match $repo at $commit"
+          fi
+          exit "$status"
       - run: bun test scripts/check-test-count-floors.test.ts
       # UNCHECKED exits nonzero too: a missing merge target must not look green.
       - name: Verify unit-count floors
