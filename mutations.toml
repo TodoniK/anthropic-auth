@@ -881,3 +881,19 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "pi-cachekeep-prewarm-body-betas"
+guards = "Pi's CacheKeep prewarm must send the betas the model request sends for the same body, including the Fable 5.1 effort beta its system effort markers need."
+file = "packages/pi/src/stream.ts"
+old = "    applyPiOAuthRequestHeaders(headers, piAttemptAccessToken(served), {"
+new = "    applyClaudeCodeHeaders(headers, piAttemptAccessToken(served), { extraBetas: [CACHE_KEEP_EXTENDED_TTL_BETA], // NON-VACUITY BREAK: rebuild prewarm betas without the body's betas"
+test_file = "packages/pi/src/tests/scoped-stream.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/pi/src/tests/scoped-stream.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["Pi CacheKeep prewarm of a Fable 5.1 body with effort markers sends the mid-conversation output config beta", "Pi CacheKeep prewarm of a Fable 5.1 body without effort markers sends the model request betas"]
+expect_message = "error: expect(received).toContain(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
+broad_report = "tmp/mutations/pi.xml"
+broad_id = "{name}"

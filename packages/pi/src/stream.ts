@@ -6,6 +6,7 @@ import {
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
+  type ClaudeCodeIdentity,
   createProviderErrorResponseScope,
   createSseFramer,
   createStickyNoRouteResponse,
@@ -247,6 +248,45 @@ function getPiCacheKeepRegistry() {
   return cacheKeepRegistry
 }
 
+/**
+ * Sets the Claude Code headers for a Pi OAuth request to Anthropic, with the
+ * betas this body needs. Model requests and CacheKeep prewarms both call it:
+ * a prewarm replays a model request's body, and Anthropic needs the same
+ * betas to accept it (for example, the effort beta for the empty
+ * `role: "system"` effort markers in a Fable 5.1 body). `leadingBetas` are
+ * placed before the body's betas.
+ */
+function applyPiOAuthRequestHeaders(
+  headers: Headers,
+  accessToken: string,
+  options: {
+    body: Record<string, unknown>
+    identity: ClaudeCodeIdentity | undefined
+    leadingBetas?: string[]
+  },
+) {
+  const { body } = options
+  applyClaudeCodeHeaders(headers, accessToken, {
+    body,
+    identity: options.identity,
+    extraBetas: [
+      ...(options.leadingBetas ?? []),
+      ...(hasThinkingBindingControls(body)
+        ? [THINKING_BINDING_CONTROLS_BETA]
+        : []),
+      ...(usesMidConversationOutputConfig(body)
+        ? [MID_CONVERSATION_OUTPUT_CONFIG_BETA]
+        : []),
+    ],
+  })
+  if (body.speed === 'fast')
+    headers.set(
+      'anthropic-beta',
+      mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
+    )
+  return headers
+}
+
 const nativePrewarmAttempts = new Map<
   number,
   {
@@ -285,21 +325,11 @@ const cacheKeepManager = new CacheKeepManager({
       served.accountIdentity as ProviderAccountUuid,
     )
     headers.delete('anthropic-beta')
-    applyClaudeCodeHeaders(headers, piAttemptAccessToken(served), {
+    applyPiOAuthRequestHeaders(headers, piAttemptAccessToken(served), {
       body,
       identity,
-      extraBetas: [
-        CACHE_KEEP_EXTENDED_TTL_BETA,
-        ...(hasThinkingBindingControls(body)
-          ? [THINKING_BINDING_CONTROLS_BETA]
-          : []),
-      ],
+      leadingBetas: [CACHE_KEEP_EXTENDED_TTL_BETA],
     })
-    if (body.speed === 'fast')
-      headers.set(
-        'anthropic-beta',
-        mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
-      )
     nativePrewarmAttempts.set(attempt.id, { runtime, served, reported: false })
     return headers
   },
@@ -565,23 +595,7 @@ async function sendAnthropicRequest(options: {
   const fastMode = body.speed === 'fast'
   const headers = options.apiAccount
     ? new Headers()
-    : applyClaudeCodeHeaders(new Headers(), '', {
-        body,
-        identity,
-        extraBetas: [
-          ...(hasThinkingBindingControls(body)
-            ? [THINKING_BINDING_CONTROLS_BETA]
-            : []),
-          ...(usesMidConversationOutputConfig(body)
-            ? [MID_CONVERSATION_OUTPUT_CONFIG_BETA]
-            : []),
-        ],
-      })
-  if (!options.apiAccount && fastMode)
-    headers.set(
-      'anthropic-beta',
-      mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
-    )
+    : applyPiOAuthRequestHeaders(new Headers(), '', { body, identity })
   const relayAffinity = options.streamOptions?.sessionId ?? null
   let input = options.apiAccount
     ? new URL('https://api.anthropic.com/v1/messages')

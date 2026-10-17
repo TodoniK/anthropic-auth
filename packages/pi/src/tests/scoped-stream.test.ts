@@ -5,9 +5,12 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   __setLogTestSink,
+  CACHE_KEEP_EXTENDED_TTL_BETA,
   type NativeCustodyClient as ClaustrumScopedClient,
   getLogLevel,
   type LogTestRecord,
+  MID_CONVERSATION_OUTPUT_CONFIG_BETA,
+  PER_TURN_CONTROL_BETA,
   resolveNativePoolPaths,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
@@ -1036,6 +1039,154 @@ registerTest.each([200, 401])(
     )
   }),
 )
+
+// Sends one model request through Pi's real stream path, then replays its
+// captured URL, headers and body through Pi's CacheKeep prewarm, recording
+// both outbound requests. CacheKeep rebuilds the prewarm headers itself, so a
+// beta the model request needed but the prewarm forgot shows up as a
+// difference between the two captures.
+async function sendAndPrewarm(
+  f: Awaited<ReturnType<typeof fixture>>,
+  modelId: string,
+  effortTransitions?: Array<{
+    afterAssistantMessages: number
+    effort: 'low' | 'high'
+  }>,
+) {
+  const sent: Array<{ url: string; headers: Headers; body: string }> = []
+  globalThis.fetch = Object.assign(
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      if (!String(input).includes('/v1/messages'))
+        throw new Error('unexpected Pi request destination')
+      sent.push({
+        url: String(input),
+        headers: new Headers(init?.headers),
+        body: String(init?.body),
+      })
+      return sent.length === 1
+        ? success()
+        : new Response(JSON.stringify({ usage: { input_tokens: 1 } }))
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const conversation: Context = {
+    systemPrompt: 'Test',
+    tools: [],
+    messages: [
+      { role: 'user', content: 'first', timestamp: 0 },
+      {
+        role: 'assistant',
+        provider: 'anthropic',
+        api: 'anthropic-messages',
+        model: modelId,
+        content: [{ type: 'text', text: 'first answer' }],
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: 'stop',
+        timestamp: 0,
+      },
+      { role: 'user', content: 'second', timestamp: 0 },
+    ],
+  }
+  const result = await streamCortexKitAnthropic(
+    { ...model, id: modelId },
+    conversation,
+    { sessionId: `pi-prewarm-betas-${modelId}`, reasoning: 'high' },
+    effortTransitions,
+  ).result()
+  expect(result.stopReason).toBe('stop')
+  const [main] = sent
+  if (!main) throw new Error('Pi sent no model request')
+  const prewarm = await __prewarmPiCacheKeepForTest({
+    sessionId: `pi-prewarm-betas-${modelId}`,
+    url: main.url,
+    headers: main.headers,
+    bodyText: main.body,
+    oauthAccountId: 'main',
+    oauthAccountIdentity: fixtureAccountIdentity('main'),
+    accountStoragePath: f.path,
+  })
+  expect(prewarm.ok).toBe(true)
+  expect(sent).toHaveLength(2)
+  const warm = sent[1]!
+  const betas = (headers: Headers) =>
+    (headers.get('anthropic-beta') ?? '').split(',')
+  return {
+    main: { ...main, betas: betas(main.headers), json: JSON.parse(main.body) },
+    warm: { ...warm, betas: betas(warm.headers), json: JSON.parse(warm.body) },
+  }
+}
+
+const hasEffortMarker = (body: { messages: Array<{ role?: string }> }) =>
+  body.messages.some((message) => message.role === 'system')
+
+// The prewarm adds the extended cache TTL beta to what the model request
+// sent. These bodies have the full agent shape, whose Claude Code beta list
+// already includes that beta, so the prewarm must send the model request's
+// beta header byte for byte, and the same value for every other header.
+// Authorization and the per-request id are minted for each send and are
+// excluded.
+function expectPrewarmHeadersMatchModelRequest(
+  main: { headers: Headers; betas: string[] },
+  warm: { headers: Headers; betas: string[] },
+) {
+  expect(main.betas).toContain(CACHE_KEEP_EXTENDED_TTL_BETA)
+  expect(warm.betas).toEqual(main.betas)
+  const others = (headers: Headers) =>
+    [...headers.entries()].filter(
+      ([name]) =>
+        name !== 'anthropic-beta' &&
+        name !== 'authorization' &&
+        name !== 'x-client-request-id',
+    )
+  expect(others(warm.headers)).toEqual(others(main.headers))
+}
+
+test('Pi CacheKeep prewarm of a Fable 5.1 body with effort markers sends the mid-conversation output config beta', async () => {
+  const f = await fixture()
+  const { main, warm } = await sendAndPrewarm(f, 'claude-fable-5-1', [
+    { afterAssistantMessages: 0, effort: 'low' },
+    { afterAssistantMessages: 1, effort: 'high' },
+  ])
+  expect(hasEffortMarker(main.json)).toBe(true)
+  expect(hasEffortMarker(warm.json)).toBe(true)
+  expect(main.betas).toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+  expect(warm.betas).toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+  expectPrewarmHeadersMatchModelRequest(main, warm)
+})
+
+test('Pi CacheKeep prewarm of a Fable 5.1 body without effort markers sends the model request betas', async () => {
+  const f = await fixture()
+  const { main, warm } = await sendAndPrewarm(f, 'claude-fable-5-1')
+  expect(hasEffortMarker(main.json)).toBe(false)
+  expect(hasEffortMarker(warm.json)).toBe(false)
+  // Every OAuth Fable 5.1 model request carries this beta, markers or not.
+  expect(main.betas).toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+  expect(warm.betas).toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+  expectPrewarmHeadersMatchModelRequest(main, warm)
+})
+
+test('Pi CacheKeep prewarm of an Opus 5.5 body with effort markers keeps the per-turn control beta', async () => {
+  const f = await fixture()
+  const { main, warm } = await sendAndPrewarm(f, 'claude-opus-5-5', [
+    { afterAssistantMessages: 0, effort: 'low' },
+    { afterAssistantMessages: 1, effort: 'high' },
+  ])
+  expect(hasEffortMarker(main.json)).toBe(true)
+  expect(hasEffortMarker(warm.json)).toBe(true)
+  expect(warm.betas).toContain(PER_TURN_CONTROL_BETA)
+  expect(warm.betas).not.toContain(MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+  expectPrewarmHeadersMatchModelRequest(main, warm)
+})
 
 registerTest.each([200, 401])(
   'Pi WebSocket relay retries a strict-newer native receipt once and reports every rejected version; final status %i',
