@@ -328,6 +328,32 @@ function lifetimeSignal() {
 }
 
 /**
+ * Waits on values a test's mocks record. A mock calls `changed()` after each
+ * update, which wakes every waiter whose condition now holds; the test waits
+ * for the update itself instead of sleeping a fixed time or polling a fixed
+ * number of times. Teardown wakes the rest, so the caller's assertion then
+ * reports what was actually recorded.
+ */
+function recordedCondition() {
+  const waiters = new Set<{ holds: () => boolean; open: () => void }>()
+  return {
+    changed() {
+      for (const waiter of [...waiters])
+        if (waiter.holds()) {
+          waiters.delete(waiter)
+          waiter.open()
+        }
+    },
+    until(holds: () => boolean): Promise<void> {
+      if (holds()) return Promise.resolve()
+      const gate = bodyLifetime().gate()
+      waiters.add({ holds, open: gate.open })
+      return gate.wait
+    },
+  }
+}
+
+/**
  * Paces a helper that re-reads state until it matches. `notify` wakes the
  * current wait (an event source calls it after each write that may matter).
  * Without an event source, pass `pauseMs` and each wait is that short pause.
@@ -17075,6 +17101,7 @@ describe('auth.loader', () => {
     const warmBodies: Array<Record<string, unknown>> = []
     let firstFable = true
     let releaseFinalWarm: (() => void) | undefined
+    const recorded = recordedCondition()
     const successfulSse = [
       'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
       'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
@@ -17104,6 +17131,7 @@ describe('auth.loader', () => {
         const body = JSON.parse(String(init?.body)) as Record<string, unknown>
         if (body.max_tokens === 0) {
           warmBodies.push(body)
+          recorded.changed()
           const warmResponse = () =>
             new Response(
               JSON.stringify({ usage: { cache_read_input_tokens: 100 } }),
@@ -17117,6 +17145,7 @@ describe('auth.loader', () => {
           return Promise.resolve(warmResponse())
         }
         normalModels.push(String(body.model))
+        recorded.changed()
         if (body.model === 'claude-fable-5' && firstFable) {
           firstFable = false
           return Promise.resolve(new Response(refusalSse, { status: 200 }))
@@ -17161,11 +17190,17 @@ describe('auth.loader', () => {
         if (noticeStatusChecks === 1) {
           return new Promise<Record<string, { type: string }>>((resolve) => {
             releaseStaleIdleStatus = resolve
+            recorded.changed()
           })
         }
         return {}
       },
     )
+    // Record each notice the plugin sends so the test can wait for it.
+    mockClient.session.promptAsync = mock((_input: unknown) => {
+      queueMicrotask(recorded.changed)
+      return Promise.resolve()
+    })
     const plugin = await getPlugin(mockClient)
     const result = await plugin.auth.loader(
       () =>
@@ -17244,9 +17279,7 @@ describe('auth.loader', () => {
         properties: { sessionID: 'ses_fable_filter' },
       },
     })
-    for (let attempt = 0; attempt < 100 && !releaseStaleIdleStatus; attempt++) {
-      await Bun.sleep(1)
-    }
+    await recorded.until(() => releaseStaleIdleStatus !== undefined)
     expect(releaseStaleIdleStatus).toBeDefined()
     await plugin.event?.({
       event: {
@@ -17273,6 +17306,7 @@ describe('auth.loader', () => {
               resolve(response ?? { data: [] }),
             )
           }
+          recorded.changed()
         }),
     )
     await plugin.event?.({
@@ -17281,9 +17315,7 @@ describe('auth.loader', () => {
         properties: { sessionID: 'ses_fable_filter' },
       },
     })
-    for (let attempt = 0; attempt < 100 && !releasePromptContext; attempt++) {
-      await Bun.sleep(1)
-    }
+    await recorded.until(() => releasePromptContext !== undefined)
     expect(releasePromptContext).toBeDefined()
     await plugin.event?.({
       event: {
@@ -17310,6 +17342,7 @@ describe('auth.loader', () => {
               resolve(response ?? { data: [] }),
             )
           }
+          recorded.changed()
         }),
     )
     await plugin.event?.({
@@ -17318,13 +17351,7 @@ describe('auth.loader', () => {
         properties: { sessionID: 'ses_fable_filter' },
       },
     })
-    for (
-      let attempt = 0;
-      attempt < 100 && !releaseUserMessagePromptContext;
-      attempt++
-    ) {
-      await Bun.sleep(1)
-    }
+    await recorded.until(() => releaseUserMessagePromptContext !== undefined)
     expect(releaseUserMessagePromptContext).toBeDefined()
     await plugin.event?.({
       event: {
@@ -17368,7 +17395,9 @@ describe('auth.loader', () => {
         properties: { sessionID: 'ses_fable_filter' },
       },
     })
-    await waitForMockCall(mockClient.session.promptAsync)
+    await recorded.until(
+      () => mockClient.session.promptAsync.mock.calls.length > 0,
+    )
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
     expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
@@ -17405,9 +17434,7 @@ describe('auth.loader', () => {
       await response.text()
     }
 
-    for (let attempt = 0; attempt < 100 && warmBodies.length < 10; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 1))
-    }
+    await recorded.until(() => warmBodies.length >= 10)
     expect(normalModels).toEqual([
       'claude-fable-5',
       ...Array.from({ length: 10 }, () => 'claude-opus-4-8'),
@@ -17447,13 +17474,9 @@ describe('auth.loader', () => {
       }),
     }
     const opus5ResponsePromise = result.fetch(MESSAGES_URL, opus5Request)
-    for (
-      let attempt = 0;
-      attempt < 1_000 && normalModels.at(-1) !== 'claude-opus-5';
-      attempt++
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 1))
-    }
+    // A plugin that held this request behind the pending Fable warm would
+    // keep waiting here until teardown; the assertion below then fails.
+    await recorded.until(() => normalModels.at(-1) === 'claude-opus-5')
     const opus5ReachedUpstream = normalModels.at(-1) === 'claude-opus-5'
     if (!opus5ReachedUpstream) releaseFinalWarm?.()
     expect(opus5ReachedUpstream).toBe(true)
@@ -17512,13 +17535,9 @@ describe('auth.loader', () => {
     await restored.text()
     expect(normalModels.at(-1)).toBe('claude-fable-5')
 
-    await waitForMockCall({
-      mock: {
-        get calls() {
-          return mockClient.session.promptAsync.mock.calls.slice(1)
-        },
-      },
-    })
+    await recorded.until(
+      () => mockClient.session.promptAsync.mock.calls.length > 1,
+    )
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(2)
     expect(mockClient.session.promptAsync.mock.calls[1]?.[0]).toEqual(
       expect.objectContaining({
