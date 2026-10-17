@@ -1298,11 +1298,11 @@ async function refreshPoolMainElsewhere(successor: {
 }
 
 /**
- * The pause between reads of shared files, which no in-process event reports.
- * It paces the reads; it is not a budget, since the wait lasts until the state
- * arrives or the test ends.
+ * The pause between reads of state that no in-process event reports (shared
+ * files, a test's log sink). It paces the reads; it is not a budget, since the
+ * wait lasts until the state arrives or the test ends.
  */
-const FILE_STATE_READ_PAUSE_MS = 10
+const STATE_READ_PAUSE_MS = 10
 
 /**
  * Wait for an account-bound credential write without changing test deadlines:
@@ -1319,7 +1319,7 @@ async function waitForPoolCredential(routeId: string, access: string) {
     paths: pool.paths,
     quota: nativeQuotaCodec,
   })
-  const changes = untilStateOrTestEnd(FILE_STATE_READ_PAUSE_MS)
+  const changes = untilStateOrTestEnd(STATE_READ_PAUSE_MS)
   try {
     while (!changes.ended) {
       await changes.next()
@@ -1995,7 +1995,7 @@ async function readAccountStorage(): Promise<AccountStorage | null> {
 async function waitForAccountStorage(
   predicate: (storage: AccountStorage | null) => boolean,
 ) {
-  const changes = untilStateOrTestEnd(FILE_STATE_READ_PAUSE_MS)
+  const changes = untilStateOrTestEnd(STATE_READ_PAUSE_MS)
   try {
     while (!changes.ended) {
       await changes.next()
@@ -2517,7 +2517,7 @@ async function waitForFeedEntries(
   predicate: (entries: Awaited<ReturnType<typeof readFeedEntries>>) => boolean,
   description: string,
 ) {
-  const changes = untilStateOrTestEnd(FILE_STATE_READ_PAUSE_MS)
+  const changes = untilStateOrTestEnd(STATE_READ_PAUSE_MS)
   try {
     while (!changes.ended) {
       await changes.next()
@@ -2533,14 +2533,24 @@ async function waitForFeedEntries(
   )
 }
 
+/**
+ * Wait for a log record matching `predicate`, re-checking the test's sink
+ * until one arrives or the test ends rather than to a fixed wall-clock
+ * deadline.
+ */
 async function waitForLogRecord(
   records: LogTestRecord[],
   predicate: (record: LogTestRecord) => boolean,
   description: string,
 ) {
-  const deadline = performance.now() + 2_500
-  while (!records.some(predicate) && performance.now() < deadline) {
-    await Bun.sleep(10)
+  const changes = untilStateOrTestEnd(STATE_READ_PAUSE_MS)
+  try {
+    while (!changes.ended) {
+      await changes.next()
+      if (records.some(predicate)) return
+    }
+  } finally {
+    changes.close()
   }
   if (!records.some(predicate)) {
     throw new Error(
