@@ -256,14 +256,18 @@ async function catalogueIds(): Promise<string[]> {
 
 /**
  * Reads the shard reports that the summary job downloaded into `directory`.
- * Each shard's run folder holds `invocation.json` naming its shard and the
- * runner's `rows.json`; a shard that stopped before its report has no entry
- * and is reported missing by `verifyShardedAudit`.
+ * Each shard's run folder, which `replay` creates as `ci-*`, holds
+ * `invocation.json` naming its shard and the runner's `rows.json`; a shard
+ * that stopped before its report has no entry and is reported missing by
+ * `verifyShardedAudit`. The uploaded artifact also holds the Bun wrapper's
+ * `audits/named-*` and `audits/package-*` folders, whose own
+ * `invocation.json` records one test command, not a shard, so only `ci-*`
+ * folders are read.
  */
 async function readShardReports(directory: string, count: number) {
   const reports = new Map<number, unknown>()
   const problems: string[] = []
-  const glob = new Bun.Glob('**/invocation.json')
+  const glob = new Bun.Glob('**/ci-*/invocation.json')
   for await (const path of glob.scan({ cwd: directory, onlyFiles: true })) {
     const folder = dirname(resolve(directory, path))
     let shard: MutationShard | undefined

@@ -12,28 +12,43 @@ Never point builds at a live host installation.
 
 ## Toolchain and scope
 
-Use Bun **1.3.14** and **ckdev-mutate 0.9.2**, pinned to the [CortexKit Commons repository](https://github.com/cortexkit/commons)
-at `b491012199d98b09fd167e00783df297d35a62b8` (the reviewed release).
-`ckdev-mutate 0.9.2` passes descriptive test names as single arguments, including
+Use Bun **1.3.14** and **ckdev-mutate 0.12.5**, pinned to the [CortexKit Commons repository](https://github.com/cortexkit/commons)
+at `bd31bef35db3bd7b1c3f91b11409f927dd95283d` (the reviewed release).
+`ckdev-mutate 0.12.5` passes descriptive test names as single arguments, including
 interior spaces, and reads JUnit results from the full owning-package test run.
+It can also take a testcase's collateral target from the JUnit `<testsuite>`
+nesting rather than Bun's `classname` (`junit_class = "suites"`; see
+[JUnit identity normalization](#junit-identity-normalization)).
 The rows need no alternate test names or compatibility layer.
 
 Install the runner under the checkout-local ignored directory
-`node_modules/.cache/ckdev-mutate-0.9.2`. Keep `CARGO_HOME`, `CARGO_TARGET_DIR` and the
+`node_modules/.cache/ckdev-mutate-0.12.5`. Keep `CARGO_HOME`, `CARGO_TARGET_DIR` and the
 install `--root` there, and do not overwrite a global executable. The command
-below installs ckdev-mutate 0.9.2 from that exact source revision:
+below installs ckdev-mutate 0.12.5 from that exact source revision:
 
 ```sh
-CARGO_HOME="$PWD/node_modules/.cache/ckdev-mutate-0.9.2/cargo-home" \
-CARGO_TARGET_DIR="$PWD/node_modules/.cache/ckdev-mutate-0.9.2/target" \
+CARGO_HOME="$PWD/node_modules/.cache/ckdev-mutate-0.12.5/cargo-home" \
+CARGO_TARGET_DIR="$PWD/node_modules/.cache/ckdev-mutate-0.12.5/target" \
 cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev b491012199d98b09fd167e00783df297d35a62b8 \
-  --root "$PWD/node_modules/.cache/ckdev-mutate-0.9.2/install" cortexkit-mutate
+  --rev bd31bef35db3bd7b1c3f91b11409f927dd95283d \
+  --root "$PWD/node_modules/.cache/ckdev-mutate-0.12.5/install" cortexkit-mutate
 ```
 
-Verify that `ckdev-mutate --version` reports 0.9.2 and its Cargo install metadata
-records revision `b491012199d98b09fd167e00783df297d35a62b8`. Put its install `bin`
-directory and Bun 1.3.14 on `PATH`, including for nested build scripts.
+Verify that `ckdev-mutate --version` reports 0.12.5 and its Cargo install metadata
+records revision `bd31bef35db3bd7b1c3f91b11409f927dd95283d`. Put its install `bin`
+directory and Bun 1.3.14 on `PATH`, including for nested build scripts. Another
+`ckdev-mutate` already on `PATH` (for example an older global install) must come
+after it.
+
+Changes since 0.9.2 that matter here: 0.10.0 refuses duplicate control IDs;
+0.12.1 makes `check` name every command row without a `list_command` as "test
+names not verified" (no row here has one, so `check` lists all of them and still
+exits 0; `check --strict` would fail); 0.12.4 adds a `baseline_failure` object to
+ERROR rows whose clean baseline failed. `run --all`, `--diff`, `--broad`,
+`--shard i/n`, the JSON report array, outcome names and exit statuses (0 when
+every row passes, 1 when a row does not, 2 on a runner error) are unchanged for the commands the
+workflow uses. Without `--shard-weights`, `--shard i/n` still assigns rows round
+robin in byte-sorted ID order; the workflow does not pass `--shard-weights`.
 
 These proofs send no HTTP requests to model providers and use no real credentials.
 They do not change existing application tests, CI workflows, dependencies or
@@ -150,7 +165,8 @@ current baseline. These are unit-package domains, not workspace or E2E audits.
 Core guards also affect OpenCode and Pi; auditing Core alone does **not** prove
 absence of host/workspace collateral.
 
-The supported fields are `broad_command`, `broad_report` and `broad_id = "{name}"`.
+The supported fields are `broad_command`, `broad_report`, `broad_id = "{name}"`
+and, on OpenCode rows, `junit_class = "suites"`.
 Bun creates fresh JUnit XML at the owning package's `tmp/mutations/core.xml`,
 `tmp/mutations/opencode.xml` or `tmp/mutations/pi.xml`.
 The runner deletes the selected report before every invocation and validates the
@@ -200,11 +216,40 @@ XML structural validation remains the official runner's responsibility.
 The wrapper retains raw and normalized XML, matched IDs, argv/cwd/status and raw
 child stdout/stderr in separate invocation folders under `tmp/mutations/audits`.
 A successful JUnit audit sets the runner JSON field `breadth_observed` to `true`.
-Command-row targets are
-exactly JUnit classnames (including the empty Core top-level classname), not
-files. Same-class collateral remains CAUGHT; other classes can yield
-CAUGHT_BROADLY. Those observed failures are evidence, not a claim of unchanged
-behavior outside the declared package.
+Each testcase also gets a collateral target, its class: collateral in the
+expected test's own target remains CAUGHT, and collateral in other targets can
+yield CAUGHT_BROADLY. Those observed failures are evidence, not a claim of
+unchanged behavior outside the declared package.
+
+### Suite-path grading
+
+Core and Pi rows use the default target, Bun's `classname`; a top-level test's
+empty classname falls back to its source file. OpenCode rows set
+`junit_class = "suites"`: their target is the `{suite}` path, the names of the
+enclosing describe `<testsuite>` elements, outermost first, joined with ` > `
+and without the file-level suite, falling back to the source file for a
+top-level test. For a test one describe deep and a top-level test, both forms
+give the same target unless a describe name contains characters that Bun
+escapes twice. Beyond one describe the classname is reversed and escaped
+(`quota header harvest &gt; auth.loader` for a test in `auth.loader > quota
+header harvest`), so with the classname, collateral in the same nested describe
+was graded against that reversed form. With suite targets the four nested
+OpenCode rows (`header-routing-current-credential-epoch`,
+`header-routing-raw-exhaustion-proof`, `local-quota-survives-token-refresh`,
+`local-metadata-requires-token-version`) are graded against
+`auth.loader > quota header harvest`, the path Bun prints. A future `hub_targets`
+entry for an OpenCode row is written in that same ` > ` form.
+
+All OpenCode rows set the field, not only the nested ones. The rule is the same
+at every depth, and the runner shares one clean OpenCode baseline only among
+rows with the same `broad_id` and `junit_class`, so a mixed set would rerun the
+OpenCode suite's baseline within a shard.
+
+The rows keep `broad_id = "{name}"` rather than the runner's `{suite} > {name}`.
+The wrapper has already replaced each testcase `name` with the full
+console name built from the same nesting, so `{name}` is the full id, and
+`{suite} > {name}` would repeat the describe path. It would also give a
+top-level test a leading ` > `.
 
 The verified `history-refuses-meaningful-assistant` replay also fails 13 other
 Core assertions in the same empty JUnit classname, while the empty-assistant
@@ -251,10 +296,12 @@ whole package suite (on a 4-vCPU Linux runner, about 1.5 minutes for Core, 5 to
 job matrix:
 
 - `audit-plan` reads `mutations.toml` and plans `ceil(rows / 3)` shards
-  (`BROAD_ROWS_PER_SHARD` in `scripts/run-mutation-ci.ts`): 17 shards for the
-  current 51 rows. Three rows per shard keep even a shard of three OpenCode rows
-  plus its OpenCode baseline under about 25 minutes, inside the 30-minute job
-  limit. The plan grows with the catalogue, so a new row needs no workflow edit.
+  (`BROAD_ROWS_PER_SHARD` in `scripts/run-mutation-ci.ts`), so the shard count
+  changes as rows are added or removed. Three rows per shard keep even a shard
+  of three OpenCode rows plus its OpenCode baseline under about 25 minutes,
+  inside the 30-minute job limit. The plan grows with the catalogue, so a new
+  row needs no workflow edit. The summary job refuses a shard count that does
+  not match this plan.
 - Each `audit (i/n)` job runs `ckdev-mutate run --all --broad --shard i/n`. The
   runner sorts rows by ID and gives shard `i` every `n`-th row starting at
   position `i - 1`, so every row lands in exactly one shard. Each shard is a

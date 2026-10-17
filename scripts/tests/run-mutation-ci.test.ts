@@ -738,7 +738,8 @@ async function writeShardReport(
   shard: string,
   rows: unknown,
 ) {
-  const folder = resolve(directory, `mutation-1-1-shard-${shard}`, 'ci-run')
+  const artifact = resolve(directory, `mutation-1-1-shard-${shard}`)
+  const folder = resolve(artifact, 'ci-run')
   await mkdir(folder, { recursive: true })
   await writeFile(
     resolve(folder, 'invocation.json'),
@@ -746,6 +747,17 @@ async function writeShardReport(
   )
   if (rows !== undefined)
     await writeFile(resolve(folder, 'rows.json'), JSON.stringify(rows))
+  // A real shard artifact also carries the Bun wrapper's per-command evidence
+  // folders, each with an invocation.json that names no shard. The summary
+  // must not mistake them for shard reports.
+  for (const audit of ['named-x1', 'package-x2']) {
+    const evidence = resolve(artifact, 'audits', audit)
+    await mkdir(evidence, { recursive: true })
+    await writeFile(
+      resolve(evidence, 'invocation.json'),
+      JSON.stringify({ argv: ['bun', 'test'], cwd: '.', exitCode: 0 }),
+    )
+  }
 }
 
 lifetimes.test(
