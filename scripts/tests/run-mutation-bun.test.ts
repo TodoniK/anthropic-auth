@@ -658,7 +658,8 @@ test('a result line without a duration still parses to its exact name', () => {
   expect(
     parseExecution(undefined, packageGreen()).events.map((entry) => entry.name),
   ).toEqual(['handles timeout', 'scope > second'])
-  // Nothing else about the result line became optional.
+  // Only the trailing " [x ms]" duration is optional. A result line with an
+  // empty name, no name or a wrong status word must still be refused.
   for (const malformed of [
     '(pass)  [1.00ms]',
     '(pass) [1.00ms]',
