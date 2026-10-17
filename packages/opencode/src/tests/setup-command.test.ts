@@ -1226,8 +1226,14 @@ for (const host of ['opencode', 'pi'] as const) {
 
 const STAYS_CONNECTED =
   'OpenCode stays connected to the vault. In OpenCode, run /claude → Accounts → Disconnect from the vault to undo it. Or run setup again to finish connecting.'
-const MAYBE_CONNECTED =
-  'OpenCode may be connected to the vault; setup could not tell. Check with ck auth status.'
+// The status lines runSetup itself prints, once per host, when it fails after
+// vault enrollment began.
+const OPENCODE_CONNECTED = 'OpenCode: connected to the vault'
+const OPENCODE_UNKNOWN = 'OpenCode: unknown, check with ck auth status'
+
+function occurrences(screen: string, text: string) {
+  return screen.split(text).length - 1
+}
 
 lifetimes.test(
   'a failed vault setup trusts its own enrollment record over the files left on disk',
@@ -1254,9 +1260,10 @@ lifetimes.test(
     expect(screen).toContain(
       'The vault has no verified default Claude account. Sign in through the vault and rerun setup.',
     )
-    expect(screen).toContain(STAYS_CONNECTED)
-    expect(screen).not.toContain(MAYBE_CONNECTED)
-    expect(screen).not.toContain('OpenCode: connected to the vault')
+    expect(occurrences(screen, STAYS_CONNECTED)).toBe(1)
+    // runSetup prints the status line; the command does not repeat it.
+    expect(occurrences(screen, OPENCODE_CONNECTED)).toBe(1)
+    expect(screen).not.toContain(OPENCODE_UNKNOWN)
     expect(screen).not.toContain('unexpected-error')
     await expectNoDiagnostics(f)
   },
@@ -1287,9 +1294,42 @@ lifetimes.test(
       }),
     ).toBe(1)
     const screen = f.screen()
-    expect(screen).toContain(MAYBE_CONNECTED)
+    // runSetup prints the unknown status line once; the command adds no
+    // second line for it and no undo steps for a connection it cannot confirm.
+    expect(occurrences(screen, OPENCODE_UNKNOWN)).toBe(1)
+    expect(screen).not.toContain('may be connected to the vault')
+    expect(screen).not.toContain(OPENCODE_CONNECTED)
     expect(screen).not.toContain(STAYS_CONNECTED)
     expect(screen).not.toContain(ECHO_SK)
+  },
+)
+
+lifetimes.test(
+  'a failed two-host vault setup prints each host status once, then the undo steps for the connected host',
+  async () => {
+    const f = await callbackFixture({
+      opencode: true,
+      pi: true,
+      claustrum: true,
+    })
+    expect(
+      await runSetupCommand(['--yes', '--claustrum', '--opencode=2'], {
+        ...f.io,
+        // OpenCode enrolls, then its activation fails, so Pi is never reached.
+        vaultActivate: async () => {
+          throw new NativeVaultActivationError('primary-unverified')
+        },
+      }),
+    ).toBe(1)
+    const lines = f.screen().trimEnd().split('\n')
+    expect(lines.slice(lines.indexOf(OPENCODE_CONNECTED))).toEqual([
+      OPENCODE_CONNECTED,
+      'Pi: not connected',
+      'The vault has no verified default Claude account. Sign in through the vault and rerun setup.',
+      STAYS_CONNECTED,
+    ])
+    expect(f.screen()).not.toContain('Pi stays connected')
+    await expectNoDiagnostics(f)
   },
 )
 

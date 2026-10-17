@@ -337,26 +337,19 @@ export async function runSetupCommand(
     await runSetup(plugin, args, { ...options, env, terminal, runner, fence })
     return 0
   } catch (error) {
-    // runSetup records each host's vault enrollment on a failure after
-    // enrollment began, and adds one line per host to the message for
-    // callers that print it as is. This command prints its own host lines
-    // below, so it classifies the message without those added lines.
-    const enrollment = setupEnrollmentOutcomes(error)
-    const message =
-      setupRefusalMessage(error) ??
-      knownFailureMessage(error, enrollment?.length ?? 0)
+    const message = setupRefusalMessage(error) ?? knownFailureMessage(error)
     const text = message ?? (await reportThrownFailure(phase, error, env))
     if (text) print(text)
-    for (const { host, outcome } of enrollment ?? []) {
+    // When it fails after vault enrollment began, runSetup has already printed
+    // one status line per host (connected, not connected, or unknown) and
+    // records the same outcomes for setupEnrollment. Only the undo and retry
+    // steps for a host left connected are added here.
+    for (const { host, outcome } of setupEnrollmentOutcomes(error) ?? []) {
+      if (outcome !== 'enrolled') continue
       const name = host === 'opencode' ? 'OpenCode' : 'Pi'
-      if (outcome === 'enrolled')
-        print(
-          `${name} stays connected to the vault. In ${name}, run /claude → Accounts → Disconnect from the vault to undo it. Or run setup again to finish connecting.`,
-        )
-      else if (outcome === 'unknown')
-        print(
-          `${name} may be connected to the vault; setup could not tell. Check with ck auth status.`,
-        )
+      print(
+        `${name} stays connected to the vault. In ${name}, run /claude → Accounts → Disconnect from the vault to undo it. Or run setup again to finish connecting.`,
+      )
     }
     return 1
   } finally {

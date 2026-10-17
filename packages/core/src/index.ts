@@ -14,10 +14,13 @@ export type {
   SetupResult,
 } from '@cortexkit/common-auth/setup'
 // Host adapters use the bundled runner without adding a runtime dependency.
+// setupEnrollment reads a record runSetup keeps inside this bundled copy, so
+// it must come from the same copy as runSetup.
 export {
   assertHostsStopped,
   createProcessFence,
   runSetup,
+  setupEnrollment,
 } from '@cortexkit/common-auth/setup'
 export * from './accounts.ts'
 export * from './auth.ts'
