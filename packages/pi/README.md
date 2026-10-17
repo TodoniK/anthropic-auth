@@ -16,29 +16,37 @@ This project is not affiliated with or endorsed by Anthropic. Using Claude subsc
 ## Install
 
 ```bash
-npx @cortexkit/opencode-anthropic-auth setup
+bunx @cortexkit/opencode-anthropic-auth setup
 ```
 
-Next steps for OpenCode 1, OpenCode 2 and Pi, respectively:
+After setup:
 
 OpenCode 1: open `/claude` → **Accounts** to sign in.
 
-In OpenCode, sign in to Anthropic with "Claude Pro / Max (native account pool)".
+OpenCode 2: In OpenCode, sign in to Anthropic with "Claude Pro / Max (native account pool)".
 
 Pi: open `/claude` and use **Start OAuth sign-in**, then **Finish OAuth sign-in**.
 
 ## Documentation
 
 - [Installation, configuration and manual registration](../../docs/installation.md#installation-and-configuration)
+- [Features and host support](../../docs/features.md#features-and-host-support)
+- [Models, thinking and fast mode](../../docs/models.md#models-thinking-and-fast-mode)
 - [Accounts, routing and quota](../../docs/accounts-and-routing.md#accounts-routing-and-quota)
+- [Settings and routing reference](../../docs/configuration.md#settings-and-routing-reference)
 - [Vault custody](../../docs/vault.md#vault-custody)
 - [Credential custody contract](../../docs/custody-state-machine.md#anthropic-credential-custody)
 - [Commands and menus](../../docs/commands.md#commands-and-menus)
 - [Cache, keepalive and quota priming](../../docs/cache.md#cache-keepalive-and-quota-priming)
+- [Cache diagnostics](../../docs/cache-diagnostics.md#cache-diagnostics)
 - [OpenCode 2](../../docs/opencode-2.md#opencode-2)
+- [OpenCode sidebar and TUI preferences](../../docs/sidebar.md#opencode-sidebar-and-tui-preferences)
+- [Environment variables](../../docs/environment.md#environment-variables)
+- [Request rewriting and safety fallback](../../docs/request-rewriting.md#request-rewriting-and-safety-fallback)
 - [Transports and request diagnostics](../../docs/transports.md#transports-and-request-diagnostics)
 - [Troubleshooting](../../docs/troubleshooting.md#troubleshooting)
 - [Development](../../docs/development.md#development)
+- [Build modes](../../docs/build-modes.md#build-modes)
 - [Upgrades, recovery and releases](../../docs/releases.md#upgrades-recovery-and-releases)
 
 ## License
