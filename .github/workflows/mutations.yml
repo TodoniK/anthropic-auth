@@ -16,7 +16,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Pull requests replay the rows their diff selects and main pushes replay
+  # every row's named checks, in one job.
   guards:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -56,3 +59,108 @@ jobs:
           name: mutation-${{ github.run_id }}-${{ github.run_attempt }}
           path: tmp/mutations/
           if-no-files-found: warn
+
+  # The scheduled and manual broad audit reruns a whole package suite for every
+  # row, which takes far longer than one job may run. audit-plan sizes a job
+  # matrix from the catalogue (at most three rows per shard). Each shard is a
+  # separate runner and checkout that replays every n-th row in catalogue ID
+  # order (ckdev-mutate --shard i/n), after building and running its own clean
+  # prebuild and package baselines.
+  audit-plan:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5
+        with:
+          minimum_release_age: 0s
+      - id: plan
+        run: bun scripts/run-mutation-ci.ts --plan
+
+  audit:
+    name: audit (${{ matrix.shard }}/${{ strategy.job-total }})
+    needs: audit-plan
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.audit-plan.outputs.shards) }}
+    env:
+      MUTATION_EVENT: ${{ github.event_name }}
+      MUTATION_SHARD: ${{ matrix.shard }}/${{ needs.audit-plan.outputs.count }}
+      MUTATION_HOME: ${{ github.workspace }}/node_modules/.cache/ckdev-mutate-0.9.2
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5
+        with:
+          minimum_release_age: 0s
+      - run: bun install --frozen-lockfile
+      - name: Build Core and packed OpenCode exports for preparation tests
+        run: |
+          bun run --cwd packages/core build
+          bun run --cwd packages/opencode build
+      - name: Install pinned mutation runner
+        shell: bash
+        run: |
+          CARGO_HOME="$MUTATION_HOME/cargo-home" \
+          CARGO_TARGET_DIR="$MUTATION_HOME/target" \
+          cargo install --locked --git https://github.com/cortexkit/commons \
+            --rev b491012199d98b09fd167e00783df297d35a62b8 \
+            --root "$MUTATION_HOME/install" cortexkit-mutate
+          echo "$MUTATION_HOME/install/bin" >> "$GITHUB_PATH"
+      - name: Verify CI selection and report guards
+        run: bun test scripts/tests/run-mutation-ci.test.ts scripts/tests/run-mutation-bun.test.ts
+      - name: Replay this shard's mutation rows with package breadth
+        run: bun scripts/run-mutation-ci.ts
+      - name: Retain reports and raw test evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mutation-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard }}
+          path: tmp/mutations/
+          if-no-files-found: warn
+
+  # One verdict for the whole audit: fails when any shard failed or was
+  # cancelled, or when the shard reports together miss, repeat or leave
+  # uncaught any catalogue row.
+  audit-summary:
+    needs: [audit-plan, audit]
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MUTATION_SHARD_COUNT: ${{ needs.audit-plan.outputs.count }}
+      AUDIT_RESULT: ${{ needs.audit.result }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5
+        with:
+          minimum_release_age: 0s
+      - name: Download every shard's report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: mutation-${{ github.run_id }}-${{ github.run_attempt }}-shard-*
+          path: tmp/mutation-shards/
+      - name: Verify the combined audit
+        if: always()
+        run: bun scripts/run-mutation-ci.ts --summarize tmp/mutation-shards
+      - name: Require every shard job to succeed
+        if: always()
+        run: |
+          if [ "$AUDIT_RESULT" != success ]; then
+            echo "::error::Mutation audit shards finished with result: $AUDIT_RESULT"
+            exit 1
+          fi

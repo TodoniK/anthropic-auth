@@ -231,9 +231,41 @@ parsed catalogue entries. Root prebuild changes also select all rows.
 
 Changes to the Bun wrapper, its self-tests, the CI driver/workflow or shared test
 configuration force `--all`, because the runner does not follow helper dependencies.
-Main pushes run all named checks. Scheduled and manually requested jobs also use
-`--broad` for full Core/Pi package audits. These domains still exclude OpenCode,
-workspace-wide and process E2E collateral.
+Main pushes run all named checks. Pull-request and push replays each run in one
+`guards` job.
+
+Scheduled and manually requested runs perform the `--broad` audit: each row also
+runs its owning package's full unit suite (Core, OpenCode or Pi). These domains
+still exclude workspace-wide and process E2E collateral. Each broad row costs a
+whole package suite (on a 4-vCPU Linux runner, about 1.5 minutes for Core, 5 to
+6 minutes for OpenCode and under a minute for Pi), so the audit is split into a
+job matrix:
+
+- `audit-plan` reads `mutations.toml` and plans `ceil(rows / 3)` shards
+  (`BROAD_ROWS_PER_SHARD` in `scripts/run-mutation-ci.ts`): 17 shards for the
+  current 51 rows. Three rows per shard keep even a shard of three OpenCode rows
+  plus its OpenCode baseline under about 25 minutes, inside the 30-minute job
+  limit. The plan grows with the catalogue, so a new row needs no workflow edit.
+- Each `audit (i/n)` job runs `ckdev-mutate run --all --broad --shard i/n`. The
+  runner sorts rows by ID and gives shard `i` every `n`-th row starting at
+  position `i - 1`, so every row lands in exactly one shard. Each shard is a
+  separate runner with its own checkout, dependency install, Core and packed
+  OpenCode build and runner install. Within its session, the runner runs the
+  catalogue prebuild on the unmutated tree and collects a clean baseline of the
+  package suites its rows use before any mutant; shards share no files or
+  baselines. The driver checks that the shard reported exactly the rows assigned
+  to it, and uploads its report as `mutation-<run>-<attempt>-shard-<i>`.
+- `audit-summary` runs after every shard, even when some fail. It downloads all
+  shard reports and fails if a shard job failed or was cancelled, if a shard's
+  report is missing, or if the reports together omit, repeat or leave uncaught
+  (for example `SURVIVED` or `ERROR`) any catalogue row, or lack breadth
+  evidence. Its log lists each shard's expected row count and reported outcomes.
+
+Shards run in parallel, so the audit's wall time is roughly its slowest shard
+plus the plan and summary jobs. Each shard repeats setup and the clean baselines
+of its packages, so the total runner time is higher than one sequential replay.
+For a single shard elsewhere, run `ckdev-mutate run --all --broad --shard i/n`
+from an isolated clone, as for any full replay.
 
 The CI driver verifies the runner version and requires tests to detect each
 mutation (`CAUGHT`, `CAUGHT_BROADLY` or `HUB`), rather than accepting skipped or
