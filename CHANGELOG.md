@@ -2,6 +2,21 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Sidebar
+
+- The collapsed OpenCode 1 sidebar now draws quotas with common-auth's shared narrow form, the same one the other CortexKit auth plugins use. An account-wide window without a reading is now left out instead of shown as a placeholder: `5h 87% · 7d — left` becomes `5h 87% left`. An account with no reading at all still shows a muted `—`, and stale readings are still dimmed.
+
+### Setup
+
+- When vault setup finds no Claude account it can use, it now says why from the vault's own listing (#354). With no read grant for the host, it prints the `ck auth grant` command that adds one. With a grant that reaches no Claude login, it suggests `ck auth reclassify --from-registry` and checking the logins with `ck auth status`. On older vaults that do not report grant reach, the previous message is unchanged.
+- When setup fails after vault enrollment began, it now prints one line per host: connected to the vault, not connected, or unknown (check with `ck auth status`). A host left connected also gets the Disconnect / run-setup-again remedy. Setup no longer rereads enrollment files for this, so a failure before enrollment began no longer reports a host connected by an earlier run.
+
+### Compatibility
+
+- Move to `@cortexkit/common-auth` 0.19.0 and `@cortexkit/claustrum-client` 0.10.0.
+
 ## 2.0.3
 
 ### Prompt cache
