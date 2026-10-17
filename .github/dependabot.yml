@@ -6,6 +6,13 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    groups:
+      # @opentui/solid pins an exact @opentui/core version. Bumping one
+      # without the other installs a second, nested core whose types don't
+      # match, so both move in one pull request.
+      opentui:
+        patterns:
+          - "@opentui/*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
