@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import {
+  link,
   mkdir,
   readdir,
   readFile,
@@ -65,6 +66,14 @@ function normalizeRecord(value: unknown): CacheKeepRegistryRecord | undefined {
   }
 }
 
+function isExpiredRecord(
+  record: CacheKeepRegistryRecord,
+  now: number,
+  leaseMs: number,
+): boolean {
+  return record.updatedAt <= now && now - record.updatedAt > leaseMs
+}
+
 export function getDefaultCacheKeepRegistryDirectory(scope: 'opencode' | 'pi') {
   return join(tmpdir(), 'opencode-anthropic-auth', 'cachekeep-sessions', scope)
 }
@@ -72,6 +81,7 @@ export function getDefaultCacheKeepRegistryDirectory(scope: 'opencode' | 'pi') {
 export class CacheKeepSessionRegistry {
   private readonly filePath: string
   private writeChain: Promise<void> = Promise.resolve()
+  private lastSweepAt?: number
 
   constructor(
     private readonly options: {
@@ -90,21 +100,24 @@ export class CacheKeepSessionRegistry {
     this.writeChain = this.writeChain
       .catch(() => {})
       .then(async () => {
+        const now = this.options.now?.() ?? Date.now()
+        const leaseMs = this.options.leaseMs ?? CACHE_KEEP_REGISTRY_LEASE_MS
         if (snapshot.length === 0) {
           await rm(this.filePath, { force: true })
-          return
+        } else {
+          await mkdir(this.options.directory, { recursive: true, mode: 0o700 })
+          const tempPath = `${this.filePath}.${randomUUID()}.tmp`
+          const record: CacheKeepRegistryRecord = {
+            version: 1,
+            updatedAt: now,
+            sessions: snapshot,
+          }
+          await writeFile(tempPath, `${JSON.stringify(record)}\n`, {
+            mode: 0o600,
+          })
+          await rename(tempPath, this.filePath)
         }
-        await mkdir(this.options.directory, { recursive: true, mode: 0o700 })
-        const tempPath = `${this.filePath}.${randomUUID()}.tmp`
-        const record: CacheKeepRegistryRecord = {
-          version: 1,
-          updatedAt: this.options.now?.() ?? Date.now(),
-          sessions: snapshot,
-        }
-        await writeFile(tempPath, `${JSON.stringify(record)}\n`, {
-          mode: 0o600,
-        })
-        await rename(tempPath, this.filePath)
+        await this.sweepExpiredRecords(now, leaseMs)
       })
     return this.writeChain
   }
@@ -115,6 +128,7 @@ export class CacheKeepSessionRegistry {
     await this.writeChain.catch(() => {})
     const now = this.options.now?.() ?? Date.now()
     const leaseMs = this.options.leaseMs ?? CACHE_KEEP_REGISTRY_LEASE_MS
+    await this.sweepExpiredRecords(now, leaseMs)
     let names: string[]
     try {
       names = (await readdir(this.options.directory)).filter((name) =>
@@ -164,5 +178,116 @@ export class CacheKeepSessionRegistry {
   async dispose(): Promise<void> {
     await this.writeChain.catch(() => {})
     await rm(this.filePath, { force: true })
+  }
+
+  private async sweepExpiredRecords(
+    now: number,
+    leaseMs: number,
+  ): Promise<void> {
+    if (this.lastSweepAt !== undefined && now - this.lastSweepAt < leaseMs) {
+      return
+    }
+    this.lastSweepAt = now
+
+    let names: string[]
+    try {
+      names = (await readdir(this.options.directory)).filter((name) =>
+        name.endsWith('.json'),
+      )
+    } catch {
+      return
+    }
+
+    await Promise.all(
+      names.map(async (name) => {
+        const recordPath = join(this.options.directory, name)
+        if (recordPath === this.filePath) return
+
+        let initialRecord: CacheKeepRegistryRecord | undefined
+        try {
+          initialRecord = normalizeRecord(
+            JSON.parse(await readFile(recordPath, 'utf8')),
+          )
+        } catch {
+          return
+        }
+        if (!initialRecord || !isExpiredRecord(initialRecord, now, leaseMs)) {
+          return
+        }
+
+        const sweptPath = `${recordPath}.${randomUUID()}.sweep`
+        try {
+          await rename(recordPath, sweptPath)
+        } catch {
+          // Another publisher or sweeper may have moved the record first.
+          return
+        }
+
+        let raw: string | undefined
+        let record: CacheKeepRegistryRecord | undefined
+        try {
+          raw = await readFile(sweptPath, 'utf8')
+          record = normalizeRecord(JSON.parse(raw))
+        } catch {
+          // Unreadable records are not safe to classify as expired.
+        }
+
+        if (record && isExpiredRecord(record, now, leaseMs)) {
+          try {
+            await rm(sweptPath, { force: true })
+          } catch {
+            // Cleanup is best-effort and must not change CacheKeep behavior.
+          }
+          return
+        }
+
+        await this.restoreSweptRecord(recordPath, sweptPath, raw)
+      }),
+    )
+  }
+
+  private async restoreSweptRecord(
+    recordPath: string,
+    sweptPath: string,
+    raw: string | undefined,
+  ): Promise<void> {
+    try {
+      await link(sweptPath, recordPath)
+    } catch (error) {
+      const code =
+        error && typeof error === 'object' && 'code' in error
+          ? error.code
+          : undefined
+      if (code === 'EEXIST') {
+        // A newer atomic publication already occupies the original path.
+        try {
+          await rm(sweptPath, { force: true })
+        } catch {
+          // Cleanup is best-effort and must not change CacheKeep behavior.
+        }
+        return
+      }
+      if (raw === undefined) return
+
+      try {
+        await writeFile(recordPath, raw, {
+          encoding: 'utf8',
+          flag: 'wx',
+          mode: 0o600,
+        })
+      } catch (writeError) {
+        const writeCode =
+          writeError && typeof writeError === 'object' && 'code' in writeError
+            ? writeError.code
+            : undefined
+        if (writeCode !== 'EEXIST') return
+      }
+    }
+
+    try {
+      await rm(sweptPath, { force: true })
+    } catch {
+      // Cleanup is best-effort and must not change CacheKeep behavior.
+    }
   }
 }

@@ -831,3 +831,19 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "cachekeep-sweep-preserves-fresh-records"
+guards = "A fresh lease from another CacheKeep instance must survive the expired-record sweep."
+file = "packages/core/src/cachekeep-registry.ts"
+old = "return record.updatedAt <= now && now - record.updatedAt > leaseMs"
+new = "return true /* NON-VACUITY BREAK: delete fresh CacheKeep leases */"
+test_file = "packages/core/src/tests/cachekeep-registry.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/cachekeep-registry.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["reader keeps a fresh record belonging to another instance"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
