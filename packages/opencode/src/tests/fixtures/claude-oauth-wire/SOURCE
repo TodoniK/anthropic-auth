@@ -2,5 +2,5 @@
 # copy README.md, vectors.json and SHA256SUMS from that commit into this folder.
 # CI (.github/workflows/ci.yml) reads these three keys and fails on any drift.
 repository=https://github.com/cortexkit/commons.git
-commit=d2e88a554662227b126aec9f9250ed84563d8f25
+commit=3ce6295dd1cd523ee857da8adfe79af2b1100b8f
 path=crates/cortexkit-anthropic-policy/test-vectors/claude-oauth-wire
