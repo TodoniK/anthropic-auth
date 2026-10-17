@@ -56,6 +56,9 @@ export interface SetupCommandOptions extends SetupIO {
   vaultActivate?: typeof completeNativeVaultActivation
 }
 
+const OPENCODE_VAULT_LOGIN_WARNING =
+  'Warning: OpenCode holds a separate Anthropic OAuth login. Remove the separate OpenCode Anthropic login, then choose "Claude via credential vault". Setup has left that login unchanged.'
+
 function hostPlan<Value>(
   plans: ReadonlyMap<HarnessKind, Value>,
   host: HarnessKind,
@@ -225,9 +228,14 @@ export async function runSetupCommand(
               selected,
               await (options.vaultPreflight ?? preflightNativeVaultForHost)(
                 selected,
-                vaultOptions(selected),
+                {
+                  ...vaultOptions(selected),
+                  inspectOpenCodeAuth: context.opencodeGeneration !== '2',
+                },
               ),
             )
+            if (hostPlan(vault, selected).separateOpenCodeLogin)
+              print(OPENCODE_VAULT_LOGIN_WARNING)
           } else {
             local.set(
               selected,
@@ -287,6 +295,13 @@ export async function runSetupCommand(
     async migrate(host, context) {
       if (context.mode === 'claustrum') {
         await revalidateVault(host, true)
+        // runSetup prints fixed completion instructions with no plugin-supplied lines.
+        // Repeat the login warning in its last callback to keep it near those instructions.
+        if (
+          host === context.hosts.at(-1) &&
+          vault.get('opencode')?.separateOpenCodeLogin
+        )
+          print(OPENCODE_VAULT_LOGIN_WARNING)
         return
       }
       const plan = hostPlan(local, host)

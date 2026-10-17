@@ -67,6 +67,8 @@ export interface NativeVaultActivationOptions {
    * production resolves them from the host's environment.
    */
   paths?: NativeSetupPaths
+  /** Set false for OpenCode 2, whose setup must not read the OpenCode 1 auth file. */
+  inspectOpenCodeAuth?: boolean
   enrollment?: Pick<
     NativeVaultEnrollmentOptions,
     'paths' | 'client' | 'ckBinary' | 'connectionFile'
@@ -87,6 +89,7 @@ async function readHostAuth(path: string): Promise<unknown> {
 export interface NativeVaultPreflight {
   priorMode: 'local' | 'claustrum'
   fingerprint: string
+  separateOpenCodeLogin?: boolean
 }
 
 export async function fingerprintNativeVaultInputs(
@@ -141,6 +144,13 @@ export async function preflightNativeVaultForHost(
   const processFence = () => vaultProcessFence({ ...options, env })
   await processFence()
   const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
+  const separateOpenCodeLogin =
+    host === 'opencode' &&
+    options.inspectOpenCodeAuth !== false &&
+    inspectNativeHostAuthEntry(
+      'opencode',
+      await readHostAuth(plan.hostAuthPath),
+    ).kind === 'oauth'
   if (host === 'pi') {
     const entry = inspectNativeHostAuthEntry(
       'pi',
@@ -162,6 +172,7 @@ export async function preflightNativeVaultForHost(
   return {
     priorMode: await readNativeEnrollmentMode(host, env),
     fingerprint: await fingerprintNativeVaultInputs(host, { ...options, env }),
+    separateOpenCodeLogin,
   }
 }
 

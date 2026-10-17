@@ -10,7 +10,10 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { enrollNativeVaultForHost } from './native-enrollment.ts'
+import {
+  enrollNativeVaultForHost,
+  grantNativeVaultForHost,
+} from './native-enrollment.ts'
 import type { CommandRunner } from './types.ts'
 
 async function fixture(body: (root: string) => Promise<void>) {
@@ -20,6 +23,72 @@ async function fixture(body: (root: string) => Promise<void>) {
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+}
+
+for (const [name, exitCode, stdout] of [
+  [
+    'a fresh grant',
+    0,
+    'granted enrolled:anthropic-auth-opencode read category:anthropic-native',
+  ],
+  [
+    'an existing identical grant',
+    0,
+    'already granted (no change) enrolled:anthropic-auth-opencode read category:anthropic-native',
+  ],
+  ['a real grant failure', 1, 'synthetic-secret-output'],
+] as const) {
+  test(`${name} uses only the grant exit status and never exposes command output`, async () => {
+    const calls: Array<{ command: string; args: string[] }> = []
+    let fences = 0
+    const operation = grantNativeVaultForHost('opencode', {
+      env: {},
+      ckBinary: '/fixture/ck',
+      processFence: async () => {
+        fences++
+      },
+      runner: {
+        run: async (command, args) => {
+          calls.push({ command, args })
+          return {
+            exitCode,
+            stdout,
+            stderr:
+              'error: the running module refused the op: credential already exists; synthetic-secret-stderr',
+          }
+        },
+      },
+    })
+    if (exitCode === 0) await expect(operation).resolves.toBeUndefined()
+    else {
+      await expect(operation).rejects.toMatchObject({
+        code: 'permission-refused',
+      })
+      await expect(operation).rejects.toThrow(
+        'Update CortexKit tools and run setup again.',
+      )
+      await expect(operation).rejects.not.toThrow('synthetic-secret')
+      await expect(operation).rejects.not.toThrow('credential already exists')
+    }
+    expect(fences).toBe(1)
+    expect(calls).toEqual([
+      {
+        command: '/fixture/ck',
+        args: [
+          'auth',
+          'grant',
+          '--principal',
+          'enrolled:anthropic-auth-opencode',
+          '--selector-kind',
+          'category',
+          '--selector',
+          'anthropic-native',
+          '--operation',
+          'read',
+        ],
+      },
+    ])
+  })
 }
 
 test('explicit offline enrollment uses public ceremony and permission APIs without legacy account writes', async () => {

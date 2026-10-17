@@ -2607,6 +2607,9 @@ lifetimes.test(
       expect(data.hits).toEqual([])
       expect(f.screen()).not.toContain(ECHO_SK)
       expect(f.screen()).toContain('permission-refused')
+      expect(f.screen()).toContain(
+        'Native vault setup: permission-refused. Could not grant this host read access to native Claude accounts. An older ck may refuse a grant that already exists. Update CortexKit tools and run setup again.',
+      )
     } finally {
       data.restore()
       await fsPromises.chmod(f.plan.hostAuthPath, 0o600)
@@ -3001,6 +3004,78 @@ for (const mode of ['local', 'claustrum'] as const) {
       expect(f.screen()).not.toContain(ECHO_SK)
       expect(f.screen()).not.toContain('Details were written')
       expect(await readNativeMigrationJournal(f.plan.paths)).toBeUndefined()
+    },
+  )
+}
+
+for (const [slot, anthropic] of [
+  ['absent', undefined],
+  ['plugin placeholder', custodyTombstoneOAuth('anthropic')],
+  ['separate OAuth login', SETUP_HOST_LOGIN],
+  ['API key', { type: 'api', key: 'synthetic-host-api-key' }],
+] as const) {
+  lifetimes.test(
+    `vault setup ${slot}: gives only necessary login guidance without changing or printing host credentials`,
+    async () => {
+      const f = await callbackFixture({
+        opencode: true,
+        pi: false,
+        claustrum: true,
+      })
+      await writeSetupJson(f.plan.hostAuthPath, {
+        ...(anthropic ? { anthropic } : {}),
+        unrelated: { type: 'api', key: 'synthetic-unrelated-api-key' },
+      })
+      const before = await readFile(f.plan.hostAuthPath, 'utf8')
+      const warning =
+        'Warning: OpenCode holds a separate Anthropic OAuth login. Remove the separate OpenCode Anthropic login, then choose "Claude via credential vault". Setup has left that login unchanged.'
+      let activated = false
+      const callbackScreens: string[] = []
+      expect(
+        await runSetupCommand(['--yes', '--claustrum', '--opencode=1'], {
+          ...f.io,
+          connect: async (options) => {
+            const client = await f.io.connect!(options)
+            return {
+              ...client,
+              enrollPropose: async (input) => {
+                callbackScreens.push(f.screen())
+                return client.enrollPropose(input)
+              },
+            }
+          },
+          vaultActivate: (host, options, preflight) => {
+            activated = true
+            callbackScreens.push(f.screen())
+            return completeNativeVaultActivation(
+              host,
+              {
+                ...options,
+                discover: async () => verifiedSetupInventory(),
+              },
+              preflight,
+            )
+          },
+        }),
+      ).toBe(0)
+      expect(activated).toBe(true)
+      expect(callbackScreens).toHaveLength(2)
+      for (const screen of callbackScreens)
+        expect(screen.split(warning).length - 1).toBe(
+          slot === 'separate OAuth login' ? 1 : 0,
+        )
+      expect(f.screen().split(warning).length - 1).toBe(
+        slot === 'separate OAuth login' ? 2 : 0,
+      )
+      for (const secret of [
+        SETUP_HOST_LOGIN.access,
+        SETUP_HOST_LOGIN.refresh,
+        'synthetic-host-api-key',
+        'synthetic-unrelated-api-key',
+        'claustrum-tombstone:',
+      ])
+        expect(f.screen()).not.toContain(secret)
+      expect(await readFile(f.plan.hostAuthPath, 'utf8')).toBe(before)
     },
   )
 }

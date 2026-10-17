@@ -67,7 +67,11 @@ export class NativeVaultEnrollmentError extends Error {
       | 'approval-refused'
       | 'permission-refused',
   ) {
-    super(`Native vault setup: ${code}`)
+    super(
+      code === 'permission-refused'
+        ? 'Native vault setup: permission-refused. Could not grant this host read access to native Claude accounts. An older ck may refuse a grant that already exists. Update CortexKit tools and run setup again.'
+        : `Native vault setup: ${code}`,
+    )
     this.name = 'NativeVaultEnrollmentError'
   }
 }
