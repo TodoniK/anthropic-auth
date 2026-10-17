@@ -1,0 +1,39 @@
+# Vault custody
+
+Claustrum is a local credential-vault service. Each host explicitly enrolls as `anthropic-auth-opencode` or `anthropic-auth-pi`; its enrollment record, not an account setting, selects vault custody. OpenCode and Pi can be enrolled, disconnected or revoked independently.
+
+## Setup
+
+Stop all OpenCode, LiteCode and Pi processes. With `ck` installed and the Claustrum daemon running, run:
+
+```sh
+npx @cortexkit/opencode-anthropic-auth setup --claustrum
+```
+
+The shared runner owns the per-host enrollment ceremony. Anthropic callbacks then ensure the host-specific grant to read the `anthropic-native` category, discover inventory and require a verified default Claude account. If that default is unverified, sign in through the vault and rerun setup; setup does not import local tokens into the vault.
+
+For noninteractive setup, add `--yes`. If Pi has stored Anthropic auth, explicit `--remove-pi-auth` consent is also required; `--yes` alone is not consent. Do not combine `--login` with `--claustrum`. Dry runs invoke no callbacks and do not validate inventory or consent.
+
+Vault setup leaves local pool files, journals, runtime metadata and session pins unchanged, even if those local files are malformed. It never reads or writes OpenCode 1 auth in generation-2-only setup and never opens a host database. See [custody storage](custody-state-machine.md#storage) for the separate vault namespace.
+
+## Host activation
+
+- OpenCode 1: choose **Claude via credential vault**. An occupied separate Anthropic login is refused; remove it with OpenCode's own tools before choosing the vault option, or disconnect instead. The plugin writes only an inert placeholder into an empty slot.
+- OpenCode 2: choose **Claude vault accounts**. It returns the plugin's non-secret marker through the host API; setup does not create a connection.
+- Pi: a stored OAuth or API-key login would take precedence. With consent, setup moves that slot into a private stash and installs an inert marker. The original login is preserved for disconnect.
+
+No placeholder can authorize a request. Each native model send, quota/profile query and cache or Prime request obtains scoped vault authorization. A revoked, unavailable or unreadable enrollment never falls back to local accounts. Ordinary host API-key routes that the plugin does not own keep stock host behavior.
+
+## Accounts while enrolled
+
+`/claude` → **Accounts** shows that accounts are managed in the vault. Enable/disable, reset backoff and disconnect remain available; local sign-in, API-key additions, removal, reordering and enrollment reset do not. New vault accounts added with `ck auth login --provider anthropic` are discovered without a host restart.
+
+Local accounts remain unchanged and hidden while enrolled. A failed vault authorization does not unlock them. Enrollment files are owner-only; overrides are `OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE` and `PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE`. The [authority table](custody-state-machine.md#authority) covers approved state without a token and unreadable records.
+
+## Disconnect and recovery
+
+Choose **Disconnect from the vault** in Accounts and confirm. It is also available when enrollment cannot be read. This removes the host's local enrollment files, not the vault's approval; an operator must revoke that approval in Claustrum separately.
+
+OpenCode's stored sign-ins are not read or changed by disconnect. Pi first restores its stashed slot byte-for-byte, then ends enrollment. If a different Pi login occupies the slot, disconnect refuses and preserves the stash, current login and enrollment instead of overwriting either login.
+
+Disconnect returns to local custody but does not migrate or initialize a pool. If no local authority exists, stop the hosts and run local setup. For OpenCode 2, follow [empty initialization](opencode-2.md#empty-initialization). **Reset host enrollment**, available only in local custody, clears eligible denied/blocked ceremony state; it neither enrolls nor disconnects an approved host. Only setup proposes and polls enrollment.

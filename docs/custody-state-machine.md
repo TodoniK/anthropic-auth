@@ -40,13 +40,15 @@ The local pool is shared by every process of that host, including the `opencode-
 
 ### Migration
 
-`bunx @cortexkit/opencode-anthropic-auth setup` without vault custody migrates each selected host. Setup is offline in the sense that every OpenCode, LiteCode and Pi process must be stopped; it still uses the network, for example for Claude sign-in. It rechecks that the processes are stopped before each write. Migration:
+`npx @cortexkit/opencode-anthropic-auth setup` without vault custody establishes local authority for each selected host. Setup is offline in the sense that every OpenCode, LiteCode and Pi process must be stopped; it can still use the network, for example for Claude sign-in. It rechecks that the processes are stopped before each write. OpenCode 2 alone uses [empty initialization](opencode-2.md#empty-initialization), without opening OpenCode 1 auth or a host database. OpenCode 1, `--opencode=both` and Pi use migration:
 
 - imports the old sidecar's fallback OAuth accounts, API-key routes and settings into the local pool, and carries sticky routing assignments over;
 - moves OpenCode's stored Claude OAuth login into the pool as the main account and leaves an inert placeholder in OpenCode's auth slot: a fixed, non-secret OAuth-shaped marker that is not a usable credential and only tells OpenCode to route Claude requests through the plugin. A stored OpenCode API key is left as it is;
 - moves Pi's stored Anthropic OAuth login into the pool and removes it from Pi's auth file, only with explicit consent (`--remove-pi-auth` when running with `--yes`).
 
 Request serving refuses until migration has committed. It never falls back to old host tokens.
+
+An empty-init journal also authorizes local use. A later OpenCode 1 setup can import legacy accounts while that pool has no account data, preserving native preferences and gap-filling session pins without replacing native pins. Credentials, account rows or private account metadata make the pool populated; preferences and pins alone do not. A direct migration library call then refuses `pool-populated`. The setup CLI's OpenCode 1 callback instead skips import, leaves the separate login and legacy sidecars unchanged, and installs only a placeholder if the host slot is absent. Completed migration authority is reused rather than re-imported; a later separate OAuth login is not overwritten.
 
 ### Recovery with `setup --login`
 
@@ -56,7 +58,7 @@ Before importing a stored main OAuth login, migration uses the account UUID in t
 Stop OpenCode and Pi, then run bunx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum. Existing credentials have not been changed.
 ```
 
-`setup --login` runs a Claude sign-in during setup, requires the sign-in to resolve a Claude account UUID, migrates, and stores that account as the main account in the local pool. `--login` and `--claustrum` are separate choices; setup rejects them together with `Local sign-in and vault setup are two separate choices. Use --login or --claustrum, not both.`
+For OpenCode 1 and Pi, `setup --login` runs a Claude sign-in during setup, requires the sign-in to resolve a Claude account UUID, establishes or reuses local authority, and stores that account as the main account in the local pool. The equivalent recovery command is `npx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum`. Generation-2-only setup [refuses `--login`](opencode-2.md#setup-login-and-host-selection). `--login` and `--claustrum` are separate choices; setup rejects them together with `Local sign-in and vault setup are two separate choices. Use --login or --claustrum, not both.`
 
 ### Local sign-in while running
 
@@ -105,11 +107,25 @@ OpenCode 1 activates the plugin's provider only for an OAuth-typed Anthropic ent
 | Custody | OpenCode Anthropic entry | Outcome |
 | --- | --- | --- |
 | any | API key, or none | Stock OpenCode behavior; the plugin does not serve |
-| local | inert placeholder | Served from the local pool |
-| local | any other OAuth login | Refused: `Native OAuth requires inert OpenCode activation; run offline setup` |
+| local | inert placeholder | Existing local-pool admission, subject to local authority and account availability below |
 | claustrum | inert placeholder | Served from the vault |
 | claustrum | any other OAuth login | Refused: `This host uses the credential vault, but OpenCode holds a separate Anthropic login. Remove it and choose the vault login, or disconnect from the vault.` |
 | unreadable | OAuth entry | Refused |
+
+For local OAuth entries, `T` is the recognized inert placeholder, `R` is a separate OAuth login with both access and refresh, and `X` is any other non-placeholder OAuth record (including a missing access or refresh). `snapshotHasServableLocalOAuth` means the native snapshot contains an enabled local OAuth account whose state is not `unsupported-access`; API-key, disabled, unsupported-access and vault-sourced rows do not qualify, and ordinary account-selection or authorization refusals can still prevent a send.
+
+| Host record `T` / `R` / `X` | Authority phase | `snapshotHasServableLocalOAuth` | Outcome |
+| --- | --- | --- | --- |
+| `T`, `R` or `X` | absent | either | `NativeAuthorityError`: `migration-required` |
+| `T`, `R` or `X` | `building`, `verified` or `activation-installed` | either | `NativeAuthorityError`: `migration-incomplete` |
+| `T` | `committed` or `retired` | either | Placeholder admission is unchanged; serve only an eligible native account, never the marker |
+| `R` | `committed` or `retired` | true | `LOCAL_SERVE`, for any fallback custody state (`R`, `T` or `M`) |
+| `R` | `committed` or `retired` | false | Refused before custody reconciliation: `Native OAuth requires inert OpenCode activation; run offline setup` |
+| `X` | `committed` or `retired` | either | Refused because the record is neither a placeholder nor a real login: `Native OAuth requires inert OpenCode activation; run offline setup` |
+
+Malformed or conflicting authority refuses rather than becoming local permission. The plugin takes authorization, refresh tokens and identity only from native accounts, never from the separate host record; OpenCode 1.18's own stored-OAuth refresh behavior is not established here, so no host-side refresh claim is made.
+
+On each local OpenCode 1 Accounts render, a real `R` login with committed or retired authority and a servable local OAuth snapshot shows the notice "OpenCode's separate Anthropic login is not used. Add that account through /claude Accounts if needed, or remove the separate login from OpenCode." once; changing the slot to `T` removes the line, a failed notice read shows nothing, and OpenCode 2 and Pi never show it.
 
 **Claude via credential vault** is offered only while the host holds an enrollment token. It checks OpenCode's Anthropic slot without changing it, and writes the placeholder only into an empty slot of an enrolled host. An occupied slot is refused with `OpenCode already holds an Anthropic login; remove it before choosing the vault login`. An unreadable slot is also refused.
 

@@ -242,3 +242,82 @@ rows may report an empty selection; it is not recorded as a caught mutation.
 Reports, invocation/status records and raw test evidence are uploaded even when
 a replay fails. Runner installation is pinned to the public commons revision and
 kept in checkout-local ignored storage; no private repository token is required.
+
+## Setup authority and local-login omission controls
+
+These three removal controls were run during development of the migration
+library and setup callbacks with Bun 1.3.14. They omit empty authority publication,
+the populated-pool import check and the real-login custody admission row,
+respectively. They protect the distinction between an
+initialized empty pool, a populated native pool and a separate OpenCode login.
+They are recorded semantic controls, not additional rows in `mutations.toml`.
+Compilation failures do not count as catches.
+
+Here, empty-init means a journal authorizing a local pool before accounts are
+added; OC1 and OC2 mean OpenCode 1 and 2. Exact test names below are retained so
+the assertions can be found in the owning suites.
+
+### Empty-init publication
+
+Removing `publishNativeEmptyInit`, which publishes that empty local authority,
+from the setup callback made
+`acceptance 1: offline OC2 setup, registered fixture login and first native Bearer request`
+fail at the registered OC2 login with `NativeAuthorityError` code
+`migration-required`. This proves registration alone cannot authorize native
+login. The selected run had **2 pass, 1 fail**, 42 filtered tests and 11 assertions.
+The registration and write-free-preview companions stayed green:
+
+- `setup wizard command > configures OpenCode with pinned plugin and TUI entry`
+- `dry setup with overlapping storage and running hosts remains a write-free preview`
+
+### Populated-pool import refusal
+
+Removing `nativePoolHoldsAccountData` from migration's capture step, which checks
+the source and destination before any import write, made
+`direct migration refuses populated empty-init before any write for every host slot`
+fail: its before-write hook observed
+`capture must refuse before a journal write is attempted`, instead of the
+required `pool-populated` refusal. The later owner-check remained in place; the
+test observes the earliest attempted write so that recheck cannot hide the
+missing capture guard. The run had **3 pass, 1 fail**, 49 filtered tests, with
+these companions green:
+
+- `empty-init imports later OC1 accounts and metadata, preserves preferences and gap-fills pins`
+- `empty-init imports every unpopulated host slot and absent sources install the placeholder`
+- `v5 crash after account import resumes with exact settings or refuses changed settings without writes`
+
+An initial attempt without rebuilt Core dist failed at package resolution before
+any test ran; it was **not reached**, not a catch. The build-first run above
+reached the intended semantic assertion. Exact-byte restoration and the same
+build/filter replay then passed **4 tests, zero failures, 48 assertions**.
+
+### Real-login custody admission
+
+Removing only `reconcileCustodyStartup`'s admission row for a real host login
+alongside a servable native OAuth pool made
+`S1 populated real-login request uses native pool (same UUID)` fail with
+`custody state mismatch: FAIL_CLOSED`, for local mode, main `R`, fallbacks `R`,
+valid evidence, committed authority and `localOAuthServable: true`. The run had
+**3 pass, 1 fail**, 41 filtered tests and 34 assertions. These companions passed:
+
+- `acceptance 1: offline OC2 setup, registered fixture login and first native Bearer request`
+- `S1 orphan skips but the OC1 request remains inert`
+- `S1 quota-only skips but the OC1 request remains inert`
+
+The orphan and quota-only companions retain the inert-activation refusal; broad
+account metadata is not evidence of a servable local OAuth account. See the
+[OC1 admission table](../custody-state-machine.md#opencode-1).
+
+### Restoration and limits
+
+Each control started with staged live bytes and an empty unstaged diff, produced
+a non-empty one-file diff marked `NON-VACUITY BREAK`, and ended with restoration
+and an empty unstaged diff. Only its named target failed; the companions above
+did not. The setup owner's final restored replay passed **77 tests, zero
+failures, 2346 assertions**, including both setup controls' targets and
+companions, export-manifest tests and adjacent activation/path/enrollment tests.
+Separate per-control restored setup counts were not recorded.
+
+These named and focused replays do not establish an all-green workspace suite.
+The owners retained unrelated full-suite timeouts rather than retrying them to
+green. No live host or live Claude credentials were used for the controls.
