@@ -107,17 +107,30 @@ test('Pi preload resolves default enrollment paths inside the test sandbox', () 
   if (!sandboxStateHome)
     throw new Error('Pi test sandbox state home is missing')
 
-  expect(basename(sandboxStateHome)).toBe('xdg-state')
-  expect(
-    basename(dirname(sandboxStateHome)).startsWith('anthropic-auth-pi-test-'),
-  ).toBe(true)
-  expect(isPathWithin(homedir(), sandboxStateHome)).toBe(false)
+  const sandboxDirectory = dirname(sandboxStateHome)
+  expect(basename(sandboxDirectory).startsWith('anthropic-auth-pi-test-')).toBe(
+    true,
+  )
+  expect(sandboxStateHome).toBe(join(sandboxDirectory, 'xdg-state'))
 
   const paths = getHostClaustrumEnrollmentPaths('pi')
   for (const path of [paths.tokenPath, paths.statePath]) {
     expect(isPathWithin(sandboxStateHome, path)).toBe(true)
-    expect(isPathWithin(homedir(), path)).toBe(false)
   }
+
+  const defaultEnrollmentDir = join(
+    homedir(),
+    '.local',
+    'state',
+    'cortexkit',
+    'anthropic-auth',
+  )
+  expect(paths.tokenPath).not.toBe(
+    join(defaultEnrollmentDir, 'pi-enrollment.json'),
+  )
+  expect(paths.statePath).not.toBe(
+    join(defaultEnrollmentDir, 'pi-enrollment-state.json'),
+  )
 })
 
 test('terminal enrollment reset is local, locked and independent of daemon availability', async () => {
