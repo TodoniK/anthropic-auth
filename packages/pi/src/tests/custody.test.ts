@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import {
   type AccountStorage,
   getClaustrumMode,
@@ -10,6 +10,16 @@ import {
 import { createPiCustodyCommands } from '../custody.ts'
 
 let dir: string | undefined
+
+function isPathWithin(root: string, path: string): boolean {
+  const relativePath = relative(root, path)
+  return (
+    relativePath === '' ||
+    (relativePath !== '..' &&
+      !relativePath.startsWith(`..${sep}`) &&
+      !isAbsolute(relativePath))
+  )
+}
 afterEach(async () => {
   delete process.env.PI_CODING_AGENT_DIR
   delete process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
@@ -89,6 +99,25 @@ test('offline custody guidance does not need a live vault preflight or reconfigu
   await expect(readFile(f.tokenPath, 'utf8')).rejects.toMatchObject({
     code: 'ENOENT',
   })
+})
+
+test('Pi preload resolves default enrollment paths inside the test sandbox', () => {
+  const sandboxStateHome = process.env.XDG_STATE_HOME
+  expect(sandboxStateHome).toBeDefined()
+  if (!sandboxStateHome)
+    throw new Error('Pi test sandbox state home is missing')
+
+  expect(basename(sandboxStateHome)).toBe('xdg-state')
+  expect(
+    basename(dirname(sandboxStateHome)).startsWith('anthropic-auth-pi-test-'),
+  ).toBe(true)
+  expect(isPathWithin(homedir(), sandboxStateHome)).toBe(false)
+
+  const paths = getHostClaustrumEnrollmentPaths('pi')
+  for (const path of [paths.tokenPath, paths.statePath]) {
+    expect(isPathWithin(sandboxStateHome, path)).toBe(true)
+    expect(isPathWithin(homedir(), path)).toBe(false)
+  }
 })
 
 test('terminal enrollment reset is local, locked and independent of daemon availability', async () => {
