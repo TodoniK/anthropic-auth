@@ -13,9 +13,13 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - When vault setup finds no Claude account it can use, it now says why from the vault's own listing (#354). With no read grant for the host, it prints the `ck auth grant` command that adds one. With a grant that reaches no Claude login, it suggests `ck auth reclassify --from-registry` and checking the logins with `ck auth status`. On older vaults that do not report grant reach, the previous message is unchanged.
 - When setup fails after vault enrollment began, it now prints one line per host: connected to the vault, not connected, or unknown (check with `ck auth status`). A host left connected also gets the Disconnect / run-setup-again remedy. Setup no longer rereads enrollment files for this, so a failure before enrollment began no longer reports a host connected by an earlier run.
 
+### Quota
+
+- Vault-mode quota now reads Claude's cached quota from insula, with Anthropic usage polls retained as a per-account fallback for stale or missing readings.
+
 ### Compatibility
 
-- Move to `@cortexkit/common-auth` 0.19.0 and `@cortexkit/claustrum-client` 0.10.0.
+- Move to `@cortexkit/common-auth` 0.19.1 and `@cortexkit/claustrum-client` 0.10.0.
 - Update the OpenCode plugin and SDK test dependencies together to 1.19.0. The plugin's peer range and the OpenCode 1.18.18 host used by the process E2E and packed TUI checks are unchanged.
 - Update the Pi SDK test dependencies (`pi-coding-agent`, `pi-ai`, `pi-agent-core`, `pi-tui`) together to 1.2.0. The Pi peer range is unchanged.
 
