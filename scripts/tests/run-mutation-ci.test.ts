@@ -496,6 +496,10 @@ function invokeCI(
       ...fixture.env,
       PATH: `${fixture.root}/bin:${process.env.PATH}`,
       GITHUB_ACTIONS: 'true',
+      // The nightly audit runs this file inside a shard job, whose environment
+      // carries MUTATION_SHARD. Each case states its own shard, if any.
+      MUTATION_SHARD: undefined,
+      MUTATION_SHARD_COUNT: undefined,
       MUTATION_EVENT: event,
       MUTATION_BASE: fixture.base,
       ...extra,
