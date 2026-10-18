@@ -382,7 +382,7 @@ describe('CLI vault refusal', () => {
       await expect(
         withAccountEnv(env.OPENCODE_ANTHROPIC_AUTH_FILE, env, run),
       ).rejects.toThrow(
-        'Anthropic account migration is required. Stop OpenCode, LiteCode and Pi, then run bunx @cortexkit/opencode-anthropic-auth@2.0.0 setup',
+        'Anthropic account migration is required. Stop OpenCode, LiteCode and Pi, then run npx @cortexkit/opencode-anthropic-auth@2.0.0 setup',
       )
 
     await enrollVault(env)

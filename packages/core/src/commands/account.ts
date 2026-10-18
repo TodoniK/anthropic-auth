@@ -188,7 +188,7 @@ export function formatEnrollmentStatus(
   scopedServing = false,
 ): string[] {
   const setup =
-    '- Next: Quit the host and run `bunx @cortexkit/opencode-anthropic-auth setup`'
+    '- Next: Quit the host and run `npx @cortexkit/opencode-anthropic-auth setup`'
   switch (status.state) {
     case 'idle':
       return ['- Enrollment: not enrolled']

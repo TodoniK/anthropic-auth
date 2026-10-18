@@ -5288,7 +5288,7 @@ const anthropicAuthPlugin = async (
       transition: async (mode) => ({
         text:
           mode === 'claustrum'
-            ? 'Run `bunx @cortexkit/opencode-anthropic-auth setup` to enroll and activate scoped custody safely while OpenCode is stopped.'
+            ? 'Run `npx @cortexkit/opencode-anthropic-auth setup` to enroll and activate scoped custody safely while OpenCode is stopped.'
             : 'Local exit requires replacing the OpenCode auth tombstone with a verified local OAuth login while OpenCode is stopped. Do not change custody mode alone.',
       }),
       resetEnrollment: async () => {

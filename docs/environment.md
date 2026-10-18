@@ -68,7 +68,7 @@ The [sidebar guide](sidebar.md#tui-preferences), [quota feed](configuration.md#q
 | `OPENCODE_ANTHROPIC_AUTH_API_BASE_URL` | API fallback base URL for `api add` |
 | `OPENCODE_ANTHROPIC_AUTH_API_KEY` | Secret API fallback key for `api add` |
 | `OPENCODE_ANTHROPIC_AUTH_API_AUTH_HEADER` | `authorization-bearer` or `x-api-key` for `api add` |
-| `CLOUDFLARE_API_TOKEN` | Token used to create/update the Cloudflare relay Worker with `bunx @cortexkit/opencode-anthropic-auth relay setup`; not stored as relay settings |
+| `CLOUDFLARE_API_TOKEN` | Token used to create/update the Cloudflare relay Worker with `npx @cortexkit/opencode-anthropic-auth relay setup`; not stored as relay settings |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID for relay setup |
 
 Treat secret environment values as credentials; do not include them in logs or issue reports.

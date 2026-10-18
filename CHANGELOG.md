@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Setup
 
+- Setup and remedies now show `npx @cortexkit/opencode-anthropic-auth setup`; `bunx` still works.
 - When vault setup finds no Claude account it can use, it now says why from the vault's own listing (#354). With no read grant for the host, it prints the `ck auth grant` command that adds one. With a grant that reaches no Claude login, it suggests `ck auth reclassify --from-registry` and checking the logins with `ck auth status`. On older vaults that do not report grant reach, the previous message is unchanged.
 - When setup fails after vault enrollment began, it now prints one line per host: connected to the vault, not connected, or unknown (check with `ck auth status`). A host left connected also gets the Disconnect / run-setup-again remedy. Setup no longer rereads enrollment files for this, so a failure before enrollment began no longer reports a host connected by an earlier run.
 
@@ -42,7 +43,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Setup
 
-- `bunx @cortexkit/opencode-anthropic-auth setup` now runs on common-auth's shared setup runner, the same one the other CortexKit auth plugins use. Host detection, the OpenCode generation choice, the running-process check, host registration and vault enrollment come from the shared runner; Anthropic keeps its own sign-in, migration, Pi consent and vault activation. Pressing Escape or Ctrl-C at the vault question now stops setup without changes.
+- `npx @cortexkit/opencode-anthropic-auth setup` now runs on common-auth's shared setup runner, the same one the other CortexKit auth plugins use. Host detection, the OpenCode generation choice, the running-process check, host registration and vault enrollment come from the shared runner; Anthropic keeps its own sign-in, migration, Pi consent and vault activation. Pressing Escape or Ctrl-C at the vault question now stops setup without changes.
 - OpenCode 2 alone can now be set up without OpenCode 1: setup records an empty local account pool, and you then sign in from OpenCode with "Claude Pro / Max (native account pool)". Setup does not read OpenCode 1's login or open any OpenCode database.
 - A later OpenCode 1 setup can import an older 1.x account setup into that pool while it still holds no accounts. Your native preferences stay, and existing session pins are kept. Once the pool holds accounts, setup skips the import instead of overwriting them.
 - OpenCode 1 now serves from the native pool even when OpenCode still holds its own separate Anthropic login, as long as the pool has a usable sign-in. `/claude` → Accounts notes that the separate login is not used. Its tokens are never used.
@@ -88,7 +89,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Breaking Changes
 
-- Store Claude logins, fallback accounts and plugin settings in a shared native account store instead of the old `anthropic-auth.json` / `anthropic-auth-state.json` sidecars. Upgrading requires one offline step: quit every OpenCode, LiteCode and Pi process, then run `bunx @cortexkit/opencode-anthropic-auth@2.0.0 setup`. Until it completes, OpenCode and Pi refuse Anthropic requests with that remedy and never serve, refresh or rewrite the old credentials. Migration preserves session routing. There is no reverse migration; returning to 1.23.0 requires a fresh configuration and new sign-ins.
+- Store Claude logins, fallback accounts and plugin settings in a shared native account store instead of the old `anthropic-auth.json` / `anthropic-auth-state.json` sidecars. Upgrading requires one offline step: quit every OpenCode, LiteCode and Pi process, then run `npx @cortexkit/opencode-anthropic-auth@2.0.0 setup`. Until it completes, OpenCode and Pi refuse Anthropic requests with that remedy and never serve, refresh or rewrite the old credentials. Migration preserves session routing. There is no reverse migration; returning to 1.23.0 requires a fresh configuration and new sign-ins.
 - Replace the separate `/claude-*` commands with one `/claude` menu in OpenCode and Pi.
 - Remove the handle-based Claustrum serving path, manifest bindings and per-account gates. Vault custody now comes only from this host's setup enrollment and uses a separate vault account namespace; while connected, only vault accounts serve and local accounts remain unchanged. Disconnecting returns to the local accounts, restoring any Pi login that setup moved aside. Remove Core's process-shared enrollment-registry export.
 
@@ -140,7 +141,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
   - Expose native adaptive `low`, `medium`, `high`, `xhigh`, and `max` effort variants for Opus 5.5 in OpenCode's provider catalog and Pi.
   - Support Anthropic fast mode (`speed: "fast"` with `fast-mode-2026-02-01` beta header) on Opus 5.5.
   - Provide refusal recovery and server-side safety fallback parity for Opus 5.5, isolating recovery state between Opus 5 and Opus 5.5.
-- Add unified interactive `opencode-anthropic-auth setup` wizard (`bunx @cortexkit/opencode-anthropic-auth setup`) for one-step detection and configuration of OpenCode, Pi, and zero-bind Claustrum vault custody.
+- Add unified interactive `opencode-anthropic-auth setup` wizard (`npx @cortexkit/opencode-anthropic-auth setup`) for one-step detection and configuration of OpenCode, Pi, and zero-bind Claustrum vault custody.
 - Add Claustrum vault custody support to Pi with native ambient authentication, per-dispatch scoped credential authorization, atomic roster reconciliation, and version-fenced 401 reporting.
 - Implement zero-bind scoped Claustrum custody across OpenCode and Pi, discovering vaulted Anthropic accounts automatically via `listScoped` under `category:anthropic-native` without manual capability handle minting, manifest files, or process restarts.
 

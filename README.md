@@ -16,7 +16,7 @@ This project is not affiliated with or endorsed by Anthropic. Using Claude subsc
 ## Install
 
 ```bash
-bunx @cortexkit/opencode-anthropic-auth setup
+npx @cortexkit/opencode-anthropic-auth setup
 ```
 
 After setup:

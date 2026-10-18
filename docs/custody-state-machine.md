@@ -40,7 +40,7 @@ The local pool is shared by every process of that host, including the `opencode-
 
 ### Migration
 
-`bunx @cortexkit/opencode-anthropic-auth setup` without vault custody establishes local authority for each selected host. Setup is offline in the sense that every OpenCode, LiteCode and Pi process must be stopped; it can still use the network, for example for Claude sign-in. It rechecks that the processes are stopped before each write. OpenCode 2 alone uses [empty initialization](opencode-2.md#empty-initialization), without opening OpenCode 1 auth or a host database. OpenCode 1, `--opencode=both` and Pi use migration:
+`npx @cortexkit/opencode-anthropic-auth setup` without vault custody establishes local authority for each selected host. Setup is offline in the sense that every OpenCode, LiteCode and Pi process must be stopped; it can still use the network, for example for Claude sign-in. It rechecks that the processes are stopped before each write. OpenCode 2 alone uses [empty initialization](opencode-2.md#empty-initialization), without opening OpenCode 1 auth or a host database. OpenCode 1, `--opencode=both` and Pi use migration:
 
 - imports the old sidecar's fallback OAuth accounts, API-key routes and settings into the local pool, and carries sticky routing assignments over;
 - moves OpenCode's stored Claude OAuth login into the pool as the main account and leaves an inert placeholder in OpenCode's auth slot: a fixed, non-secret OAuth-shaped marker that is not a usable credential and only tells OpenCode to route Claude requests through the plugin. A stored OpenCode API key is left as it is;
@@ -55,10 +55,10 @@ An empty-init journal also authorizes local use. A later OpenCode 1 setup can im
 Before importing a stored main OAuth login, migration uses the account UUID in the legacy main profile only when that profile's recorded access-token fingerprint matches the host login. It does not query Anthropic for identity. If that proof is missing, migration stops without changing credentials and reports:
 
 ```text
-Stop OpenCode and Pi, then run bunx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum. Existing credentials have not been changed.
+Stop OpenCode and Pi, then run npx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum. Existing credentials have not been changed.
 ```
 
-For OpenCode 1 and Pi, `setup --login` runs a Claude sign-in during setup, requires the sign-in to resolve a Claude account UUID, establishes or reuses local authority, and stores that account as the main account in the local pool. The equivalent recovery command is `bunx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum`. Generation-2-only setup [refuses `--login`](opencode-2.md#setup-login-and-host-selection). `--login` and `--claustrum` are separate choices; setup rejects them together with `Local sign-in and vault setup are two separate choices. Use --login or --claustrum, not both.`
+For OpenCode 1 and Pi, `setup --login` runs a Claude sign-in during setup, requires the sign-in to resolve a Claude account UUID, establishes or reuses local authority, and stores that account as the main account in the local pool. The equivalent recovery command is `npx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum`. Generation-2-only setup [refuses `--login`](opencode-2.md#setup-login-and-host-selection). `--login` and `--claustrum` are separate choices; setup rejects them together with `Local sign-in and vault setup are two separate choices. Use --login or --claustrum, not both.`
 
 ### Local sign-in while running
 

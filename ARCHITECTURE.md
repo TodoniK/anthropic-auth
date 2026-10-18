@@ -222,7 +222,7 @@
 
 **OpenCode CLI:**
 - Location: `packages/opencode/src/cli.ts`
-- Triggers: User runs `bunx @cortexkit/opencode-anthropic-auth <command>`
+- Triggers: User runs `npx @cortexkit/opencode-anthropic-auth <command>`
 - Responsibilities: Fallback account login (OAuth + API key), account listing, relay setup (Cloudflare Worker provisioning)
 
 **Pi Extension:**

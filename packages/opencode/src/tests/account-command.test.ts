@@ -550,7 +550,7 @@ describe('executeAccountCommand status', () => {
     })
     expect(result.text).toContain('Enrollment: pending approval (request_123)')
     expect(result.text).toContain(
-      'bunx @cortexkit/opencode-anthropic-auth setup',
+      'npx @cortexkit/opencode-anthropic-auth setup',
     )
     expect(result.text).not.toContain('ck auth enroll approve')
   })
@@ -572,7 +572,7 @@ describe('executeAccountCommand status', () => {
     })
     expect(result.text).toContain('scoped serving not active yet')
     expect(result.text).toContain(
-      'bunx @cortexkit/opencode-anthropic-auth setup',
+      'npx @cortexkit/opencode-anthropic-auth setup',
     )
     expect(result.text).not.toContain('ck auth grant')
   })
@@ -630,7 +630,7 @@ describe('executeAccountCommand status', () => {
     })
     expect(result.text).toContain('pending approval')
     expect(result.text).toContain(
-      'bunx @cortexkit/opencode-anthropic-auth setup',
+      'npx @cortexkit/opencode-anthropic-auth setup',
     )
     expect(result.text).not.toContain('request`touch')
   })

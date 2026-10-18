@@ -55,7 +55,7 @@ export function createPiCustodyCommands(): PiCustodyCommands {
       // Mode changes can remove host credentials and require offline consent.
       // A menu never enrolls, grants custody or writes the authority journal.
       return {
-        text: `Refused: Changing Pi authentication to ${mode} requires offline setup. Run \`bunx @cortexkit/opencode-anthropic-auth setup\` and review the migration and host OAuth removal consent.`,
+        text: `Refused: Changing Pi authentication to ${mode} requires offline setup. Run \`npx @cortexkit/opencode-anthropic-auth setup\` and review the migration and host OAuth removal consent.`,
       }
     },
   }

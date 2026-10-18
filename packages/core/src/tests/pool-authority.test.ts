@@ -269,7 +269,7 @@ test('a readable empty pool without a committed journal cannot authorize dispatc
   await expect(requireNativePoolAuthority(paths)).rejects.toMatchObject({
     code: 'migration-required',
     message:
-      'Anthropic account migration is required. Stop OpenCode, LiteCode and Pi, then run bunx @cortexkit/opencode-anthropic-auth@2.0.0 setup',
+      'Anthropic account migration is required. Stop OpenCode, LiteCode and Pi, then run npx @cortexkit/opencode-anthropic-auth@2.0.0 setup',
   })
   await expect(stat(paths.journal)).rejects.toMatchObject({ code: 'ENOENT' })
 })

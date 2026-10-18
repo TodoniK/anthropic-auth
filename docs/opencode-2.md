@@ -7,7 +7,7 @@ OpenCode 1 and OpenCode 2 use the same native account pool for a given OpenCode 
 Stop every OpenCode, LiteCode and Pi process, then run:
 
 ```sh
-bunx @cortexkit/opencode-anthropic-auth setup --yes --opencode=2
+npx @cortexkit/opencode-anthropic-auth setup --yes --opencode=2
 ```
 
 Without `--login`, generation-2-only local setup registers the main OpenCode config and initializes an empty native account pool, or reuses matching completed setup. A version-5 `empty-init` journal records that the pool is ready for sign-in. Setup does not read or write OpenCode 1's auth file, install an OpenCode 1 placeholder, create an OpenCode 2 connection, or access an OpenCode database.

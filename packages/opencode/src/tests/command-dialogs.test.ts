@@ -281,12 +281,12 @@ describe('openCommandDialog — global custody mode', () => {
       custodyMode: 'claustrum',
       custodyModeKnown: true,
       enrollmentStatus:
-        '- Enrollment: pending approval (request-1)\n- Next: Quit the host and run `bunx @cortexkit/opencode-anthropic-auth setup`',
+        '- Enrollment: pending approval (request-1)\n- Next: Quit the host and run `npx @cortexkit/opencode-anthropic-auth setup`',
     })
 
     expect(dialog.enrollmentStatus).toContain('pending approval (request-1)')
     expect(dialog.enrollmentStatus).toContain(
-      'bunx @cortexkit/opencode-anthropic-auth setup',
+      'npx @cortexkit/opencode-anthropic-auth setup',
     )
   })
 

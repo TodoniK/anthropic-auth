@@ -215,7 +215,7 @@ describe('zero-bind scoped custody', () => {
         JSON.stringify({ errors: assistants.map((message) => message.info.error), statuses, finalStatus }),
       ).toEqual(
         assistants.map(
-          () => 'Anthropic account migration is required. Stop OpenCode, LiteCode and Pi, then run bunx @cortexkit/opencode-anthropic-auth@2.0.0 setup',
+          () => 'Anthropic account migration is required. Stop OpenCode, LiteCode and Pi, then run npx @cortexkit/opencode-anthropic-auth@2.0.0 setup',
         ),
       )
       expect(statuses).not.toContain('retry')

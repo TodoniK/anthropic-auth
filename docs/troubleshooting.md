@@ -14,7 +14,7 @@
 For an `invalid_grant` account, re-login through Accounts. If legacy main-account identity cannot be proved during OpenCode 1 migration, use the explicit stopped-host recovery:
 
 ```sh
-bunx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum
+npx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum
 ```
 
 `setup --login` does not perform an OpenCode 2-only login. Use the registered OpenCode 2 login instead when generation 2 is selected.

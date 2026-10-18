@@ -8,7 +8,7 @@ Prepare OpenCode's local pool with [setup](installation.md#recommended-setup) be
 
 ```sh
 CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... \
-  bunx @cortexkit/opencode-anthropic-auth relay setup
+  npx @cortexkit/opencode-anthropic-auth relay setup
 ```
 
 This creates a KV namespace, uploads/enables the Worker, generates a relay shared secret and saves the URL, secret and HTTP transport in OpenCode's local settings. The Cloudflare API token is used for provisioning, not stored by the plugin. Keep it and the relay secret out of reports. This command does not configure Pi: Pi's existing relay settings can be imported from its legacy `anthropic-auth.json` during Pi migration. `/claude` has no relay actions.

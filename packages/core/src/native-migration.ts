@@ -87,7 +87,7 @@ export class NativeMigrationError extends Error {
   ) {
     super(
       code === 'primary-unverified'
-        ? 'Stop OpenCode and Pi, then run bunx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum. Existing credentials have not been changed.'
+        ? 'Stop OpenCode and Pi, then run npx @cortexkit/opencode-anthropic-auth setup --login --no-claustrum. Existing credentials have not been changed.'
         : `Native migration: ${code}`,
     )
     this.name = 'NativeMigrationError'
