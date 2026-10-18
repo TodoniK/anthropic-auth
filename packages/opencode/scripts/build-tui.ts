@@ -9,6 +9,7 @@ const outputRoot = join(sourceRoot, 'tui-compiled')
 const shippedSourceFiles = [
   'tui.tsx',
   'tui/command-dialogs.tsx',
+  'tui/claude-sidebar.tsx',
   'sidebar-state.ts',
   'tui-preferences.ts',
   'rpc/rpc-client.ts',

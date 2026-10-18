@@ -45,6 +45,10 @@ OpenCode 1 and 2 share the [local routing file](accounts-and-routing.md#local-st
 
 Version-5 journals have no rollback path. Do not delete or rewrite a journal to make an older release accept it; see [upgrade and recovery](releases.md#upgrade-and-recovery).
 
+## Quota sidebar
+
+The TUI adds the CLAUDE quota panel to the session sidebar and polls the server's `sidebar` RPC method at the preference poll interval. See [sidebar](sidebar.md#quota-sidebar). Quota readings refresh in the background once the location has served a request; before that, persisted readings are shown with their age.
+
 ## Vault and transport boundaries
 
 Generation-2 vault setup also leaves OpenCode 1 auth and all OpenCode databases untouched. In an enrolled host, choose **Claude vault accounts**, not the local-pool login. The vault and local-pool login methods both return only the non-secret marker; startup creates neither connection automatically. Enrollment, not account settings, selects custody. See [vault setup](vault.md#setup) and [custody gates](custody-state-machine.md#opencode-2).

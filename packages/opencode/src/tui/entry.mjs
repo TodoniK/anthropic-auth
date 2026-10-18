@@ -37,6 +37,17 @@ async function loadLegacyTui() {
   return mod.default
 }
 
+// The quota sidebar renderer shared with OpenCode 1, loaded the same way.
+async function loadSidebar() {
+  try {
+    await import(runtimeProbe)
+  } catch (error) {
+    if (!isMissingRuntimeRegistry(error)) throw error
+    return import('./claude-sidebar.tsx')
+  }
+  return import('../tui-compiled/tui/claude-sidebar.tsx')
+}
+
 let legacyModule
 
 // OpenCode 1 reads id and tui from the default definition; OpenCode 2 reads
@@ -57,7 +68,10 @@ export const setup = async (context) => {
   // TUI must not load the OpenCode 1 renderer or start that renderer's separate
   // loopback notification poller.
   const { setupAnthropicTui } = await import('../../dist/v2/tui.js')
-  return setupAnthropicTui(context)
+  return setupAnthropicTui(context, {
+    mountSidebar: async (ctx, read) =>
+      (await loadSidebar()).mountClaudeSidebar(ctx, read),
+  })
 }
 
 export default { id, tui, setup }

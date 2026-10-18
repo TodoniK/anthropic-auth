@@ -22,6 +22,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { LANE_START_TEXT } from '../lane-start'
 import type { NativeMenuCapabilities } from './menu-contract'
+import { buildNativeSidebarState } from './sidebar'
 import type { NativeSource } from './source'
 
 export type { NativeMenuCapabilities } from './menu-contract'
@@ -319,6 +320,17 @@ export function createNativeMenuCapabilities(options: {
         prime: 'prime',
       } as const
       return JSON.stringify(snapshot.settings[fields[command]] ?? {})
+    },
+    async readSidebar(sessionID) {
+      const [snapshot, sessions] = await Promise.all([
+        runtime.read(),
+        options.cacheKeepRegistry?.list() ?? [],
+      ])
+      return buildNativeSidebarState(snapshot, {
+        activeId: source.servedAccount(sessionID),
+        trackedSessions: sessions.length,
+        now: Date.now(),
+      })
     },
     forgetSession(sessionID) {
       pending.get(sessionID)?.active.abort()

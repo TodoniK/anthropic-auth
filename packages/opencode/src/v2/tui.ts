@@ -6,7 +6,17 @@ import type {
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin as Tui } from '@opencode/plugin/tui'
 import type { KeyEvent, PasteEvent } from '@opentui/core'
+import type { SidebarState } from '../sidebar-state'
 import { NATIVE_MENU_RPC } from './rpc'
+
+/**
+ * Claims the quota sidebar. `entry.mjs` passes the precompiled renderer, so
+ * this bundle stays free of JSX and of the OpenCode 1 TUI.
+ */
+export type MountSidebar = (
+  ctx: Tui.Context,
+  read: (sessionID: string, signal: AbortSignal) => Promise<SidebarState>,
+) => Promise<() => void>
 
 /**
  * Shows the `claude` account menu in OpenCode 2 dialogs. The menu's sections,
@@ -14,7 +24,10 @@ import { NATIVE_MENU_RPC } from './rpc'
  * the same Core menu code that OpenCode 1 and Pi render, so every host shows
  * the same menu.
  */
-export async function setupAnthropicTui(ctx: Tui.Context) {
+export async function setupAnthropicTui(
+  ctx: Tui.Context,
+  options: { readonly mountSidebar?: MountSidebar } = {},
+) {
   const rpc = ctx.client.rpc(NATIVE_MENU_RPC)
   let active = true
   let rendering = false
@@ -254,11 +267,21 @@ export async function setupAnthropicTui(ctx: Tui.Context) {
       },
     ],
   }))
+  let releaseSidebar: (() => void) | undefined
+  try {
+    releaseSidebar = await options.mountSidebar?.(ctx, (sessionId, signal) =>
+      rpc.sidebar({ sessionId }, { signal, location: ctx.location }),
+    )
+  } catch {
+    // The /claude menu works without the sidebar; a renderer that cannot
+    // load must not take the menu down with it.
+  }
   return () => {
     active = false
     abort.abort()
     remove()
     removeNotifications()
+    releaseSidebar?.()
   }
 }
 

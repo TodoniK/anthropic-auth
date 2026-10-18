@@ -110,6 +110,8 @@ export interface NativeSource
   extends NativeAnthropicSource<OAuthQuotaSnapshot, NativeSourceProvenance> {
   readonly close: () => Promise<void>
   readonly resetRouting: (sessionID: string) => Promise<void>
+  /** The account that served the session's latest authorization, if any. */
+  readonly servedAccount: (sessionID: string) => string | undefined
   readonly recordPrime: (
     provenance: NativeSourceProvenance,
     usage: { inputTokens?: number; outputTokens?: number },
@@ -146,6 +148,9 @@ export function createNativeAnthropicSource(
   const retries = new Map<string, Retry>()
   const choices = new Map<string, Retry[]>()
   const sessions = new Map<string, AbortController>()
+  // The account behind each session's latest authorization, for the sidebar.
+  // Entries leave with forgetSession, which also bounds `sessions`.
+  const servedBy = new Map<string, string>()
   const reported = new WeakSet<NativeCustodyReceipt>()
   let closed = false
   const boundRetries = () => {
@@ -467,6 +472,7 @@ export function createNativeAnthropicSource(
             active,
             relayFallback,
           })
+        servedBy.set(scope.sessionID, accountId)
         return { ...choice.auth, dispatch }
       }
       const common = {
@@ -496,6 +502,7 @@ export function createNativeAnthropicSource(
           subject: material.subject,
         }
         states.set(provenance, common)
+        servedBy.set(scope.sessionID, accountId)
         const headers: HeaderEdits =
           material.authHeader === 'authorization-bearer'
             ? { authorization: `Bearer ${material.apiKey}` }
@@ -521,6 +528,7 @@ export function createNativeAnthropicSource(
         states.set(provenance, { ...common, receipt })
         const identity = receipt.assertedAccountIdentity
         if (!identity) return undefined
+        servedBy.set(scope.sessionID, accountId)
         return {
           route: 'oauth',
           accessToken: receipt.accessToken,
@@ -545,6 +553,7 @@ export function createNativeAnthropicSource(
         subject: material.subject,
       }
       states.set(provenance, { ...common, access: material.access })
+      servedBy.set(scope.sessionID, accountId)
       const identity = material.subject.binding.identity
       return {
         route: 'oauth',
@@ -798,12 +807,14 @@ export function createNativeAnthropicSource(
     forgetSession(sessionID) {
       sessions.get(sessionID)?.abort()
       sessions.delete(sessionID)
+      servedBy.delete(sessionID)
       for (const [reason, retry] of retries)
         if (retry.sessionID === sessionID) retries.delete(reason)
       for (const [queueKey, queue] of choices)
         if (queue[0]?.sessionID === sessionID) choices.delete(queueKey)
       options.onForgetSession?.(sessionID)
     },
+    servedAccount: (sessionID) => servedBy.get(sessionID),
     resetRouting: async (sessionID) =>
       routerFor(await runtime.read()).clear(sessionID),
     async recordPrime(provenance, usage) {

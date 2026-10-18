@@ -8,6 +8,7 @@ import type {
 import type { Plugin } from '@opencode/plugin'
 import type { Registration } from '@opencode/plugin/promise/registration'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
+import { normalizeSidebarState, type SidebarState } from '../sidebar-state'
 import type { NativeMenuCapabilities } from './menu-contract'
 
 const record = (value: unknown): value is Record<string, unknown> =>
@@ -79,11 +80,22 @@ const result = (value: unknown): value is CommandApplyResult =>
   record(value.menu) &&
   Array.isArray(value.menu.sections)
 
+// Sidebar state is display data: anything that does not parse becomes the
+// empty state, the same fail-closed rule the OpenCode 1 sidebar file uses.
+const sidebarState: StandardSchemaV1<unknown, SidebarState> = {
+  '~standard': {
+    version: 1 as const,
+    vendor: 'cortexkit-native',
+    validate: (value: unknown) => ({ value: normalizeSidebarState(value) }),
+  },
+}
+
 export const NATIVE_MENU_RPC = {
   id: 'cortexkit-anthropic-native',
   methods: {
     open: { input: schema(session), output: schema(dialog) },
     apply: { input: schema(apply), output: schema(result) },
+    sidebar: { input: schema(session), output: sidebarState },
   },
   events: {
     opened: {
@@ -129,6 +141,7 @@ export async function registerNativeMenu(
   const rpc = await ctx.rpc.register(NATIVE_MENU_RPC, {
     open: (input) => command.open(invocation(input.sessionId)),
     apply: (input) => command.apply(input, invocation(input.sessionId)),
+    sidebar: (input) => capabilities.readSidebar(input.sessionId),
   })
   let registered: Registration
   try {

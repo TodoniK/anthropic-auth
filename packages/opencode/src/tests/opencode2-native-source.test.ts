@@ -1051,6 +1051,16 @@ describe('OC2 source over actual native services', () => {
     expect(JSON.stringify(snapshot)).not.toContain('native-only-refresh')
     expect(JSON.stringify(snapshot)).not.toContain(auth.accessToken)
   })
+  test('remembers the account that served each session until the session is forgotten', async () => {
+    const fixture = await local()
+    const native = source(fixture.runtime, fixture.paths)
+    expect(native.servedAccount(scope.sessionID)).toBeUndefined()
+    expect(await native.authorizeAccount(scope, 'main')).toBeDefined()
+    expect(native.servedAccount(scope.sessionID)).toBe('main')
+    expect(native.servedAccount('ses_never_served')).toBeUndefined()
+    native.forgetSession?.(scope.sessionID)
+    expect(native.servedAccount(scope.sessionID)).toBeUndefined()
+  })
   test('genuine header quota is account/version bound and persists through native publication', async () => {
     const fixture = await local()
     const native = source(fixture.runtime, fixture.paths)
