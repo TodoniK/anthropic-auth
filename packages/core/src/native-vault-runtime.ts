@@ -1,8 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import {
-  ClaustrumClient,
-  type ClaustrumClientOptions,
-} from '@cortexkit/claustrum-client'
+import type { ClaustrumClientOptions } from '@cortexkit/claustrum-client'
 import {
   acceptAccount,
   acquireInsulaQuotaSource,
@@ -15,6 +12,7 @@ import {
   readVaultRoster,
   refreshVaultRoster,
 } from '@cortexkit/common-auth/claustrum'
+import { SubcClient } from '@cortexkit/subc-client'
 
 import {
   fetchOAuthQuotaSnapshot,
@@ -333,6 +331,26 @@ export async function publishNativeVaultRuntimeSeed(
   })
 }
 
+const NATIVE_VAULT_CONNECT_TIMEOUT_MS = 2_000
+
+/** Connect through the same short deadline used when requests wait for a vault roster. */
+export function connectNativeVaultScopedClient(
+  connectionFile: string,
+  identity?: ClaustrumClientOptions['identity'],
+) {
+  return connectClaustrumScopedClient({
+    connectionFile,
+    identity,
+    handshakeTimeoutMs: NATIVE_VAULT_CONNECT_TIMEOUT_MS,
+    connector: ({ connectionFile: file, handshakeTimeoutMs }) =>
+      SubcClient.connect({
+        connectionFile: file,
+        handshakeTimeoutMs,
+        routeOpenRetryDeadlineMs: NATIVE_VAULT_CONNECT_TIMEOUT_MS,
+      }),
+  })
+}
+
 /** List accounts readable by this host's enrollment for offline setup. An inventory grants no bearer authority; every outbound request still needs a fresh scoped receipt. */
 export async function discoverNativeVaultInventory(
   options: NativeVaultRuntimeOptions,
@@ -347,11 +365,7 @@ export async function discoverNativeVaultInventory(
     env,
     connect:
       options.connect ??
-      (() =>
-        ClaustrumClient.connect({
-          connectionFile,
-          identity: options.identity,
-        })),
+      (() => connectNativeVaultScopedClient(connectionFile, options.identity)),
   })
   try {
     return await custody.discover(signal)
@@ -376,13 +390,8 @@ export function createNativeVaultRuntime(
     now: options.now,
     connect:
       options.connect ??
-      // The scoped client is a plain ClaustrumClient that also carries the
-      // insula transport for the same connection file and identity.
-      (() =>
-        connectClaustrumScopedClient({
-          connectionFile,
-          identity,
-        })),
+      // The scoped client carries insula's transport over the same connection.
+      (() => connectNativeVaultScopedClient(connectionFile, identity)),
     env,
   })
   // Insula's background quota cache, shared by common-auth across runtimes

@@ -19,7 +19,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Compatibility
 
-- Move to `@cortexkit/common-auth` 0.19.1 and `@cortexkit/claustrum-client` 0.10.0.
+- Move to `@cortexkit/common-auth` 0.19.1, `@cortexkit/claustrum-client` 0.11.0 and `@cortexkit/subc-client` 0.22.0.
 - Update the OpenCode plugin and SDK test dependencies together to 1.19.0. The plugin's peer range and the OpenCode 1.18.18 host used by the process E2E and packed TUI checks are unchanged.
 - Update the Pi SDK test dependencies (`pi-coding-agent`, `pi-ai`, `pi-agent-core`, `pi-tui`) together to 1.2.0. The Pi peer range is unchanged.
 
