@@ -374,6 +374,7 @@ old = '''            const unavailable = await refreshFallbackQuotas(
               false,
               requiredByPolicy,
               options.modelId,
+              'admission',
             )'''
 new = '''            const unavailable = new Set<string>() // NON-VACUITY BREAK: choose a route without polling due fallbacks'''
 test_file = "packages/opencode/src/tests/quota-sweep.test.ts"
@@ -392,9 +393,14 @@ id = "fallback-quota-sweeps-do-not-overlap"
 guards = "A fallback quota sweep started while another sweep's poll is outstanding must read the pool after that reading is stored, not poll the same account again from an older snapshot."
 file = "packages/opencode/src/index.ts"
 old = '''    const operation = fallbackQuotaRefreshQueue.then(() =>
-      pollFallbackQuotas(force, requiredByPolicy, modelId),
+      pollFallbackQuotas(force, requiredByPolicy, modelId, purpose),
     )'''
-new = '''    const operation = pollFallbackQuotas(force, requiredByPolicy, modelId) // NON-VACUITY BREAK: start sweeps without waiting for the previous one'''
+new = '''    const operation = pollFallbackQuotas(
+      force,
+      requiredByPolicy,
+      modelId,
+      purpose,
+    ) // NON-VACUITY BREAK: start sweeps without waiting for the previous one'''
 test_file = "packages/opencode/src/tests/quota-sweep.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/quota-sweep.test.ts", "{test}"]
@@ -555,7 +561,13 @@ broad_id = "{name}"
 id = "pi-forwards-physical-quota-dispatch"
 guards = "Pi forwards each native usage GET through the shared quota dispatcher rather than bypassing physical-request spacing."
 file = "packages/pi/src/stream.ts"
-old = "fetchQuota(\n          id,\n          fetchPiOAuth,\n          undefined,\n          dispatch,\n        )"
+old = '''fetchQuota(
+          id,
+          fetchPiOAuth,
+          undefined,
+          dispatch,
+          request.purpose,
+        )'''
 new = "fetchQuota(id, fetchPiOAuth)"
 test_file = "packages/pi/src/tests/quota-dispatch.test.ts"
 runner = "command"
@@ -1098,7 +1110,7 @@ guards = "A current insula reading for a vault account must replace that account
 file = "packages/core/src/native-vault-runtime.ts"
 old = '''          if (reading) {
             const stored'''
-new = '''          if (reading && false) { // NON-VACUITY BREAK: always poll
+new = '''          if (reading && !reading) { // NON-VACUITY BREAK: always poll instead of using an insula reading
             const stored'''
 test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
 runner = "command"
