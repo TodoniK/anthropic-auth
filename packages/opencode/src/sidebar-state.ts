@@ -656,7 +656,9 @@ async function writeSidebarStateAtomic(
       return 'lock-lost-before-rename'
     }
     await rename(tempFile, stateFile)
-    await testHooks?.afterRename?.(stateFile)
+    // Look the hooks up again: a test may start listening while this write is
+    // in flight, after reading the old file, and must still hear this rename.
+    await sidebarStateWriteHooksFor(stateFile)?.afterRename?.(stateFile)
     if (!(await ownsLock())) return 'lock-lost-after-rename'
     return 'written'
   } catch (error) {
