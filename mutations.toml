@@ -1126,10 +1126,14 @@ broad_id = "{name}"
 id = "vault-insula-source-released-on-close"
 guards = "Closing a vault runtime must release its reference to the shared insula source, so the source is dropped once its last holder closes."
 file = "packages/core/src/native-vault-runtime.ts"
-old = """      insula?.release()
-"""
-new = """      // NON-VACUITY BREAK: never release
-"""
+old = """    custody.close()
+    custodyClosed = true
+    insula?.release()
+    insula = undefined"""
+new = """    custody.close()
+    custodyClosed = true
+    // NON-VACUITY BREAK: skip the shared-source release
+    insula = undefined"""
 test_file = "packages/core/src/tests/native-vault-insula-quota.test.ts"
 runner = "command"
 command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-insula-quota.test.ts", "{test}"]
