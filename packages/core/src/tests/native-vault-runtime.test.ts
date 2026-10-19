@@ -1908,3 +1908,190 @@ test('observed roster credential type change forgets the OAuth receipt', async (
     code: 'unavailable',
   })
 })
+
+// Outage mode, as common-auth's scoped custody runs it through our adapter:
+// once a vault call is classified unreachable, a send for an account with a
+// kept receipt is served from memory without a vault read, and one background
+// list_scoped probe (at most one at a time, at most one a second) looks for
+// the vault's return. Any vault answer ends outage mode.
+const unreachable = () =>
+  Object.assign(new Error('synthetic outage'), { code: 'ECONNREFUSED' })
+
+/** Let the settled vault call's continuations run (all microtasks drain before a timer). */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+test('during a vault outage a second request serves the kept receipt without a vault read', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  const first = await f.runtime.authorize('main')
+  f.failure(unreachable())
+  // Hold the background probe's listing open, so the sends below can be seen
+  // to complete without waiting for it.
+  const probeEntered = gate()
+  const probeRelease = gate()
+  f.client.listScoped = async () => {
+    f.counts.lists++
+    probeEntered.open()
+    await probeRelease.wait
+    throw unreachable()
+  }
+  // The send that finds the vault unreachable asks it once, then serves the kept receipt.
+  const discovered = await f.runtime.authorize('main')
+  expect(discovered.fromKeptReceipt).toBe(true)
+  expect(f.counts.gets).toBe(2)
+  const lists = f.counts.lists
+
+  const second = await f.runtime.authorize('main')
+  expect(second).toMatchObject({
+    fromKeptReceipt: true,
+    credentialId: first.credentialId,
+    recordVersion: first.recordVersion,
+  })
+  expect(second.accessToken).toBe(first.accessToken)
+  expect(f.counts.gets).toBe(2)
+  // Serving `second` started one probe, which is still held: the send did
+  // not wait for it.
+  await probeEntered.wait
+  expect(f.counts.lists).toBe(lists + 1)
+
+  // While that probe runs (and within a second of it) no other probe starts.
+  const third = await f.runtime.authorize('main')
+  expect(third.fromKeptReceipt).toBe(true)
+  await settle()
+  expect(f.counts.gets).toBe(2)
+  expect(f.counts.lists).toBe(lists + 1)
+  probeRelease.open()
+})
+
+test('our own closed refusal is not a vault outage, so another account still reads the vault', async () => {
+  const f = await fixture()
+  const work = { ...listed, id: 'oauth:anthropic:work', accountId: uuid2 }
+  f.rows([listed, work])
+  const custody = createNativeCustody(f.options)
+  deferCleanup(() => custody.close())
+  const main = { credentialId: id, accountIdentity: uuid }
+  const other = { credentialId: work.id, accountIdentity: uuid2 }
+  await custody.authorize(main)
+  await custody.authorize(other)
+  expect(f.counts.gets).toBe(2)
+
+  // An outage would serve main's kept receipt here. A closed refusal is an
+  // answer: the send fails (common-auth reports any non-vault error as
+  // `unavailable`) and main's receipt is dropped.
+  f.failure(new NativeCustodyError('closed'))
+  await expect(custody.authorize(main)).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+  expect(custody.keptReceiptState()).toEqual({ active: false, since: null })
+  await settle()
+  const lists = f.counts.lists
+
+  // Outside outage mode the other account's kept receipt is not served: its
+  // next send asks the vault again, and no probe was started.
+  f.failure(undefined)
+  const fresh = await custody.authorize(other)
+  expect(fresh.fromKeptReceipt).toBeUndefined()
+  expect(f.counts.gets).toBe(4)
+  await settle()
+  expect(f.counts.lists).toBe(lists)
+})
+
+test("a recovered vault ends outage mode at the next send's probe, and the send after reads it fresh", async () => {
+  const f = await fixture()
+  const custody = createNativeCustody(f.options)
+  deferCleanup(() => custody.close())
+  const identity = { credentialId: id, accountIdentity: uuid }
+  const answered = gate()
+  let down = false
+  const listScoped = f.client.listScoped
+  f.client.listScoped = async (token) => {
+    if (down) throw unreachable()
+    const result = await listScoped(token)
+    answered.open()
+    return result
+  }
+  await custody.authorize(identity)
+  f.failure(unreachable())
+  down = true
+  expect((await custody.authorize(identity)).fromKeptReceipt).toBe(true)
+  expect(custody.keptReceiptState()).toEqual({ active: true, since: now })
+  expect(f.counts.gets).toBe(2)
+
+  // The vault is back. The next send still serves the kept receipt at once,
+  // and its probe gets the vault's answer, which ends outage mode.
+  f.failure(undefined)
+  down = false
+  const kept = await custody.authorize(identity)
+  expect(kept.fromKeptReceipt).toBe(true)
+  expect(f.counts.gets).toBe(2)
+  await answered.wait
+  await settle()
+  expect(custody.keptReceiptState()).toEqual({ active: false, since: null })
+
+  const fresh = await custody.authorize(identity)
+  expect(fresh.fromKeptReceipt).toBeUndefined()
+  expect(f.counts.gets).toBe(3)
+})
+
+test('closing the runtime stops the outage probe and leaves no pending timer', async () => {
+  const f = await fixture()
+  // Common-auth's custody keeps the global timer functions it finds when it
+  // is constructed, so record them only while the runtime (and with it the
+  // custody) is being created. Everything else keeps the real timers.
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+  type TimerHandle = Parameters<typeof clearTimeout>[0] & {
+    hasRef(): boolean
+  }
+  const timers: {
+    handle: TimerHandle
+    ms: number | undefined
+    cleared: boolean
+  }[] = []
+  globalThis.setTimeout = ((
+    handler: () => void,
+    ms?: number,
+    ...args: unknown[]
+  ) => {
+    const handle = realSetTimeout(handler, ms, ...args) as TimerHandle
+    timers.push({ handle, ms, cleared: false })
+    return handle
+  }) as unknown as typeof setTimeout
+  globalThis.clearTimeout = ((handle: TimerHandle) => {
+    for (const timer of timers)
+      if (timer.handle === handle) timer.cleared = true
+    realClearTimeout(handle)
+  }) as unknown as typeof clearTimeout
+  let runtime: ReturnType<typeof createNativeVaultRuntime>
+  try {
+    runtime = createNativeVaultRuntime(f.options)
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+    globalThis.clearTimeout = realClearTimeout
+  }
+  deferCleanup(() => runtime.close())
+  await runtime.refresh()
+  await runtime.authorize('main')
+  f.failure(unreachable())
+  f.client.listScoped = async () => {
+    f.counts.lists++
+    throw unreachable()
+  }
+  const before = timers.length
+  expect((await runtime.authorize('main')).fromKeptReceipt).toBe(true)
+
+  // Outage mode scheduled exactly one probe, two seconds out, unref'd so it
+  // never keeps the process alive on its own.
+  const probes = timers.slice(before)
+  expect(probes).toHaveLength(1)
+  expect(probes[0]?.ms).toBe(2_000)
+  expect(probes[0]?.handle.hasRef()).toBe(false)
+  expect(probes[0]?.cleared).toBe(false)
+  const lists = f.counts.lists
+
+  runtime.close()
+  // Closing cancelled the probe, and nothing else is left scheduled.
+  expect(timers.slice(before).every((timer) => timer.cleared)).toBe(true)
+  await settle()
+  expect(f.counts.lists).toBe(lists)
+})
