@@ -2,6 +2,7 @@ import { enrollmentAuthority } from '@cortexkit/common-auth/claustrum'
 
 import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
 import { NativeCustodyError } from './native-custody.ts'
+import { closeNativeVaultAuthority } from './native-vault-invalidation.ts'
 
 /** Enrollment files, not account settings, choose the host's credential source. */
 export async function readNativeEnrollmentMode(
@@ -12,6 +13,10 @@ export async function readNativeEnrollmentMode(
     getHostClaustrumEnrollmentPaths(host, env),
     `anthropic-auth-${host}`,
   )
+  if (authority !== 'vault')
+    closeNativeVaultAuthority(
+      getHostClaustrumEnrollmentPaths(host, env).tokenPath,
+    )
   if (authority === 'unreadable') throw new NativeCustodyError('invalid-token')
   return authority === 'vault' ? 'claustrum' : 'local'
 }

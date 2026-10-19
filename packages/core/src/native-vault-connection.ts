@@ -3,6 +3,7 @@ import { disconnectClaustrumEnrollment } from '@cortexkit/common-auth/claustrum'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { openPiSlot, type PiSlot } from '@cortexkit/common-auth/pi-slot'
 import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
+import { closeNativeVaultAuthority } from './native-vault-invalidation.ts'
 
 export type {
   PiSlot as NativePiAuthSlot,
@@ -57,8 +58,12 @@ export async function disconnectNativeVaultForHost(
 ): Promise<NativeVaultDisconnectResult> {
   if (options.host === 'pi' && (await options.slot.exitVault()) === 'conflict')
     return 'conflict'
-  return disconnectClaustrumEnrollment(
-    getHostClaustrumEnrollmentPaths(options.host, options.env),
+  const paths = getHostClaustrumEnrollmentPaths(options.host, options.env)
+  const result = await disconnectClaustrumEnrollment(
+    paths,
     `anthropic-auth-${options.host}`,
   )
+  if (result === 'disconnected' || result === 'idle')
+    closeNativeVaultAuthority(paths.tokenPath)
+  return result
 }

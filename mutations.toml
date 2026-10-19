@@ -1181,6 +1181,73 @@ command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/cachek
 test_count_pattern = "CKDEV executed {count} tests"
 expect_red = ["CacheKeep rejects unknown provider types and never returns provider text"]
 expect_message = "error: expect(received).toMatchObject(expected)"
+
+[[control]]
+id = "vault-kept-unreachable-marker"
+guards = "A confirmed transport outage must reach custody as unreachable, not a generic refusal."
+file = "packages/core/src/native-custody.ts"
+old = "throw new ClaustrumUnreachableError()"
+new = "throw new ClaustrumConsumerError('unavailable', 'NON-VACUITY BREAK')"
+test_file = "packages/core/src/tests/native-vault-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["vault outage serves the last validated receipt without local fallback"]
+expect_message = "Expected promise that resolves"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-kept-marker-excludes-shutdown"
+guards = "An adapter's own closed error must not authorize reuse of its last credential."
+file = "packages/core/src/native-custody.ts"
+old = '''throw new ClaustrumConsumerError(
+          error.code,
+          'Native custody operation refused',
+        )'''
+new = "throw new ClaustrumUnreachableError() // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/native-vault-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["adapter shutdown closed is not a vault outage"]
+expect_message = "Expected promise that rejects"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-kept-retain-roster"
+guards = "A removed binding cannot resurrect its old receipt when rediscovered during an outage."
+file = "packages/core/src/native-custody.ts"
+old = '''retain: (rows) =>
+      primitive.retain(
+        rows.map((row) => ({ ...row, credentialType: 'oauth' })),
+      ),'''
+new = "retain: (_rows) => { /* NON-VACUITY BREAK */ },"
+test_file = "packages/core/src/tests/native-vault-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["vault roster removal forgets a receipt even if the same binding returns"]
+expect_message = "Expected promise that rejects"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-kept-forget-on-401"
+guards = "A kept receipt's 401 must forget it even before any failure report is attempted."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "custody.forget(served.credentialId)"
+new = "/* NON-VACUITY BREAK: keep the rejected receipt */"
+test_file = "packages/core/src/tests/native-vault-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["kept receipt retry admission forgets before any later 401 reporting"]
+expect_message = "Expected promise that rejects"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"

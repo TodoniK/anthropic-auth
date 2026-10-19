@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as vaultRoster from '@cortexkit/common-auth/claustrum'
 import {
+  ClaustrumCredentialError,
   mutateVaultRoster,
   projectVaultRoster,
   readVaultRoster,
@@ -17,9 +18,14 @@ import {
   setLogLevel,
 } from '../logger.ts'
 import { createNativeAccountRuntime } from '../native-account-runtime.ts'
-import type { NativeCustodyClient } from '../native-custody.ts'
+import {
+  createNativeCustody,
+  type NativeCustodyClient,
+  NativeCustodyError,
+} from '../native-custody.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { readNativeRuntime, updateNativeRuntime } from '../native-runtime.ts'
+import { disconnectNativeVaultForHost } from '../native-vault-connection.ts'
 import { nativeVaultPaths } from '../native-vault-paths.ts'
 import {
   acquireNativeVaultRuntime,
@@ -104,6 +110,8 @@ async function fixture() {
   })
   let rows: readonly Row[] = [listed]
   let version = 7
+  let clock = now
+  let failure: unknown
   let token = '01'.repeat(32)
   const counts = { connects: 0, lists: 0, gets: 0, closes: 0 }
   const reports: Parameters<
@@ -121,6 +129,7 @@ async function fixture() {
     },
     getScoped: async (input) => {
       counts.gets++
+      if (failure) throw failure
       return {
         credentialId: input.credentialId,
         accountId: rows.find((row) => row.id === input.credentialId)?.accountId,
@@ -140,7 +149,7 @@ async function fixture() {
     paths,
     host: 'opencode' as const,
     env,
-    now: () => now,
+    now: () => clock,
     connect: async () => {
       counts.connects++
       return client
@@ -168,6 +177,12 @@ async function fixture() {
     },
     version: (value: number) => {
       version = value
+    },
+    clock: (value: number) => {
+      clock = value
+    },
+    failure: (value: unknown) => {
+      failure = value
     },
     token: (value: string) => {
       token = value
@@ -1632,4 +1647,264 @@ test('vault poll returns and native views use its reading before runtime sync wh
     durable.status === 'ready' &&
       durable.state.accounts[f.primaryRouteId]?.quota?.anthropic,
   ).toMatchObject({ remainingPercent: { five_hour: 2 } })
+})
+
+test('vault outage serves the last validated receipt without local fallback', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  const first = await f.runtime.authorize('main')
+  f.failure(
+    Object.assign(new Error('synthetic outage'), { code: 'ECONNREFUSED' }),
+  )
+  const pending = f.runtime.authorize('main')
+  await expect(pending).resolves.toMatchObject({ fromKeptReceipt: true })
+  const kept = await pending
+  expect(kept).toMatchObject({
+    fromKeptReceipt: true,
+    credentialId: first.credentialId,
+    assertedAccountIdentity: first.assertedAccountIdentity,
+    recordVersion: first.recordVersion,
+    expiresAtMs: first.expiresAtMs,
+  })
+  expect(kept.accessToken).toBe(first.accessToken)
+  expect(f.counts.gets).toBe(2)
+  expect(JSON.stringify(kept)).not.toContain(first.accessToken)
+})
+
+for (const remaining of [59_999, 60_000]) {
+  test(`vault kept receipt refuses with ${remaining} ms remaining`, async () => {
+    const f = await fixture()
+    await f.runtime.refresh()
+    await f.runtime.authorize('main')
+    f.clock(now + 3_600_000 - remaining)
+    f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+    await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+      code: 'unavailable',
+    })
+  })
+}
+
+test('vault explicit refusal and unknown failure discard the kept receipt', async () => {
+  for (const code of ['grant_denied', 'future_failure', 'closed']) {
+    const f = await fixture()
+    await f.runtime.refresh()
+    await f.runtime.authorize('main')
+    f.failure(Object.assign(new Error('refused'), { code }))
+    await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+      code: 'unavailable',
+    })
+    f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+    await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+      code: 'unavailable',
+    })
+  }
+})
+
+test('vault roster removal forgets a receipt even if the same binding returns', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  f.rows([])
+  await f.runtime.refresh()
+  f.rows([listed])
+  await f.runtime.refresh()
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+})
+
+test('vault decline forgets a receipt even if reenabled before the next send', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  await f.runtime.setEnabled('main', false)
+  await f.runtime.setEnabled('main', true)
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+})
+
+test('vault rebinding forgets a receipt even if the original account returns', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  f.rows([{ ...listed, accountId: uuid2 }])
+  await f.runtime.refresh()
+  f.rows([listed])
+  await f.runtime.refresh()
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+})
+
+test('vault kept receipt 401 neither retries nor reports and drops the receipt', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  const kept = await f.runtime.authorize('main')
+  expect(kept.fromKeptReceipt).toBe(true)
+  const gets = f.counts.gets
+  expect(await f.runtime.prepareRetry(kept)).toMatchObject({ retry: false })
+  await f.runtime.reportFailure(kept, 401, 'direct')
+  expect(f.counts.gets).toBe(gets)
+  expect(f.reports).toHaveLength(0)
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+})
+
+for (const failedReport of [false, true]) {
+  test(`vault reported fresh 401 cannot be kept after outage (report fails=${failedReport})`, async () => {
+    const f = await fixture()
+    await f.runtime.refresh()
+    const served = await f.runtime.authorize('main')
+    if (failedReport)
+      f.client.reportAuthFailureScoped = async () => {
+        throw new Error('report failed')
+      }
+    await f.runtime.reportFailure(served, 401, 'direct').catch(() => {})
+    expect(f.reports).toHaveLength(failedReport ? 0 : 1)
+    f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+    await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+      code: 'unavailable',
+    })
+  })
+}
+
+test('fresh vault runtime has no kept receipt after host restart', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  f.runtime.close()
+  const restarted = createNativeVaultRuntime(f.options)
+  deferCleanup(() => restarted.close())
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  await expect(restarted.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+})
+
+test('adapter shutdown closed is not a vault outage', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  f.failure(new NativeCustodyError('closed'))
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNREFUSED' }))
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+})
+
+test('vault disconnect closes retained custody before reenrollment', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  const tokenPath = f.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
+  const token = await readFile(tokenPath)
+  expect(
+    await disconnectNativeVaultForHost({ host: 'opencode', env: f.env }),
+  ).toBe('disconnected')
+  expect(f.counts.closes).toBe(1)
+  await writeFile(tokenPath, token, { mode: 0o600 })
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNREFUSED' }))
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+})
+
+test('roster publication invalidates other live vault runtimes', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  const publisher = createNativeVaultRuntime(f.options)
+  deferCleanup(() => publisher.close())
+  f.rows([])
+  await publisher.refresh()
+  f.rows([listed])
+  await publisher.refresh()
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+})
+
+test('kept receipt retry admission forgets before any later 401 reporting', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  const kept = await f.runtime.authorize('main')
+  expect(await f.runtime.prepareRetry(kept)).toMatchObject({ retry: false })
+  expect(f.reports).toHaveLength(0)
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+})
+
+test('vault enrollment revocation closes custody and forgets its receipt', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  f.failure(
+    new ClaustrumCredentialError('enrollment_revoked', 'permanent', 'gone'),
+  )
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
+  expect(f.counts.closes).toBe(1)
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'closed',
+  })
+})
+
+test('adapter kept receipt state is nonsecret and clears on forget and close', async () => {
+  const f = await fixture()
+  const custody = createNativeCustody(f.options)
+  deferCleanup(() => custody.close())
+  const identity = { credentialId: id, accountIdentity: uuid }
+  await custody.authorize(identity)
+  expect(custody.keptReceiptState()).toEqual({ active: false, since: null })
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  await custody.authorize(identity)
+  expect(custody.keptReceiptState()).toEqual({ active: true, since: now })
+  custody.forget(id)
+  expect(custody.keptReceiptState()).toEqual({ active: false, since: null })
+  f.failure(undefined)
+  await custody.authorize(identity)
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  await custody.authorize(identity)
+  custody.close()
+  expect(custody.keptReceiptState()).toEqual({ active: false, since: null })
+  await expect(custody.authorize(identity)).rejects.toMatchObject({
+    code: 'closed',
+  })
+})
+
+test('observed roster credential type change forgets the OAuth receipt', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  await f.runtime.authorize('main')
+  await mutateVaultRoster(f.vaultPaths.roster, (roster) => {
+    if (!roster?.rows[0]) throw new Error('Missing roster')
+    roster.rows[0].credentialType = 'api_key'
+    return { next: roster, result: undefined }
+  })
+  await f.runtime.read()
+  await mutateVaultRoster(f.vaultPaths.roster, (roster) => {
+    if (!roster?.rows[0]) throw new Error('Missing roster')
+    roster.rows[0].credentialType = 'oauth'
+    return { next: roster, result: undefined }
+  })
+  f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
+  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    code: 'unavailable',
+  })
 })

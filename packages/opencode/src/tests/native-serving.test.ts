@@ -2859,3 +2859,24 @@ test('vault direct cancel after a 401 arrives and before re-authorization ends a
   expect(served).toEqual([assigned, assigned])
   expect(fixture.scopedReports).toHaveLength(1)
 })
+
+test('OpenCode 1 serves through a vault outage without local token rescue', async () => {
+  const f = await migrateServingFixture('claustrum')
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => f.scopedClient,
+  })
+  expect((await sendNative(plugin)).status).toBe(200)
+  f.scopedClient.getScoped = async () => {
+    throw Object.assign(new Error('outage'), { code: 'ECONNREFUSED' })
+  }
+  expect((await sendNative(plugin)).status).toBe(200)
+  const sent = f.records.filter((record) => record.url.includes('/v1/messages'))
+  expect(sent.map((record) => record.authorization)).toEqual([
+    'Bearer sk-ant-oat01-vault-main-v1',
+    'Bearer sk-ant-oat01-vault-main-v1',
+  ])
+  expect(f.records.some((record) => record.url.includes('/oauth/token'))).toBe(
+    false,
+  )
+  expect(f.scopedReports).toHaveLength(0)
+})

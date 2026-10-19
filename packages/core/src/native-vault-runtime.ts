@@ -77,6 +77,10 @@ import {
   nativeRuntimeOptionIdentity,
   nativeRuntimeStorageKey,
 } from './native-runtime-registry.ts'
+import {
+  retainNativeVaultRoster,
+  watchNativeVaultAuthority,
+} from './native-vault-invalidation.ts'
 import type { NativeVaultPaths } from './native-vault-paths.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
 import { nativeVaultFileAbsent } from './native-vault-seed.ts'
@@ -282,7 +286,7 @@ export async function publishNativeVaultRosterSeed(
   options: { assertOwned?: () => Promise<void> } = {},
 ): Promise<NativeVaultRosterSeed> {
   const seed = buildNativeVaultRosterSeed(input)
-  return mutateVaultRoster(
+  const published = await mutateVaultRoster(
     paths.roster,
     async (current, lease) => {
       if (current) {
@@ -296,6 +300,8 @@ export async function publishNativeVaultRosterSeed(
     },
     { beforePublish: options.assertOwned },
   )
+  retainNativeVaultRoster(paths.roster, await readVaultRoster(paths.roster))
+  return published
 }
 
 /** Match imported metadata to the held vault roster before publishing it. The caller's assertOwned fences its captured input; the roster lease separately prevents account replacement during the metadata write. */
@@ -384,16 +390,38 @@ export function createNativeVaultRuntime(
   const identity = options.identity ? { ...options.identity } : undefined
   const shutdown = new AbortController()
   const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
-  const custody = createNativeCustody({
-    host: options.host,
-    readToken: options.readToken,
-    now: options.now,
-    connect:
-      options.connect ??
-      // The scoped client carries insula's transport over the same connection.
-      (() => connectNativeVaultScopedClient(connectionFile, identity)),
-    env,
-  })
+  const newCustody = () =>
+    createNativeCustody({
+      host: options.host,
+      readToken: options.readToken,
+      now: options.now,
+      connect:
+        options.connect ??
+        // The scoped client carries insula's transport over the same connection.
+        (() => connectNativeVaultScopedClient(connectionFile, identity)),
+      env,
+    })
+  let custody = newCustody()
+  let custodyClosed = false
+  function closeCustody() {
+    custody.close()
+    custodyClosed = true
+    insula?.release()
+    insula = undefined
+  }
+  function retainRoster(roster: NativeVaultRosterDocument | undefined) {
+    custody.retain(
+      (roster?.rows ?? []).map((row) => ({
+        credentialId: row.credentialId,
+        accountIdentity: row.accountIdentity ?? '',
+        enabled: row.enabled,
+        state:
+          row.credentialType === 'oauth' && nativeAccountCanServe(row)
+            ? 'active'
+            : 'not-active',
+      })),
+    )
+  }
   // Insula's background quota cache, shared by common-auth across runtimes
   // with the same resolved connection file and enrollment token path (one
   // fetch a minute between them). Acquired on the first background tick that
@@ -401,6 +429,12 @@ export function createNativeVaultRuntime(
   const tokenPath = getHostClaustrumEnrollmentPaths(options.host, env).tokenPath
   const clock = options.now ?? Date.now
   let insula: { source: InsulaQuotaSource; release(): void } | undefined
+  const unwatchAuthority = watchNativeVaultAuthority({
+    roster: paths.roster,
+    tokenPath,
+    retain: retainRoster,
+    close: closeCustody,
+  })
   /**
    * Refresh insula's cache for one background tick. Enrollment is read fresh
    * each time: outside vault custody, or with a missing or unreadable token,
@@ -532,6 +566,10 @@ export function createNativeVaultRuntime(
     check()
     const mode = await readNativeEnrollmentMode(options.host, env)
     check()
+    if (mode === 'claustrum' && custodyClosed) {
+      custody = newCustody()
+      custodyClosed = false
+    }
     return mode === 'claustrum'
   }
   async function requireActive(signal?: AbortSignal) {
@@ -667,6 +705,7 @@ export function createNativeVaultRuntime(
     async read() {
       await requireActive()
       const roster = await readVaultRoster(paths.roster)
+      retainRoster(roster)
       check()
       return roster
     },
@@ -684,6 +723,7 @@ export function createNativeVaultRuntime(
         projection: () => ({ reservedRouteIds }),
       })
         .then(async (roster) => {
+          retainNativeVaultRoster(paths.roster, roster)
           // Publish the primary account pin once for the shared discovery refresh,
           // rather than once for each caller waiting for that refresh.
           await publishPrimaryPin(shutdown.signal)
@@ -700,6 +740,7 @@ export function createNativeVaultRuntime(
       const roster =
         (await readVaultRoster(paths.roster)) ??
         (await runtime.refresh(combined))
+      retainRoster(roster)
       const row = await rowFor(roster, logicalId)
       if (row?.credentialType !== 'oauth' || !row.accountIdentity)
         throw new NativeCustodyError('route-unavailable')
@@ -714,10 +755,9 @@ export function createNativeVaultRuntime(
         combined,
       )
       await requireActive(combined)
-      const current = await rowFor(
-        await readVaultRoster(paths.roster),
-        logicalId,
-      )
+      const currentRoster = await readVaultRoster(paths.roster)
+      retainRoster(currentRoster)
+      const current = await rowFor(currentRoster, logicalId)
       if (
         !current?.enabled ||
         current.routeId !== row.routeId ||
@@ -746,6 +786,10 @@ export function createNativeVaultRuntime(
     },
     async prepareRetry(served, signal, site) {
       const route = requireIssued(served)
+      if (served.fromKeptReceipt) {
+        custody.forget(served.credentialId)
+        return { retry: false, reason: 'reauthorize-failed' }
+      }
       // Return the retry decision with any fresh receipt, including a refused
       // one, so diagnostics can record the newly observed recordVersion.
       const decide = async (): Promise<
@@ -770,7 +814,10 @@ export function createNativeVaultRuntime(
           return [{ retry: false, reason: 'credential-changed' }, next]
         if (next.assertedAccountIdentity !== served.assertedAccountIdentity)
           return [{ retry: false, reason: 'account-changed' }, next]
-        if (!(next.recordVersion > served.recordVersion))
+        if (
+          next.fromKeptReceipt ||
+          !(next.recordVersion > served.recordVersion)
+        )
           return [{ retry: false, reason: 'version-not-newer' }, next]
         // Mark the retry-issued receipt too, so handing it back cannot restart
         // the request's one permitted strict-newer-version 401 retry.
@@ -999,7 +1046,7 @@ export function createNativeVaultRuntime(
       // disable calls report no change. Enabling removes this credential/account
       // pair from declined entries; disabling adds it so discovery cannot enable
       // it again.
-      return mutateVaultRoster(paths.roster, (current) => {
+      const changed = await mutateVaultRoster(paths.roster, (current) => {
         const held = current?.rows.find(
           (entry) => entry.routeId === row.routeId,
         )
@@ -1008,6 +1055,7 @@ export function createNativeVaultRuntime(
             'route-unavailable',
             'Claustrum route is not in the roster',
           )
+        if (!enabled) custody.forget(held.credentialId)
         return {
           next: {
             ...current,
@@ -1029,15 +1077,16 @@ export function createNativeVaultRuntime(
           result: held.enabled !== enabled,
         }
       })
+      retainNativeVaultRoster(paths.roster, await readVaultRoster(paths.roster))
+      return changed
     },
     close() {
       watchers.clear()
       schedulePoll()
       if (shutdown.signal.aborted) return
       shutdown.abort(new NativeCustodyError('closed'))
-      insula?.release()
-      insula = undefined
-      custody.close()
+      unwatchAuthority()
+      closeCustody()
     },
   }
   function currentDisplaySubject(receipt: NativeCustodyReceipt) {

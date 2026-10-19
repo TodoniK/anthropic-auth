@@ -396,7 +396,7 @@ async function vault(
     },
   }))
   cleanups.push(() => runtime.close())
-  return { runtime, paths, store, localStore, env, gets, reports }
+  return { runtime, paths, store, localStore, env, gets, reports, client }
 }
 
 /**
@@ -1540,4 +1540,30 @@ describe('OC2 vault enrollment callbacks for the claude menu', () => {
       snapshot.accounts.find((account) => account.id === 'main')?.source,
     ).toBe('local')
   })
+})
+
+test('OpenCode 2 serves through a vault outage with the original receipt', async () => {
+  const f = await vault()
+  const native = source(f.runtime, f.paths)
+  expect(await native.chooseAccount(scope)).toBe('main')
+  const first = await native.authorizeAccount(scope, 'main')
+  if (first?.route !== 'oauth') throw new Error('Missing vault authorization')
+  f.client.getScoped = async () => {
+    throw Object.assign(new Error('outage'), { code: 'ECONNREFUSED' })
+  }
+  const next = await native.authorizeAccount(scope, 'main')
+  if (next?.route !== 'oauth')
+    throw new Error('Outage refused the kept receipt')
+  expect(next.accessToken).toBe(first.accessToken)
+  const attempt = context(next.provenance)
+  await native.limitFromResponse?.({
+    ...attempt,
+    status: 401,
+    headers: new Headers(),
+    body: async () => '{}',
+  })
+  await native.onAttemptEnd?.(attempt, { status: 401, outputStarted: false })
+  expect(f.reports).toHaveLength(0)
+  expect(f.gets).toHaveLength(1)
+  await expect(native.authorizeAccount(scope, 'main')).rejects.toThrow()
 })

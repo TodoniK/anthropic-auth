@@ -43,6 +43,7 @@ import {
   type NativeRuntimeState,
   readNativeRuntime,
 } from './native-runtime.ts'
+import { retainNativeVaultRoster } from './native-vault-invalidation.ts'
 import { publishNativeVaultRuntimeSeed } from './native-vault-runtime.ts'
 import {
   advanceNativeCustodyActivation,
@@ -935,6 +936,10 @@ export async function runNativeCustodyActivation(
             { beforePublish: preparedFence },
           )
           await step('after:roster')
+          retainNativeVaultRoster(
+            paths.roster,
+            await readVaultRoster(paths.roster),
+          )
 
           // Rebind runtime metadata from local rows to vault routes before
           // any row is removed: the target is computed from those rows.

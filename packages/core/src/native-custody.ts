@@ -1,6 +1,9 @@
 import {
   ClaustrumConsumerError,
+  ClaustrumCredentialError,
   ClaustrumScopedCustody,
+  ClaustrumUnreachableError,
+  classifyVaultFailure,
 } from '@cortexkit/common-auth/claustrum'
 import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
 
@@ -113,6 +116,7 @@ export interface NativeCustodyReceipt {
   readonly recordVersion: number
   readonly expiresAtMs: number | null
   readonly accessToken: string
+  readonly fromKeptReceipt?: true
 }
 
 export interface NativeCustodyInventory {
@@ -237,6 +241,14 @@ export interface NativeCustody {
   ) => Promise<NativeCustodyRetry>
   /** The shared connection's insula transport, connecting first if needed; undefined when the client has none. */
   insulaTransport: () => Promise<NativeInsulaUsageTransport | undefined>
+  retain: (
+    rows: readonly (NativeCustodyIdentity & {
+      enabled: boolean
+      state: string
+    })[],
+  ) => void
+  forget: (credentialId: string) => void
+  keptReceiptState: () => Readonly<{ active: boolean; since: number | null }>
   close: () => void
 }
 
@@ -248,6 +260,7 @@ export function createNativeCustody(
   const connect = options.connect
   const logger = options.logger
   let closed = false
+  let revoked = false
   let client: NativeCustodyClient | undefined
   let connecting: Promise<NativeCustodyClient> | undefined
   const onClose = new Set<() => void>()
@@ -284,9 +297,27 @@ export function createNativeCustody(
   async function scoped<T>(
     operation: (owned: NativeCustodyClient) => Promise<T>,
   ): Promise<T> {
-    const owned = await connection()
-    check()
-    return operation(owned)
+    try {
+      const owned = await connection()
+      check()
+      return await operation(owned)
+    } catch (error) {
+      check()
+      if (
+        error instanceof ClaustrumCredentialError &&
+        error.code === 'enrollment_revoked'
+      )
+        revoked = true
+      // Local shutdown and adapter validation are not evidence of a vault outage.
+      if (error instanceof NativeCustodyError)
+        throw new ClaustrumConsumerError(
+          error.code,
+          'Native custody operation refused',
+        )
+      if (classifyVaultFailure(error) === 'unreachable')
+        throw new ClaustrumUnreachableError()
+      throw error
+    }
   }
 
   const primitive = new ClaustrumScopedCustody({
@@ -349,6 +380,7 @@ export function createNativeCustody(
     } finally {
       onClose.delete(stop)
       signal?.removeEventListener('abort', abort)
+      if (revoked) custody.close()
     }
   }
 
@@ -395,6 +427,10 @@ export function createNativeCustody(
     prepareRetry: async (served, signal) => {
       check(signal)
       requireReceipt(served)
+      if (served.fromKeptReceipt) {
+        primitive.forget(served.credentialId)
+        return { retry: false, reason: 'reauthorize-failed' }
+      }
       if (served.assertedAccountIdentity === undefined) {
         throw new NativeCustodyError('no-receipt')
       }
@@ -427,12 +463,21 @@ export function createNativeCustody(
       if (current.assertedAccountIdentity !== served.assertedAccountIdentity) {
         return { retry: false, reason: 'account-changed' }
       }
-      if (!(current.recordVersion > served.recordVersion)) {
+      if (
+        current.fromKeptReceipt ||
+        !(current.recordVersion > served.recordVersion)
+      ) {
         return { retry: false, reason: 'version-not-newer' }
       }
       return { retry: true, receipt: current }
     },
     insulaTransport: () => scoped(async (owned) => owned.insula),
+    retain: (rows) =>
+      primitive.retain(
+        rows.map((row) => ({ ...row, credentialType: 'oauth' })),
+      ),
+    forget: (credentialId) => primitive.forget(credentialId),
+    keptReceiptState: () => primitive.keptReceiptState(),
     close: () => {
       if (closed) return
       closed = true

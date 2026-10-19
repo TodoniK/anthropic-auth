@@ -1912,3 +1912,40 @@ test('first Pi request after a 1.x vault upgrade uses legacy fallback-first befo
   })
   expect(await readFile(f.path, 'utf8')).toBe(legacy)
 })
+
+test('Pi serves through a vault outage without local token rescue', async () => {
+  const f = await fixture()
+  const sent: string[] = []
+  globalThis.fetch = Object.assign(
+    async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      sent.push(new Headers(init?.headers).get('authorization') ?? '')
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  expect(
+    (
+      await streamCortexKitAnthropic(model, context, {
+        sessionId: 'outage',
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  f.client.getScoped = async () => {
+    throw Object.assign(new Error('outage'), { code: 'ECONNREFUSED' })
+  }
+  expect(
+    (
+      await streamCortexKitAnthropic(model, context, {
+        sessionId: 'outage',
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  expect(sent).toEqual([
+    'Bearer vault-test-access-1',
+    'Bearer vault-test-access-1',
+  ])
+  expect(f.reports).toHaveLength(0)
+  expect(await Promise.all(f.localFiles.map((file) => readFile(file)))).toEqual(
+    f.beforeLocal,
+  )
+})
