@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto'
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
+import {
+  diagnosticInventory,
+  fixtureRedactor,
+  setupEvidence,
+} from './setup-evidence.mjs'
 
 export const sha256 = (bytes) =>
   createHash('sha256').update(bytes).digest('hex')
@@ -47,21 +52,44 @@ export function isolatedEnvironment(root, inherited = process.env) {
 }
 
 /** A failed proof still produces a receipt; no failed or skipped step qualifies Windows. */
-export async function withReceipt(path, result, run, cleanup = async () => {}) {
+export async function withReceipt(
+  path,
+  result,
+  run,
+  cleanup = async () => {},
+  options = {},
+) {
   result.steps = []
-  const step = async (name, action) => {
+  options = { fixtureRoots: [result.profile], ...options }
+  const redact = fixtureRedactor(options)
+  const step = async (name, action, { setupChild = false } = {}) => {
+    const before = setupChild
+      ? await diagnosticInventory(options.diagnosticsDirectory)
+      : undefined
+    let value
+    let failure
+    let passed = false
     try {
-      const evidence = await action()
-      result.steps.push({ name, status: 'passed', evidence })
-      return evidence
+      value = await action()
+      passed = true
     } catch (error) {
-      result.steps.push({
-        name,
-        status: 'failed',
-        error: String(error).replaceAll(result.profile ?? '\0', '<profile>'),
-      })
-      return undefined
+      failure = error
     }
+    const entry = { name, status: passed ? 'passed' : 'failed' }
+    if (setupChild) {
+      entry.evidence = await setupEvidence(
+        passed ? value : failure,
+        passed,
+        options,
+        before,
+      )
+      if (!passed)
+        entry.error = `Setup step failed (child exit ${entry.evidence.exitCode ?? entry.evidence.errorCode ?? 'unknown'})`
+    } else if (passed) entry.evidence = value
+    else entry.error = redact(String(failure))
+    result.steps.push(entry)
+    if (setupChild) (options.log ?? console.log)(JSON.stringify(entry))
+    return passed ? entry.evidence : undefined
   }
   try {
     await run(step)

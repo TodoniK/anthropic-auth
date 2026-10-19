@@ -1,13 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import {
-  mkdir,
-  mkdtemp,
-  readdir,
-  readFile,
-  rm,
-  writeFile,
-} from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -18,6 +11,7 @@ import {
   snapshot,
   withReceipt,
 } from './harness.mjs'
+import { cleanupFixture } from './setup-evidence.mjs'
 
 const exec = promisify(execFile)
 if (process.platform !== 'win32') {
@@ -35,6 +29,7 @@ const root = await mkdtemp(join(homedir(), 'anthropic-windows-'))
 const profile = join(root, 'profile')
 const consumer = join(root, 'consumer')
 const env = isolatedEnvironment(profile)
+const fixtureToken = 'a'.repeat(64)
 const result = {
   platform: process.platform,
   arch: process.arch,
@@ -183,53 +178,59 @@ const ok = await withReceipt(
       return { command: 'tasklist.exe /fo csv /nh' }
     })
     const args = [cli, 'setup', '--yes', '--no-claustrum', '--opencode=1']
-    await step('setup-dry-run-no-writes', async () => {
-      const before = await snapshot(profile)
-      await exec(process.execPath, [...args, '--dry-run'], {
-        cwd: consumer,
-        env,
-        timeout: 60_000,
-      })
-      assert.deepEqual(
-        await snapshot(profile),
-        before,
-        'Dry-run changed the isolated profile',
-      )
-      return { unchangedFiles: before }
-    })
-    let setupError
-    await step('setup-local-noninteractive', async () => {
-      try {
-        await exec(process.execPath, args, {
+    await step(
+      'setup-dry-run-no-writes',
+      async () => {
+        const before = await snapshot(profile)
+        result.files.dryRunBefore = before
+        let output
+        try {
+          output = await exec(process.execPath, [...args, '--dry-run'], {
+            cwd: consumer,
+            env,
+            timeout: 60_000,
+          })
+          assert.deepEqual(
+            await snapshot(profile),
+            before,
+            'Dry-run changed the isolated profile',
+          )
+        } catch (error) {
+          if (output) Object.assign(error, output, { exitCode: 0 })
+          throw error
+        }
+        return { ...output, exitCode: 0 }
+      },
+      { setupChild: true },
+    )
+    const setup = await step(
+      'setup-local-noninteractive',
+      async () => ({
+        ...(await exec(process.execPath, args, {
           cwd: consumer,
           env,
           timeout: 120_000,
-        })
-      } catch (error) {
-        setupError = error
-        throw new Error(`Local setup exited ${error.code ?? 'unknown'}`)
-      }
-      return { exitCode: 0, credentials: 'none', mode: 'local' }
-    })
+        })),
+        exitCode: 0,
+      }),
+      { setupChild: true },
+    )
+    const setupRecord = result.steps.find(
+      (entry) => entry.name === 'setup-local-noninteractive',
+    ).evidence
     await step('publication-deadline', async () => {
-      let details = `${setupError?.stdout ?? ''}\n${setupError?.stderr ?? ''}`
-      const files = await snapshot(profile)
-      for (const file of Object.keys(files).filter((name) =>
-        name.endsWith('.log'),
-      ))
-        details += await readFile(join(profile, file), 'utf8')
       assert(
-        !/ETIMEDOUT|Publication deadline expired/.test(details),
+        setupRecord.publication.kind !== 'publication-timeout',
         'common-auth publication timeout (500 ms); adopt upstream 0.20.0, no local workaround',
       )
-      if (setupError)
+      if (!setup)
         throw new Error(
-          'Local setup failed for a reason other than publication timeout',
+          'Setup failure remains unclassified; publication timeout has not been excluded. Inspect setup-local-noninteractive evidence.',
         )
       return { timeoutObserved: false }
     })
     await step('setup-journal-and-owner-only-readers', async () => {
-      assert(!setupError, 'Successful setup is required to qualify its files')
+      assert(setup, 'Successful setup is required to qualify its files')
       const paths = await core.resolveNativePoolPaths(
         join(env.OPENCODE_CONFIG_DIR, 'anthropic-auth.json'),
       )
@@ -263,7 +264,7 @@ const ok = await withReceipt(
       const token = join(profile, 'synthetic-enrollment.json')
       await api.createPrivateFile(
         token,
-        JSON.stringify({ token: 'a'.repeat(64), token_generation: 1 }),
+        JSON.stringify({ token: fixtureToken, token_generation: 1 }),
       )
       assert.equal(
         (
@@ -283,7 +284,21 @@ const ok = await withReceipt(
       }
     })
   },
-  () => rm(root, { recursive: true, force: true }),
+  async () => {
+    const evidence = await cleanupFixture(root, { secrets: [fixtureToken] })
+    console.log(JSON.stringify({ name: 'cleanup', evidence }))
+    return evidence
+  },
+  {
+    fixtureRoots: [root, profile],
+    secrets: [fixtureToken],
+    diagnosticsDirectory: join(
+      env.XDG_STATE_HOME,
+      'cortexkit',
+      'anthropic-auth',
+      'diagnostics',
+    ),
+  },
 )
 console.log(
   `Windows packed setup: ${result.steps.length} steps, ${result.status}; receipt: ${receipt}`,
