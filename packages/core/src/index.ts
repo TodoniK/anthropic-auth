@@ -77,6 +77,12 @@ export type {
   NativeCustodyReceipt,
   NativeCustodyReporterSource,
   NativeCustodyRetry,
+  NativeRosterWatch,
+  NativeRosterWatchMode,
+  NativeRosterWatchOptions,
+  NativeScopedWatchEnd,
+  NativeScopedWatchHandle,
+  NativeScopedWatchNotice,
 } from './native-custody.ts'
 export { createNativeCustody, NativeCustodyError } from './native-custody.ts'
 export type {

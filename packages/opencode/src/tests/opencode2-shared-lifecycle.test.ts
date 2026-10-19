@@ -8,6 +8,10 @@ import {
   resolveNativePoolPaths,
 } from '@cortexkit/anthropic-auth-core'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
+import {
+  recordedTimers,
+  watchableVaultClient,
+} from '../../../core/src/tests/vault-watch-fixture.ts'
 import { startNativeAnthropicLifecycle } from '../v2/lifecycle.ts'
 
 const { test, deferCleanup, gate } = createTestLifetimeSuite()
@@ -133,3 +137,98 @@ test('OpenCode 2 lifecycles share discovery and retain the surviving account lea
   expect(counts.closes).toBe(1)
   expect(timers.size).toBe(0)
 }, 10_000)
+
+for (const outcome of ['watching', 'fallback'] as const)
+  test(`OpenCode 2 lists the vault every five minutes only while a vault watch is open (${outcome})`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oc2-vault-watch-'))
+    deferCleanup(() => rm(root, { recursive: true, force: true }))
+    const paths = await resolveNativePoolPaths(
+      join(root, 'anthropic-auth.json'),
+    )
+    const env = {
+      OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+        root,
+        'enrollment.json',
+      ),
+    }
+    await writeFile(
+      env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
+      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    const client: NativeCustodyClient = {
+      async listScoped() {
+        return {
+          view: 'oc2-watch',
+          rows: [
+            {
+              id: 'oauth:anthropic',
+              accountId: '11111111-2222-4333-8444-555555555555',
+              credentialType: 'oauth',
+              categories: ['anthropic-native'],
+              serves: ['anthropic'],
+              providerIds: [],
+              refreshAdapter: 'anthropic',
+              operations: ['read'],
+              state: 'active',
+              recordVersion: 1,
+              createdAtMs: null,
+            },
+          ],
+          grants: undefined,
+          grantTuples: undefined,
+        }
+      },
+      async getScoped(input) {
+        return {
+          credentialId: input.credentialId,
+          accountId: '11111111-2222-4333-8444-555555555555',
+          material: 'fresh-watch',
+          recordVersion: 1,
+          expiresAtMs: Date.now() + 3_600_000,
+        }
+      },
+      async reportAuthFailureScoped() {},
+      close() {},
+    }
+    const vault = watchableVaultClient(client, gate)
+    const timers = recordedTimers(deferCleanup)
+    const runtime = acquireNativeAccountRuntime({
+      paths,
+      host: 'opencode',
+      vault: { env, connect: async () => client },
+    })
+    // Keep the lifecycle's own 60 s pace; only the timer functions are ours.
+    const watch = runtime.vault.watch.bind(runtime.vault)
+    const spy = spyOn(runtime.vault, 'watch').mockImplementation((options) =>
+      watch({
+        ...options,
+        setInterval: timers.setInterval,
+        clearInterval: timers.clearInterval,
+      }),
+    )
+    const transport = Object.assign(async () => Response.json({}), {
+      preconnect: fetch.preconnect,
+    }) as typeof fetch
+    const lifecycle = startNativeAnthropicLifecycle(runtime, transport)
+    deferCleanup(async () => {
+      await lifecycle.dispose()
+      runtime.close()
+      spy.mockRestore()
+    })
+    const opened = await vault.nth(0)
+    const poll = timers.created.find((timer) => timer.ms === 60_000)
+    expect(poll && timers.live(poll.handle)).toBe(true)
+    const before = timers.created.length
+    if (outcome === 'watching') opened.notify('oc2-watch')
+    else opened.finish({ kind: 'unsupported' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const added = timers.created.slice(before).map((timer) => timer.ms)
+    if (outcome === 'watching') {
+      expect(added).toEqual([5 * 60_000])
+      expect(poll && timers.live(poll.handle)).toBe(false)
+    } else {
+      expect(added).toEqual([])
+      expect(poll && timers.live(poll.handle)).toBe(true)
+    }
+  })

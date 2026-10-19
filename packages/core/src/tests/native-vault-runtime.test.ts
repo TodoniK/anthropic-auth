@@ -39,6 +39,7 @@ import { createNativePoolStore } from '../pool-store.ts'
 import { QuotaManager } from '../quota-manager.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
+import { recordedTimers, watchableVaultClient } from './vault-watch-fixture.ts'
 
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
 const uuid = '11111111-2222-4333-8444-555555555555'
@@ -2094,4 +2095,248 @@ test('closing the runtime stops the outage probe and leaves no pending timer', a
   expect(timers.slice(before).every((timer) => timer.cleared)).toBe(true)
   await settle()
   expect(f.counts.lists).toBe(lists)
+})
+
+// The vault account watch (claustrum-client 0.12.0 `watchScoped`), as
+// common-auth's custody runs it through our adapter and the shared runtime:
+// a notice whose view differs from the roster we hold runs our discovery,
+// and while the watch is open the list timer only runs every five minutes.
+const FIVE_MINUTES_MS = 5 * 60_000
+
+/**
+ * A runtime with recorded timers, watched by one host at a 2 s pace (OpenCode
+ * 1 and Pi's default). Resolves once the first discovery has run.
+ */
+async function watchedRuntime(
+  f: Awaited<ReturnType<typeof fixture>>,
+  intervalMs = 2_000,
+) {
+  const timers = recordedTimers(deferCleanup)
+  const runtime = createNativeVaultRuntime({
+    ...f.options,
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+  })
+  deferCleanup(() => runtime.close())
+  let refreshes = 0
+  const refreshWaiters: { count: number; open: () => void }[] = []
+  const watch = runtime.watch({
+    intervalMs,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    onRefresh: () => {
+      refreshes++
+      for (const waiter of [...refreshWaiters])
+        if (waiter.count <= refreshes) {
+          refreshWaiters.splice(refreshWaiters.indexOf(waiter), 1)
+          waiter.open()
+        }
+    },
+  })
+  await watch.ready
+  return {
+    runtime,
+    timers,
+    watch,
+    refreshes: () => refreshes,
+    /**
+     * Wait until the hosts have been told about `count` discoveries in all.
+     * Teardown releases the wait, which then fails the test.
+     */
+    async refreshed(count: number) {
+      if (refreshes >= count) return
+      const told = gate()
+      refreshWaiters.push({ count, open: told.open })
+      await told.wait
+      expect(refreshes).toBeGreaterThanOrEqual(count)
+    },
+    listPace: () => [...timers.intervals.values()],
+  }
+}
+
+test('a vault notice with a new view runs discovery once and publishes the roster', async () => {
+  const f = await fixture()
+  const vault = watchableVaultClient(f.client, gate)
+  const w = await watchedRuntime(f)
+  expect(f.counts.lists).toBe(1)
+  const notices = await vault.nth(0)
+  expect(notices.options).toEqual({ enrollmentToken: '01'.repeat(32) })
+  await w.refreshed(1)
+
+  const work = { ...listed, id: 'oauth:anthropic:work', accountId: uuid2 }
+  f.rows([listed, work])
+  notices.notify('changed-view')
+  await w.refreshed(2)
+  await settle()
+  expect(f.counts.lists).toBe(2)
+  expect(w.refreshes()).toBe(2)
+  const roster = await readVaultRoster(f.vaultPaths.roster)
+  expect(roster?.view).toBe(`view-2-${uuid}`)
+  expect(roster?.rows.map((row) => row.credentialId).sort()).toEqual(
+    [id, work.id].sort(),
+  )
+})
+
+test('a burst of vault notices runs at most one more discovery', async () => {
+  const f = await fixture()
+  const vault = watchableVaultClient(f.client, gate)
+  const w = await watchedRuntime(f)
+  const notices = await vault.nth(0)
+  await w.refreshed(1)
+  const listScoped = f.client.listScoped
+  const entered = gate()
+  const release = gate()
+  f.client.listScoped = async (token) => {
+    entered.open()
+    await release.wait
+    return listScoped(token)
+  }
+  notices.notify('burst-1')
+  await entered.wait
+  // Arrive while that discovery is listing: they share one follow-up.
+  for (const view of ['burst-2', 'burst-3', 'burst-4', 'burst-5'])
+    notices.notify(view)
+  release.open()
+  await w.refreshed(3)
+  await settle()
+  await settle()
+  expect(f.counts.lists).toBe(3)
+  expect(w.refreshes()).toBe(3)
+})
+
+test('a vault notice carrying the roster view runs no discovery', async () => {
+  const f = await fixture()
+  const vault = watchableVaultClient(f.client, gate)
+  const w = await watchedRuntime(f)
+  const notices = await vault.nth(0)
+  await w.refreshed(1)
+  const view = (await readVaultRoster(f.vaultPaths.roster))?.view
+  expect(view).toBe(`view-1-${uuid}`)
+  notices.notify(view as string)
+  notices.notify(view as string)
+  await settle()
+  await settle()
+  expect(f.counts.lists).toBe(1)
+  expect(w.refreshes()).toBe(1)
+})
+
+test('an open vault watch slows the list timer to five minutes, and fallback keeps the host pace', async () => {
+  const f = await fixture()
+  const vault = watchableVaultClient(f.client, gate)
+  const w = await watchedRuntime(f)
+  const first = await vault.nth(0)
+  // Opened but not yet accepted: the host's own pace.
+  expect(w.listPace()).toEqual([2_000])
+  first.notify(`view-1-${uuid}`)
+  expect(w.listPace()).toEqual([FIVE_MINUTES_MS])
+
+  // The accepted watch closes (the vault restarted): no watch is open while
+  // it re-subscribes, so the host pace returns at once.
+  first.finish({ kind: 'ended' })
+  await settle()
+  expect(w.listPace()).toEqual([2_000])
+  expect([...w.timers.timeouts.values()]).toEqual([1_000])
+
+  // A host with a slower pace than five minutes is never sped up.
+  const slow = await fixture()
+  const slowVault = watchableVaultClient(slow.client, gate)
+  const s = await watchedRuntime(slow, 10 * 60_000)
+  ;(await slowVault.nth(0)).notify(`view-1-${uuid}`)
+  expect(s.listPace()).toEqual([10 * 60_000])
+})
+
+test('a vault without the watch method falls back and keeps the host pace', async () => {
+  const f = await fixture()
+  const vault = watchableVaultClient(f.client, gate)
+  const w = await watchedRuntime(f)
+  ;(await vault.nth(0)).finish({ kind: 'unsupported' })
+  await settle()
+  expect(w.listPace()).toEqual([2_000])
+  // An older vault is not asked again: no retry is scheduled.
+  expect([...w.timers.timeouts.values()]).toEqual([])
+  expect(vault.opened).toHaveLength(1)
+
+  // A claustrum-client without watchScoped (before 0.12.0) opens nothing.
+  const old = await fixture()
+  const o = await watchedRuntime(old)
+  await settle()
+  expect(old.client.watchScoped).toBeUndefined()
+  expect(o.listPace()).toEqual([2_000])
+  expect([...o.timers.timeouts.values()]).toEqual([])
+})
+
+for (const code of ['not_found', 'enrollment_revoked'] as const) {
+  test(`a ${code} watch refusal drops kept receipts and refuses as a refused listing does`, async () => {
+    const f = await fixture()
+    const vault = watchableVaultClient(f.client, gate)
+    const w = await watchedRuntime(f)
+    const notices = await vault.nth(0)
+    await w.runtime.authorize('main')
+    // Closed before any notice: the client's confirming listing was refused.
+    notices.finish({
+      kind: 'refused',
+      error: new ClaustrumCredentialError(code, 'permanent', 'gone'),
+    })
+    await settle()
+    expect(w.listPace()).toEqual([2_000])
+    // An outage would now serve the kept receipt; it was dropped instead.
+    f.failure(unreachable())
+    if (code === 'enrollment_revoked') {
+      // As a revocation met by any vault call: custody closes for good.
+      expect(f.counts.closes).toBe(1)
+      await expect(w.runtime.authorize('main')).rejects.toMatchObject({
+        code: 'closed',
+      })
+    } else {
+      expect(f.counts.closes).toBe(0)
+      await expect(w.runtime.authorize('main')).rejects.toMatchObject({
+        code: 'unavailable',
+      })
+    }
+  })
+}
+
+test('closing the runtime closes the vault watch and leaves no pending timer', async () => {
+  const f = await fixture()
+  const vault = watchableVaultClient(f.client, gate)
+  const w = await watchedRuntime(f)
+  const first = await vault.nth(0)
+  // A watch that was never accepted schedules one retry five minutes out.
+  first.finish({ kind: 'not_accepting' })
+  await settle()
+  expect([...w.timers.timeouts.values()]).toEqual([FIVE_MINUTES_MS])
+  expect(w.listPace()).toEqual([2_000])
+
+  w.runtime.close()
+  expect(w.timers.timeouts.size).toBe(0)
+  expect(w.timers.intervals.size).toBe(0)
+
+  // And an open, accepted watch is stopped by close.
+  const g = await fixture()
+  const gVault = watchableVaultClient(g.client, gate)
+  const x = await watchedRuntime(g)
+  const open = await gVault.nth(0)
+  open.notify(`view-1-${uuid}`)
+  expect(x.listPace()).toEqual([FIVE_MINUTES_MS])
+  x.runtime.close()
+  expect(open.stopped).toBe(true)
+  expect(x.timers.timeouts.size).toBe(0)
+  expect(x.timers.intervals.size).toBe(0)
+  await settle()
+  expect(g.counts.lists).toBe(1)
+})
+
+test('a host leaving vault custody closes the vault watch', async () => {
+  const f = await fixture()
+  const vault = watchableVaultClient(f.client, gate)
+  const w = await watchedRuntime(f)
+  const open = await vault.nth(0)
+  open.notify(`view-1-${uuid}`)
+  expect(w.listPace()).toEqual([FIVE_MINUTES_MS])
+  expect(
+    await disconnectNativeVaultForHost({ host: 'opencode', env: f.env }),
+  ).toBe('disconnected')
+  expect(open.stopped).toBe(true)
+  expect(w.listPace()).toEqual([2_000])
+  expect(w.timers.timeouts.size).toBe(0)
 })

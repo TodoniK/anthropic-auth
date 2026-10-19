@@ -274,7 +274,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     await readFile(join(core, 'package.json'), 'utf8'),
   )
   expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.21.0')
-  expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe('0.11.0')
+  expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe('0.12.0')
   expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.22.0')
   expect(manifest.dependencies['jsonc-parser']).toBe('^3.3.1')
   expect(manifest.dependencies['@cortexkit/private-files']).toBe('0.2.1')
@@ -335,7 +335,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
       'utf8',
     ),
   )
-  expect(claustrumManifest.version).toBe('0.11.0')
+  expect(claustrumManifest.version).toBe('0.12.0')
   const subcManifests = allInstalled.filter((path) =>
     /(?:^|\/)@cortexkit\/subc-client\/package\.json$/.test(path),
   )

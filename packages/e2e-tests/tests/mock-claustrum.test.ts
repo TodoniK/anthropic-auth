@@ -113,6 +113,50 @@ describe('fake Claustrum daemon', () => {
       socket.destroy()
     }
   })
+
+  it('answers a vault watch as a vault without the method, on its own route', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-claustrum-'))
+    roots.push(root)
+    const daemon = await startFakeClaustrumDaemon({
+      directory: root,
+      scopedCredentials: {
+        'oauth:anthropic': {
+          payload: JSON.stringify({ access_token: 'vault-main' }),
+          account_id: 'account-main',
+          record_version: 7,
+          expires_at_ms: Date.now() + 60 * 60 * 1000,
+        },
+      },
+    })
+    daemons.push(daemon)
+    const identity = { project_root: root, harness: 'e2e', session: 'fixture-watch' }
+    const client = await SubcClient.connect({ connectionFile: daemon.connectionFile, identity })
+    clients.push(client)
+    const credential = () =>
+      client.call('claustrum', 'credential.get_scoped', {
+        credential_id: 'oauth:anthropic',
+        enrollment_token: 'aa'.repeat(32),
+        min_ttl_ms: 0,
+      })
+    await credential()
+
+    // Opened the way claustrum-client 0.12.0 opens its watch.
+    const route = await client.routeOpen(
+      { kind: 'management_surface', module_id: 'claustrum' },
+      identity,
+      { consumerIdentity: null },
+    )
+    const watch = client.subscribe(
+      route,
+      { method: 'auth.watch_scoped', params: { enrollment_token: 'aa'.repeat(32) } },
+      () => {},
+    )
+    await expect(watch.closed).rejects.toMatchObject({ code: 'unknown_method' })
+    await client.closeRoute(route)
+
+    // The credential route still answers after the watch route closed.
+    expect(await credential()).toMatchObject({ result: { credential_id: 'oauth:anthropic' } })
+  })
 })
 
 async function connectRawDaemon(connectionFile: string): Promise<Socket> {

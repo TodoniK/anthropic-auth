@@ -33,10 +33,15 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
+import {
+  recordedTimers,
+  watchableVaultClient,
+} from '../../../core/src/tests/vault-watch-fixture.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import {
   closePiNativeRuntime,
   getPiNativeRuntime,
+  PI_VAULT_POLL_INTERVAL_MS,
   PiNativeRuntime,
 } from '../native.ts'
 import {
@@ -275,6 +280,40 @@ test('Pi background vault poll adopts a main re-login while a fallback serves, w
   expect(state).toBe('active')
   expect(requestRefresh).toHaveBeenCalledTimes(0)
 })
+
+for (const outcome of ['watching', 'fallback'] as const)
+  test(`Pi lists the vault every five minutes only while a vault watch is open (${outcome})`, async () => {
+    const f = await fixture('main-first')
+    const vault = watchableVaultClient(f.client, lifetimes.gate)
+    const timers = recordedTimers(deferCleanup)
+    // The fixture's runtime does not poll; this one shares its vault runtime
+    // and turns the background poll on at Pi's default pace.
+    const polled = new PiNativeRuntime(f.path, {
+      connect: f.connect,
+      vaultPoll: {
+        intervalMs: PI_VAULT_POLL_INTERVAL_MS,
+        setInterval: timers.setInterval,
+        clearInterval: timers.clearInterval,
+      },
+    })
+    deferCleanup(() => polled.close())
+    await polled.service()
+    const watch = await vault.nth(0)
+    const poll = timers.created.find((timer) => timer.ms === 2_000)
+    expect(poll && timers.live(poll.handle)).toBe(true)
+    const before = timers.created.length
+    if (outcome === 'watching') watch.notify('pi-watch')
+    else watch.finish({ kind: 'unsupported' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const added = timers.created.slice(before).map((timer) => timer.ms)
+    if (outcome === 'watching') {
+      expect(added).toEqual([5 * 60_000])
+      expect(poll && timers.live(poll.handle)).toBe(false)
+    } else {
+      expect(added).toEqual([])
+      expect(poll && timers.live(poll.handle)).toBe(true)
+    }
+  })
 
 test('Pi same-key replacement drains its predecessor without closing the shared consumer', async () => {
   const f = await fixture()

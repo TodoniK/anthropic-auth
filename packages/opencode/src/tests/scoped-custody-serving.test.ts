@@ -11,6 +11,10 @@ import type { ScopedInventoryRow } from '@cortexkit/claustrum-client'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
+import {
+  recordedTimers,
+  watchableVaultClient,
+} from '../../../core/src/tests/vault-watch-fixture.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
 import { drainSidebarWrites, getSidebarStateFile } from '../sidebar-state.ts'
 import {
@@ -451,6 +455,58 @@ describe('OpenCode scoped custody serving', () => {
     expect(polls.size).toBe(0)
     expect(intervals.size).toBe(0)
   }, 15_000)
+
+  for (const outcome of ['watching', 'fallback'] as const)
+    test(`OpenCode 1 lists the vault every five minutes only while a vault watch is open (${outcome})`, async () => {
+      const { root, plugins } = await startBody('opencode-vault-watch-')
+      const fixture = await migrateScopedSeat(root, {
+        rows: () => [mainRow],
+        token: 'ab'.repeat(32),
+        expectedCredentials: [mainRow.id],
+        legacyConfig: scopedLegacyConfig(),
+      })
+      const client: NativeCustodyClient = {
+        listScoped: async () => ({
+          view: 'oc1-watch',
+          rows: [mainRow],
+          grants: undefined,
+          grantTuples: undefined,
+        }),
+        getScoped: async () => {
+          throw new Error('no credential read expected')
+        },
+        reportAuthFailureScoped: async () => {},
+        close: () => {},
+      }
+      const vault = watchableVaultClient(client, lifetimes.gate)
+      const timers = recordedTimers(lifetimes.deferCleanup)
+      // No poll override: the plugin's own 2 s roster poll.
+      const plugin = await createPlugin(plugins, fixture, {
+        claustrumScopedConnect: async () => client,
+        cacheKeepAggregateRefreshIntervalMs: 0,
+        setInterval: timers.setInterval,
+        clearInterval: timers.clearInterval,
+      })
+      await (plugin as any).__fallbackRefreshReady
+      const watch = await vault.nth(0)
+      const poll = timers.created.find((timer) => timer.ms === 2_000)
+      expect(poll && timers.live(poll.handle)).toBe(true)
+      const before = timers.created.length
+      if (outcome === 'watching') watch.notify('oc1-watch')
+      else watch.finish({ kind: 'unsupported' })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      const added = timers.created
+        .slice(before)
+        .map((timer) => timer.ms)
+        .filter((ms) => ms === 2_000 || ms === 5 * 60_000)
+      if (outcome === 'watching') {
+        expect(added).toEqual([5 * 60_000])
+        expect(poll && timers.live(poll.handle)).toBe(false)
+      } else {
+        expect(added).toEqual([])
+        expect(poll && timers.live(poll.handle)).toBe(true)
+      }
+    })
 
   test('native vault quota identity rejects an unbound receipt without a legacy roster flag', async () => {
     const { root, plugins } = await startBody('opencode-vault-identity-')

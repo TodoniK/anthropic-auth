@@ -73,11 +73,82 @@ export interface NativeCustodyClient {
   }) => Promise<void>
   close: () => void
   /**
+   * Open one vault watch that announces changes to the accounts this
+   * enrollment can see. Present from claustrum-client 0.12.0; without it the
+   * host keeps listing on its own timer.
+   */
+  watchScoped?(
+    onNotice: (notice: NativeScopedWatchNotice) => void,
+    options?: { enrollmentToken?: string },
+  ): NativeScopedWatchHandle
+  /**
    * How to read insula's background quota cache on the same daemon. Present
    * when the connection was made with connectClaustrumScopedClient; reading
    * it opens a separate short-lived socket and never uses this connection.
    */
   insula?: NativeInsulaUsageTransport
+}
+
+/**
+ * A vault watch notice. `view` is the same digest `listScoped` returns, so
+ * only a different view means the visible accounts changed. Declared here,
+ * like the rest of this client shape, so published declarations do not
+ * depend on claustrum-client or common-auth.
+ */
+export interface NativeScopedWatchNotice {
+  readonly kind: string
+  readonly epoch: string
+  readonly seq: number
+  readonly view: string
+}
+
+/**
+ * How a vault watch ended. `refused` carries the vault's refusal of the
+ * confirming account listing (a revoked enrollment answers `not_found`);
+ * `unsupported` means the vault does not know the watch method.
+ */
+export type NativeScopedWatchEnd =
+  | { readonly kind: 'refused'; readonly error: unknown }
+  | { readonly kind: 'transport_lost'; readonly error: unknown }
+  | {
+      readonly kind: 'ended' | 'not_accepting' | 'unsupported' | 'stopped'
+    }
+
+export interface NativeScopedWatchHandle {
+  stop(): void
+  readonly closed: Promise<NativeScopedWatchEnd>
+}
+
+/**
+ * How the host currently learns about account changes. `watching`: a vault
+ * watch is open, so the host's list timer only needs to run as a slow safety
+ * net. `polling` and `fallback`: no watch is open, so the host lists at its
+ * usual pace.
+ */
+export type NativeRosterWatchMode = 'watching' | 'polling' | 'fallback'
+
+export interface NativeRosterWatchOptions {
+  /**
+   * Run the host's discovery and roster publication. Called when a notice
+   * shows the visible accounts changed since the roster the host holds; one
+   * call at a time, and notices that arrive meanwhile earn at most one more.
+   */
+  onView: (view: string) => unknown
+  /** The view of the roster the host currently holds, if any. */
+  view?: () => string | undefined
+  onMode?: (mode: NativeRosterWatchMode) => void
+  /**
+   * The vault refused the watch and its confirming listing. Kept receipts are
+   * already dropped, as a refused listing drops them.
+   */
+  onRefused?: (error: unknown) => void
+  onError?: (error: unknown) => void
+}
+
+export interface NativeRosterWatch {
+  readonly mode: NativeRosterWatchMode
+  /** Stop the watch and its timers. Safe to call more than once. */
+  close(): void
 }
 
 export type NativeCustodyReporterSource =
@@ -97,6 +168,12 @@ export interface NativeCustodyOptions {
   env?: NodeJS.ProcessEnv
   now?: () => number
   logger?: NativeCustodyLogger
+  /**
+   * Timer functions for the custody's outage probe and roster watch retries.
+   * Defaults to the global ones; tests pass their own.
+   */
+  setTimeout?: typeof globalThis.setTimeout
+  clearTimeout?: typeof globalThis.clearTimeout
 }
 
 export interface NativeCustodyIdentity {
@@ -249,6 +326,12 @@ export interface NativeCustody {
   ) => void
   forget: (credentialId: string) => void
   keptReceiptState: () => Readonly<{ active: boolean; since: number | null }>
+  /**
+   * Watch the vault for account changes over the shared connection instead
+   * of relying on the host's list timer alone. A client or vault without the
+   * watch reports `fallback`. Closing the custody closes every watch.
+   */
+  watchRoster: (options: NativeRosterWatchOptions) => NativeRosterWatch
   close: () => void
 }
 
@@ -320,12 +403,68 @@ export function createNativeCustody(
     }
   }
 
+  /**
+   * Common-auth opens its roster watch synchronously, but our connection is
+   * made lazily, so this handle connects first and then forwards to the
+   * connected client's own watch. A client without `watchScoped` (before
+   * claustrum-client 0.12.0) ends the watch as `unsupported`, which leaves the
+   * host listing at its usual pace and opens nothing more.
+   */
+  function watchScoped(
+    onNotice: (notice: NativeScopedWatchNotice) => void,
+    watchOptions?: { enrollmentToken?: string },
+  ): NativeScopedWatchHandle {
+    let stopped = false
+    let inner: NativeScopedWatchHandle | undefined
+    let finish: (end: NativeScopedWatchEnd) => void = () => {}
+    const ended = new Promise<NativeScopedWatchEnd>((resolve) => {
+      finish = resolve
+    })
+    // A connection that fails because the vault is unreachable is a lost
+    // transport (common-auth then starts its outage); anything else, such as
+    // our own close, only ends this watch.
+    const failed = (error: unknown): NativeScopedWatchEnd =>
+      stopped || closed || error instanceof NativeCustodyError
+        ? { kind: 'stopped' }
+        : classifyVaultFailure(error) === 'unreachable'
+          ? { kind: 'transport_lost', error: new ClaustrumUnreachableError() }
+          : { kind: 'ended' }
+    void Promise.resolve()
+      .then(connection)
+      .then(
+        (owned) => {
+          if (stopped || closed) return finish({ kind: 'stopped' })
+          if (typeof owned.watchScoped !== 'function')
+            return finish({ kind: 'unsupported' })
+          try {
+            inner = owned.watchScoped(onNotice, watchOptions)
+          } catch (error) {
+            return finish(failed(error))
+          }
+          inner.closed.then(finish, (error: unknown) =>
+            finish({ kind: 'transport_lost', error }),
+          )
+        },
+        (error: unknown) => finish(failed(error)),
+      )
+    return {
+      stop() {
+        if (stopped) return
+        stopped = true
+        if (inner) inner.stop()
+        else finish({ kind: 'stopped' })
+      },
+      closed: ended,
+    }
+  }
+
   const primitive = new ClaustrumScopedCustody({
     client: {
       listScoped: (token) => scoped((owned) => owned.listScoped(token)),
       getScoped: (input) => scoped((owned) => owned.getScoped(input)),
       reportAuthFailureScoped: (input) =>
         scoped((owned) => owned.reportAuthFailureScoped(input)),
+      watchScoped,
       close: () => client?.close(),
     },
     family: {
@@ -341,6 +480,8 @@ export function createNativeCustody(
             .tokenPath,
         }),
     now: options.now,
+    ...(options.setTimeout && { setTimeoutImpl: options.setTimeout }),
+    ...(options.clearTimeout && { clearTimeoutImpl: options.clearTimeout }),
     // Supply logger callbacks so common-auth cannot select its default logger.
     // Only the fixed messages below reach the caller; record details never do.
     logger: {
@@ -478,6 +619,26 @@ export function createNativeCustody(
       ),
     forget: (credentialId) => primitive.forget(credentialId),
     keptReceiptState: () => primitive.keptReceiptState(),
+    watchRoster: (watchOptions) => {
+      check()
+      return primitive.watchRoster({
+        onView: watchOptions.onView,
+        ...(watchOptions.view && { view: watchOptions.view }),
+        onMode: watchOptions.onMode,
+        onRefused: (error) => {
+          // Common-auth has already dropped every kept receipt. A revoked
+          // enrollment then closes this custody, exactly as a revocation met
+          // by any other vault call does.
+          watchOptions.onRefused?.(error)
+          if (
+            error instanceof ClaustrumCredentialError &&
+            error.code === 'enrollment_revoked'
+          )
+            custody.close()
+        },
+        onError: watchOptions.onError,
+      })
+    },
     close: () => {
       if (closed) return
       closed = true

@@ -71,7 +71,11 @@ export async function startFakeClaustrumDaemon(input: {
     socket.on('error', () => {})
     let buffer = Buffer.alloc(0)
     let phase: 'hello' | 'auth' | 'frames' = 'hello'
-    let routeChannel: number | undefined
+    // Every route.open gets its own channel, as a real daemon assigns them, so
+    // a second route (claustrum-client opens one per vault watch) never
+    // shares a channel with the route that serves credential calls.
+    const routeChannels = new Set<number>()
+    let nextRouteChannel = 7
 
     socket.on('data', (chunk) => {
       buffer = Buffer.concat([
@@ -126,15 +130,33 @@ export async function startFakeClaustrumDaemon(input: {
           params?: Record<string, unknown>
         }
         if (header.channel === 0) {
-          if (request.op === 'route.open') routeChannel = 7
-          writeResponse(socket, header, { route_channel: 7, route_epoch: 1 })
+          if (request.op === 'route.open') {
+            const channel = nextRouteChannel++
+            routeChannels.add(channel)
+            writeResponse(socket, header, {
+              route_channel: channel,
+              route_epoch: 1,
+            })
+          } else
+            writeResponse(socket, header, { route_channel: 7, route_epoch: 1 })
           continue
         }
-        if (header.channel !== routeChannel) {
+        if (!routeChannels.has(header.channel)) {
           writeResponse(
             socket,
             header,
             { code: 'unknown_channel' },
+            FrameType.Error,
+          )
+          continue
+        }
+        if (request.method === 'auth.watch_scoped') {
+          // Answer as a vault that predates the account watch, so hosts keep
+          // listing on their own timer exactly as they did before it.
+          writeResponse(
+            socket,
+            header,
+            { code: 'unknown_method' },
             FrameType.Error,
           )
           continue

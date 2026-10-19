@@ -11,6 +11,7 @@ import {
   readClaustrumEnrollmentToken,
   readVaultRoster,
   refreshVaultRoster,
+  SAFETY_POLL_MS,
 } from '@cortexkit/common-auth/claustrum'
 import { SubcClient } from '@cortexkit/subc-client'
 
@@ -48,6 +49,7 @@ import {
   type NativeCustodyReceipt,
   type NativeCustodyReporterSource,
   type NativeCustodyRetry,
+  type NativeRosterWatch,
 } from './native-custody.ts'
 import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
 import { fromNativeQuotaMap, nativeQuotaCodec } from './native-quota-codec.ts'
@@ -103,6 +105,12 @@ export interface NativeVaultRuntimeOptions {
   readToken?: () => Promise<{ token: string; token_generation: number }>
   env?: NodeJS.ProcessEnv
   now?: () => number
+  /**
+   * Timer functions for the vault custody's outage probe and roster watch
+   * retries. Defaults to the global ones; tests pass their own.
+   */
+  setTimeout?: typeof globalThis.setTimeout
+  clearTimeout?: typeof globalThis.clearTimeout
 }
 
 /**
@@ -339,6 +347,19 @@ export async function publishNativeVaultRuntimeSeed(
 
 const NATIVE_VAULT_CONNECT_TIMEOUT_MS = 2_000
 
+/**
+ * The vault list timer's period. Without an open vault watch it is the
+ * host's own interval. While a watch is open, notices announce changes and
+ * the timer is only a safety net for a lost notice or a silently dead watch,
+ * so it runs every five minutes (never faster than the host asked for).
+ */
+function nativeVaultListIntervalMs(
+  hostIntervalMs: number,
+  watching: boolean,
+): number {
+  return watching ? Math.max(hostIntervalMs, SAFETY_POLL_MS) : hostIntervalMs
+}
+
 /** Connect through the same short deadline used when requests wait for a vault roster. */
 export function connectNativeVaultScopedClient(
   connectionFile: string,
@@ -390,6 +411,15 @@ export function createNativeVaultRuntime(
   const identity = options.identity ? { ...options.identity } : undefined
   const shutdown = new AbortController()
   const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+  // The vault watch for the current custody, opened while a host watches the
+  // roster. While it reports `watching`, the list timer below runs only as a
+  // slow safety net; in any other mode it keeps the host's own pace.
+  let rosterWatch: { watch: NativeRosterWatch; live: boolean } | undefined
+  let rosterWatching = false
+  // The view of the roster this runtime last committed or adopted, so a
+  // notice that carries it runs no discovery. Tracked here rather than left
+  // to custody, because a refresh can adopt a roster a peer process listed.
+  let rosterView: string | undefined
   const newCustody = () =>
     createNativeCustody({
       host: options.host,
@@ -400,16 +430,21 @@ export function createNativeVaultRuntime(
         // The scoped client carries insula's transport over the same connection.
         (() => connectNativeVaultScopedClient(connectionFile, identity)),
       env,
+      setTimeout: options.setTimeout,
+      clearTimeout: options.clearTimeout,
     })
   let custody = newCustody()
   let custodyClosed = false
   function closeCustody() {
+    // Closing the custody also stops its roster watch.
+    closeRosterWatch()
     custody.close()
     custodyClosed = true
     insula?.release()
     insula = undefined
   }
   function retainRoster(roster: NativeVaultRosterDocument | undefined) {
+    rosterView = roster?.view
     custody.retain(
       (roster?.rows ?? []).map((row) => ({
         credentialId: row.credentialId,
@@ -509,19 +544,78 @@ export function createNativeVaultRuntime(
     const owner = [...watchers]
       .filter((watch) => watch.intervalMs > 0)
       .sort((a, b) => a.intervalMs - b.intervalMs)[0]
-    if (pollTimer?.ms === owner?.intervalMs) return
+    const ms =
+      owner && nativeVaultListIntervalMs(owner.intervalMs, rosterWatching)
+    if (pollTimer?.ms === ms) return
     if (pollTimer) pollTimer.clear(pollTimer.handle)
     pollTimer = undefined
-    if (!owner) return
+    if (!owner || ms === undefined) return
     const handle = (owner.setInterval ?? setInterval)(() => {
       void poll().catch(() => {})
-    }, owner.intervalMs)
+    }, ms)
     handle.unref?.()
     pollTimer = {
       handle,
       clear: owner.clearInterval ?? clearInterval,
-      ms: owner.intervalMs,
+      ms,
     }
+  }
+  /**
+   * Open the roster watch once a host watches the roster and vault custody is
+   * active. One watch per runtime: the runtime is already shared per process.
+   */
+  function openRosterWatch() {
+    if (rosterWatch || custodyClosed || shutdown.signal.aborted) return
+    if (!watchers.size) return
+    const held = {
+      live: true,
+      watch: undefined as unknown as NativeRosterWatch,
+    }
+    rosterWatch = held
+    try {
+      held.watch = custody.watchRoster({
+        view: () => rosterView,
+        // Our existing discovery and roster publication, with the hosts'
+        // refresh callbacks. A poll already running may have listed before the
+        // change was announced, so wait for it and run one of our own.
+        onView: async () => {
+          while (polling) await polling.catch(() => {})
+          if (held.live) await poll()
+        },
+        onMode: (mode) => {
+          if (!held.live) return
+          rosterWatching = mode === 'watching'
+          schedulePoll()
+        },
+        // The vault refused the watch and the account listing that confirmed
+        // it. Custody has already dropped every kept receipt (the same thing it
+        // does when discovery's own listing is refused) and, for a revoked
+        // enrollment, closed itself. The watch is now in fallback, so the list
+        // timer is back at the host's pace and the next discovery reports the
+        // refusal through the usual refresh path.
+        onRefused: () => {
+          logger.warn('claustrum', 'vault refused the account watch')
+        },
+        onError: () => {
+          logger.debug('claustrum', 'vault account watch failed')
+        },
+      })
+    } catch {
+      // A custody closed under us opens nothing; the next poll tries again.
+      held.live = false
+      if (rosterWatch === held) rosterWatch = undefined
+    }
+  }
+  function closeRosterWatch() {
+    const held = rosterWatch
+    rosterWatch = undefined
+    if (held) {
+      held.live = false
+      held.watch?.close()
+    }
+    if (!rosterWatching) return
+    rosterWatching = false
+    schedulePoll()
   }
   function poll(): Promise<void> {
     if (polling) return polling
@@ -533,8 +627,12 @@ export function createNativeVaultRuntime(
         ),
       )
       if (shutdown.signal.aborted || !allowed.some(Boolean)) return
-      await runtime.refresh(shutdown.signal)
+      const roster = await runtime.refresh(shutdown.signal)
       if (shutdown.signal.aborted) return
+      // Watch while vault custody is active; a refresh outside it (the host
+      // left the vault) returns no roster, and the watch is closed.
+      if (roster) openRosterWatch()
+      else closeRosterWatch()
       // Keep insula's cache warm for admission lookups, which only read it.
       // It refreshes at most once a minute and never throws.
       await refreshInsula()
@@ -697,7 +795,11 @@ export function createNativeVaultRuntime(
           closed = true
           watchers.delete(watch)
           schedulePoll()
-          if (!watchers.size) pollReady = undefined
+          if (!watchers.size) {
+            pollReady = undefined
+            // Nothing listens for roster changes any more.
+            closeRosterWatch()
+          }
         },
       }
     },
@@ -1082,6 +1184,7 @@ export function createNativeVaultRuntime(
     },
     close() {
       watchers.clear()
+      closeRosterWatch()
       schedulePoll()
       if (shutdown.signal.aborted) return
       shutdown.abort(new NativeCustodyError('closed'))
@@ -1411,9 +1514,14 @@ export function nativeVaultRuntimeKey(
     options.identity
       ? Object.entries(options.identity).sort(([a], [b]) => a.localeCompare(b))
       : undefined,
-    ...[options.connect, options.discover, options.readToken, options.now].map(
-      nativeRuntimeOptionIdentity,
-    ),
+    ...[
+      options.connect,
+      options.discover,
+      options.readToken,
+      options.now,
+      options.setTimeout,
+      options.clearTimeout,
+    ].map(nativeRuntimeOptionIdentity),
   ])
 }
 
