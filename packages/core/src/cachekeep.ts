@@ -4,7 +4,11 @@ import { signRequestBody, stripBillingLineageFromBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
 import { dumpDirectRequest, dumpResponseArtifact } from './dump.ts'
 import { logger } from './logger.ts'
-import { createProviderErrorResponseScope } from './provider-error.ts'
+import {
+  createProviderErrorResponseScope,
+  type ProviderErrorSummary,
+  summarizePrewarmProviderError,
+} from './provider-error.ts'
 
 export const CLAUDE_CACHE_KEEP_COMMAND_NAME = 'claude-cachekeep'
 export const CACHE_KEEP_TTL_MS = 60 * 60_000
@@ -17,12 +21,6 @@ export const CACHE_KEEP_PREWARM_TIMEOUT_MS = 30_000
 export const CACHE_KEEP_RETRY_BASE_MS = 60_000
 export const CACHE_KEEP_RETRY_MAX_MS = 15 * 60_000
 export const CACHE_KEEP_RETRY_JITTER_MAX_MS = 30_000
-// Fixed text returned when no credential headers can be prepared for a
-// prewarm. Among retryable prewarm failures it is the only reason that is not
-// provider or exception text, so it is the only one logged verbatim.
-const CACHE_KEEP_CREDENTIAL_UNAVAILABLE_REASON =
-  'OAuth cache prewarm credential is unavailable'
-
 const STATUS_TITLE = '## Claude Cache Keep Status'
 const ENABLED_TITLE = '## Claude Cache Keep Enabled'
 const DISABLED_TITLE = '## Claude Cache Keep Disabled'
@@ -395,7 +393,13 @@ export type CacheKeepPrewarmResult =
         cache_read_input_tokens?: number
       }
     }
-  | { ok: false; reason: string; status?: number; transient?: true }
+  | {
+      ok: false
+      reason: string
+      status?: number
+      transient?: true
+      provider_error?: ProviderErrorSummary['provider_error']
+    }
 
 export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
@@ -679,7 +683,10 @@ export class CacheKeepManager {
       try {
         await this.prewarm(target, now)
       } catch {
-        logger.warn('cachekeep', 'prewarm failed', { session: target.id })
+        logger.warn('cachekeep', 'prewarm failed', {
+          session: target.id,
+          ...summarizePrewarmProviderError({ failure: 'transport' }),
+        })
         target.consecutiveFailures += 1
         target.nextPrewarmAt =
           now + cacheKeepRetryDelayMs(target.id, target.consecutiveFailures)
@@ -722,9 +729,13 @@ export class CacheKeepManager {
           )
         : new Headers(target.headers)
       if (!headers) {
+        const summary = summarizePrewarmProviderError({
+          failure: 'credential_unavailable',
+        })
         return {
           ok: false,
-          reason: CACHE_KEEP_CREDENTIAL_UNAVAILABLE_REASON,
+          ...summary,
+          reason: summary.provider_error.message,
           transient: true,
         }
       }
@@ -783,10 +794,12 @@ export class CacheKeepManager {
             response = await send(headers)
           }
         }
-      } catch (error) {
+      } catch {
+        const summary = summarizePrewarmProviderError({ failure: 'transport' })
         return {
           ok: false,
-          reason: error instanceof Error ? error.message : String(error),
+          ...summary,
+          reason: summary.provider_error.message,
           transient: true,
         }
       }
@@ -796,6 +809,9 @@ export class CacheKeepManager {
       try {
         data = raw ? JSON.parse(raw) : null
       } catch {}
+      const summary = response.ok
+        ? undefined
+        : summarizePrewarmProviderError({ status: response.status, body: raw })
       try {
         await this.options.onResponse?.({
           target,
@@ -820,15 +836,16 @@ export class CacheKeepManager {
         await dumpResponseArtifact(dumpHandle, {
           status: response.status,
           message: data,
+          ...(summary && { provider_error: summary.provider_error }),
         })
       } catch {
         logger.debug('cachekeep', 'dump failed', { session: target.id })
       }
-      if (!response.ok) {
+      if (summary) {
         return {
           ok: false,
-          reason: raw || `HTTP ${response.status}`,
-          status: response.status,
+          ...summary,
+          reason: summary.provider_error.message,
         }
       }
       const objectData =
@@ -860,16 +877,12 @@ export class CacheKeepManager {
         })
         this.targets.delete(target.id)
       } else {
-        // A failed result's reason may be the raw provider response body or a
-        // transport exception message, so only the fixed credential reason
-        // is copied into the log; everything else is described by status and
-        // the transient flag.
         logger.warn('cachekeep', 'prewarm failed', {
           session: target.id,
           status: result.status,
           ...(result.transient && { transient: true }),
-          ...(result.reason === CACHE_KEEP_CREDENTIAL_UNAVAILABLE_REASON && {
-            reason: result.reason,
+          ...(result.provider_error && {
+            provider_error: result.provider_error,
           }),
         })
         target.consecutiveFailures += 1

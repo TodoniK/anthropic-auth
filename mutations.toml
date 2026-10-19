@@ -1139,3 +1139,48 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "cachekeep-prewarm-log-reason-is-fixed"
+guards = "Immediate recovery warm logs must not contain a provider response body through the returned failure reason."
+file = "packages/core/src/cachekeep.ts"
+old = '''      if (summary) {
+        return {
+          ok: false,
+          ...summary,
+          reason: summary.provider_error.message,
+        }
+      }'''
+new = '''      if (summary) {
+        return {
+          ok: false,
+          ...summary,
+          reason: raw, // NON-VACUITY BREAK: return the provider body to the warm log
+        }
+      }'''
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["sh", "-c", 'bun run --cwd packages/core build && bun scripts/run-mutation-bun.ts packages/opencode/src/tests/index.test.ts "$1"', "prewarm-log-redaction", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > immediate recovery warm http failure logs only fixed provider metadata"]
+expect_message = "error: expect(received).not.toContain(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+junit_class = "suites"
+
+[[control]]
+id = "cachekeep-prewarm-provider-type-is-allowlisted"
+guards = "Prewarm diagnostics must replace arbitrary provider error types with unknown, not copy user content as a type."
+file = "packages/core/src/provider-error.ts"
+old = "typeof type === 'string' && KNOWN_ERROR_TYPES.has(type)"
+new = "typeof type === 'string' // NON-VACUITY BREAK: accept arbitrary provider error types"
+test_file = "packages/core/src/tests/cachekeep-provider-error.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/cachekeep-provider-error.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["CacheKeep rejects unknown provider types and never returns provider text"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

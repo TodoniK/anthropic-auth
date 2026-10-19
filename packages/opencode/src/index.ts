@@ -201,6 +201,7 @@ import {
   snapshotHasServableLocalOAuth,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
+  summarizePrewarmProviderError,
   TrailingAssistantHistoryError,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
@@ -4049,11 +4050,14 @@ const anthropicAuthPlugin = async (
           session: sessionId,
           status: result.status,
           reason: result.reason,
+          ...(result.provider_error && {
+            provider_error: result.provider_error,
+          }),
         })
-      } catch (error) {
+      } catch {
         logger.warn('fable-fallback', `${modelLabel} cache warm failed`, {
           session: sessionId,
-          error: error instanceof Error ? error.message : String(error),
+          ...summarizePrewarmProviderError({ failure: 'transport' }),
         })
       }
     }

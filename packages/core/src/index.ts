@@ -267,12 +267,14 @@ export * from './provider.ts'
 export type {
   ProviderErrorRedactor,
   ProviderErrorResponseScope,
+  ProviderErrorSummary,
   ProviderResponseMode,
   ProviderResponseSettlement,
 } from './provider-error.ts'
 export {
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
+  summarizePrewarmProviderError,
 } from './provider-error.ts'
 export * from './quota-header-feed.ts'
 export * from './quota-headers.ts'

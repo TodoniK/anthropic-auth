@@ -176,7 +176,15 @@ describe('CacheKeepManager', () => {
       expect(responsePath).toBeDefined()
       expect(
         JSON.parse(await readFile(join(dumpDir, responsePath!), 'utf8')),
-      ).toEqual({ status: 429, stream_complete: true })
+      ).toEqual({
+        status: 429,
+        stream_complete: true,
+        provider_error: {
+          type: 'unknown',
+          reason: 'parse_failure',
+          message: 'Provider prewarm error response could not be parsed',
+        },
+      })
     } finally {
       resetDumpState()
       if (originalDumpDir === undefined)
@@ -511,7 +519,8 @@ describe('CacheKeepManager', () => {
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected prewarm to fail')
     expect(result.transient).toBe(true)
-    expect(result.reason).toContain('timed out')
+    expect(result.reason).toBe('Provider prewarm transport failed')
+    expect(result.provider_error?.reason).toBe('transport')
   })
 
   test('passes OAuth account identity to prewarm header refresh', async () => {

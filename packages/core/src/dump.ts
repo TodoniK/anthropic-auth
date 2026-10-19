@@ -13,6 +13,7 @@ import { join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
 import { parseJsonRedacted } from './json.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
+import type { ProviderErrorSummary } from './provider-error.ts'
 
 type DumpHeaders = ConstructorParameters<typeof Headers>[0]
 
@@ -783,7 +784,12 @@ export async function dumpRelayRequest(input: {
 
 export async function dumpResponseArtifact(
   handle: DumpHandle | null,
-  input: { status: number; message: unknown; complete?: boolean },
+  input: {
+    status: number
+    message: unknown
+    complete?: boolean
+    provider_error?: ProviderErrorSummary['provider_error']
+  },
 ): Promise<void> {
   if (!handle) return
   const message =
@@ -805,6 +811,7 @@ export async function dumpResponseArtifact(
     artifact.diagnostics = message.diagnostics
   if (typeof message.stop_reason === 'string' && message.stop_reason.length > 0)
     artifact.stop_reason = message.stop_reason
+  if (input.provider_error) artifact.provider_error = input.provider_error
   try {
     await writeDumpFile(
       handle.responsePath,

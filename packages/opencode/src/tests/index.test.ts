@@ -17944,7 +17944,10 @@ describe('auth.loader', () => {
     expect(state.fableRecoveries).toHaveLength(1)
   })
 
-  test('warms Fable with the OAuth account that was filtered when Opus routes elsewhere', async () => {
+  async function testRecoveryWarm(warmFailure?: 'http' | 'transport') {
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    const prompt = 'FAKE PROMPT LINE: private recovery request'
     const now = Date.now()
     await useTempAccountFile(
       bindPoolAccounts(
@@ -18043,8 +18046,27 @@ describe('auth.loader', () => {
             max_tokens?: number
           }
           const auth = new Headers(init?.headers).get('authorization') ?? ''
-          calls.push({ model: body.model, auth, warm: body.max_tokens === 0 })
+          calls.push({
+            model: body.model,
+            auth,
+            warm: body.max_tokens === 0,
+          })
           if (body.max_tokens === 0) {
+            if (warmFailure === 'transport')
+              throw new TypeError(`${prompt} ${auth}`)
+            if (warmFailure === 'http')
+              return Promise.resolve(
+                new Response(
+                  JSON.stringify({
+                    type: 'error',
+                    error: {
+                      type: 'invalid_request_error',
+                      message: `${prompt} ${auth}`,
+                    },
+                  }),
+                  { status: 400 },
+                ),
+              )
             return Promise.resolve(new Response('{}', { status: 200 }))
           }
           if (body.model === 'claude-fable-5' && firstFable) {
@@ -18107,7 +18129,39 @@ describe('auth.loader', () => {
         warm: true,
       },
     ])
-  })
+    if (warmFailure) {
+      await waitForLogRecord(
+        records,
+        (record) =>
+          record.channel === 'fable-fallback' &&
+          record.message === 'Fable cache warm skipped',
+        'fixed recovery warm failure',
+      )
+      const record = records.find(
+        (record) => record.message === 'Fable cache warm skipped',
+      )
+      expect(record?.payload).toMatchObject({
+        provider_error: {
+          type: warmFailure === 'http' ? 'invalid_request_error' : 'unknown',
+          reason: warmFailure === 'http' ? 'http_validation' : 'transport',
+          message:
+            warmFailure === 'http'
+              ? 'Provider rejected the prewarm request'
+              : 'Provider prewarm transport failed',
+        },
+      })
+      const text = JSON.stringify(record)
+      expect(text).not.toContain(prompt)
+      expect(text).not.toContain('sk-ant-oat01-fallback-access')
+    }
+  }
+
+  test('warms Fable with the OAuth account that was filtered when Opus routes elsewhere', () =>
+    testRecoveryWarm())
+  test('immediate recovery warm http failure logs only fixed provider metadata', () =>
+    testRecoveryWarm('http'))
+  test('immediate recovery warm transport failure logs only fixed provider metadata', () =>
+    testRecoveryWarm('transport'))
 
   test('sidebar refresh reads metadata without authorizing expired main credentials', async () => {
     const main = { ...syntheticMainHostAuth(), expires: Date.now() - 1_000 }

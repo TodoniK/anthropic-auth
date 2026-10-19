@@ -107,7 +107,7 @@ const ONE_CHARACTER_ESCAPES: Readonly<Record<string, string>> = {
  * Error types kept in a generic replacement body. A closed list rather than
  * a syntax check: an opaque credential can look like any identifier.
  */
-const KNOWN_ERROR_TYPES: ReadonlySet<string> = new Set([
+const PROVIDER_ERROR_TYPES = [
   'api_error',
   'authentication_error',
   'billing_error',
@@ -119,7 +119,70 @@ const KNOWN_ERROR_TYPES: ReadonlySet<string> = new Set([
   'relay_upstream_error',
   'request_too_large',
   'timeout_error',
-])
+] as const
+type ProviderErrorType = (typeof PROVIDER_ERROR_TYPES)[number]
+const KNOWN_ERROR_TYPES: ReadonlySet<string> = new Set(PROVIDER_ERROR_TYPES)
+
+const PREWARM_ERROR_MESSAGES = {
+  http_validation: 'Provider rejected the prewarm request',
+  http_error: 'Provider prewarm request failed',
+  credential_unavailable: 'OAuth cache prewarm credential is unavailable',
+  transport: 'Provider prewarm transport failed',
+  withheld: 'Provider prewarm error details were withheld',
+  parse_failure: 'Provider prewarm error response could not be parsed',
+} as const
+
+export type ProviderErrorSummary = {
+  status?: number
+  provider_error: {
+    type: ProviderErrorType | 'unknown'
+    reason: keyof typeof PREWARM_ERROR_MESSAGES
+    message: (typeof PREWARM_ERROR_MESSAGES)[keyof typeof PREWARM_ERROR_MESSAGES]
+  }
+}
+
+/**
+ * Prompt-safe prewarm metadata, not a replacement for per-send redaction.
+ * Read input.body from the response returned by ProviderErrorResponseScope's
+ * redactResponse, using a scope created for the physical request's credentials.
+ * Parsing is bounded independently; no provider text is copied to the result.
+ */
+export function summarizePrewarmProviderError(input: {
+  status?: number
+  body?: string
+  failure?: 'credential_unavailable' | 'transport'
+}): ProviderErrorSummary {
+  let reason: ProviderErrorSummary['provider_error']['reason'] =
+    input.failure ?? 'parse_failure'
+  let type: ProviderErrorSummary['provider_error']['type'] = 'unknown'
+  if (!input.failure) {
+    const body = input.body ?? ''
+    if (
+      body.length > PROVIDER_ERROR_MAX_BODY_BYTES ||
+      encoder.encode(body).byteLength > PROVIDER_ERROR_MAX_BODY_BYTES
+    ) {
+      reason = 'withheld'
+    } else {
+      const payload = tryParseJson(body)?.value
+      if (isPlainJsonObject(payload) && isPlainJsonObject(payload.error)) {
+        type = safeErrorType(payload) ?? 'unknown'
+        const message = payload.error.message
+        reason =
+          message === PROVIDER_ERROR_WITHHELD_MESSAGE ||
+          message === PROVIDER_ERROR_OVERSIZED_MESSAGE ||
+          message === PROVIDER_ERROR_SCOPE_CLOSED_MESSAGE
+            ? 'withheld'
+            : input.status === 400 || input.status === 422
+              ? 'http_validation'
+              : 'http_error'
+      }
+    }
+  }
+  return {
+    ...(isStatus(input.status) && { status: input.status }),
+    provider_error: { type, reason, message: PREWARM_ERROR_MESSAGES[reason] },
+  }
+}
 
 const encoder = new TextEncoder()
 
@@ -559,13 +622,13 @@ function isErrorPayload(value: unknown): boolean {
 }
 
 /** Keep `error.type` in a generic body only when it is a known Anthropic type. */
-function safeErrorType(payload: unknown): string | undefined {
+function safeErrorType(payload: unknown): ProviderErrorType | undefined {
   if (!isPlainJsonObject(payload)) return undefined
   const error = payload.error
   if (!isPlainJsonObject(error)) return undefined
   const type = error.type
   return typeof type === 'string' && KNOWN_ERROR_TYPES.has(type)
-    ? type
+    ? (type as ProviderErrorType)
     : undefined
 }
 
