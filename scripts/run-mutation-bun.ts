@@ -242,6 +242,7 @@ function isPromiseOutcomeFailure(
 export function parseExecution(
   name: string | undefined,
   transcript: Transcript,
+  mode: 'target' | 'broad' = 'target',
 ) {
   const { stdout, stderr, exitCode, signal } = transcript
   if (signal || (exitCode !== 0 && exitCode !== 1))
@@ -356,6 +357,25 @@ export function parseExecution(
     !/^ (?:\d+ snapshots?, )?[1-9]\d* expect\(\) calls$/.test(expects[0] ?? '')
   )
     throw new Error('No verified assertion executed')
+  if (mode === 'broad' && name === undefined) {
+    // Breadth records failed testcases, not proof of the named assertion. Bun
+    // reports timeouts and ordinary thrown errors as failures in JUnit. Late
+    // between-test errors have no testcase: retain their raw output, but never
+    // manufacture a failed identity for them or accept an error-only exit.
+    if (
+      matches(/^ \d+ (?:skip|todo)/).length ||
+      matches(/^\((?:skip|todo)\) /).length ||
+      /^(?:SyntaxError|ReferenceError|TypeError|ResolveMessage|BuildMessage):/m.test(
+        text,
+      ) ||
+      matches(/^(?:beforeEach|afterEach|beforeAll|afterAll)/i).length ||
+      (failed === 0 &&
+        (/^error:|^.*error between tests/m.test(text) ||
+          matches(/^ \d+ errors?\b/).length))
+    )
+      throw new Error('Compilation, import, skipped test or runtime error')
+    return { count: total, events }
+  }
   // Look for timeouts, hook failures and unhandled errors before the
   // expect-diagnostic count below. Bun prints no "error:" line for a timed-out
   // test, so the count check would otherwise refuse first and name the wrong
@@ -748,6 +768,7 @@ async function runInvocation(
       const execution = parseExecution(
         'name' in selected ? selected.name : undefined,
         transcript,
+        'report' in selected ? 'broad' : 'target',
       )
       if ('report' in selected) {
         if (!dependencies.report) throw new Error('No broad report writer')

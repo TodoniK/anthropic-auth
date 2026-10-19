@@ -174,6 +174,28 @@ complete XML, expected identities and baseline failures. Missing, empty, garbage
 ambiguous or mismatched reports are refused. Such reports are not evidence that
 the intended assertion caught the mutation.
 
+Broad runs record the observed package failures rather than proving the named
+assertion again. A per-test timeout or ordinary thrown error is accepted with
+status **1** only when its failed console event matches its JUnit testcase, just
+like an assertion failure. Missing/mismatched JUnit, abnormal exits, signals,
+spawn/version failures, compilation/import failures and skipped tests still
+refuse with **126**. Named mode keeps the stricter assertion-only contract above.
+
+Bun does not give an unhandled error between tests a JUnit testcase of its own.
+Such errors remain in the raw audit output; the wrapper never invents a red identity
+for them. They can accompany independently verified failed testcases, but an
+error-only nonzero exit with no failed testcase is rejected with **126**. Broad
+output cannot turn a missing named catch into a catch: the runner grades the separate strict
+named checks before recording collateral from JUnit.
+
+The pinned runner deliberately tolerates unrelated baseline-red testcases and
+excludes them from mutant collateral. This repository's CI policy is stricter:
+both shard verification and combined audit verification require an empty
+`baseline_failures` map on every broad row. Any clean-package timeout or error
+therefore fails the audit even if all named checks caught their mutants. This
+check happens after runner replay, not before it; direct `ckdev-mutate` use
+without `scripts/run-mutation-ci.ts` retains the runner's baseline-red policy.
+
 ### JUnit identity normalization
 
 Real Bun 1.3.14 XML nests one `<testsuite>` per describe block inside each test

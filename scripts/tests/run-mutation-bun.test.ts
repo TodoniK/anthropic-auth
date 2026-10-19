@@ -28,6 +28,7 @@ import {
   type Transcript,
   testEnvironment,
 } from '../run-mutation-bun'
+import { verifyMutationReport } from '../run-mutation-ci.ts'
 
 const file = 'packages/core/src/tests/fast.test.ts'
 const name = 'fast mode eligibility for claude-opus-4-7[1m] is false'
@@ -1163,6 +1164,171 @@ test('package assertion failures retain a red case and a healthy companion in JU
   expect(output.out()).toBe(`${header}CKDEV executed 2 tests\n`)
 })
 
+function broadTimeout(): Transcript {
+  return {
+    ...packageGreen(),
+    exitCode: 1,
+    stderr: packageGreen()
+      .stderr.replace(
+        '(pass) scope > second [2.00ms]',
+        '(fail) scope > second [5001.00ms]\n  ^ this test timed out after 5000ms.',
+      )
+      .replace(' 2 pass\n 0 fail', ' 1 pass\n 1 fail'),
+  }
+}
+
+function broadTimeoutXml() {
+  return junit([
+    testcase('handles timeout'),
+    ...describeSuite('scope', [
+      testcase('second', 'scope', '>'),
+      '      <failure type="TimeoutError" />',
+      '    </testcase>',
+    ]),
+  ]).replace('tests="2" failures="0"', 'tests="2" failures="1"')
+}
+
+async function runBroadFailure(
+  transcript = broadTimeout(),
+  raw = broadTimeoutXml(),
+) {
+  const output = sinks()
+  let written = ''
+  const status = await runPackage(
+    'packages/core',
+    'tmp/mutations/core.xml',
+    {
+      ...output,
+      spawn: () => childFor(transcript),
+      report: {
+        read: async () => raw,
+        write: async (_path, normalized) => {
+          written = normalized.xml
+        },
+      },
+    },
+    new AbortController().signal,
+  )
+  return { status, written, stdout: output.out(), stderr: output.err() }
+}
+
+test('broad timeout publishes its failed testcase without inventing a catch', async () => {
+  const result = await runBroadFailure()
+  expect(result.status).toBe(1)
+  expect(result.written).toContain('<failure type="TimeoutError" />')
+  expect(result.written).toContain('name="scope &gt; second"')
+  expect(result.written).toContain('name="handles timeout"')
+  expect(result.stdout).toBe(`${header}CKDEV executed 2 tests\n`)
+})
+
+test('target timeout still refuses without a count or report', async () => {
+  const transcript = {
+    ...red(),
+    stderr: red().stderr.replace(
+      'error: expect(received).toBe(expected)',
+      'Test timed out after 5000ms',
+    ),
+  }
+  const output = sinks()
+  expect(
+    await runTest(
+      file,
+      name,
+      {
+        ...output,
+        spawn: () => childFor(transcript),
+      },
+      new AbortController().signal,
+    ),
+  ).toBe(126)
+  expect(output.out()).toBe(header)
+  expect(output.err()).toContain('Timeout, hook or unhandled error')
+})
+
+test('broad baseline timeout still fails the CI audit even when unrelated to the named catch', async () => {
+  const baseline = await runBroadFailure()
+  expect(baseline.status).toBe(1)
+  expect(() =>
+    verifyMutationReport(
+      [
+        {
+          id: 'guard',
+          outcome: 'CAUGHT',
+          breadth_observed: true,
+          baseline_failures: {
+            'scope > second': 'Test timed out after 5000ms',
+          },
+        },
+      ],
+      ['--all', '--broad'],
+      ['guard'],
+    ),
+  ).toThrow('Mutation baseline was not green')
+})
+
+test('broad between-test errors retain only independently failed testcases', async () => {
+  const transcript = broadTimeout()
+  transcript.stderr +=
+    '\n# Unhandled error between tests\nerror: late rejection\n 1 error\n'
+  const result = await runBroadFailure(transcript)
+  expect(result.status).toBe(1)
+  expect(result.written.match(/<testcase\b/g)).toHaveLength(2)
+  expect(result.written).not.toContain('late rejection')
+  expect(result.stderr).toContain('# Unhandled error between tests')
+  const errorOnly = packageGreen()
+  errorOnly.exitCode = 1
+  errorOnly.stderr +=
+    '\n# Unhandled error between tests\nerror: late rejection\n 1 error\n'
+  const refused = await runBroadFailure(errorOnly)
+  expect(refused.status).toBe(126)
+  expect(refused.written).toBe('')
+})
+
+test('broad thrown failures accept matching JUnit but not erased or moved timeout failures', async () => {
+  const thrown = broadTimeout()
+  thrown.stderr = thrown.stderr.replace(
+    '(fail) scope > second [5001.00ms]\n  ^ this test timed out after 5000ms.',
+    'error: quota state did not persist\n(fail) scope > second [2.00ms]',
+  )
+  const result = await runBroadFailure(
+    thrown,
+    broadTimeoutXml().replaceAll('TimeoutError', 'AssertionError'),
+  )
+  expect(result.status).toBe(1)
+  for (const raw of [
+    junit([
+      testcase('handles timeout'),
+      ...describeSuite('scope', [testcase('second', 'scope')]),
+    ]),
+    broadTimeoutXml().replace('name="second"', 'name="different"'),
+    '',
+  ]) {
+    const refused = await runBroadFailure(broadTimeout(), raw)
+    expect(refused.status).toBe(126)
+    expect(refused.written).toBe('')
+  }
+})
+
+test('broad failures still refuse run-level corruption', async () => {
+  const transcript = broadTimeout()
+  for (const invalid of [
+    { ...transcript, signal: 'SIGTERM' as const },
+    { ...transcript, exitCode: 2 },
+    { ...transcript, stdout: header.replace('1.3.14', '1.4.2') },
+    {
+      ...transcript,
+      stderr: `${transcript.stderr}\nSyntaxError: failed import\n`,
+    },
+    { ...transcript, stderr: `${transcript.stderr}\n 1 skip\n` },
+    { ...transcript, stderr: `${transcript.stderr}\nbeforeAll failed\n` },
+  ]) {
+    const result = await runBroadFailure(invalid)
+    expect(result.status).toBe(126)
+    expect(result.written).toBe('')
+    expect(result.stdout).not.toContain('CKDEV executed')
+  }
+})
+
 function consistencyTranscript(): Transcript {
   return {
     stdout: header,
@@ -2039,7 +2205,7 @@ test('never settles', async () => {
 `
 
 filesystemTests.test(
-  'real pinned Bun timeouts are refused as timeouts',
+  'real pinned Bun timeouts refuse strict parsing but retain broad testcase failures',
   async () => {
     const sandbox = await promiseFixtureSandbox()
     await writeFile(
@@ -2047,11 +2213,14 @@ filesystemTests.test(
       timeoutFixture,
     )
     for (const github of [false, true]) {
+      const report = resolve(sandbox, 'timeout.xml')
       const transcript = await pinnedChild(
         sandbox,
         'timeout.test.ts',
         undefined,
         github,
+        undefined,
+        ['--reporter=junit', `--reporter-outfile=${report}`],
       )
       expect(transcript.exitCode).toBe(1)
       expect(`${transcript.stdout}\n${transcript.stderr}`).toContain(
@@ -2060,6 +2229,14 @@ filesystemTests.test(
       expect(() => parseExecution(undefined, transcript)).toThrow(
         'Timeout, hook or unhandled error',
       )
+      const broad = await runBroadFailure(
+        transcript,
+        await readFile(report, 'utf8'),
+      )
+      expect(broad.status).toBe(1)
+      expect(broad.written).toContain('<failure type="TimeoutError" />')
+      expect(broad.written).toContain('name="never settles"')
+      expect(broad.stdout).toContain('CKDEV executed 2 tests')
     }
   },
 )

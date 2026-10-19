@@ -168,6 +168,21 @@ export function verifyMutationReport(
       throw new Error('Broad catch is missing breadth evidence')
     if (selection.includes('--broad') && !row.breadth_observed)
       throw new Error('Requested mutation breadth was not observed')
+    // The pinned runner tolerates unrelated baseline reds and excludes them
+    // from collateral. This audit requires every clean-package test to pass.
+    if (selection.includes('--broad')) {
+      const failures =
+        'baseline_failures' in row ? row.baseline_failures : undefined
+      if (
+        !failures ||
+        typeof failures !== 'object' ||
+        Array.isArray(failures) ||
+        Object.keys(failures).length
+      )
+        throw new Error(
+          `Mutation baseline was not green: ${row.id}: ${failures && typeof failures === 'object' ? Object.keys(failures).join(', ') : 'missing failure map'}`,
+        )
+    }
     ids.add(row.id)
   }
   if (selection.includes('--all') && ids.size !== expected.size)

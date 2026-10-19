@@ -29,6 +29,7 @@ const caught = (id: string, broad = false) => ({
   id,
   outcome: 'CAUGHT',
   breadth_observed: broad,
+  baseline_failures: {},
 })
 
 test('PR target edits use the official committed diff selector', () => {
@@ -150,6 +151,31 @@ test('nightly breadth is required on every reported row, not just one', () => {
   ).toThrow()
 })
 
+test('broad audits refuse missing malformed or nonempty baseline failures', () => {
+  for (const baseline_failures of [
+    undefined,
+    null,
+    [],
+    '',
+    { collateral: 'TimeoutError' },
+  ]) {
+    expect(() =>
+      verifyMutationReport(
+        [{ ...caught('fast', true), baseline_failures }],
+        ['--all', '--broad'],
+        ['fast'],
+      ),
+    ).toThrow('Mutation baseline was not green')
+  }
+  expect(
+    verifyMutationReport(
+      [caught('fast', true)],
+      ['--all', '--broad'],
+      ['fast'],
+    ),
+  ).toBe(1)
+})
+
 test('shard values are 1-based i/n and anything else refuses', () => {
   expect(parseMutationShard(undefined)).toBeUndefined()
   expect(parseMutationShard('')).toBeUndefined()
@@ -245,6 +271,7 @@ test('sharded audit passes only when every shard reports exactly its own caught 
     id,
     outcome,
     breadth_observed: true,
+    baseline_failures: {},
   })
   const healthy = () =>
     new Map<number, unknown>([
@@ -391,7 +418,7 @@ const report = process.argv[process.argv.indexOf('--report') + 1]
 const shard = process.argv.indexOf('--shard')
 const [index, count] = shard < 0 ? [1, 1] : process.argv[shard + 1].split('/').map(Number)
 const selected = ['history','fast','binding'].sort().filter((_, position) => position % count === index - 1)
-const rows = process.env.FAKE_EMPTY === '1' ? [] : selected.map(id => ({ id, outcome: process.env.FAKE_SURVIVED === id ? 'SURVIVED' : 'CAUGHT', breadth_observed:process.argv.includes('--broad') }))
+const rows = process.env.FAKE_EMPTY === '1' ? [] : selected.map(id => ({ id, outcome: process.env.FAKE_SURVIVED === id ? 'SURVIVED' : 'CAUGHT', breadth_observed:process.argv.includes('--broad'), baseline_failures:{} }))
 writeFileSync(report, process.env.FAKE_BAD_JSON === '1' ? 'invalid' : JSON.stringify(rows))
 process.exit(process.env.FAKE_FAILURE === '1' ? 1 : 0)
 `,
