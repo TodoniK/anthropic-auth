@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import {
   assertFreshOpenCode1Journal,
+  assertHealthySetupPublication,
   isolatedEnvironment,
   sha256,
   snapshot,
@@ -243,17 +244,9 @@ const ok = await withReceipt(
     const setupRecord = result.steps.find(
       (entry) => entry.name === 'setup-local-noninteractive',
     ).evidence
-    await step('publication-deadline', async () => {
-      assert(
-        setupRecord.publication.kind !== 'publication-timeout',
-        'common-auth publication timeout (500 ms); adopt upstream 0.20.0, no local workaround',
-      )
-      if (!setup)
-        throw new Error(
-          'Setup failure remains unclassified; publication timeout has not been excluded. Inspect setup-local-noninteractive evidence.',
-        )
-      return { timeoutObserved: false }
-    })
+    await step('publication-deadline', async () =>
+      assertHealthySetupPublication(setupRecord, Boolean(setup)),
+    )
     await step('setup-journal-and-owner-only-readers', async () => {
       assert(setup, 'Successful setup is required to qualify its files')
       const paths = await core.resolveNativePoolPaths(

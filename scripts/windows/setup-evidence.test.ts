@@ -224,22 +224,22 @@ test('stderr rename deadline metadata remains release-blocking even without a pr
       import assert from 'node:assert/strict';
       import { execFile } from 'node:child_process';
       import { promisify } from 'node:util'; import { join } from 'node:path';
-      import { withReceipt } from ${JSON.stringify(harness)};
-      import { classifyPublication } from ${JSON.stringify(evidence)};
+       import { withReceipt, assertHealthySetupPublication } from ${JSON.stringify(harness)};
+       import { classifyPublication } from ${JSON.stringify(evidence)};
       const exec = promisify(execFile);
       const result = { platform: 'win32', profile: process.argv[1] };
       const ok = await withReceipt(join(process.argv[1], 'receipt.json'), result, async step => {
         await step('setup-local-noninteractive', () => exec(process.execPath, ['-e', ${JSON.stringify(child)}]), { setupChild: true });
         const metadata = result.steps[0].evidence;
-        await step('publication-deadline', () => {
-          assert.notEqual(metadata.publication.kind, 'publication-timeout', 'common-auth publication timeout; upstream adoption is required');
-        });
+         await step('publication-deadline', () => assertHealthySetupPublication(metadata, false));
       }, async () => {}, { diagnosticsDirectory: join(process.argv[1], 'absent-diagnostics'), log() {} });
       assert.equal(result.steps[0].evidence.publication.kind, 'publication-timeout');
       assert.equal(result.steps[0].evidence.publication.basis, 'private-file-rename-metadata');
       assert.equal(result.steps[0].evidence.diagnostics.state, 'absent');
       assert.equal(result.steps[1].name, 'publication-deadline');
-      assert.equal(result.steps[1].status, 'failed');
+       assert.equal(result.steps[1].status, 'failed');
+       assert(result.steps[1].error.includes('Unexpected Windows publication timeout'));
+       assert(!result.steps[1].error.includes('adopt upstream'));
       assert.equal(ok, false); assert.equal(result.nativeWindowsQualified, false);
       for (const body of [null, [], { saveError: ${JSON.stringify(payload.error)} },
         { error: { name: 'Error', code: 'ETIMEDOUT', stage: 'rename' } },

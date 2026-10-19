@@ -26,6 +26,26 @@ export function assertFreshOpenCode1Journal(journal) {
   })
 }
 
+/** After the upstream deadline fix, publication timeouts are unexpected failures. */
+export function assertHealthySetupPublication(setupRecord, setupSucceeded) {
+  assert(setupRecord?.publication, 'Setup publication evidence is missing')
+  assert.notEqual(
+    setupRecord.publication.kind,
+    'publication-timeout',
+    'Unexpected Windows publication timeout; common-auth already includes the deadline fix',
+  )
+  assert(
+    setupSucceeded && setupRecord.exitCode === 0,
+    'Setup did not complete successfully. Inspect setup-local-noninteractive evidence.',
+  )
+  assert.equal(
+    setupRecord.publication.kind,
+    'succeeded',
+    'Setup publication evidence is not successful',
+  )
+  return { timeoutObserved: false }
+}
+
 export async function snapshot(root) {
   const files = {}
   async function walk(directory) {

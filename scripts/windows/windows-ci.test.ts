@@ -246,3 +246,56 @@ test('artifact publishing selects the supplied scoped-package tarball and disabl
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('publication-deadline passes healthy setup after the adopted upstream fix', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'healthy-publication-'))
+  try {
+    const harness = new URL('harness.mjs', import.meta.url).href
+    const output = await run('node', [
+      '--input-type=module',
+      '-e',
+      `
+      import assert from 'node:assert/strict';
+      import { withReceipt, assertHealthySetupPublication } from ${JSON.stringify(harness)};
+      const result = { platform: 'win32' };
+      const ok = await withReceipt(process.argv[1], result, async step => {
+        await step('publication-deadline', () => assertHealthySetupPublication({ exitCode: 0, publication: { kind: 'succeeded' } }, true));
+      });
+      assert.equal(ok, true); assert.equal(result.nativeWindowsQualified, true);
+      assert.equal(result.steps[0].status, 'passed');
+      assert.deepEqual(result.steps[0].evidence, { timeoutObserved: false });
+      console.log('healthy setup qualifies with a passed publication-deadline step');
+    `,
+      join(dir, 'receipt.json'),
+    ])
+    expect(output.stdout).toContain(
+      'healthy setup qualifies with a passed publication-deadline step',
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('publication timeout is an unexpected failure and missing success cannot qualify', async () => {
+  const harness = new URL('harness.mjs', import.meta.url).href
+  const output = await run('node', [
+    '--input-type=module',
+    '-e',
+    `
+    import assert from 'node:assert/strict';
+    import { assertHealthySetupPublication } from ${JSON.stringify(harness)};
+    assert.throws(() => assertHealthySetupPublication({ exitCode: 1, publication: { kind: 'publication-timeout' } }, false), /Unexpected Windows publication timeout/);
+    for (const [record, success] of [
+      [{ exitCode: 1, publication: { kind: 'unclassified-setup-failure' } }, true],
+      [{ exitCode: 1, publication: { kind: 'succeeded' } }, true],
+      [{ exitCode: 0, publication: { kind: 'unclassified-setup-failure' } }, true],
+      [{ exitCode: 0, publication: { kind: 'succeeded' } }, false],
+      [undefined, true],
+    ]) assert.throws(() => assertHealthySetupPublication(record, success));
+    console.log('timeout and 5 incomplete/failed setup controls refused');
+  `,
+  ])
+  expect(output.stdout).toContain(
+    'timeout and 5 incomplete/failed setup controls refused',
+  )
+})
