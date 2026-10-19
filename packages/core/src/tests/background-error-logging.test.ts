@@ -235,16 +235,15 @@ function dueCacheKeep(
 test('CacheKeep provider-body and transport failures log status and flags, never the raw reason', async () => {
   const logs = captureLogs()
 
-  // A non-OK provider body: the returned reason keeps the body for callers,
-  // while the log keeps only session and status.
+  // HTTP failures retain only the allowlisted type and fixed local summary,
+  // alongside session and status; provider text never reaches the log.
   await dueCacheKeep(logs, 'ck-http', {}).manager.tick()
   // Transport failure: the exception message never reaches the log.
   await dueCacheKeep(logs, 'ck-transport', {
     fetchImpl: fakeFetch(rejectWithEcho),
   }).manager.tick()
-  // With no credential headers the prewarm fails with the fixed reason
-  // 'OAuth cache prewarm credential is unavailable'. That text is not
-  // provider output, so the log keeps it.
+  // Missing credential headers select a fixed credential-unavailable summary,
+  // not a provider message or an exception string.
   await dueCacheKeep(logs, 'ck-credential', {
     prepareHeaders: () => undefined,
   }).manager.tick()
@@ -252,28 +251,58 @@ test('CacheKeep provider-body and transport failures log status and flags, never
   expect(
     logs.find('cachekeep', 'prewarm failed').map((r) => r.payload),
   ).toEqual([
-    { session: 'ck-http', status: 500 },
-    { session: 'ck-transport', transient: true },
+    {
+      session: 'ck-http',
+      status: 500,
+      provider_error: {
+        type: 'api_error',
+        reason: 'http_error',
+        message: 'Provider prewarm request failed',
+      },
+    },
+    {
+      session: 'ck-transport',
+      transient: true,
+      provider_error: {
+        type: 'unknown',
+        reason: 'transport',
+        message: 'Provider prewarm transport failed',
+      },
+    },
     {
       session: 'ck-credential',
       transient: true,
-      reason: 'OAuth cache prewarm credential is unavailable',
+      provider_error: {
+        type: 'unknown',
+        reason: 'credential_unavailable',
+        message: 'OAuth cache prewarm credential is unavailable',
+      },
     },
   ])
   expectNoEcho(JSON.stringify(logs.records))
 
-  // prewarmNow still returns the provider response body as its failure reason;
-  // only the log omits it.
+  // Immediate callers receive the same fixed summary and reason text rather
+  // than the provider response body.
   const direct = await dueCacheKeep(logs, 'ck-direct', {}).manager.prewarmNow({
     sessionId: 'ck-direct',
     url: 'https://api.anthropic.com/v1/messages',
     headers: new Headers(),
     bodyText: cacheKeepBody,
   })
-  expect(direct).toEqual({ ok: false, reason: echoBody, status: 500 })
+  expect(direct).toEqual({
+    ok: false,
+    reason: 'Provider prewarm request failed',
+    status: 500,
+    provider_error: {
+      type: 'api_error',
+      reason: 'http_error',
+      message: 'Provider prewarm request failed',
+    },
+  })
+  expectNoEcho(JSON.stringify(direct))
 })
 
-test('CacheKeep callback and stage exceptions log fixed stages with session only', async () => {
+test('CacheKeep callback and stage exceptions log fixed stages and safe summaries without exception text', async () => {
   const logs = captureLogs()
 
   await dueCacheKeep(logs, 'ck-thrown', {
@@ -312,7 +341,16 @@ test('CacheKeep callback and stage exceptions log fixed stages with session only
       .find('cachekeep', 'prewarm failed')
       .filter((r) => r.payload?.session === 'ck-thrown')
       .map((r) => r.payload),
-  ).toEqual([{ session: 'ck-thrown' }])
+  ).toEqual([
+    {
+      session: 'ck-thrown',
+      provider_error: {
+        type: 'unknown',
+        reason: 'transport',
+        message: 'Provider prewarm transport failed',
+      },
+    },
+  ])
   expect(
     logs.find('cachekeep', 'prepare body failed').map((r) => r.payload),
   ).toEqual([{ session: 'ck-prepare' }])
