@@ -1160,7 +1160,7 @@ new = '''      if (summary) {
       }'''
 test_file = "packages/opencode/src/tests/index.test.ts"
 runner = "command"
-command = ["sh", "-c", 'bun run --cwd packages/core build && bun scripts/run-mutation-bun.ts packages/opencode/src/tests/index.test.ts "$1"', "prewarm-log-redaction", "{test}"]
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
 expect_red = ["auth.loader > immediate recovery warm http failure logs only fixed provider metadata"]
 expect_message = "error: expect(received).not.toContain(expected)"
