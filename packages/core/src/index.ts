@@ -250,6 +250,7 @@ export {
 export * from './oauth-profile.ts'
 export {
   createWindowsOwnerOnly,
+  ensureWindowsOwnerOnlyDirectory,
   isOwnerOnly,
   type OwnerOnlyOptions,
 } from './owner-only.ts'

@@ -123,3 +123,25 @@ test('isolated profile removes inherited credentials and snapshots detect files 
   ])
   expect(output.stdout).toContain('4 isolation and snapshot controls verified')
 })
+
+test('OpenCode 1 journal proof accepts the real v4 retired migration and rejects empty-init or unfinished state', async () => {
+  const harness = new URL('harness.mjs', import.meta.url).href
+  const output = await run('node', [
+    '--input-type=module',
+    '-e',
+    `
+    import assert from 'node:assert/strict';
+    import { assertFreshOpenCode1Journal } from ${JSON.stringify(harness)};
+    const journal = { version: 4, host: 'opencode', phase: 'retired', sources: {
+      config: null, state: null, hostAuth: 'absent', routing: null,
+    } };
+    assertFreshOpenCode1Journal(journal);
+    for (const bad of [undefined, { ...journal, version: 5 }, { ...journal, kind: 'empty-init' }, { ...journal, phase: 'committed' }, { ...journal, host: 'pi' }])
+      assert.throws(() => assertFreshOpenCode1Journal(bad));
+    console.log('v4 retired journal accepted and 5 wrong-route/unfinished controls refused');
+  `,
+  ])
+  expect(output.stdout).toContain(
+    'v4 retired journal accepted and 5 wrong-route/unfinished controls refused',
+  )
+})

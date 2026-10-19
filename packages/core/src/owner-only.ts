@@ -1,3 +1,6 @@
+import { lstat } from 'node:fs/promises'
+import { dirname } from 'node:path'
+import { types as utilTypes } from 'node:util'
 import type * as PrivateFiles from '@cortexkit/private-files'
 
 /** Per-operation injection keeps simulated Windows policy out of process globals. */
@@ -7,7 +10,12 @@ export interface OwnerOnlyOptions {
     typeof PrivateFiles,
     'verifyOwnerOnly' | 'readPrivateFile'
   > &
-    Partial<Pick<typeof PrivateFiles, 'verifySafeParent' | 'createPrivateFile'>>
+    Partial<
+      Pick<
+        typeof PrivateFiles,
+        'verifySafeParent' | 'createPrivateFile' | 'createPrivateDirectory'
+      >
+    >
 }
 
 async function windowsBackend(options: OwnerOnlyOptions) {
@@ -68,5 +76,87 @@ export async function createWindowsOwnerOnly(
   if (!api.createPrivateFile)
     throw new Error('Private-file creation unavailable')
   await api.createPrivateFile(path, bytes)
+  return true
+}
+
+/**
+ * Create only missing Windows directories; never tighten an existing shared directory.
+ * Returns false off Windows so callers retain their POSIX directory policy.
+ */
+export async function ensureWindowsOwnerOnlyDirectory(
+  path: string,
+  options: OwnerOnlyOptions = {},
+): Promise<boolean> {
+  const backend = await windowsBackend(options)
+  if (!backend) return false
+  const api = backend
+  const verify = api.verifySafeParent
+  if (!verify) throw new Error('Safe-parent verifier unavailable')
+  const verifySafeParent = verify
+  const refused = (stage: string, reason: string) =>
+    Object.assign(new Error('Private directory refused'), {
+      code: 'ERR_PRIVATE_FILES_SECURITY',
+      stage,
+      reason,
+    })
+  const field = (error: unknown, key: string): unknown => {
+    if (error === null || typeof error !== 'object' || utilTypes.isProxy(error))
+      return undefined
+    const descriptor = Object.getOwnPropertyDescriptor(error, key)
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined
+  }
+  async function exists(directory: string) {
+    try {
+      const metadata = await lstat(directory)
+      if (metadata.isSymbolicLink()) throw refused('verify', 'reparse-point')
+      if (!metadata.isDirectory()) throw refused('verify', 'wrong-kind')
+      return true
+    } catch (error) {
+      if (field(error, 'code') === 'ENOENT') return false
+      throw error
+    }
+  }
+  async function safe(directory: string) {
+    const verdict = await verifySafeParent(directory)
+    if (!verdict.ok) throw refused('safe-parent', verdict.reason)
+  }
+  async function privateDirectory(directory: string) {
+    const verdict = await api.verifyOwnerOnly(directory)
+    if (!verdict.ok) throw refused('verify', verdict.refusal.reason)
+    await safe(directory)
+  }
+  async function create(directory: string) {
+    const createPrivateDirectory = api.createPrivateDirectory
+    if (!createPrivateDirectory)
+      throw new Error('Private-directory creation unavailable')
+    try {
+      await createPrivateDirectory(directory)
+    } catch (error) {
+      const win32Code = field(error, 'win32Code')
+      // Only demonstrated exclusive-create collisions allow adopting a raced directory.
+      if (
+        field(error, 'code') !== 'EEXIST' &&
+        !(
+          field(error, 'reason') === 'io-error' &&
+          typeof win32Code === 'number' &&
+          [80, 183].includes(win32Code)
+        )
+      )
+        throw error
+    }
+    if (!(await exists(directory))) throw refused('verify', 'io-error')
+    await privateDirectory(directory)
+  }
+  async function ancestors(directory: string): Promise<void> {
+    if (await exists(directory)) return safe(directory)
+    const parent = dirname(directory)
+    if (parent === directory) throw refused('safe-parent', 'io-error')
+    await ancestors(parent)
+    await create(directory)
+  }
+  // Existing ancestors need entry integrity; the requested leaf needs confidentiality.
+  await ancestors(dirname(path))
+  if (await exists(path)) await privateDirectory(path)
+  else await create(path)
   return true
 }

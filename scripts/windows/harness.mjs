@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
@@ -9,6 +10,21 @@ import {
 
 export const sha256 = (bytes) =>
   createHash('sha256').update(bytes).digest('hex')
+
+/** Fresh OpenCode 1 migration retires a v4 journal; empty-init is the OC2 route. */
+export function assertFreshOpenCode1Journal(journal) {
+  assert(journal, 'OpenCode 1 setup must publish its migration journal')
+  assert.equal(journal.version, 4)
+  assert.equal(journal.host, 'opencode')
+  assert.equal(Object.hasOwn(journal, 'kind'), false)
+  assert.equal(journal.phase, 'retired')
+  assert.deepEqual(journal.sources, {
+    config: null,
+    state: null,
+    hostAuth: 'absent',
+    routing: null,
+  })
+}
 
 export async function snapshot(root) {
   const files = {}

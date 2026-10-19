@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import {
+  assertFreshOpenCode1Journal,
   isolatedEnvironment,
   sha256,
   snapshot,
@@ -166,6 +167,30 @@ const ok = await withReceipt(
         'Native DACL verifier must load and accept the native-created file',
       )
       result.dacls['native-prebuild-probe'] = verdict
+      // Keep this probe separate so it cannot pre-create the CLI diagnostics directory.
+      const directoryProbe = join(profile, 'diagnostics-helper-probe', 'nested')
+      assert.equal(
+        await core.ensureWindowsOwnerOnlyDirectory(directoryProbe),
+        true,
+      )
+      const diagnosticProbe = join(directoryProbe, 'synthetic.log')
+      assert.equal(
+        await core.createWindowsOwnerOnly(
+          diagnosticProbe,
+          'synthetic diagnostic; no credentials',
+        ),
+        true,
+      )
+      for (const [label, path] of [
+        ['diagnostics-helper-directory', directoryProbe],
+        ['diagnostics-helper-file', diagnosticProbe],
+      ]) {
+        result.dacls[label] = await api.verifyOwnerOnly(path)
+        assert.equal(result.dacls[label].ok, true)
+      }
+      result.files['diagnostics-helper-file'] = sha256(
+        await readFile(diagnosticProbe),
+      )
       return { nativeAddonLoaded: true, arch: process.arch }
     })
     await step('tasklist-preflight', async () => {
@@ -235,8 +260,7 @@ const ok = await withReceipt(
         join(env.OPENCODE_CONFIG_DIR, 'anthropic-auth.json'),
       )
       const journal = await core.readNativeMigrationJournal(paths)
-      assert.equal(journal?.kind, 'empty-init')
-      assert.equal(journal?.phase, 'committed')
+      assertFreshOpenCode1Journal(journal)
       result.dacls['setup-journal'] = await api.verifyOwnerOnly(paths.journal)
       assert.equal(result.dacls['setup-journal'].ok, true)
       result.files['setup-journal'] = sha256(await readFile(paths.journal))
@@ -277,7 +301,7 @@ const ok = await withReceipt(
       )
       result.files.profile = await snapshot(profile)
       return {
-        journal: 'setup-written',
+        journal: 'setup-written v4 retired migration',
         runtime: 'synthetic empty',
         hostAuth: 'synthetic absent',
         enrollment: 'synthetic token, never used for a connection',

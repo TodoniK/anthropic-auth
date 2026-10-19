@@ -22,6 +22,7 @@ import { types as utilTypes } from 'node:util'
 import {
   createProviderErrorRedactor,
   createWindowsOwnerOnly,
+  ensureWindowsOwnerOnlyDirectory,
   formatLogLine,
   isOwnerOnly,
   isSecretKey,
@@ -715,10 +716,11 @@ export function cliDiagnosticsDirectory(env: unknown): string | undefined {
 
 /**
  * Write one failure detail to a new owner-only file and return its path, or
- * undefined if that cannot be done safely. An existing directory that is not
- * a real directory owned by this user with no group or other access is
- * refused, never repaired. Exclusive creation uses mode 0600 on POSIX and a
- * protected owner-only DACL on Windows, without following a symlink.
+ * undefined if that cannot be done safely. An existing non-private leaf
+ * directory is refused, never repaired. POSIX checks its uid/mode and creates
+ * missing directories with mode 0700; Windows uses native DACL checks and
+ * private directory creation. Files are exclusive mode 0600 on POSIX and
+ * protected owner-only DACL storage on Windows; a leaf symlink is never followed.
  */
 export async function writeDiagnosticFile(
   env: unknown,
@@ -747,18 +749,22 @@ async function writeDiagnosticResult(
     const directory = cliDiagnosticsDirectory(env)
     if (directory === undefined)
       return refuse('ERR_DIAGNOSTICS_DIRECTORY_UNAVAILABLE')
-    await mkdir(directory, { recursive: true, mode: 0o700 })
-    const metadata = await lstat(directory)
-    if (!metadata.isDirectory()) return refuse('ERR_DIAGNOSTICS_NOT_DIRECTORY')
-    if (
-      !(await isOwnerOnly(
-        directory,
-        () =>
-          (metadata.mode & 0o077) === 0 && metadata.uid === process.getuid?.(),
-        ownership,
-      ))
-    )
-      return refuse('ERR_DIAGNOSTICS_NOT_OWNER_ONLY')
+    if (!(await ensureWindowsOwnerOnlyDirectory(directory, ownership))) {
+      await mkdir(directory, { recursive: true, mode: 0o700 })
+      const metadata = await lstat(directory)
+      if (!metadata.isDirectory())
+        return refuse('ERR_DIAGNOSTICS_NOT_DIRECTORY')
+      if (
+        !(await isOwnerOnly(
+          directory,
+          () =>
+            (metadata.mode & 0o077) === 0 &&
+            metadata.uid === process.getuid?.(),
+          ownership,
+        ))
+      )
+        return refuse('ERR_DIAGNOSTICS_NOT_OWNER_ONLY')
+    }
     const path = join(
       directory,
       `${stage}-${Date.now()}-${process.pid}-${randomUUID()}.log`,

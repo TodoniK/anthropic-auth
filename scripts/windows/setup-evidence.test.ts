@@ -203,3 +203,59 @@ for (const failed of [true, false]) {
     }
   })
 }
+
+test('stderr rename deadline metadata remains release-blocking even without a private diagnostic file', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'metadata-deadline-'))
+  try {
+    const evidence = new URL('setup-evidence.mjs', import.meta.url).href
+    const payload = {
+      error: { name: 'PrivateFileError', code: 'ETIMEDOUT', stage: 'rename' },
+      saveError: {
+        name: 'DiagnosticFileError',
+        code: 'ERR_DIAGNOSTICS_NOT_OWNER_ONLY',
+      },
+    }
+    const line = `CLI failure metadata: ${JSON.stringify(payload)}\n`
+    const child = `process.stderr.write(${JSON.stringify(line)}); process.exit(1);`
+    const output = await run('node', [
+      '--input-type=module',
+      '-e',
+      `
+      import assert from 'node:assert/strict';
+      import { execFile } from 'node:child_process';
+      import { promisify } from 'node:util'; import { join } from 'node:path';
+      import { withReceipt } from ${JSON.stringify(harness)};
+      import { classifyPublication } from ${JSON.stringify(evidence)};
+      const exec = promisify(execFile);
+      const result = { platform: 'win32', profile: process.argv[1] };
+      const ok = await withReceipt(join(process.argv[1], 'receipt.json'), result, async step => {
+        await step('setup-local-noninteractive', () => exec(process.execPath, ['-e', ${JSON.stringify(child)}]), { setupChild: true });
+        const metadata = result.steps[0].evidence;
+        await step('publication-deadline', () => {
+          assert.notEqual(metadata.publication.kind, 'publication-timeout', 'common-auth publication timeout; upstream adoption is required');
+        });
+      }, async () => {}, { diagnosticsDirectory: join(process.argv[1], 'absent-diagnostics'), log() {} });
+      assert.equal(result.steps[0].evidence.publication.kind, 'publication-timeout');
+      assert.equal(result.steps[0].evidence.publication.basis, 'private-file-rename-metadata');
+      assert.equal(result.steps[0].evidence.diagnostics.state, 'absent');
+      assert.equal(result.steps[1].name, 'publication-deadline');
+      assert.equal(result.steps[1].status, 'failed');
+      assert.equal(ok, false); assert.equal(result.nativeWindowsQualified, false);
+      for (const body of [null, [], { saveError: ${JSON.stringify(payload.error)} },
+        { error: { name: 'Error', code: 'ETIMEDOUT', stage: 'rename' } },
+        { error: { name: 'PrivateFileError', code: 'ETIMEDOUT', stage: 'verify' } },
+        { error: { name: 'PrivateFileError', code: 'EPERM', stage: 'rename' } }]) {
+        assert.equal(classifyPublication({ exitCode: 1, stderr: 'CLI failure metadata: ' + JSON.stringify(body) }).kind, 'unclassified-setup-failure');
+      }
+      assert.equal(classifyPublication({ exitCode: 1, stderr: 'CLI failure metadata: {invalid' }).kind, 'unclassified-setup-failure');
+      console.log('metadata timeout blocks release; 7 malformed/non-primary controls stay unclassified');
+    `,
+      root,
+    ])
+    expect(output.stdout).toContain(
+      'metadata timeout blocks release; 7 malformed/non-primary controls stay unclassified',
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

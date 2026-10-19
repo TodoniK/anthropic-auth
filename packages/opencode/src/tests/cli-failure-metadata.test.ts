@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { reportThrownFailure } from '../cli-failure.ts'
@@ -11,6 +11,7 @@ async function refusedReport(
   error: unknown,
   saveError: unknown,
   submitted: string[] = [],
+  failDirectory = false,
 ) {
   const root = await mkdtemp(join(tmpdir(), 'cli-failure-metadata-'))
   const stderr: string[] = []
@@ -25,6 +26,13 @@ async function refusedReport(
           platform: 'win32',
           privateFiles: {
             readPrivateFile: readFile,
+            async verifySafeParent() {
+              return { ok: true }
+            },
+            async createPrivateDirectory(path) {
+              if (failDirectory) throw saveError
+              await mkdir(path)
+            },
             async verifyOwnerOnly() {
               return { ok: true as const }
             },
@@ -179,13 +187,15 @@ test('stderr metadata never invokes accessors or proxy traps on either error', a
     },
   )
   for (const value of [accessor, proxy]) {
-    const output = await refusedReport(value, value)
-    expect(output.stderr).toEqual([`${prefix}{"error":{},"saveError":{}}\n`])
+    for (const failDirectory of [false, true]) {
+      const output = await refusedReport(value, value, [], failDirectory)
+      expect(output.stderr).toEqual([`${prefix}{"error":{},"saveError":{}}\n`])
+    }
   }
   expect(reads).toBe(0)
 })
 
-test('a refused directory owner-only predicate is reported without inventing a native refusal reason', async () => {
+test('a refused directory owner-only verdict retains its actual reason and creates no log', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cli-failure-directory-'))
   const stderr: string[] = []
   let creations = 0
@@ -200,6 +210,12 @@ test('a refused directory owner-only predicate is reported without inventing a n
           platform: 'win32',
           privateFiles: {
             readPrivateFile: readFile,
+            async verifySafeParent() {
+              return { ok: true }
+            },
+            async createPrivateDirectory(path) {
+              await mkdir(path)
+            },
             async verifyOwnerOnly() {
               return {
                 ok: false as const,
@@ -218,7 +234,7 @@ test('a refused directory owner-only predicate is reported without inventing a n
     )
     expect(screen).toContain('Details could not be saved')
     expect(stderr).toEqual([
-      `${prefix}{"error":{"name":"Error"},"saveError":{"name":"DiagnosticFileError","code":"ERR_DIAGNOSTICS_NOT_OWNER_ONLY"}}\n`,
+      `${prefix}{"error":{"name":"Error"},"saveError":{"name":"Error","code":"ERR_PRIVATE_FILES_SECURITY","stage":"verify","reason":"not-protected"}}\n`,
     ])
     expect(creations).toBe(0)
   } finally {

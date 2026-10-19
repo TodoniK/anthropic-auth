@@ -66,6 +66,35 @@ export function classifyPublication({
   diagnostics = [],
 }) {
   const details = [stdout, stderr, ...diagnostics].join('\n')
+  for (const line of details.split(/\r?\n/)) {
+    const prefix = 'CLI failure metadata: '
+    if (!line.startsWith(prefix)) continue
+    try {
+      const metadata = JSON.parse(line.slice(prefix.length))
+      const error =
+        metadata !== null &&
+        typeof metadata === 'object' &&
+        !Array.isArray(metadata) &&
+        Object.hasOwn(metadata, 'error')
+          ? metadata.error
+          : undefined
+      if (
+        error !== null &&
+        typeof error === 'object' &&
+        !Array.isArray(error) &&
+        ['name', 'code', 'stage'].every((key) => Object.hasOwn(error, key)) &&
+        error.name === 'PrivateFileError' &&
+        error.code === 'ETIMEDOUT' &&
+        error.stage === 'rename'
+      )
+        return {
+          kind: 'publication-timeout',
+          basis: 'private-file-rename-metadata',
+        }
+    } catch {
+      // Partial or malformed metadata does not identify the setup failure.
+    }
+  }
   if (/publication\s+deadline\s+expired/i.test(details))
     return {
       kind: 'publication-timeout',
