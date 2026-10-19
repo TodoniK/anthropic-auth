@@ -201,7 +201,6 @@ import {
   snapshotHasServableLocalOAuth,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
-  summarizePrewarmProviderError,
   TrailingAssistantHistoryError,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
@@ -305,7 +304,6 @@ import {
   isInsecure,
   mergeHeaders,
   normalizeToolNameResponseError,
-  prepareFableCacheWarmSource,
   rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
@@ -792,16 +790,10 @@ const ZERO_MODEL_COST = {
   cache: { read: 0, write: 0 },
 }
 
-type FableWarmTarget = {
-  url: string
-  headers: Headers
-  bodyText: string
-  oauthAccountId: string
-}
-
 type FableRequestContext = {
   plan: FableFallbackPlan
-  warmTarget?: FableWarmTarget
+  oauthAccountId?: string
+  serverFallback?: boolean
   opusCacheAnchor?: FableStandbyCacheAnchor
   standbyBridgeLogged?: boolean
 }
@@ -849,36 +841,20 @@ function asProviderAccountUuid(
   return value as ProviderAccountUuid | undefined
 }
 
-const FABLE_SWITCHED_TO_OPUS_NOTICE =
-  'Fable content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the Fable cache warm.'
-const FABLE_RESTORED_NOTICE =
-  'Fable recovery window complete. Returning to Fable 5.'
-
 /**
  * Compose the recovery-window notice text for the requested model. Fable 5 and
  * Opus 5 follow the same Anthropic-recommended fallback (Opus 4.8) for the
  * same reason (cyber safety classifiers returning `stop_reason: "refusal"`),
  * so the message structure is shared; only the model name moves.
  */
-function buildSwitchedToOpusNotice(modelId: string): string {
-  if (isClaudeOpus5Model(modelId)) {
-    return 'Opus 5 content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the Opus 5 cache warm.'
-  }
-  if (isClaudeFableOrMythos51Model(modelId)) {
-    const label = fallbackModelLabel(modelId)
-    return `${label} content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the ${label} cache warm.`
-  }
-  return FABLE_SWITCHED_TO_OPUS_NOTICE
+function buildSwitchedToOpusNotice(modelId: string, remaining: number): string {
+  const label = fallbackModelLabel(modelId)
+  return `${label} content filter detected. Switched to Opus 4.8 for a ${remaining}-response recovery window before trying ${label} again.`
 }
 
 function buildRestoredNotice(modelId: string): string {
-  if (isClaudeOpus5Model(modelId)) {
-    return 'Opus 5 recovery window complete. Returning to Opus 5.'
-  }
-  if (isClaudeFableOrMythos51Model(modelId)) {
-    return `Recovery window complete. Returning to ${fallbackModelLabel(modelId)}.`
-  }
-  return FABLE_RESTORED_NOTICE
+  const label = fallbackModelLabel(modelId)
+  return `${label} recovery window complete. Returning to ${label}.`
 }
 
 function fallbackModelLabel(modelId: string): string {
@@ -3648,8 +3624,6 @@ const anthropicAuthPlugin = async (
     },
   })
 
-  const recoveryWarmChains = new Map<string, Promise<void>>()
-
   // Prime sends a minimal Haiku request after the account's quota reset to
   // start its next five-hour usage window. One shared manager and an atomic
   // claim file prevent different projects or processes firing for the same reset.
@@ -4000,78 +3974,6 @@ const anthropicAuthPlugin = async (
   const primeManager: PrimeManager = primeManagerAdoption.manager
   if (isPrimePersistentlyEnabled(initialStorage)) {
     primeManager.start()
-  }
-
-  function warmRecoverySourceAfterOpus(context: FableRequestContext) {
-    const sessionId = context.plan.sessionId
-    const modelLabel = isClaudeOpus5Model(context.plan.requestedModel)
-      ? 'Opus 5'
-      : 'Fable'
-    const run = async () => {
-      const target = context.warmTarget
-      if (!target) {
-        logger.debug('fable-fallback', 'cache warm skipped', {
-          session: sessionId,
-          reason: 'Opus response was not served by an OAuth route',
-        })
-        return
-      }
-      const source = prepareFableCacheWarmSource(
-        target.bodyText,
-        context.plan.requestedModel,
-      )
-      if (!source.ok) {
-        logger.warn('fable-fallback', 'cache warm skipped', {
-          session: sessionId,
-          reason: source.reason,
-        })
-        return
-      }
-
-      try {
-        const result = await cacheKeepManager.prewarmNow({
-          sessionId,
-          url: target.url,
-          headers: target.headers,
-          bodyText: source.bodyText,
-          oauthAccountId:
-            fableFallbackManager.recoveryAccount(context.plan) ??
-            target.oauthAccountId,
-        })
-        if (result.ok) {
-          logger.debug('fable-fallback', `${modelLabel} cache warmed`, {
-            session: sessionId,
-            remaining: fableFallbackManager.remaining(context.plan),
-            ...(result.usage && { usage: result.usage }),
-          })
-          return
-        }
-        logger.warn('fable-fallback', `${modelLabel} cache warm skipped`, {
-          session: sessionId,
-          status: result.status,
-          reason: result.reason,
-          ...(result.provider_error && {
-            provider_error: result.provider_error,
-          }),
-        })
-      } catch {
-        logger.warn('fable-fallback', `${modelLabel} cache warm failed`, {
-          session: sessionId,
-          ...summarizePrewarmProviderError({ failure: 'transport' }),
-        })
-      }
-    }
-
-    const { recoveryKey } = context.plan
-    const previous = recoveryWarmChains.get(recoveryKey) ?? Promise.resolve()
-    const current = previous.then(run, run)
-    recoveryWarmChains.set(recoveryKey, current)
-    void current.finally(() => {
-      if (recoveryWarmChains.get(recoveryKey) === current) {
-        recoveryWarmChains.delete(recoveryKey)
-      }
-    })
-    return current
   }
 
   async function getAllTrackedCacheKeepSessions() {
@@ -6125,6 +6027,7 @@ const anthropicAuthPlugin = async (
       }
 
       if (value.type === 'session.deleted') {
+        fableFallbackManager.clearSession(sessionId)
         nativeCommands.delete(sessionId)
         oauthPending.delete(sessionId)
         laneStartTracker.clearSession(sessionId)
@@ -6901,8 +6804,8 @@ const anthropicAuthPlugin = async (
             mainQuotaIdentity?: MainQuotaIdentityBinding,
           ) {
             void currentStorage
-            if (fableRequest?.plan.downgraded) {
-              fableRequest.warmTarget = undefined
+            if (fableRequest) {
+              fableRequest.oauthAccountId = undefined
               fableRequest.opusCacheAnchor = undefined
             }
             const start = nowMs()
@@ -7338,14 +7241,7 @@ const anthropicAuthPlugin = async (
             const cacheDiagnosticsBetas =
               await getCacheDiagnosticsBetas(requestHeaders)
             const rewritten = rewriteUrl(input)
-            if (fableRequest && typeof body === 'string') {
-              fableRequest.warmTarget = {
-                url: rewritten.url?.toString() ?? rewritten.input.toString(),
-                headers: new Headers(requestHeaders),
-                bodyText: body,
-                oauthAccountId,
-              }
-            }
+            if (fableRequest) fableRequest.oauthAccountId = oauthAccountId
             if (
               typeof body === 'string' &&
               isCache1hEnabled() &&
@@ -8514,14 +8410,25 @@ const anthropicAuthPlugin = async (
                 incomingHeaders.get('x-session-affinity') ||
                 incomingHeaders.get('x-opencode-session')
               const requestModel = parseRequestModel(init?.body)
-              let fablePlan = fableFallbackManager.plan(sessionId, init?.body)
-              if (fablePlan && !fablePlan.downgraded) {
-                const finalWarm = recoveryWarmChains.get(fablePlan.recoveryKey)
-                if (finalWarm) {
-                  await finalWarm
-                  fablePlan = fableFallbackManager.plan(sessionId, init?.body)
+              // Match sticky routing's original requested-model affinity, not
+              // the effective model chosen by recovery or a subagent's model.
+              const recoveryModelChanged = Boolean(
+                sessionId &&
+                  requestModel &&
+                  !isSubagentRequest(incomingHeaders) &&
+                  fableFallbackManager.resetForModelChange(
+                    sessionId,
+                    requestModel,
+                  ),
+              )
+              if (recoveryModelChanged && sessionId) {
+                for (const key of pendingRecoveryDesktopNotices.keys()) {
+                  if (key.startsWith(`${sessionId}\0`))
+                    pendingRecoveryDesktopNotices.delete(key)
                 }
+                pendingDesktopNotices.delete(sessionId)
               }
+              const fablePlan = fableFallbackManager.plan(sessionId, init?.body)
               const serverFallbackModel =
                 fallbackMode === 'server' &&
                 isRecoverableRefusalModel(
@@ -8576,7 +8483,7 @@ const anthropicAuthPlugin = async (
                   ...(!fablePlan?.downgraded && fablePlan
                     ? {
                         onContentFilter: (context) => {
-                          if (!fableRequest?.warmTarget) {
+                          if (!fableRequest?.oauthAccountId) {
                             logger.debug(
                               'fable-fallback',
                               'content filter recovery unavailable for non-OAuth route',
@@ -8586,14 +8493,17 @@ const anthropicAuthPlugin = async (
                           }
                           const remaining = fableFallbackManager.activate(
                             fablePlan,
-                            fableRequest.warmTarget.oauthAccountId,
+                            fableRequest.oauthAccountId,
                           )
                           pendingRecoveryDesktopNotices.delete(
                             fablePlan.recoveryKey,
                           )
                           pendingRecoveryDesktopNotices.set(
                             fablePlan.recoveryKey,
-                            buildSwitchedToOpusNotice(fablePlan.requestedModel),
+                            buildSwitchedToOpusNotice(
+                              fablePlan.requestedModel,
+                              remaining,
+                            ),
                           )
                           while (pendingRecoveryDesktopNotices.size > 128) {
                             const oldest = pendingRecoveryDesktopNotices
@@ -8628,9 +8538,16 @@ const anthropicAuthPlugin = async (
                         },
                       }
                     : {}),
-                  ...(fablePlan?.downgraded && fableRequest
+                  ...(fablePlan && fableRequest
                     ? {
                         onComplete: (finishReason: string) => {
+                          if (!fablePlan.downgraded) {
+                            fableFallbackManager.completeSource(
+                              fablePlan,
+                              !fableRequest.serverFallback,
+                            )
+                            return
+                          }
                           const completed = fableFallbackManager.complete(
                             fablePlan,
                             fableRequest.opusCacheAnchor,
@@ -8675,26 +8592,18 @@ const anthropicAuthPlugin = async (
                             storage,
                             auth,
                           )
-                          const warm = warmRecoverySourceAfterOpus(fableRequest)
                           if (completed.remaining === 0) {
-                            const notifyRestored = () => {
-                              if (
-                                fableFallbackManager.remaining(fablePlan) !== 0
-                              )
-                                return
-                              publishFableRecoveryNotice(
-                                {
-                                  sessionId: fablePlan.sessionId,
-                                  mode: 'fable',
-                                  remaining: 0,
-                                  requestedModelId: fablePlan.requestedModel,
-                                },
-                                storage,
-                                auth,
-                                buildRestoredNotice(fablePlan.requestedModel),
-                              )
-                            }
-                            void warm.then(notifyRestored, notifyRestored)
+                            publishFableRecoveryNotice(
+                              {
+                                sessionId: fablePlan.sessionId,
+                                mode: 'fable',
+                                remaining: 0,
+                                requestedModelId: fablePlan.requestedModel,
+                              },
+                              storage,
+                              auth,
+                              buildRestoredNotice(fablePlan.requestedModel),
+                            )
                           }
                         },
                       }
@@ -8706,13 +8615,16 @@ const anthropicAuthPlugin = async (
                           ? {
                               onServerSideFallbackOutcome: (
                                 outcome: ServerSideFallbackOutcome,
-                              ) =>
+                              ) => {
+                                if (fableRequest)
+                                  fableRequest.serverFallback = outcome.fallback
                                 observeServerFallbackOutcome(
                                   fablePlan,
                                   outcome,
                                   storage,
                                   auth,
-                                ),
+                                )
+                              },
                             }
                           : {}),
                       }
@@ -8818,6 +8730,7 @@ const anthropicAuthPlugin = async (
                 ? fableRecoveryNotices.get(sessionId)
                 : undefined
               if (
+                recoveryModelChanged ||
                 !fablePlan ||
                 (fallbackMode === 'server' &&
                   visibleRecovery?.requestedModelId &&

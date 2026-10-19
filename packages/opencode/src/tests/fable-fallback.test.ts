@@ -4,6 +4,7 @@ import {
   FABLE_FALLBACK_TURNS,
   FableFallbackManager,
 } from '../fable-fallback'
+import { createStrippedStream } from '../transform'
 
 function body(model = 'claude-fable-5') {
   return JSON.stringify({
@@ -222,7 +223,7 @@ describe('FableFallbackManager', () => {
     const probe = { ...initial }
     manager.activate(probe)
 
-    expect(manager.complete(oldOpus)).toEqual({ counted: false, remaining: 10 })
+    expect(manager.complete(oldOpus)).toEqual({ counted: false, remaining: 20 })
   })
 
   test('routes dated Fable snapshot to Opus 4.8 after filter activation', () => {
@@ -260,6 +261,136 @@ describe('FableFallbackManager', () => {
     expect(fable5Recovery.cycle).not.toBe(fable51Recovery.cycle)
     expect(fable5Recovery.cacheAccountId).toBe('fable5-account')
     expect(fable51Recovery.cacheAccountId).toBe('fable51-account')
+  })
+})
+
+describe('refusal recovery backoff', () => {
+  function finishRound(manager: FableFallbackManager, responses: number) {
+    for (let index = 0; index < responses; index++) {
+      const plan = manager.plan('session-a', body('claude-opus-5-5'))!
+      expect(plan.downgraded).toBe(true)
+      expect(manager.complete(plan)).toEqual({
+        counted: true,
+        remaining: responses - index - 1,
+      })
+    }
+    expect(manager.plan('session-a', body('claude-opus-5-5'))?.downgraded).toBe(
+      false,
+    )
+  }
+
+  test('backs off source attempts after 10, 20, then 40 completed responses', () => {
+    const manager = new FableFallbackManager()
+    for (const responses of [10, 20, 40]) {
+      const source = manager.plan('session-a', body('claude-opus-5-5'))!
+      expect(manager.activate(source, 'account')).toBe(responses)
+      finishRound(manager, responses)
+      // Successful source tool responses do not clear the refusal history.
+      for (let index = 0; index < 2; index++) {
+        const sourceToolResponse = manager.plan(
+          'session-a',
+          body('claude-opus-5-5'),
+        )!
+        expect(sourceToolResponse.downgraded).toBe(false)
+        expect(manager.completeSource(sourceToolResponse)).toBe(true)
+      }
+    }
+  })
+
+  test('caps every further recovery round at 40 and always retries the source', () => {
+    const manager = new FableFallbackManager()
+    for (const responses of [10, 20, 40, 40, 40, 40]) {
+      expect(
+        manager.activate(
+          manager.plan('session-a', body('claude-opus-5-5'))!,
+          'account',
+        ),
+      ).toBe(responses)
+      finishRound(manager, responses)
+    }
+  })
+
+  test('resets to 10 only after 10 consecutive successful source responses', () => {
+    const manager = new FableFallbackManager()
+    manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!)
+    finishRound(manager, 10)
+    for (let index = 0; index < 9; index++) {
+      const plan = manager.plan('session-a', body('claude-opus-5-5'))!
+      expect(manager.completeSource(plan)).toBe(true)
+      expect(manager.completeSource(plan)).toBe(false)
+    }
+    expect(
+      manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!),
+    ).toBe(20)
+    finishRound(manager, 20)
+    for (let index = 0; index < 10; index++) {
+      expect(
+        manager.completeSource(
+          manager.plan('session-a', body('claude-opus-5-5'))!,
+        ),
+      ).toBe(true)
+    }
+    expect(
+      manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!),
+    ).toBe(10)
+  })
+
+  test('ignores stale source completions and clears all family state on session reset', () => {
+    const manager = new FableFallbackManager()
+    manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!)
+    finishRound(manager, 10)
+    const staleSource = manager.plan('session-a', body('claude-opus-5-5'))!
+    manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!)
+    finishRound(manager, 20)
+    expect(manager.completeSource(staleSource)).toBe(false)
+    for (let index = 0; index < 9; index++) {
+      manager.completeSource(
+        manager.plan('session-a', body('claude-opus-5-5'))!,
+      )
+    }
+    expect(
+      manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!),
+    ).toBe(40)
+    const staleOpus = manager.plan('session-a', body('claude-opus-5-5'))!
+    manager.activate(manager.plan('session-a', body('claude-fable-5'))!)
+    manager.clearSession('session-a')
+    expect(manager.complete(staleOpus).counted).toBe(false)
+    for (const model of ['claude-opus-5-5', 'claude-fable-5']) {
+      const plan = manager.plan('session-a', body(model))!
+      expect(plan.downgraded).toBe(false)
+      expect(manager.activate(plan)).toBe(10)
+    }
+  })
+
+  test('active source requests preserve re-refusal history beyond 24 hours', () => {
+    let now = 0
+    const manager = new FableFallbackManager(() => now)
+    manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!)
+    finishRound(manager, 10)
+    for (let hour = 1; hour <= 30; hour++) {
+      now = hour * 60 * 60_000
+      expect(
+        manager.plan('session-a', body('claude-opus-5-5'))?.downgraded,
+      ).toBe(false)
+    }
+    expect(
+      manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!),
+    ).toBe(20)
+  })
+
+  test('backoff is isolated by session and source family', () => {
+    const manager = new FableFallbackManager()
+    manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!)
+    finishRound(manager, 10)
+    expect(
+      manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!),
+    ).toBe(20)
+    expect(
+      manager.activate(manager.plan('session-b', body('claude-opus-5-5'))!),
+    ).toBe(10)
+    expect(
+      manager.activate(manager.plan('session-a', body('claude-opus-5'))!),
+    ).toBe(10)
   })
 })
 
@@ -431,4 +562,86 @@ test('tracks Opus 5.5 recovery independently from Opus 5 in the same session', (
     downgraded: true,
   })
   expect(downgradedOpus5.cycle).not.toBe(downgradedOpus55.cycle)
+})
+
+test('counts only terminal completed responses, including tool_use, on either model', async () => {
+  const manager = new FableFallbackManager()
+  manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!)
+  const respond = async (reason?: string) => {
+    const plan = manager.plan('session-a', body('claude-opus-5-5'))!
+    const stream = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_test"}}\n\n',
+      ...(reason
+        ? [
+            `event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: reason } })}\n\n`,
+          ]
+        : []),
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    await createStrippedStream(new Response(stream), {
+      onComplete: () => {
+        if (plan.downgraded) manager.complete(plan)
+        else manager.completeSource(plan)
+      },
+    }).text()
+    return plan
+  }
+  expect(manager.remaining(await respond())).toBe(10)
+  expect(manager.remaining(await respond('refusal'))).toBe(10)
+  for (let index = 0; index < 10; index++) await respond('tool_use')
+  expect(manager.plan('session-a', body('claude-opus-5-5'))?.downgraded).toBe(
+    false,
+  )
+  for (let index = 0; index < 9; index++) await respond('tool_use')
+  await respond()
+  await respond('tool_use')
+  expect(
+    manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!),
+  ).toBe(10)
+})
+
+test('a provider fallback response does not count as a clean source response', () => {
+  const manager = new FableFallbackManager()
+  manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!)
+  for (let index = 0; index < 10; index++)
+    manager.complete(manager.plan('session-a', body('claude-opus-5-5'))!)
+  for (let index = 0; index < 9; index++)
+    manager.completeSource(manager.plan('session-a', body('claude-opus-5-5'))!)
+  expect(
+    manager.completeSource(
+      manager.plan('session-a', body('claude-opus-5-5'))!,
+      false,
+    ),
+  ).toBe(false)
+  manager.completeSource(manager.plan('session-a', body('claude-opus-5-5'))!)
+  expect(
+    manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!),
+  ).toBe(20)
+})
+
+test('only a changed primary selection clears recovery, not another family using the session', () => {
+  const manager = new FableFallbackManager()
+  expect(manager.resetForModelChange('session-a', 'claude-opus-5-5')).toBe(
+    false,
+  )
+  manager.activate(manager.plan('session-a', body('claude-opus-5-5'))!)
+  manager.activate(manager.plan('session-a', body('claude-fable-5'))!)
+  expect(manager.resetForModelChange('session-a', 'claude-opus-5-5')).toBe(
+    false,
+  )
+  expect(manager.plan('session-a', body('claude-opus-5-5'))?.downgraded).toBe(
+    true,
+  )
+  expect(manager.plan('session-a', body('claude-fable-5'))?.downgraded).toBe(
+    true,
+  )
+  expect(manager.resetForModelChange('session-a', 'claude-sonnet-4-6')).toBe(
+    true,
+  )
+  expect(manager.plan('session-a', body('claude-opus-5-5'))?.downgraded).toBe(
+    false,
+  )
+  expect(manager.plan('session-a', body('claude-fable-5'))?.downgraded).toBe(
+    false,
+  )
 })

@@ -9,7 +9,6 @@ import {
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
-  CLAUDE_FABLE_5_MODEL_ID,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
   CLAUDE_HAIKU_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
@@ -41,7 +40,6 @@ import {
   SseFrameTooLargeError,
   selectClaudeCodeBetas,
   signRequestBody,
-  stripBillingLineageFromBody,
   stripEmptyTrailingAssistantMessages,
   TEXT_REPLACEMENTS,
   type ThinkingPrefixMismatchBehavior,
@@ -1357,26 +1355,6 @@ function normalizeHaiku55Request(
   }
   parsed.thinking = { ...CLAUDE_HAIKU_5_5_ADAPTIVE_THINKING }
   return { replacedExisting: hadThinking, display: 'summarized' }
-}
-
-export function prepareFableCacheWarmSource(
-  bodyText: string,
-  fableModel = CLAUDE_FABLE_5_MODEL_ID,
-): { ok: true; bodyText: string } | { ok: false; reason: string } {
-  try {
-    const body = JSON.parse(bodyText) as Record<string, unknown>
-    body.model = fableModel
-    delete body.speed
-    // The prewarm must reach the source model (not be fallback-routed),
-    // so strip any server-side fallback opt-in inherited from the captured body.
-    delete body.fallbacks
-    stripBillingLineageFromBody(body)
-    normalizeFableMythosRequest(body)
-    normalizeOpus5Request(body)
-    return { ok: true, bodyText: JSON.stringify(body) }
-  } catch {
-    return { ok: false, reason: 'body is not valid JSON' }
-  }
 }
 
 function applyCache1hStrategy(

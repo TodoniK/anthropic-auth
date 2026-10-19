@@ -8,7 +8,6 @@ import {
   OPENCODE_IDENTITY_PREFIX,
   PER_TURN_CONTROL_BETA,
   REQUIRED_BETAS,
-  selectClaudeCodeBetas,
   THINKING_BINDING_CONTROLS_BETA,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
   TrailingAssistantHistoryError,
@@ -38,7 +37,6 @@ import {
   mergeHeaders,
   NON_STREAMING_DIAGNOSTICS_MAX_BYTES,
   prefixToolNames,
-  prepareFableCacheWarmSource,
   prependClaudeCodeIdentity,
   resetPinnedFirstUserTextsForTest,
   rewriteRequestBody,
@@ -2546,116 +2544,6 @@ describe('createStrippedStream', () => {
     const original = new Response(null, { status: 204 })
     const result = createStrippedStream(original)
     expect(result).toBe(original)
-  })
-})
-
-describe('prepareFableCacheWarmSource', () => {
-  test('restores the Fable model shape from an Opus request without changing its input', () => {
-    const source = prepareFableCacheWarmSource(
-      JSON.stringify({
-        model: 'claude-opus-4-8',
-        speed: 'fast',
-        thinking: { type: 'enabled', budget_tokens: 4096 },
-        output_config: { effort: 'xhigh' },
-        system: [
-          {
-            type: 'text',
-            text: 'x-anthropic-billing-header: cc_version=2.1.258.123; cc_entrypoint=cli; cch=abcde; cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001;',
-          },
-          {
-            type: 'text',
-            text: 'stable',
-            cache_control: { type: 'ephemeral', ttl: '1h' },
-          },
-        ],
-        messages: [{ role: 'user', content: 'same input' }],
-      }),
-    )
-
-    expect(source.ok).toBe(true)
-    if (!source.ok) throw new Error(source.reason)
-    const body = JSON.parse(source.bodyText)
-    expect(body.model).toBe('claude-fable-5')
-    expect(body.speed).toBeUndefined()
-    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
-    expect(body.output_config).toEqual({ effort: 'xhigh' })
-    expect(body.messages).toEqual([{ role: 'user', content: 'same input' }])
-    expect(source.bodyText).not.toContain('cc_prev_req=')
-    expect(source.bodyText).not.toContain('cc_prompt_id=')
-  })
-
-  test('restores an Opus 5 request to claude-opus-5 when explicitly requested', () => {
-    const source = prepareFableCacheWarmSource(
-      JSON.stringify({
-        model: 'claude-opus-4-8',
-        speed: 'fast',
-        thinking: { type: 'enabled', budget_tokens: 4096 },
-        output_config: { effort: 'xhigh' },
-        messages: [{ role: 'user', content: 'same input' }],
-      }),
-      'claude-opus-5',
-    )
-
-    expect(source.ok).toBe(true)
-    if (!source.ok) throw new Error(source.reason)
-    const body = JSON.parse(source.bodyText)
-    expect(body.model).toBe('claude-opus-5')
-    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
-  })
-
-  test('strips the server-side fallback opt-in so the source-model prewarm never triggers Anthropic fallback routing', () => {
-    const source = prepareFableCacheWarmSource(
-      JSON.stringify({
-        model: 'claude-opus-4-8',
-        fallbacks: 'default',
-        speed: 'fast',
-        messages: [{ role: 'user', content: 'same input' }],
-      }),
-    )
-
-    expect(source.ok).toBe(true)
-    if (!source.ok) throw new Error(source.reason)
-    const body = JSON.parse(source.bodyText)
-    expect(body.fallbacks).toBeUndefined()
-    expect(body.speed).toBeUndefined()
-    expect(selectClaudeCodeBetas(body).split(',')).not.toContain(
-      'server-side-fallback-2026-07-01',
-    )
-  })
-
-  test('strips request lineage before reusing a source-cache body', () => {
-    const source = prepareFableCacheWarmSource(
-      JSON.stringify({
-        model: 'claude-opus-4-8',
-        system: [
-          {
-            type: 'text',
-            text: 'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=abcde; cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001;',
-          },
-        ],
-        messages: [{ role: 'user', content: 'same input' }],
-      }),
-    )
-
-    expect(source.ok).toBe(true)
-    if (!source.ok) throw new Error(source.reason)
-    expect(JSON.parse(source.bodyText).system[0].text).toBe(
-      'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=abcde;',
-    )
-  })
-
-  test('preserves the requested Fable 5.1 model when warming its source cache', () => {
-    const source = prepareFableCacheWarmSource(
-      JSON.stringify({
-        model: 'claude-opus-4-8',
-        messages: [{ role: 'user', content: 'same input' }],
-      }),
-      'claude-fable-5-1',
-    )
-
-    expect(source.ok).toBe(true)
-    if (!source.ok) throw new Error(source.reason)
-    expect(JSON.parse(source.bodyText).model).toBe('claude-fable-5-1')
   })
 })
 

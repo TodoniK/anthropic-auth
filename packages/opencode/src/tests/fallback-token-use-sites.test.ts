@@ -60,6 +60,7 @@ const fixtureEnvKeys = [
   'CLAUDE_CONFIG_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
   'OPENCODE_AUTH_CONTENT',
+  'OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE',
 ] as const
 
 const livePlugins = new Set<Set<PluginHooks>>()
@@ -213,6 +214,8 @@ async function createFixture(
     secondFallback?: boolean
     fallbackState?: 'active' | 'needs_reauth'
     fallbackEnabled?: boolean
+    fallbackMode?: 'server' | 'legacy'
+    recoveryToolUse?: boolean
   } = {},
 ) {
   const now = options.now ?? Date.now()
@@ -588,6 +591,51 @@ async function createFixture(
           Response.json({ usage: { input_tokens: 20, output_tokens: 1 } }),
         )
       }
+      if (options.recoveryToolUse) {
+        const model = (JSON.parse(body) as { model: string }).model
+        const events = [
+          [
+            'message_start',
+            {
+              type: 'message_start',
+              message: { id: 'msg_tool', model, usage: {} },
+            },
+          ],
+          [
+            'content_block_start',
+            {
+              type: 'content_block_start',
+              index: 0,
+              content_block: {
+                type: 'tool_use',
+                id: 'call_1',
+                name: 'read',
+                input: {},
+              },
+            },
+          ],
+          ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+          [
+            'message_delta',
+            {
+              type: 'message_delta',
+              delta: { stop_reason: 'tool_use' },
+              usage: { output_tokens: 1 },
+            },
+          ],
+          ['message_stop', { type: 'message_stop' }],
+        ]
+        return Promise.resolve(
+          new Response(
+            events
+              .map(
+                ([event, data]) =>
+                  `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`,
+              )
+              .join(''),
+          ),
+        )
+      }
       return Promise.resolve(new Response(successSse, { status: 200 }))
     }
     return Promise.resolve(new Response('unexpected', { status: 599 }))
@@ -609,6 +657,8 @@ async function createFixture(
   const clearInterval = mock(
     () => {},
   ) as unknown as typeof globalThis.clearInterval
+  if (options.fallbackMode)
+    process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = options.fallbackMode
   const plugin = (await (
     AnthropicAuthPlugin as unknown as (
       context: unknown,
@@ -649,6 +699,9 @@ async function createFixture(
     storage,
     discoverNextFallback() {
       includeNextInRoster = true
+    },
+    refuseNext() {
+      refusalPending = true
     },
   }
 }
@@ -847,54 +900,123 @@ describe('vault-served fallback outbound token census', () => {
     },
   )
 
-  test.serial('recovery source-model prewarm', async () => {
-    // Recovery and ordinary CacheKeep prewarms intentionally share prepareHeaders.
-    const now = Date.now()
-    const fixture = await createFixture('recovery', {
-      now,
-      quotaEnabled: true,
-      quotaSnapshot: quota(now, 98),
-      recovery: true,
-    })
-    fixture.records.length = 0
-    const request = {
-      method: 'POST',
-      headers: { 'x-session-affinity': 'recovery-census' },
-      body: JSON.stringify({
-        model: 'claude-fable-5',
-        max_tokens: 128_000,
-        stream: true,
-        system: [{ type: 'text', text: 'stable system' }],
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
-    }
-    const refused = await fixture.result.fetch(MESSAGES_URL, request)
-    await expect(refused.text()).rejects.toThrow()
-    await (await fixture.result.fetch(MESSAGES_URL, request)).text()
-    try {
-      await waitFor(
-        () =>
-          fixture.records.some((record) => {
-            if (!record.url.includes('/v1/messages')) return false
-            return (
-              (JSON.parse(record.body) as { max_tokens?: number })
-                .max_tokens === 0
-            )
-          }),
-        'recovery source-model prewarm did not run',
+  for (const fallbackMode of ['server', 'legacy'] as const)
+    for (const cleanReset of [false, true])
+      test.serial(
+        `recovery ${cleanReset ? 'clean-source reset' : 'backoff and model reset'} counts tool responses without source warms (${fallbackMode})`,
+        async () => {
+          const now = Date.now()
+          const fixture = await createFixture('recovery', {
+            now,
+            quotaEnabled: true,
+            quotaSnapshot: quota(now, 98),
+            recovery: true,
+            fallbackMode,
+            recoveryToolUse: true,
+            captureIntervals: true,
+          })
+          fixture.records.length = 0
+          const request = {
+            method: 'POST',
+            headers: { 'x-session-affinity': 'recovery-census' },
+            body: JSON.stringify({
+              model: 'claude-opus-5-5',
+              max_tokens: 128_000,
+              stream: true,
+              system: [{ type: 'text', text: 'stable system' }],
+              messages: [{ role: 'user', content: 'hello' }],
+            }),
+          }
+          const manager = fixture.plugin.__cacheKeepManager
+          const immediateWarm = mock(manager.prewarmNow.bind(manager))
+          manager.prewarmNow = immediateWarm
+          const messages = () =>
+            fixture.records
+              .filter((record) => record.url.includes('/v1/messages'))
+              .map((record) => JSON.parse(record.body))
+          const send = async (model: string, refusal = false) => {
+            if (refusal) fixture.refuseNext()
+            const response = await fixture.result.fetch(MESSAGES_URL, request)
+            if (refusal) await expect(response.text()).rejects.toThrow()
+            else expect(await response.text()).toContain('tool_use')
+            expect(
+              messages()
+                .filter((body) => body.max_tokens !== 0)
+                .at(-1)?.model,
+            ).toBe(model)
+            expect(immediateWarm).not.toHaveBeenCalled()
+            expect(
+              messages()
+                .filter((body) => body.max_tokens === 0)
+                .every((body) => body.model === 'claude-opus-4-8'),
+            ).toBe(true)
+          }
+          for (const responses of [10]) {
+            await send('claude-opus-5-5', true)
+            for (let index = 0; index < responses; index++) {
+              await send('claude-opus-4-8')
+              if (responses === 10 && index === 0) {
+                expect(
+                  messages().filter((body) => body.max_tokens === 0),
+                ).toHaveLength(0)
+                ;(
+                  fixture.intervals as IntervalRecord[] & {
+                    clock: (now: number) => void
+                  }
+                ).clock(now + 55 * 60_000)
+                await manager.tick()
+                expect(
+                  messages()
+                    .filter((body) => body.max_tokens === 0)
+                    .map((body) => body.model),
+                ).toEqual(['claude-opus-4-8'])
+              }
+            }
+            await send('claude-opus-5-5')
+            await send('claude-opus-5-5')
+          }
+          // Two source tool responses have completed; eight more clear the backoff.
+          if (cleanReset)
+            for (let index = 0; index < 8; index++)
+              await send('claude-opus-5-5')
+          await send('claude-opus-5-5', true)
+          await drainSidebarWrites()
+          expect(
+            (await getSidebarState()).fableRecoveries?.find(
+              (recovery) => recovery.sessionId === 'recovery-census',
+            )?.remaining,
+          ).toBe(cleanReset ? 10 : 20)
+          await send('claude-opus-4-8')
+          if (!cleanReset) {
+            const changedModel = {
+              ...request,
+              body: JSON.stringify({
+                ...JSON.parse(request.body),
+                model: 'claude-sonnet-4-6',
+              }),
+            }
+            await (
+              await fixture.result.fetch(MESSAGES_URL, changedModel)
+            ).text()
+            await send('claude-opus-5-5')
+            await send('claude-opus-5-5', true)
+            await drainSidebarWrites()
+            expect(
+              (await getSidebarState()).fableRecoveries?.find(
+                (recovery) => recovery.sessionId === 'recovery-census',
+              )?.remaining,
+            ).toBe(10)
+            await send('claude-opus-4-8')
+            await fixture.plugin.event({
+              event: {
+                type: 'session.deleted',
+                properties: { sessionID: 'recovery-census' },
+              },
+            })
+            await send('claude-opus-5-5')
+          }
+        },
       )
-    } catch (error) {
-      throw new Error(
-        `${error instanceof Error ? error.message : String(error)}: ${JSON.stringify({ records: fixture.records, credentialGets: fixture.credentialGets })}`,
-      )
-    }
-
-    expectOnlyVaultToken(
-      fixture.records.filter((record) => record.url.includes('/v1/messages')),
-      'recovery',
-      fixture.credentialGets,
-    )
-  })
 
   test.serial('profile hydration', async () => {
     const fixture = await createFixture('profile', { profile: true })

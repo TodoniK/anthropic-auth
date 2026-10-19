@@ -1142,7 +1142,7 @@ broad_id = "{name}"
 
 [[control]]
 id = "cachekeep-prewarm-log-reason-is-fixed"
-guards = "Immediate recovery warm logs must not contain a provider response body through the returned failure reason."
+guards = "CacheKeep prewarm failures return fixed local reason text rather than a provider response body, and scheduled warm logs never expose that body."
 file = "packages/core/src/cachekeep.ts"
 old = '''      if (summary) {
         return {
@@ -1158,14 +1158,14 @@ new = '''      if (summary) {
           reason: raw, // NON-VACUITY BREAK: return the provider body to the warm log
         }
       }'''
-test_file = "packages/opencode/src/tests/index.test.ts"
+test_file = "packages/core/src/tests/background-error-logging.test.ts"
 runner = "command"
-command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/background-error-logging.test.ts", "{test}"]
 test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["auth.loader > immediate recovery warm http failure logs only fixed provider metadata"]
-expect_message = "error: expect(received).not.toContain(expected)"
-broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
-broad_report = "tmp/mutations/opencode.xml"
+expect_red = ["CacheKeep provider-body and transport failures log status and flags, never the raw reason"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
 junit_class = "suites"
 

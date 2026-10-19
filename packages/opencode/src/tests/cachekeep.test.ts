@@ -483,7 +483,7 @@ describe('CacheKeepManager', () => {
     expect(JSON.parse(sentBody).max_tokens).toBe(0)
   })
 
-  test('bounds immediate prewarm requests so final Fable recovery cannot hang', async () => {
+  test('bounds immediate prewarm requests with an abort deadline', async () => {
     const fetchImpl = mock(
       (_input: string | URL | Request, init?: RequestInit) =>
         new Promise<Response>((_resolve, reject) => {

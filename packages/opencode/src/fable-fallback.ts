@@ -36,6 +36,8 @@ export type FableFallbackPlan = {
 type FableFallbackState = {
   model: string
   remaining: number
+  reRefusals: number
+  sourceSuccesses: number
   cycle: number
   cacheAccountId?: string
   standbyCacheAnchor?: FableStandbyCacheAnchor
@@ -46,9 +48,9 @@ type FableFallbackState = {
 
 /**
  * Models whose content-filter refusal we recover from by downgrading to Opus 4.8
- * for a short window. Fable 5, Fable 5.1, and Opus 5 each have a separate
+ * for a bounded window. Fable 5, Fable 5.1, Opus 5, and Opus 5.5 have separate
  * source family because recovery state must not cross-contaminate distinct
- * requested models. All three use Anthropic's `claude-opus-4-8` fallback for
+ * requested models. All use Anthropic's `claude-opus-4-8` fallback for
  * the same classifier refusal shape and recovery period. Mythos has no
  * classifiers and Sonnet 5 is not flagged — both stay outside this gate.
  */
@@ -100,6 +102,7 @@ function parseBody(bodyText: string) {
 
 export class FableFallbackManager {
   private readonly recoveries = new Map<string, FableFallbackState>()
+  private readonly selectedModels = new Map<string, string>()
   private nextCycle = 1
 
   constructor(private readonly now: () => number = Date.now) {}
@@ -118,18 +121,47 @@ export class FableFallbackManager {
     }
   }
 
+  clearSession(sessionId: string) {
+    this.selectedModels.delete(sessionId)
+    for (const key of this.recoveries.keys()) {
+      if (key.startsWith(`${sessionId}\0`)) this.recoveries.delete(key)
+    }
+  }
+
+  resetForModelChange(sessionId: string, model: string) {
+    const previous = this.selectedModels.get(sessionId)
+    const changed = previous !== undefined && previous !== model
+    if (changed) this.clearSession(sessionId)
+    this.selectedModels.delete(sessionId)
+    this.selectedModels.set(sessionId, model)
+    while (this.selectedModels.size > MAX_TRACKED_RECOVERIES) {
+      const oldest = this.selectedModels.keys().next().value
+      if (oldest === undefined) break
+      this.selectedModels.delete(oldest)
+    }
+    return changed
+  }
+
   plan(
     sessionId: string | null | undefined,
     bodyText: unknown,
   ): FableFallbackPlan | null {
     if (!sessionId || typeof bodyText !== 'string') return null
+    this.prune()
+    // Source probes and other source families are session activity too. In
+    // particular, an exhausted round must not age out during a long source run.
+    for (const [key, recovery] of [...this.recoveries]) {
+      if (!key.startsWith(`${sessionId}\0`)) continue
+      recovery.updatedAt = this.now()
+      this.recoveries.delete(key)
+      this.recoveries.set(key, recovery)
+    }
     const parsed = parseBody(bodyText)
     if (!parsed || !isRecoverableRefusalModel(parsed.model)) return null
     const recoveryKey = fallbackRecoveryKey(sessionId, parsed.model)
     if (!recoveryKey) return null
-
-    this.prune()
     const state = this.recoveries.get(recoveryKey)
+    if (state) state.nextRequestSequence++
     if (!state || state.remaining <= 0) {
       return {
         sessionId,
@@ -138,12 +170,12 @@ export class FableFallbackManager {
         effectiveModel: parsed.model,
         bodyText,
         downgraded: false,
+        cycle: state?.cycle,
         standbyCacheAnchor: state?.standbyCacheAnchor,
       }
     }
 
     state.updatedAt = this.now()
-    state.nextRequestSequence++
     this.recoveries.delete(recoveryKey)
     this.recoveries.set(recoveryKey, state)
     parsed.body.model = FABLE_FALLBACK_MODEL_ID
@@ -187,9 +219,16 @@ export class FableFallbackManager {
     if (plan.downgraded || !isRecoverableRefusalModel(plan.requestedModel)) {
       return this.remaining(plan)
     }
+    const previous = this.recoveries.get(plan.recoveryKey)
+    const reRefusals =
+      previous && previous.sourceSuccesses < FABLE_FALLBACK_TURNS
+        ? previous.reRefusals + 1
+        : 0
     const state: FableFallbackState = {
       model: plan.requestedModel,
-      remaining: FABLE_FALLBACK_TURNS,
+      remaining: FABLE_FALLBACK_TURNS * 2 ** Math.min(reRefusals, 2),
+      reRefusals,
+      sourceSuccesses: 0,
       cycle: this.nextCycle++,
       cacheAccountId,
       standbyCacheAnchor: plan.standbyCacheAnchor,
@@ -201,6 +240,24 @@ export class FableFallbackManager {
     this.recoveries.set(plan.recoveryKey, state)
     this.prune()
     return state.remaining
+  }
+
+  completeSource(plan: FableFallbackPlan, servedBySource = true): boolean {
+    if (plan.downgraded || plan.cycle == null || plan.completed) return false
+    plan.completed = true
+    const state = this.recoveries.get(plan.recoveryKey)
+    if (!state || state.cycle !== plan.cycle || state.remaining > 0)
+      return false
+    if (!servedBySource) {
+      state.sourceSuccesses = 0
+      return false
+    }
+    state.sourceSuccesses = Math.min(
+      state.sourceSuccesses + 1,
+      FABLE_FALLBACK_TURNS,
+    )
+    state.updatedAt = this.now()
+    return true
   }
 
   complete(
@@ -228,9 +285,8 @@ export class FableFallbackManager {
       state.standbyAnchorSequence = plan.requestSequence
     }
     state.updatedAt = this.now()
-    // Retain the zero-remaining state so a later refusal can bridge back
-    // to this model-specific Opus cache boundary without continuously warming
-    // Opus while the original model is healthy.
+    // Retain refusal history and the Opus cache boundary across source probes.
+    // A few successful source responses do not yet clear the refusal backoff.
     this.recoveries.delete(plan.recoveryKey)
     this.recoveries.set(plan.recoveryKey, state)
     return { counted: true, remaining: state.remaining }

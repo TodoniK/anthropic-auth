@@ -25,7 +25,11 @@ API-key/proxy sends have a separate policy: proxy header/model overrides apply t
 
 By default, Fable 5, Fable 5.1, Opus 5 and Opus 5.5 requests authenticated with OAuth opt into Anthropic's server-side safety fallback. The plugin sends `fallbacks: "default"` with `server-side-fallback-2026-07-01`, preserves fallback conversation boundaries in OpenCode history and reports handoffs/restoration in the sidebar or Desktop. Follow-up requests may remain on Anthropic's selected model for about one hour.
 
-If a response from one of those models still ends in refusal, OpenCode 1 starts a deterministic recovery through `claude-opus-4-8`. After **10 successful Opus 4.8 responses** (not ten attempted requests), it prewarms the originally selected model without server-fallback opt-in and returns to that model. A refused response that already completed a tool call keeps the call/result rather than replaying the tool. Recovery state is separate per session and requested model family. Mythos and Sonnet are outside this refusal-recovery gate.
+If a response from one of those models still ends in refusal, OpenCode 1 starts a deterministic recovery through `claude-opus-4-8`. The first round lasts **10 completed Opus 4.8 responses**, the next lasts **20** if the source refuses again, and every further round lasts **40**. The source model is always tried again after each round; recovery never pins the session to Opus. Completed `tool_use` turns count, but failed or incomplete responses and duplicate or stale completion callbacks do not.
+
+After returning to the source model, **10 consecutive successful source-model responses** (including `tool_use`) clear the backoff, so a later refusal starts a new 10-response Opus recovery round. A refusal before that point is a re-refusal, even after two successful source tool responses. A refused response that already completed a tool call keeps the call/result rather than replaying the tool. Recovery state is separate per session and requested model family. Activity refreshes its lifetime even while trying the source, so the 24-hour inactivity cleanup does not reset an active session's backoff. Picking a different model or ending the session clears the state. It is in memory: an OpenCode restart resets it, so a restarted session may try the original model once more. Mythos and Sonnet are outside this refusal-recovery gate.
+
+Recovery does **not** prewarm the source model after Opus responses or wait for a source warm before returning. Retargeting an already-converted Opus request loses the source's fallback boundaries and cannot reproduce the next source request's cache prefix. Ordinary CacheKeep still warms the active model; the account-bound Opus standby anchor remains available for later recovery rounds.
 
 To bypass the server policy and use client recovery from the first refusal, start OpenCode 1 with:
 
@@ -33,11 +37,11 @@ To bypass the server policy and use client recovery from the first refusal, star
 OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy opencode
 ```
 
-Unset the variable and restart to return to server-first policy with client recovery as its backstop. Recovery keeps the session's assigned OAuth account through the temporary model switch and the source-model prewarm. Custom API-key routes receive neither the OAuth fallback beta nor the body field.
+Unset `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` and restart to return to server-first policy with client recovery as its backstop. In either mode, repeated refusals lengthen the Opus recovery rounds from 10 to 20 to 40 completed responses, repeating at 40; ten consecutive successful source responses reset the next round to 10 Opus responses. Recovery keeps the session's assigned OAuth account through the temporary model switch, migrating it only when routing requires another eligible account. Custom API-key routes receive neither the OAuth fallback beta nor the body field.
 
 ### OpenCode 2 boundary
 
-OpenCode 2 applies server-side fallback and response-boundary rewriting in its Anthropic provider integration. It does not run OpenCode 1's 10-response client recovery. `OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK` controls the server opt-in: `legacy` disables it without adding client recovery. The OpenCode 1 variable `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` is not an OpenCode 2 recovery switch.
+OpenCode 2 applies server-side fallback and response-boundary rewriting in its Anthropic provider integration. It does not run OpenCode 1's client recovery backoff. `OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK` controls the server opt-in: `legacy` disables it without adding client recovery. The OpenCode 1 variable `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` is not an OpenCode 2 recovery switch.
 
 ## Implementation
 

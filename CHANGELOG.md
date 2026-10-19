@@ -4,6 +4,11 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+### Refusal recovery
+
+- OpenCode 1 retries a refusing source model less often: 10 completed Opus 4.8 responses after the first refusal, 20 after the first re-refusal, then 40 after every further re-refusal. It always tries the source again after each round and never pins to Opus. Ten consecutive successful source responses reset the backoff to 10; tool-use responses count on both models. Picking another model or ending the session clears recovery. State is in memory: an OpenCode restart resets it, so a restarted session may try the original model once more. The same rules apply in legacy fallback mode.
+- Stop the immediate source-model cache warm after every Opus recovery response and the wait before returning to the source. That warm used an already-converted Opus request without the source's fallback boundaries, not the source's next prompt. Ordinary CacheKeep still warms the active model, and recovery retains its account binding and Opus standby cache anchor. Desktop notices show the current recovery window without claiming the source cache is being warmed; the sidebar keeps its existing per-session recovery notice.
+
 ### Sidebar
 
 - The collapsed OpenCode 1 sidebar now draws quotas with common-auth's shared narrow form, the same one the other CortexKit auth plugins use. An account-wide window without a reading is now left out instead of shown as a placeholder: `5h 87% · 7d — left` becomes `5h 87% left`. An account with no reading at all still shows a muted `—`, and stale readings are still dimmed.

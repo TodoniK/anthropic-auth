@@ -17105,7 +17105,7 @@ describe('auth.loader', () => {
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
   })
 
-  test('downgrades a filtered Fable session for ten successful Opus turns and warms Fable after each', async () => {
+  test('downgrades a filtered Fable session for ten completed Opus responses without source warms', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
@@ -17114,9 +17114,7 @@ describe('auth.loader', () => {
       }),
     )
     const normalModels: string[] = []
-    const warmBodies: Array<Record<string, unknown>> = []
     let firstFable = true
-    let releaseFinalWarm: (() => void) | undefined
     const recorded = recordedCondition()
     const successfulSse = [
       'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
@@ -17145,21 +17143,7 @@ describe('auth.loader', () => {
           )
         }
         const body = JSON.parse(String(init?.body)) as Record<string, unknown>
-        if (body.max_tokens === 0) {
-          warmBodies.push(body)
-          recorded.changed()
-          const warmResponse = () =>
-            new Response(
-              JSON.stringify({ usage: { cache_read_input_tokens: 100 } }),
-              { status: 200 },
-            )
-          if (warmBodies.length === 10) {
-            return new Promise<Response>((resolve) => {
-              releaseFinalWarm = () => resolve(warmResponse())
-            })
-          }
-          return Promise.resolve(warmResponse())
-        }
+        expect(body.max_tokens).not.toBe(0)
         normalModels.push(String(body.model))
         recorded.changed()
         if (body.model === 'claude-fable-5' && firstFable) {
@@ -17450,74 +17434,28 @@ describe('auth.loader', () => {
       await response.text()
     }
 
-    await recorded.until(() => warmBodies.length >= 10)
     expect(normalModels).toEqual([
       'claude-fable-5',
       ...Array.from({ length: 10 }, () => 'claude-opus-4-8'),
     ])
-    expect(warmBodies).toHaveLength(10)
-    for (const warm of warmBodies) {
-      expect(warm.model).toBe('claude-fable-5')
-      expect(warm.max_tokens).toBe(0)
-      expect(warm.stream).toBeUndefined()
-      expect(warm.thinking).toEqual({
-        type: 'adaptive',
-        display: 'summarized',
-      })
-      expect(warm.messages).toHaveLength(1)
-      expect(warm.messages).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            role: 'user',
-            content: expect.arrayContaining([
-              expect.objectContaining({ text: 'same session input' }),
-            ]),
-          }),
-        ]),
-      )
-    }
-
-    const restoredPromise = result.fetch(MESSAGES_URL, request)
-    await new Promise((resolve) => setTimeout(resolve, 5))
-    expect(normalModels).toHaveLength(11)
-    expect(releaseFinalWarm).toBeDefined()
-
-    const opus5Request = {
-      ...request,
-      body: JSON.stringify({
-        ...JSON.parse(request.body),
-        model: 'claude-opus-5',
-      }),
-    }
-    const opus5ResponsePromise = result.fetch(MESSAGES_URL, opus5Request)
-    // A plugin that held this request behind the pending Fable warm would
-    // keep waiting here until teardown; the assertion below then fails.
-    await recorded.until(() => normalModels.at(-1) === 'claude-opus-5')
-    const opus5ReachedUpstream = normalModels.at(-1) === 'claude-opus-5'
-    if (!opus5ReachedUpstream) releaseFinalWarm?.()
-    expect(opus5ReachedUpstream).toBe(true)
-    const opus5Response = await opus5ResponsePromise
-    await opus5Response.text()
-    expect(normalModels).toHaveLength(12)
-
-    const waitingState = await waitForSidebarState((state) =>
+    const restoredState = await waitForSidebarState((state) =>
       Boolean(
         state.fableRecoveries?.some(
           (recovery) =>
             recovery.sessionId === 'ses_fable_filter' &&
-            recovery.mode === 'opus' &&
+            recovery.mode === 'fable' &&
             recovery.remaining === 0,
         ),
       ),
     )
     expect(
-      waitingState.fableRecoveries?.find(
+      restoredState.fableRecoveries?.find(
         (recovery) => recovery.sessionId === 'ses_fable_filter',
       )?.mode,
-    ).toBe('opus')
+    ).toBe('fable')
 
-    // Reproduce the host race: OpenCode can publish idle while the final cache
-    // warm is still pending, before the restoration notice has been queued.
+    // Queue the return-to-Fable notice at the tenth completed Opus response.
+    // Delivery must not depend on a source-cache prewarm request.
     await plugin.event?.({
       event: {
         type: 'session.idle',
@@ -17544,10 +17482,7 @@ describe('auth.loader', () => {
         },
       },
     })
-    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
-
-    releaseFinalWarm?.()
-    const restored = await restoredPromise
+    const restored = await result.fetch(MESSAGES_URL, request)
     await restored.text()
     expect(normalModels.at(-1)).toBe('claude-fable-5')
 
@@ -17571,17 +17506,7 @@ describe('auth.loader', () => {
         }),
       }),
     )
-    expect(normalModels).toHaveLength(13)
-
-    const restoredState = await waitForSidebarState((state) =>
-      Boolean(
-        state.fableRecoveries?.some(
-          (recovery) =>
-            recovery.sessionId === 'ses_fable_filter' &&
-            recovery.mode === 'fable',
-        ),
-      ),
-    )
+    expect(normalModels).toHaveLength(12)
     expect(
       restoredState.fableRecoveries?.find(
         (recovery) => recovery.sessionId === 'ses_fable_filter',
@@ -17944,10 +17869,7 @@ describe('auth.loader', () => {
     expect(state.fableRecoveries).toHaveLength(1)
   })
 
-  async function testRecoveryWarm(warmFailure?: 'http' | 'transport') {
-    const records: LogTestRecord[] = []
-    __setLogTestSink((record) => records.push(record))
-    const prompt = 'FAKE PROMPT LINE: private recovery request'
+  test('migrates recovery to an available OAuth account without warming the source', async () => {
     const now = Date.now()
     await useTempAccountFile(
       bindPoolAccounts(
@@ -18051,24 +17973,6 @@ describe('auth.loader', () => {
             auth,
             warm: body.max_tokens === 0,
           })
-          if (body.max_tokens === 0) {
-            if (warmFailure === 'transport')
-              throw new TypeError(`${prompt} ${auth}`)
-            if (warmFailure === 'http')
-              return Promise.resolve(
-                new Response(
-                  JSON.stringify({
-                    type: 'error',
-                    error: {
-                      type: 'invalid_request_error',
-                      message: `${prompt} ${auth}`,
-                    },
-                  }),
-                  { status: 400 },
-                ),
-              )
-            return Promise.resolve(new Response('{}', { status: 200 }))
-          }
           if (body.model === 'claude-fable-5' && firstFable) {
             firstFable = false
             return Promise.resolve(new Response(refusal, { status: 200 }))
@@ -18108,9 +18012,6 @@ describe('auth.loader', () => {
 
     const opus = await result.fetch(MESSAGES_URL, request)
     await opus.text()
-    for (let attempt = 0; attempt < 100 && calls.length < 3; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 1))
-    }
 
     expect(calls).toEqual([
       {
@@ -18123,45 +18024,8 @@ describe('auth.loader', () => {
         auth: 'Bearer sk-ant-oat01-main-access',
         warm: false,
       },
-      {
-        model: 'claude-fable-5',
-        auth: 'Bearer sk-ant-oat01-fallback-access',
-        warm: true,
-      },
     ])
-    if (warmFailure) {
-      await waitForLogRecord(
-        records,
-        (record) =>
-          record.channel === 'fable-fallback' &&
-          record.message === 'Fable cache warm skipped',
-        'fixed recovery warm failure',
-      )
-      const record = records.find(
-        (record) => record.message === 'Fable cache warm skipped',
-      )
-      expect(record?.payload).toMatchObject({
-        provider_error: {
-          type: warmFailure === 'http' ? 'invalid_request_error' : 'unknown',
-          reason: warmFailure === 'http' ? 'http_validation' : 'transport',
-          message:
-            warmFailure === 'http'
-              ? 'Provider rejected the prewarm request'
-              : 'Provider prewarm transport failed',
-        },
-      })
-      const text = JSON.stringify(record)
-      expect(text).not.toContain(prompt)
-      expect(text).not.toContain('sk-ant-oat01-fallback-access')
-    }
-  }
-
-  test('warms Fable with the OAuth account that was filtered when Opus routes elsewhere', () =>
-    testRecoveryWarm())
-  test('immediate recovery warm http failure logs only fixed provider metadata', () =>
-    testRecoveryWarm('http'))
-  test('immediate recovery warm transport failure logs only fixed provider metadata', () =>
-    testRecoveryWarm('transport'))
+  })
 
   test('sidebar refresh reads metadata without authorizing expired main credentials', async () => {
     const main = { ...syntheticMainHostAuth(), expires: Date.now() - 1_000 }
