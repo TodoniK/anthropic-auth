@@ -3,16 +3,15 @@ import { execFile } from 'node:child_process'
 import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import {
-  assertFreshOpenCode1Journal,
   assertHealthySetupPublication,
   isolatedEnvironment,
   sha256,
   snapshot,
   withReceipt,
 } from './harness.mjs'
+import { loadPackedRuntime, verifySetupReaders } from './packed-readers.mjs'
 import { cleanupFixture } from './setup-evidence.mjs'
 
 const exec = promisify(execFile)
@@ -109,14 +108,7 @@ const ok = await withReceipt(
       )
     const packageRoot = (name) =>
       join(consumer, 'node_modules', ...name.split('/'))
-    const cli = join(packageRoot(opencodeName), 'dist', 'cli.js')
-    const privateEntry = fileURLToPath(
-      import.meta.resolve('@cortexkit/private-files', pathToFileURL(cli).href),
-    )
-    const api = await import(pathToFileURL(privateEntry).href)
-    const core = await import(
-      import.meta.resolve(coreName, pathToFileURL(cli).href)
-    )
+    const { cli, privateEntry, api, core } = await loadPackedRuntime(consumer)
     await step('installed-runtime-loader-and-prebuild', async () => {
       assert(privateEntry.startsWith(join(consumer, 'node_modules')))
       for (const arch of ['x64', 'arm64']) {
@@ -249,56 +241,14 @@ const ok = await withReceipt(
     )
     await step('setup-journal-and-owner-only-readers', async () => {
       assert(setup, 'Successful setup is required to qualify its files')
-      const paths = await core.resolveNativePoolPaths(
-        join(env.OPENCODE_CONFIG_DIR, 'anthropic-auth.json'),
-      )
-      const journal = await core.readNativeMigrationJournal(paths)
-      assertFreshOpenCode1Journal(journal)
-      result.dacls['setup-journal'] = await api.verifyOwnerOnly(paths.journal)
-      assert.equal(result.dacls['setup-journal'].ok, true)
-      result.files['setup-journal'] = sha256(await readFile(paths.journal))
-      // Setup without login creates no runtime account. Exercise the real writer
-      // with an empty synthetic runtime, then read it through the installed Core.
-      await core.updateNativeRuntime(paths.runtime, paths.storageId, () => ({
-        version: 1,
-        storageId: paths.storageId,
-        accounts: {},
-      }))
-      assert.equal(
-        (await core.readNativeRuntime(paths.runtime, paths.storageId)).status,
-        'ready',
-      )
-      result.dacls['synthetic-runtime'] = await api.verifyOwnerOnly(
-        paths.runtime,
-      )
-      assert.equal(result.dacls['synthetic-runtime'].ok, true)
-      const auth = join(profile, 'synthetic-host-auth.json')
-      await api.createPrivateFile(auth, '{}')
-      assert.equal(
-        await core.readNativeHostAuthKind('opencode', auth),
-        'absent',
-      )
-      const token = join(profile, 'synthetic-enrollment.json')
-      await api.createPrivateFile(
-        token,
-        JSON.stringify({ token: fixtureToken, token_generation: 1 }),
-      )
-      assert.equal(
-        (
-          await core.readClaustrumEnrollmentStatus({
-            tokenPath: token,
-            statePath: join(profile, 'missing-state'),
-          })
-        ).state,
-        'approved',
-      )
-      result.files.profile = await snapshot(profile)
-      return {
-        journal: 'setup-written v4 retired migration',
-        runtime: 'synthetic empty',
-        hostAuth: 'synthetic absent',
-        enrollment: 'synthetic token, never used for a connection',
-      }
+      return verifySetupReaders({
+        core,
+        api,
+        env,
+        profile,
+        result,
+        fixtureToken,
+      })
     })
   },
   async () => {

@@ -47,6 +47,15 @@ jobs:
           npm pack ./packages/core --ignore-scripts --pack-destination "$PACKS"
           npm pack ./packages/opencode --ignore-scripts --pack-destination "$PACKS"
           npm pack ./packages/pi --ignore-scripts --pack-destination "$PACKS"
+      - name: Prove installed packed readers before Windows dispatch
+        run: node --experimental-import-meta-resolve scripts/windows/prove-packed-readers.mjs "$RUNNER_TEMP/anthropic-packed" "$RUNNER_TEMP/anthropic-producer-readers.json"
+      - name: Upload portable reader receipt
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: anthropic-producer-readers
+          path: ${{ runner.temp }}/anthropic-producer-readers.json
+          if-no-files-found: warn
       - name: Upload package tarballs
         uses: actions/upload-artifact@v7
         with:

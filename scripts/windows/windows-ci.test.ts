@@ -29,9 +29,24 @@ test('one Linux producer builds and packs the release artifacts once', () => {
   ).run
   for (const name of ['core', 'opencode', 'pi'])
     expect(pack).toContain(`npm pack ./packages/${name} --ignore-scripts`)
-  const upload = job.steps.find((step: any) =>
-    step.uses?.startsWith('actions/upload-artifact@'),
+  const upload = job.steps.find(
+    (step: any) =>
+      step.uses?.startsWith('actions/upload-artifact@') &&
+      step.with.name === 'anthropic-release-packages',
   )
+  const proof = job.steps.find(
+    (step: any) =>
+      step.name === 'Prove installed packed readers before Windows dispatch',
+  )
+  expect(proof.run).toContain(
+    'node --experimental-import-meta-resolve scripts/windows/prove-packed-readers.mjs',
+  )
+  expect(job.steps.indexOf(proof)).toBeGreaterThan(
+    job.steps.findIndex(
+      (step: any) => step.name === 'Pack Core, OpenCode and Pi',
+    ),
+  )
+  expect(job.steps.indexOf(proof)).toBeLessThan(job.steps.indexOf(upload))
   expect(upload.with.name).toBe('anthropic-release-packages')
   expect(upload.with.path).toContain('anthropic-packed/*.tgz')
   expect(upload.with['if-no-files-found']).toBe('error')
