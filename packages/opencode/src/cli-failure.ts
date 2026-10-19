@@ -5,6 +5,8 @@
  * Other failures show a fixed step label, failure code and private diagnostic
  * file path. Details are bounded and scrubbed by the shared authentication
  * library using known credentials and Bearer, JWT and `sk-` token patterns.
+ * If private storage is unavailable, stderr gets only closed error metadata,
+ * never messages, paths or stacks from the command or its failed diagnostic save.
  *
  * Thrown values, credential lists and environments are read only through own
  * data properties: getters, iterators, `toJSON`, `toString` and proxy traps are
@@ -57,6 +59,11 @@ const STAGE_LABELS = {
 } as const
 
 export type CliFailureStage = keyof typeof STAGE_LABELS
+
+interface FailureReportOptions {
+  ownership?: OwnerOnlyOptions
+  stderr?: (line: string) => void
+}
 
 /**
  * Returns its argument unchanged, but fails to type-check unless the list
@@ -135,6 +142,120 @@ const CUSTODY_CODES = everyCode<NativeCustodyErrorCode>()([
   'host-slot-placeholder',
   'placeholder-refresh',
 ])
+
+const ERROR_FIELD_VALUES = {
+  name: new Set([
+    'Error',
+    'TypeError',
+    'SyntaxError',
+    'RangeError',
+    'AggregateError',
+    'AbortError',
+    'PrivateFileError',
+    'PrivateFilesUnavailableError',
+    'DiagnosticFileError',
+    'NativeRuntimeError',
+    'NativeAuthorityError',
+    'NativeMigrationError',
+    'NativeMigrationSourceError',
+    'NativeHostAuthError',
+    'NativeHostAuthWriteError',
+    'NativePiAuthSlotError',
+    'NativeCustodyError',
+    'NativeVaultActivationError',
+    'NativeVaultEnrollmentError',
+    'SetupCommandError',
+    'ProcessFenceViolationError',
+    'ProcessInspectionError',
+    'LockOwnershipError',
+    'LockContentionError',
+    'ClaustrumConsumerError',
+    'ClaustrumCredentialError',
+  ]),
+  code: new Set<string>([
+    ...ACTIVATION_CODES,
+    ...ENROLLMENT_CODES,
+    ...MIGRATION_CODES,
+    ...PI_SLOT_CODES,
+    ...CUSTODY_CODES,
+    'EACCES',
+    'EPERM',
+    'ENOENT',
+    'EEXIST',
+    'ENOTDIR',
+    'EISDIR',
+    'ENOTEMPTY',
+    'EBUSY',
+    'ETIMEDOUT',
+    'ECONNREFUSED',
+    'ECONNRESET',
+    'ECANCELED',
+    'EIO',
+    'EINVAL',
+    'ENOTSUP',
+    'ENOSYS',
+    'ENOMEM',
+    'EMFILE',
+    'ENFILE',
+    'ELOOP',
+    'EROFS',
+    'EXDEV',
+    'ENAMETOOLONG',
+    'EBADF',
+    'EPIPE',
+    'ENOSPC',
+    'EINTR',
+    'ERR_INVALID_ARG_TYPE',
+    'ERR_INVALID_ARG_VALUE',
+    'ERR_OUT_OF_RANGE',
+    'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM',
+    'ERR_PRIVATE_FILES_SECURITY',
+    'ERR_PRIVATE_FILES_UNAVAILABLE',
+    'ERR_PRIVATE_FILE',
+    'ERR_DIAGNOSTICS_DIRECTORY_UNAVAILABLE',
+    'ERR_DIAGNOSTICS_NOT_DIRECTORY',
+    'ERR_DIAGNOSTICS_NOT_OWNER_ONLY',
+    'unsafe-runtime',
+    'invalid-runtime',
+    'runtime-io',
+    'runtime-conflict',
+    'publication-refused',
+    'invalid-journal',
+    'source-io',
+    'source-changed',
+    'source-too-large',
+    'write-io',
+  ]),
+  stage: new Set([
+    'safe-parent',
+    'verify',
+    'directory',
+    'read',
+    'create',
+    'directory-create',
+    'rename',
+    'stage-directory',
+    'stage-create',
+    'before-rename',
+    'published-callback',
+    'published-verify',
+    'directory-sync-unsupported',
+  ]),
+  reason: new Set([
+    'wrong-owner',
+    'extra-ace',
+    'not-protected',
+    'null-dacl',
+    'empty-dacl',
+    'reparse-point',
+    'unsupported-filesystem',
+    'unsafe-ancestor',
+    'wrong-kind',
+    'io-error',
+    'mode',
+    'writable-by-others',
+  ]),
+}
 
 /**
  * Every fixed message a known failure can carry. Messages of error classes
@@ -484,6 +605,33 @@ function errorKind(value: object): string {
   return 'object'
 }
 
+/** Closed metadata remains safe to display even when private storage is unavailable. */
+function stableErrorFields(value: unknown, secrets: string[] | undefined) {
+  const fields: Partial<Record<keyof typeof ERROR_FIELD_VALUES, string>> = {}
+  if (secrets === undefined) return fields
+  try {
+    if (!isInspectable(value)) return fields
+    const redactor = createProviderErrorRedactor(secrets)
+    try {
+      for (const key of ['name', 'code', 'stage', 'reason'] as const) {
+        const field = key === 'name' ? errorKind(value) : ownData(value, key)
+        if (
+          typeof field === 'string' &&
+          ERROR_FIELD_VALUES[key].has(field) &&
+          redactor.redactText(field) === field
+        )
+          fields[key] = field
+      }
+    } finally {
+      redactor.dispose()
+    }
+  } catch {
+    // Unreadable metadata is omitted rather than coercing an untrusted value.
+    return {}
+  }
+  return fields
+}
+
 /**
  * Core's bundle contains its own SetupCommandError constructor, so instanceof
  * against a separately imported constructor would reject the runner's errors.
@@ -578,12 +726,30 @@ export async function writeDiagnosticFile(
   contents: string,
   ownership: OwnerOnlyOptions = {},
 ): Promise<string | undefined> {
+  return (await writeDiagnosticResult(env, stage, contents, ownership)).path
+}
+
+interface DiagnosticWriteResult {
+  path?: string
+  error?: unknown
+}
+
+async function writeDiagnosticResult(
+  env: unknown,
+  stage: CliFailureStage,
+  contents: string,
+  ownership: OwnerOnlyOptions = {},
+): Promise<DiagnosticWriteResult> {
+  const refuse = (code: string): DiagnosticWriteResult => ({
+    error: { name: 'DiagnosticFileError', code },
+  })
   try {
     const directory = cliDiagnosticsDirectory(env)
-    if (directory === undefined) return undefined
+    if (directory === undefined)
+      return refuse('ERR_DIAGNOSTICS_DIRECTORY_UNAVAILABLE')
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const metadata = await lstat(directory)
-    if (!metadata.isDirectory()) return undefined
+    if (!metadata.isDirectory()) return refuse('ERR_DIAGNOSTICS_NOT_DIRECTORY')
     if (
       !(await isOwnerOnly(
         directory,
@@ -592,12 +758,12 @@ export async function writeDiagnosticFile(
         ownership,
       ))
     )
-      return undefined
+      return refuse('ERR_DIAGNOSTICS_NOT_OWNER_ONLY')
     const path = join(
       directory,
       `${stage}-${Date.now()}-${process.pid}-${randomUUID()}.log`,
     )
-    if (await createWindowsOwnerOnly(path, contents, ownership)) return path
+    if (await createWindowsOwnerOnly(path, contents, ownership)) return { path }
     const handle = await open(
       path,
       constants.O_WRONLY |
@@ -611,9 +777,9 @@ export async function writeDiagnosticFile(
     } finally {
       await handle.close()
     }
-    return path
-  } catch {
-    return undefined
+    return { path }
+  } catch (error) {
+    return { error }
   }
 }
 
@@ -624,6 +790,8 @@ async function recordFailure(
   submitted: unknown,
   fields: Record<string, unknown>,
   detail: () => { text: string; keep: 'head' | 'tail' },
+  failure: unknown,
+  options: FailureReportOptions = {},
 ): Promise<string> {
   let lines: string[]
   const secrets = collectKnownSecrets(env, submitted)
@@ -652,11 +820,26 @@ async function recordFailure(
     code,
     ...fields,
   })
-  const path = await writeDiagnosticFile(
+  const saved = await writeDiagnosticResult(
     env,
     stage,
     `${[header, ...lines].join('\n')}\n`,
+    options.ownership,
   )
+  const path = saved.path
+  if (path === undefined) {
+    const metadata = {
+      error: stableErrorFields(failure, secrets),
+      saveError: stableErrorFields(saved.error, secrets),
+    }
+    try {
+      const write =
+        options.stderr ?? ((line: string) => process.stderr.write(line))
+      write(`CLI failure metadata: ${JSON.stringify(metadata)}\n`)
+    } catch {
+      // Failure reporting must preserve the original command result.
+    }
+  }
   return path === undefined
     ? `${label} failed (${code}). Details could not be saved to a private diagnostics file.`
     : `${label} failed (${code}). Details were written to ${path}`
@@ -668,12 +851,15 @@ async function recordFailure(
  * and replaced by a fixed line naming that file. `env` supplies both the
  * secret-named values to scrub and the diagnostics location; `submitted`
  * holds the credentials the failing command handled.
+ * When the private file cannot be saved, one allowlisted metadata line is
+ * also emitted to stderr without changing the fixed screen text.
  */
 export async function reportThrownFailure(
   stage: CliFailureStage,
   error: unknown,
   env: unknown,
   submitted: unknown = [],
+  options: FailureReportOptions = {},
 ): Promise<string> {
   const known = knownFailureMessage(error)
   if (known !== undefined) return known
@@ -698,6 +884,8 @@ export async function reportThrownFailure(
       ].join('\n'),
       keep: 'head',
     }),
+    error,
+    options,
   )
 }
 
@@ -717,5 +905,6 @@ export async function reportInstallerFailure(
       text: typeof result.stderr === 'string' ? result.stderr : '',
       keep: 'tail',
     }),
+    undefined,
   )
 }
