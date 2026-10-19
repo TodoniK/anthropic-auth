@@ -351,13 +351,6 @@ describe('OpenCode Anthropic auth e2e', () => {
     )
     await harness.waitForSessionText(sessionId, 'Switched to Opus 4.8')
 
-    const anthropic = harness.anthropic
-    await harness.waitFor(
-      () =>
-        anthropic.requests().some((request) => request.body.max_tokens === 0),
-      { timeoutMs: 5_000, label: 'source-model prewarm request' },
-    )
-
     expect(await Bun.file(sideEffectPath).text()).toBe('x')
     expect(
       harness.anthropic
@@ -384,20 +377,18 @@ describe('OpenCode Anthropic auth e2e', () => {
       'cortexkit-server-fallback-v1:',
     )
 
-    const prewarmRequest = harness.anthropic
-      .requests()
-      .find((request) => request.body.max_tokens === 0)
-    expect(prewarmRequest?.body.model).toBe('claude-fable-5')
-    expect(prewarmRequest?.body.fallbacks).toBeUndefined()
-    expect(JSON.stringify(prewarmRequest?.body)).not.toContain(
-      'cortexkit-server-fallback-v1:',
-    )
-    expect(prewarmRequest?.headers['anthropic-beta']).not.toContain(
-      'server-side-fallback-2026-07-01',
-    )
+    expect(
+      harness.anthropic
+        .requests()
+        .filter(
+          (request) =>
+            request.body.model === 'claude-fable-5' &&
+            request.body.max_tokens === 0,
+        ),
+    ).toHaveLength(0)
   }, 60_000)
 
-  it('retries a Fable refusal with Opus and immediately prewarms Fable', async () => {
+  it('retries a Fable refusal with Opus without warming Fable', async () => {
     harness = await E2EHarness.create({
       hybridCache: true,
       fallbackMode: 'legacy',
@@ -431,17 +422,15 @@ describe('OpenCode Anthropic auth e2e', () => {
     expect(serialized).toContain('recovered through opus')
     await harness.waitForSessionText(sessionId, 'Switched to Opus 4.8')
     expect(serialized).not.toContain('ContentFilterError')
-    await harness.waitFor(
-      () =>
-        harness!.anthropic
-          .requests()
-          .some(
-            (request) =>
-              request.body.model === 'claude-fable-5' &&
-              request.body.max_tokens === 0,
-          ),
-      { timeoutMs: 30_000, label: 'Fable cache prewarm captured' },
-    )
+    expect(
+      harness.anthropic
+        .requests()
+        .filter(
+          (request) =>
+            request.body.model === 'claude-fable-5' &&
+            request.body.max_tokens === 0,
+        ),
+    ).toHaveLength(0)
 
     const sessionRequests = harness.anthropic.requests().filter((request) => {
       const serializedBody = JSON.stringify(request.body)
