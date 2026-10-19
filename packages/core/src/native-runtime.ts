@@ -41,6 +41,11 @@ import {
 } from './pool-binding.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
+import {
+  capturePublicationOptions,
+  type PublicationOptions,
+  renameWithWindowsSharingRetry,
+} from './publication-rename.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
 /** Identifies the vault credential and Claude account that supplied an observation. This binding contains no access token. */
@@ -578,6 +583,7 @@ export async function readNativeRuntime(
 }
 
 export interface NativeRuntimeWriteHooks {
+  publication?: PublicationOptions
   /** Verify that the observed account still matches the current pool record or vault roster and that the caller still owns the locks protecting those records. */
   beforeRename?: () => Promise<void>
   /** Check caller authority after every lease assertion, immediately before replacement. This hook can only refuse publication. */
@@ -735,6 +741,7 @@ export type NativeRuntimeOptionalPublication =
   | { status: 'skipped' }
 
 export interface NativeRuntimeOptionalWriteHooks {
+  publication?: PublicationOptions
   /**
    * Same checks as NativeRuntimeWriteHooks.beforeRename, run at the same
    * point. Resolve 'skip' to discard the staged write without an error; throw
@@ -759,6 +766,7 @@ export async function updateNativeRuntimeOptional(
 ): Promise<NativeRuntimeOptionalPublication> {
   return writeNativeRuntimeOutcome(path, storageId, change, {
     beforeRename: hooks.beforeRename,
+    publication: hooks.publication,
   })
 }
 
@@ -787,6 +795,7 @@ async function writeNativeRuntime(
       },
       beforePublish: hooks.beforePublish,
       afterRename: hooks.afterRename,
+      publication: hooks.publication,
     },
     firstIdentity,
   )
@@ -808,6 +817,7 @@ async function writeNativeRuntimeOutcome(
   firstIdentity?: FirstIdentityPublication,
 ): Promise<NativeRuntimeOptionalPublication> {
   checkPath(path)
+  const publication = capturePublicationOptions(hooks.publication)
   try {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 })
     return await withLock(
@@ -863,7 +873,36 @@ async function writeNativeRuntimeOutcome(
           } catch {
             throw new NativeRuntimeError('publication-refused')
           }
-          await rename(stage, path)
+          if (publication.platform === 'win32') {
+            const retryHooks = hooks
+            const result = await renameWithWindowsSharingRetry(
+              stage,
+              path,
+              publication,
+              async () => {
+                let decision: 'publish' | 'skip'
+                try {
+                  decision = await retryHooks.beforeRename()
+                } catch {
+                  throw new NativeRuntimeError('publication-refused')
+                }
+                try {
+                  await lock.assertOwned()
+                } catch {
+                  throw new NativeRuntimeError('publication-refused')
+                }
+                if (decision === 'skip') return 'skip'
+                try {
+                  await retryHooks.beforePublish?.()
+                  if (retryHooks.beforePublish) await lock.assertOwned()
+                } catch {
+                  throw new NativeRuntimeError('publication-refused')
+                }
+                return 'publish'
+              },
+            )
+            if (result === 'skipped') return { status: 'skipped' }
+          } else await (publication.rename ?? rename)(stage, path)
           ownsStage = false
           try {
             await hooks.afterRename?.()

@@ -1255,3 +1255,35 @@ expect_message = "Expected promise that rejects"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "runtime-windows-sharing-retry"
+guards = "Windows runtime publication retries a transient sharing failure without dropping its authority or lease fences."
+file = "packages/core/src/native-runtime.ts"
+old = "if (publication.platform === 'win32') {"
+new = "if (false /* NON-VACUITY BREAK: bypass runtime sharing retry */) {"
+test_file = "packages/core/src/tests/windows-publication.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/windows-publication.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtime win32 publication retries EBUSY and repeats fences before success"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "host-auth-windows-sharing-retry"
+guards = "Windows host-auth publication retries a transient sharing failure and rechecks its full source and process fence."
+file = "packages/core/src/native-host-auth-write.ts"
+old = "if (publication.platform === 'win32') {"
+new = "if (false /* NON-VACUITY BREAK: bypass host-auth sharing retry */) {"
+test_file = "packages/core/src/tests/windows-publication.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/windows-publication.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["host-auth win32 publication retries EBUSY and repeats fences before success"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

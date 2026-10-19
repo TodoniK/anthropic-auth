@@ -14,6 +14,11 @@ import {
   requireNoSupervisedAuthContentSnapshot,
 } from './native-host-auth.ts'
 import { createWindowsOwnerOnly } from './owner-only.ts'
+import {
+  capturePublicationOptions,
+  type PublicationOptions,
+  renameWithWindowsSharingRetry,
+} from './publication-rename.ts'
 
 export interface NativeHostAuthWriteInput {
   readonly host: 'opencode' | 'pi'
@@ -34,6 +39,7 @@ export interface NativeHostAuthWriteInput {
 }
 
 export interface NativeHostAuthWriteHooks {
+  readonly publication?: PublicationOptions
   readonly beforeRecheck?: () => Promise<void>
   readonly beforeRename?: () => Promise<void>
   readonly afterRename?: () => Promise<void>
@@ -122,6 +128,7 @@ export async function writeNativeHostAuth(
     } = input
     requireNoSupervisedAuthContentSnapshot(input.env)
     const { beforeRecheck, beforeRename, afterRename, afterUnlink } = hooks
+    const publication = capturePublicationOptions(hooks.publication)
     if (
       (host !== 'opencode' && host !== 'pi') ||
       typeof authPath !== 'string' ||
@@ -210,7 +217,20 @@ export async function writeNativeHostAuth(
       effect = outcome
       await barrier(afterUnlink, 'hook-failed', effect)
     } else {
-      await rename(stage as string, authPath)
+      if (publication.platform === 'win32') {
+        await renameWithWindowsSharingRetry(
+          stage as string,
+          authPath,
+          publication,
+          async () => {
+            await barrier(beforeRecheck, 'hook-failed')
+            await requireUnchangedNativeMigrationSource(snapshot)
+            await barrier(beforeRename, 'hook-failed')
+            await barrier(processFence, 'process-fence-refused')
+            return 'publish'
+          },
+        )
+      } else await (publication.rename ?? rename)(stage as string, authPath)
       ownedStage = undefined
       effect = outcome
       await barrier(afterRename, 'hook-failed', effect)

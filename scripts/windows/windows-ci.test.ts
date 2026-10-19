@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { execFile } from 'node:child_process'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -15,7 +15,35 @@ const release = Bun.YAML.parse(
   await readFile(new URL('.github/workflows/release.yaml', root), 'utf8'),
 ) as any
 
-test('Windows proof uses packed packages under Node on all supported runners and always retains receipts', () => {
+test('one Linux producer builds and packs the release artifacts once', () => {
+  const job = workflow.jobs['build-packages']
+  expect(job?.['runs-on']).toBe('ubuntu-latest')
+  expect(job.strategy).toBeUndefined()
+  expect(job.steps[0].with.ref).toBe('$' + '{{ inputs.ref || github.sha }}')
+  const build = job.steps.find(
+    (step: any) => step.name === 'Build release packages',
+  )
+  expect(build.run).toBe('bun run build')
+  const pack = job.steps.find(
+    (step: any) => step.name === 'Pack Core, OpenCode and Pi',
+  ).run
+  for (const name of ['core', 'opencode', 'pi'])
+    expect(pack).toContain(`npm pack ./packages/${name} --ignore-scripts`)
+  const upload = job.steps.find((step: any) =>
+    step.uses?.startsWith('actions/upload-artifact@'),
+  )
+  expect(upload.with.name).toBe('anthropic-release-packages')
+  expect(upload.with.path).toContain('anthropic-packed/*.tgz')
+  expect(upload.with['if-no-files-found']).toBe('error')
+  expect(workflow.on.workflow_call.inputs.version.type).toBe('string')
+  expect(
+    job.steps.find(
+      (step: any) => step.name === 'Sync requested release version',
+    ).run,
+  ).toContain('scripts/version-sync.mjs')
+})
+
+test('Windows proof downloads shared tarballs under Node without repository dev installation on any runner', () => {
   expect(workflow.on.workflow_call).toBeDefined()
   expect(workflow.on.push.branches).toEqual(['main', 'windows-verify/**'])
   expect(workflow.on.pull_request.branches).toEqual(['main'])
@@ -25,12 +53,19 @@ test('Windows proof uses packed packages under Node on all supported runners and
     'windows-2022',
     'windows-11-arm',
   ])
-  const pack = job.steps.find(
-    (step: any) => step.name === 'Pack Core, OpenCode and Pi',
-  ).run
-  for (const name of ['core', 'opencode', 'pi'])
-    expect(pack).toContain(`npm pack ./packages/${name}`)
-  expect(pack.match(/LASTEXITCODE/g)?.length).toBeGreaterThanOrEqual(5)
+  expect(job.needs).toContain('build-packages')
+  expect(job.steps[0].with.ref).toBe('$' + '{{ inputs.ref || github.sha }}')
+  const download = job.steps.find((step: any) =>
+    step.uses?.startsWith('actions/download-artifact@'),
+  )
+  expect(download.with.name).toBe('anthropic-release-packages')
+  expect(download.with.path).toContain('anthropic-packed')
+  expect(
+    job.steps.some((step: any) => step.uses?.startsWith('oven-sh/setup-bun@')),
+  ).toBe(false)
+  for (const step of job.steps) {
+    expect(step.run ?? '').not.toMatch(/\bbun\b|npm\s+(?:ci|install|pack)\b/)
+  }
   const proof = job.steps.find(
     (step: any) =>
       step.name === 'Verify installed packages under Node and retain receipt',
@@ -144,4 +179,70 @@ test('OpenCode 1 journal proof accepts the real v4 retired migration and rejects
   expect(output.stdout).toContain(
     'v4 retired journal accepted and 5 wrong-route/unfinished controls refused',
   )
+})
+
+test('release publishes the exact verified tarballs without a second build or lifecycle repack', () => {
+  expect(release.jobs.windows.with.version).toBe(
+    '$' + '{{ github.event.inputs.version || github.ref_name }}',
+  )
+  const job = release.jobs['publish-npm']
+  const download = job.steps.find((step: any) =>
+    step.uses?.startsWith('actions/download-artifact@'),
+  )
+  expect(download?.with.name).toBe('anthropic-release-packages')
+  const publish = job.steps.find(
+    (step: any) => step.name === 'Publish package to npm',
+  ).run
+  expect(publish).toContain('anthropic-packed')
+  expect(publish).toContain('.tgz')
+  expect(publish).toContain('--ignore-scripts')
+  expect(publish).not.toContain('--workspace')
+  expect(
+    job.steps.some((step: any) => step.uses?.startsWith('oven-sh/setup-bun@')),
+  ).toBe(false)
+  for (const step of job.steps)
+    expect(step.run ?? '').not.toMatch(
+      /bun install|bun run build|version-sync\.mjs/,
+    )
+})
+
+test('artifact publishing selects the supplied scoped-package tarball and disables lifecycle scripts', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'verified-package-publish-'))
+  try {
+    await mkdir(join(dir, 'anthropic-packed'))
+    const script = release.jobs['publish-npm'].steps.find(
+      (step: any) => step.name === 'Publish package to npm',
+    ).run
+    for (const { package: name } of release.jobs['publish-npm'].strategy.matrix
+      .include) {
+      const archive = join(
+        dir,
+        'anthropic-packed',
+        `${name.slice(1).replace('/', '-')}-9.8.7.tgz`,
+      )
+      await writeFile(archive, 'synthetic tarball path fixture')
+      const result = await run(
+        'bash',
+        ['-c', `npm() { printf '%s\\n' "$@"; }; ${script}`],
+        {
+          env: {
+            ...process.env,
+            RUNNER_TEMP: dir,
+            PACKAGE_NAME: name,
+            PACKAGE_VERSION: '9.8.7',
+          },
+        },
+      )
+      expect(result.stdout.trim().split('\n')).toEqual([
+        'publish',
+        archive,
+        '--ignore-scripts',
+        '--access',
+        'public',
+        '--provenance',
+      ])
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
