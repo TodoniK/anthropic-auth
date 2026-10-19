@@ -9,6 +9,7 @@ import {
   nativeMigrationCanonicalJson,
   requireNativeMigrationDataObject,
 } from './native-migration-proof.ts'
+import { isOwnerOnly, type OwnerOnlyOptions } from './owner-only.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 
 const PHASES = [
@@ -522,14 +523,22 @@ function decodeJournal(
 
 export async function readNativeMigrationJournal(
   paths: NativePoolPaths,
+  ownership: OwnerOnlyOptions = {},
 ): Promise<NativeMigrationJournal | undefined> {
   try {
-    const snapshot = await readNativeMigrationSource('journal', paths.journal)
+    const snapshot = await readNativeMigrationSource('journal', paths.journal, {
+      ownership,
+    })
     if (!snapshot.data) return undefined
     if (
       !snapshot.metadata ||
-      (snapshot.metadata.mode & 0o777) !== 0o600 ||
-      (process.getuid && snapshot.metadata.uid !== process.getuid())
+      !(await isOwnerOnly(
+        paths.journal,
+        () =>
+          ((snapshot.metadata?.mode ?? 0) & 0o777) === 0o600 &&
+          (!process.getuid || snapshot.metadata?.uid === process.getuid()),
+        ownership,
+      ))
     )
       throw new NativeAuthorityError('invalid-journal')
     return decodeJournal(snapshot.data, paths.storageId)

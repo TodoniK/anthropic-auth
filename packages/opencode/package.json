@@ -53,7 +53,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/v2/server.ts src/v2/tui.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --root src --target node --format esm --splitting --external @opencode-ai/plugin --external @opencode/plugin --external jsonc-parser --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui && bun run check:bundle",
+    "build": "rm -rf dist && bun build src/index.ts src/v2/server.ts src/v2/tui.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --root src --target node --format esm --splitting --external @opencode-ai/plugin --external @opencode/plugin --external @cortexkit/anthropic-auth-core --external @cortexkit/private-files --external @cortexkit/claustrum-client --external @cortexkit/subc-client --external xxhash-wasm --external jsonc-parser --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui && bun run check:bundle",
     "build:tui": "bun scripts/build-tui.ts",
     "smoke:tui": "bun scripts/smoke-tui-pack-install.ts",
     "check:bundle": "bun scripts/check-bundle-globals.ts",
@@ -78,10 +78,14 @@
   "dependencies": {
     "@clack/prompts": "^1.6.0",
     "@cortexkit/anthropic-auth-core": "2.0.3",
+    "@cortexkit/claustrum-client": "0.11.0",
+    "@cortexkit/private-files": "0.2.1",
+    "@cortexkit/subc-client": "^0.22.0",
     "@opentui/core": "0.6.5",
     "@opentui/solid": "0.6.5",
     "jsonc-parser": "^3.3.1",
-    "solid-js": "1.9.12"
+    "solid-js": "1.9.12",
+    "xxhash-wasm": "^1.1.0"
   },
   "devDependencies": {
     "@ai-sdk/anthropic": "4.0.77",

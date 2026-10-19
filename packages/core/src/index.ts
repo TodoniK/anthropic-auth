@@ -248,6 +248,11 @@ export {
   publishNativeVaultRuntimeSeed,
 } from './native-vault-runtime.ts'
 export * from './oauth-profile.ts'
+export {
+  createWindowsOwnerOnly,
+  isOwnerOnly,
+  type OwnerOnlyOptions,
+} from './owner-only.ts'
 export * from './pkce.ts'
 export type {
   NativeEmptyInitJournal,

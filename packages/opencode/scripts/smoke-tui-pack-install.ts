@@ -257,6 +257,42 @@ async function runPackedHostRuntimeProbe(
     '@cortexkit',
     'opencode-anthropic-auth',
   )
+  const runtimePackaging = run(
+    'node',
+    [
+      '--experimental-import-meta-resolve',
+      '--input-type=module',
+      '-e',
+      `
+import assert from 'node:assert/strict';
+import { dirname, join } from 'node:path';
+import { readdir, readFile, access } from 'node:fs/promises';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+const root = process.argv[1];
+const privateEntry = fileURLToPath(import.meta.resolve('@cortexkit/private-files', pathToFileURL(join(root, 'dist/cli.js')).href));
+assert(privateEntry.includes('node_modules'));
+assert(!privateEntry.startsWith(join(root, 'dist')));
+for (const arch of ['x64', 'arm64']) {
+  await access(join(dirname(privateEntry), '../prebuilds/private-files-win32-' + arch + '.node'));
+}
+const names = await readdir(join(root, 'dist'), { recursive: true });
+const source = (await Promise.all(names.filter(n => n.endsWith('.js')).map(n => readFile(join(root, 'dist', n), 'utf8')))).join('\\n');
+assert(!source.includes('private-files-win32-'), 'private-files native loader was inlined');
+assert(!source.includes('loadPrivateFilesNative'), 'private-files implementation was inlined');
+assert(source.includes('@cortexkit/anthropic-auth-core'), 'Core must resolve from its installed dist');
+assert(source.includes('@cortexkit/private-files'), 'shared runner must retain its runtime import');
+const api = await import(pathToFileURL(privateEntry).href);
+assert.equal(typeof api.verifyOwnerOnly, 'function');
+console.log('packed runtime packages resolve with both Windows prebuilds; no inlined loader');
+`,
+      installedPackageRoot,
+    ],
+    installRoot,
+  )
+  check(
+    'packed runtime packages retain their own native resources',
+    runtimePackaging.includes('no inlined loader'),
+  )
   const probe = `
 import { createTestRenderer } from "@opentui/core/testing";
 import { readFile, writeFile } from "node:fs/promises";

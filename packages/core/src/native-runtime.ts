@@ -29,6 +29,12 @@ import type {
   NativeRefreshSubject,
 } from './native-refresh-coordinator.ts'
 import {
+  createWindowsOwnerOnly,
+  isOwnerOnly,
+  type OwnerOnlyOptions,
+  readWindowsOwnerOnly,
+} from './owner-only.ts'
+import {
   isNativeLocalPoolBinding,
   type NativeLocalPoolBinding,
   nativeLocalPoolBindingMatches,
@@ -499,6 +505,7 @@ function checkPath(path: string): void {
 export async function readNativeRuntime(
   path: string,
   storageId: string,
+  ownership: OwnerOnlyOptions = {},
 ): Promise<NativeRuntimeRead> {
   checkPath(path)
   if (!digest(storageId)) throw new NativeRuntimeError('invalid-runtime')
@@ -508,9 +515,14 @@ export async function readNativeRuntime(
       const info = await lstat(path)
       if (
         !info.isFile() ||
-        (info.mode & 0o777) !== 0o600 ||
-        (typeof process.geteuid === 'function' &&
-          info.uid !== process.geteuid())
+        !(await isOwnerOnly(
+          path,
+          () =>
+            (info.mode & 0o777) === 0o600 &&
+            (typeof process.geteuid !== 'function' ||
+              info.uid === process.geteuid()),
+          ownership,
+        ))
       )
         throw new NativeRuntimeError('unsafe-runtime')
       const file = await open(path, constants.O_RDONLY | noFollow)
@@ -518,13 +530,19 @@ export async function readNativeRuntime(
         const opened = await file.stat()
         if (
           !opened.isFile() ||
-          (opened.mode & 0o777) !== 0o600 ||
-          (typeof process.geteuid === 'function' &&
-            opened.uid !== process.geteuid())
+          !(await isOwnerOnly(
+            path,
+            () =>
+              (opened.mode & 0o777) === 0o600 &&
+              (typeof process.geteuid !== 'function' ||
+                opened.uid === process.geteuid()),
+            ownership,
+          ))
         )
           throw new NativeRuntimeError('unsafe-runtime')
         // Atomic publication may replace the file between lstat and open.
-        // O_NOFOLLOW and the opened handle's permissions establish its safety.
+        // On POSIX, O_NOFOLLOW and the opened handle's permissions establish safety.
+        // Windows reads bytes through an ACL-verified native handle below.
         // Without that flag, require matching file identity and retry once.
         if (!noFollow && (opened.dev !== info.dev || opened.ino !== info.ino)) {
           if (attempt === 0) continue
@@ -533,7 +551,8 @@ export async function readNativeRuntime(
         let contents: string
         try {
           contents = new TextDecoder('utf-8', { fatal: true }).decode(
-            await file.readFile(),
+            (await readWindowsOwnerOnly(path, ownership)) ??
+              (await file.readFile()),
           )
         } catch (error) {
           if (error instanceof TypeError)
@@ -812,10 +831,15 @@ async function writeNativeRuntimeOutcome(
         )
         let ownsStage = false
         try {
-          const file = await open(stage, 'wx', 0o600)
+          const nativeCreated = await createWindowsOwnerOnly(stage, bytes)
+          const file = await open(
+            stage,
+            nativeCreated ? constants.O_RDWR : 'wx',
+            0o600,
+          )
           ownsStage = true
           try {
-            await file.writeFile(bytes, 'utf8')
+            if (!nativeCreated) await file.writeFile(bytes, 'utf8')
             await file.sync()
           } finally {
             await file.close()

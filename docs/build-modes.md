@@ -7,7 +7,7 @@ bun run --cwd packages/opencode build
 bun run --cwd packages/opencode build:dev
 ```
 
-`build` uses Bun to bundle Core and its bundled dependencies into split `dist/` output, emits declarations, compiles the TUI and checks bundle globals. The OpenCode 1/2 plugin peers and `jsonc-parser` remain external; this is not a promise that the package needs no runtime dependencies. Preserve normal package installation and host module resolution.
+`build` uses Bun to bundle the OpenCode adapter and its shared host helpers into split `dist/` output, emits declarations, compiles the TUI and checks bundle globals. Core resolves from its installed `dist` rather than being bundled again. The OpenCode 1/2 plugin peers, `jsonc-parser`, `xxhash-wasm`, and the private-files, Claustrum and Subconscious client packages remain external so their resource and IPC loaders keep their package-relative paths. Preserve normal package installation and host module resolution.
 
 `build:dev` emits individual JavaScript/declaration files with TypeScript and requires workspace dependencies. Build Core first when its source changes. For the full ordered Core/OpenCode/Pi build, use root `bun run build`; the root does not define a `build:dev` script.
 

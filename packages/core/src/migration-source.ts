@@ -3,6 +3,7 @@ import { type BigIntStats, constants } from 'node:fs'
 import { lstat, open } from 'node:fs/promises'
 
 import { parseJsonRedacted } from './json.ts'
+import { type OwnerOnlyOptions, readWindowsOwnerOnly } from './owner-only.ts'
 
 export type NativeMigrationSourceRole =
   | 'config'
@@ -74,6 +75,7 @@ function sourceSnapshot(
 
 interface SourceReadHooks {
   onOpened?: () => Promise<void>
+  ownership?: OwnerOnlyOptions
 }
 
 /**
@@ -125,7 +127,16 @@ export async function readNativeMigrationSource(
     await hooks.onOpened?.()
     const chunks: Buffer[] = []
     let bytes = 0
-    for (;;) {
+    const privateBytes = hooks.ownership
+      ? await readWindowsOwnerOnly(path, hooks.ownership)
+      : undefined
+    if (privateBytes) {
+      bytes = privateBytes.length
+      if (bytes > MAX_SOURCE_BYTES)
+        throw new NativeMigrationSourceError(role, 'source-too-large')
+      chunks.push(privateBytes)
+    }
+    for (; !privateBytes; ) {
       const chunk = Buffer.alloc(64 * 1024)
       const read = await handle.read(chunk)
       if (!read.bytesRead) break

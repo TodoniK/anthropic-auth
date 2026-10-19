@@ -13,6 +13,7 @@ import {
   NativeHostAuthError,
   requireNoSupervisedAuthContentSnapshot,
 } from './native-host-auth.ts'
+import { createWindowsOwnerOnly } from './owner-only.ts'
 
 export interface NativeHostAuthWriteInput {
   readonly host: 'opencode' | 'pi'
@@ -180,14 +181,17 @@ export async function writeNativeHostAuth(
         `.native-host-auth-write.${randomUUID()}.tmp`,
       )
       // Never retry a collision and never clean up a stage we did not create.
-      const handle = await open(stage, 'wx', 0o600)
+      const bytes = `${JSON.stringify(next, null, 2)}\n`
+      const nativeCreated = await createWindowsOwnerOnly(stage, bytes)
+      const handle = await open(stage, nativeCreated ? 'r+' : 'wx', 0o600)
       try {
         const identity = await handle.stat()
         ownedStage = { dev: identity.dev, ino: identity.ino }
-        await handle.writeFile(`${JSON.stringify(next, null, 2)}\n`, 'utf8')
-        await handle.chmod(
-          snapshot.metadata ? snapshot.metadata.mode & 0o7777 : 0o600,
-        )
+        if (!nativeCreated) await handle.writeFile(bytes, 'utf8')
+        if (!nativeCreated)
+          await handle.chmod(
+            snapshot.metadata ? snapshot.metadata.mode & 0o7777 : 0o600,
+          )
         await handle.sync()
       } finally {
         await handle.close()

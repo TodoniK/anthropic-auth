@@ -19,11 +19,14 @@ import { isAbsolute, join } from 'node:path'
 import { types as utilTypes } from 'node:util'
 import {
   createProviderErrorRedactor,
+  createWindowsOwnerOnly,
   formatLogLine,
+  isOwnerOnly,
   isSecretKey,
   type NativeCustodyErrorCode,
   NativeMigrationError,
   NativePiAuthSlotError,
+  type OwnerOnlyOptions,
   type ProviderErrorRedactor,
   // From Core, not common-auth: Core bundles its own copy of runSetup, and
   // only that copy's setupEnrollment can see the outcomes runSetup recorded.
@@ -33,6 +36,7 @@ import type {
   SetupCommandError,
   SetupEnrollmentOutcome,
 } from '@cortexkit/common-auth/setup'
+
 import { NativeVaultActivationError } from './setup/native-activation.ts'
 import { NativeVaultEnrollmentError } from './setup/native-enrollment.ts'
 import { ProcessFenceViolationError } from './setup/process-fence.ts'
@@ -565,13 +569,14 @@ export function cliDiagnosticsDirectory(env: unknown): string | undefined {
  * Write one failure detail to a new owner-only file and return its path, or
  * undefined if that cannot be done safely. An existing directory that is not
  * a real directory owned by this user with no group or other access is
- * refused, never repaired; the file is created exclusively with mode 0600 and
- * without following a symlink.
+ * refused, never repaired. Exclusive creation uses mode 0600 on POSIX and a
+ * protected owner-only DACL on Windows, without following a symlink.
  */
-async function writeDiagnosticFile(
+export async function writeDiagnosticFile(
   env: unknown,
   stage: CliFailureStage,
   contents: string,
+  ownership: OwnerOnlyOptions = {},
 ): Promise<string | undefined> {
   try {
     const directory = cliDiagnosticsDirectory(env)
@@ -579,14 +584,20 @@ async function writeDiagnosticFile(
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const metadata = await lstat(directory)
     if (!metadata.isDirectory()) return undefined
-    if (process.platform !== 'win32') {
-      if ((metadata.mode & 0o077) !== 0) return undefined
-      if (metadata.uid !== process.getuid?.()) return undefined
-    }
+    if (
+      !(await isOwnerOnly(
+        directory,
+        () =>
+          (metadata.mode & 0o077) === 0 && metadata.uid === process.getuid?.(),
+        ownership,
+      ))
+    )
+      return undefined
     const path = join(
       directory,
       `${stage}-${Date.now()}-${process.pid}-${randomUUID()}.log`,
     )
+    if (await createWindowsOwnerOnly(path, contents, ownership)) return path
     const handle = await open(
       path,
       constants.O_WRONLY |

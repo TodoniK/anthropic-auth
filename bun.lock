@@ -53,10 +53,14 @@
       "dependencies": {
         "@clack/prompts": "^1.6.0",
         "@cortexkit/anthropic-auth-core": "2.0.3",
+        "@cortexkit/claustrum-client": "0.11.0",
+        "@cortexkit/private-files": "0.2.1",
+        "@cortexkit/subc-client": "^0.22.0",
         "@opentui/core": "0.6.5",
         "@opentui/solid": "0.6.5",
         "jsonc-parser": "^3.3.1",
         "solid-js": "1.9.12",
+        "xxhash-wasm": "^1.1.0",
       },
       "devDependencies": {
         "@ai-sdk/anthropic": "4.0.77",
@@ -1231,8 +1235,6 @@
     "@babel/traverse/@babel/parser": ["@babel/parser@7.29.7", "", { "dependencies": { "@babel/types": "^7.29.7" }, "bin": "./bin/babel-parser.js" }, "sha512-hnORnjP/1P/zFEndoeX+n+t1RwWRJiJpM/jO7FW32Kn9r5+sJB2JWOdYo4L6k78j15eCwY3Gm/7364B1EMwtNg=="],
 
     "@babel/traverse/@babel/types": ["@babel/types@7.29.7", "", { "dependencies": { "@babel/helper-string-parser": "^7.29.7", "@babel/helper-validator-identifier": "^7.29.7" } }, "sha512-4zBIxpPzowiZpusoFkyGVwakdRJUyuH5PxQ/PrqghfdFWWasvnCdPfQXHrenDai+gyLARulZjZowCOj6fjT4pA=="],
-
-    "@cortexkit/common-auth/@cortexkit/subc-client": ["@cortexkit/subc-client@0.16.1", "", {}, "sha512-TJqOcfMVxhCfZMANmEH/9w+L+zYxFSy5p5Zl/shDErtGSeUF6HFiwZ7OR/P2qFvpSg/yxCbsdenZ7rs5SE6fhA=="],
 
     "@effect/opentelemetry/effect": ["effect@4.0.0-rc.112", "", { "dependencies": { "fast-check": "^4.9.0", "msgpackr": "^2.0.5" } }, "sha512-wXxwuh1Ywnv4cPRM3Wfa0vDwuOHnZ1TsTgHJkG9XgzND6inhBH9n1vBxhg3iIXOia/OrpmvVmd3lrD4vq6bF3A=="],
 

@@ -29,6 +29,7 @@ jobs:
       - run: bun run types
       - run: bun run build
       - run: bun test --cwd packages/opencode scripts/check-bundle-globals.test.ts
+      - run: bun test scripts/windows packages/opencode/scripts/runtime-packaging.test.ts
       - run: bun test scripts/check-pi-dist-imports.test.ts
       - run: bun run check:pi-dist-imports
       - run: bun run --cwd packages/core test:scripts

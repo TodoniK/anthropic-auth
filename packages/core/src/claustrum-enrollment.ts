@@ -28,6 +28,12 @@ import {
 } from '@cortexkit/claustrum-client'
 import { acquireRefreshFileLock } from './accounts.js'
 import { parseJsonRedacted } from './json.js'
+import {
+  createWindowsOwnerOnly,
+  isSafeWindowsParent,
+  type OwnerOnlyOptions,
+  readWindowsOwnerOnly,
+} from './owner-only.ts'
 
 export const CLAUSTRUM_OPENCODE_ENROLLMENT_NAME = 'anthropic-auth-opencode'
 export const CLAUSTRUM_PI_ENROLLMENT_NAME = 'anthropic-auth-pi'
@@ -278,9 +284,18 @@ function validateReadableSecretFile(metadata: {
   }
 }
 
-async function readBoundedJson(path: string): Promise<unknown | undefined> {
+async function readBoundedJson(
+  path: string,
+  ownership: OwnerOnlyOptions = {},
+): Promise<unknown | undefined> {
   let descriptor: Awaited<ReturnType<typeof open>> | undefined
   try {
+    const bytes = await readWindowsOwnerOnly(path, ownership)
+    if (bytes !== undefined) {
+      if (bytes.length > ENROLLMENT_FILE_MAX_BYTES)
+        throw new Error('Claustrum enrollment file is too large')
+      return parseJsonRedacted(bytes.toString('utf8'))
+    }
     descriptor = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
@@ -299,7 +314,17 @@ async function readBoundedJson(path: string): Promise<unknown | undefined> {
   }
 }
 
-async function refuseWritableAncestor(parent: string): Promise<void> {
+export async function refuseWritableAncestor(
+  parent: string,
+  ownership: OwnerOnlyOptions = {},
+  metadataAt: (path: string) => Promise<{ mode: number } | undefined> = (
+    path,
+  ) => stat(path).catch(() => undefined),
+): Promise<void> {
+  const safe = await isSafeWindowsParent(parent, ownership)
+  if (safe === true) return
+  if (safe === false)
+    throw new Error('Claustrum enrollment path has an unsafe writable ancestor')
   let component: string
   try {
     component = await realpath(parent)
@@ -307,7 +332,7 @@ async function refuseWritableAncestor(parent: string): Promise<void> {
     return
   }
   for (;;) {
-    const metadata = await stat(component).catch(() => undefined)
+    const metadata = await metadataAt(component)
     if (
       metadata &&
       (metadata.mode & 0o022) !== 0 &&
@@ -341,8 +366,13 @@ async function writeStateAtomic(
   )
   let descriptor: Awaited<ReturnType<typeof open>> | undefined
   try {
-    descriptor = await open(temporary, 'wx', 0o600)
-    await descriptor.writeFile(bytes, 'utf8')
+    const nativeCreated = await createWindowsOwnerOnly(temporary, bytes)
+    descriptor = await open(
+      temporary,
+      nativeCreated ? fsConstants.O_RDWR : 'wx',
+      0o600,
+    )
+    if (!nativeCreated) await descriptor.writeFile(bytes, 'utf8')
     await descriptor.sync()
     await descriptor.close()
     descriptor = undefined
@@ -380,11 +410,12 @@ async function writeTokenAtomic(
 export async function readClaustrumEnrollmentStatus(
   paths: ClaustrumEnrollmentPaths,
   proposedName = CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+  ownership: OwnerOnlyOptions = {},
 ): Promise<ClaustrumEnrollmentStatus> {
-  const tokenValue = await readBoundedJson(paths.tokenPath)
+  const tokenValue = await readBoundedJson(paths.tokenPath, ownership)
   const token =
     tokenValue === undefined ? undefined : decodeTokenFile(tokenValue)
-  const stateValue = await readBoundedJson(paths.statePath)
+  const stateValue = await readBoundedJson(paths.statePath, ownership)
   const state =
     stateValue === undefined ? undefined : decodeEnrollmentState(stateValue)
   if (token) {
