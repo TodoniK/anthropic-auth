@@ -58,6 +58,14 @@ const envKeys = [
   'CLAUDE_CONFIG_DIR',
   'XDG_DATA_HOME',
 ] as const
+// The values these variables had before this file's tests ran. Every body
+// restores these, not values it saw when it started: a test that starts two
+// bodies would otherwise have the second one save the first one's paths, and
+// because cleanups run first-in-first-out, put them back after the first
+// body's cleanup had restored the originals. Later test files in the same
+// `bun test` process would then resolve their state paths into this file's
+// deleted temporary directories.
+const envAtLoad = new Map(envKeys.map((key) => [key, process.env[key]]))
 const originalFetch = globalThis.fetch
 const provider: Provider = {
   id: 'anthropic',
@@ -224,7 +232,6 @@ function metadata(url: string): Response | undefined {
 }
 
 async function startBody() {
-  const savedEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
   const directory = await mkdtemp(join(tmpdir(), 'oc1-provider-error-'))
   const owner: BodyOwner = {
     directory,
@@ -249,7 +256,7 @@ async function startBody() {
     } finally {
       globalThis.fetch = originalFetch
       for (const key of envKeys) {
-        const value = savedEnv.get(key)
+        const value = envAtLoad.get(key)
         if (value === undefined) delete process.env[key]
         else process.env[key] = value
       }
