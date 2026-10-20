@@ -695,12 +695,14 @@ export function createNativeVaultRuntime(
     await mutateVaultRoster(paths.roster, async (roster, lease) => {
       if (absentOnly && !(await nativeVaultFileAbsent(paths.config)))
         return { result: undefined }
+      // A default whose sign-in lapsed (needs_reauth, expired, revoked) stays
+      // pinned as main so it is shown once, as main, with its state. Serving
+      // is still refused separately for any vault row that is not active.
       const primary = roster?.rows.find(
         (row) =>
           (row.credentialId === NATIVE_PRIMARY_CREDENTIAL_ID ||
             row.aliases?.includes(NATIVE_PRIMARY_CREDENTIAL_ID)) &&
           row.credentialType === 'oauth' &&
-          row.state === 'active' &&
           !row.stale &&
           !row.unclaimed &&
           typeof row.accountIdentity === 'string' &&

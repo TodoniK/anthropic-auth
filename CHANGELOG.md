@@ -12,6 +12,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ### Sidebar
 
 - The collapsed OpenCode 1 sidebar now draws quotas with common-auth's shared narrow form, the same one the other CortexKit auth plugins use. An account-wide window without a reading is now left out instead of shown as a placeholder: `5h 87% · 7d — left` becomes `5h 87% left`. An account with no reading at all still shows a muted `—`, and stale readings are still dimmed.
+- A vault default account whose sign-in expired now shows once, as `main` with "needs sign-in in the vault", instead of also appearing as a second vault account (#392). It is still not used for requests until you sign in again.
 
 ### Setup
 

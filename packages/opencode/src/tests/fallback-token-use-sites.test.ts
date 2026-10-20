@@ -213,6 +213,8 @@ async function createFixture(
     mainFirst?: boolean
     secondFallback?: boolean
     fallbackState?: 'active' | 'needs_reauth'
+    /** The vault default's state as the plugin lists it after migration. */
+    mainState?: 'active' | 'needs_reauth'
     fallbackEnabled?: boolean
     fallbackMode?: 'server' | 'legacy'
     recoveryToolUse?: boolean
@@ -229,6 +231,9 @@ async function createFixture(
   const nextId = `${accountId}-next`
   const nextCredentialId = `oauth:anthropic:${nextId}`
   let includeNextInRoster = options.secondFallback === true
+  // Migration always sees an active default; the plugin's own listings then
+  // report options.mainState.
+  let mainRowState: 'active' | 'needs_reauth' = 'active'
   const intervals: IntervalRecord[] = []
   const records: OutboundRecord[] = []
   const credentialGets: Array<{ credentialId: string; isMain: boolean }> = []
@@ -350,7 +355,7 @@ async function createFixture(
           credentialType: 'oauth',
           refreshAdapter: 'anthropic',
           operations: ['read'],
-          state: 'active' as const,
+          state: mainRowState,
           recordVersion: 103,
           createdAtMs: null,
         },
@@ -659,6 +664,7 @@ async function createFixture(
   ) as unknown as typeof globalThis.clearInterval
   if (options.fallbackMode)
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE = options.fallbackMode
+  mainRowState = options.mainState ?? 'active'
   const plugin = (await (
     AnthropicAuthPlugin as unknown as (
       context: unknown,
@@ -1533,6 +1539,25 @@ describe('vault fallback eligibility', () => {
         quotaDated: true,
         quota: { five_hour: { remainingPercent: 90 } },
       })
+    },
+  )
+
+  test.serial(
+    'a vault default that needs sign-in shows once, as main, in the sidebar',
+    async () => {
+      const now = Date.now()
+      const fixture = await createFixture('request', {
+        now,
+        quotaEnabled: true,
+        quotaSnapshot: quota(now),
+        mainState: 'needs_reauth',
+      })
+      await serveOrdered(fixture)
+      await drainSidebarWrites()
+      const state = await getSidebarState()
+      expect(state.main.stateLine).toBe('needs sign-in in the vault')
+      // The default credential must not also appear as a vault fallback row.
+      expect(state.fallbacks.map((row) => row.id)).toEqual([fixture.accountId])
     },
   )
 

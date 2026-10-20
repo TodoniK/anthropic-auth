@@ -1335,3 +1335,19 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "vault-default-pinned-while-signed-out"
+guards = "A vault default whose sign-in lapsed must keep its main pin, so it shows once as main instead of reappearing as a second vault row."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "          !row.stale &&"
+new = "          row.state === 'active' && !row.stale && // NON-VACUITY BREAK: pin only an active default"
+test_file = "packages/core/src/tests/native-vault-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a vault default that needs sign-in keeps its main pin and one row"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

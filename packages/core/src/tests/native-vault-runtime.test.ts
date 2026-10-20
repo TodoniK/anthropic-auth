@@ -1481,6 +1481,26 @@ test('unverified default discovery removes main admission without inheriting a l
   await unchanged()
 })
 
+test('a vault default that needs sign-in keeps its main pin and one row', async () => {
+  const f = await fixture()
+  const facade = accountRuntime(f)
+  await facade.vault.refresh()
+  f.rows([{ ...listed, state: 'needs_reauth', recordVersion: 8 }])
+  await facade.vault.refresh()
+  const snapshot = await facade.read()
+  // An expired sign-in is still the same verified default account: it stays
+  // the one `main` row instead of reappearing as a separate vault fallback.
+  const rows = snapshot.accounts.filter((row) => row.credentialId === id)
+  expect(rows.map((row) => ({ id: row.id, state: row.state }))).toEqual([
+    { id: 'main', state: 'needs_reauth' },
+  ])
+  expect(snapshot.settings.mainAccountId).toBe(f.primaryRouteId)
+  await expect(facade.authorizeVault('main')).rejects.toBeInstanceOf(
+    NativeCustodyError,
+  )
+  expect(f.counts.gets).toBe(0)
+})
+
 test('offline setup inventory populates only vault files and cannot replace per-send scoped authorization', async () => {
   const f = await fixture()
   const unchanged = await preservedLocalFiles(f)
