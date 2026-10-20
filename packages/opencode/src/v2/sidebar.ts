@@ -24,10 +24,20 @@ export interface NativeSidebarExtras {
 }
 
 // Why an account cannot serve, shown in place of its quota; undefined when it can.
+// Authorization refuses an unsupported saved credential even while enabled.
 const stateLineOf = (account: NativeAccountView) =>
-  nativeAccountCanServe(account)
+  nativeAccountCanServe(account) && account.state !== 'unsupported-access'
     ? undefined
     : formatNativeAccountState(account) || undefined
+
+// OpenCode 1's `custodyStateFor` rule for a fallback; vault views are roster rows.
+const custodyStateOf = (
+  account: NativeAccountView,
+): SidebarAccountState['custodyState'] => {
+  if (account.source !== 'vault') return 'off'
+  if (account.state === 'needs_reauth') return 'on-vault-reauth'
+  return nativeAccountCanServe(account) ? 'on-vault-served' : 'on-cold'
+}
 
 const retryPending = (retryAt: number | undefined, now: number) =>
   typeof retryAt === 'number' && retryAt > now
@@ -57,7 +67,7 @@ export function buildNativeSidebarState(
       quotaBackoffUntil: quotaRetryAt,
       refreshBackedOff: refreshBackoffActive(
         refreshError,
-        undefined,
+        main?.accountIdentity,
         now,
         undefined,
       ),
@@ -65,11 +75,16 @@ export function buildNativeSidebarState(
       stateLine: mainStateLine,
       quotaDated: Boolean(mainStateLine),
     },
+    // Vault rows stay listed when turned off, as on OpenCode 1.
     fallbacks: oauth
-      .filter((account) => account.id !== 'main' && account.enabled)
+      .filter(
+        (account) =>
+          account.id !== 'main' &&
+          (account.enabled || account.source === 'vault'),
+      )
       .map((account): SidebarAccountState => {
         const stateLine = stateLineOf(account)
-        const vault = account.source === 'vault'
+        const custodyState = custodyStateOf(account)
         return {
           id: account.id,
           label: account.label,
@@ -82,14 +97,13 @@ export function buildNativeSidebarState(
             isPermanentRefreshError(account.lastRefreshError) &&
             refreshBackoffActive(
               account.lastRefreshError,
-              undefined,
+              account.accountIdentity,
               now,
               undefined,
             ),
-          ...(vault && account.state === 'needs_reauth'
-            ? { vaultReauth: true }
-            : {}),
-          ...(vault && account.state === 'active' ? { vaultServed: true } : {}),
+          ...(custodyState === 'on-vault-reauth' ? { vaultReauth: true } : {}),
+          ...(custodyState === 'on-vault-served' ? { vaultServed: true } : {}),
+          ...(custodyState !== 'off' ? { custodyState } : {}),
           stateLine,
           quotaDated: Boolean(stateLine),
         }

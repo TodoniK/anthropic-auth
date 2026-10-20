@@ -2,6 +2,13 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Sidebar
+
+- OpenCode 2 now shows the CLAUDE quota sidebar too, without opening `/claude`. It is the same panel as OpenCode 1 (per-account 5h, 7d and model bars with pacing, collapsed rows, routing, cache, Prime and health), drawn from one shared component in the active OpenCode 2 theme's colors and configured by the same `anthropic-auth` entry in `tui-preferences.jsonc`. The OpenCode 2 server answers it through the native RPC (`sidebar` method) from the account pool, with no file and no credential; the active account is the one that last served the sidebar's session. Turned-off vault accounts stay listed, as on OpenCode 1, and reset countdowns, reading ages and pacing keep advancing between server changes. A TUI talking to an older server shows "Waiting for quota…".
+- Before an account has served the session, the collapsed sidebar no longer marks `main` as active, matching the expanded view.
+
 ## 2.1.1
 
 ### Packaging
@@ -17,7 +24,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Sidebar
 
-- OpenCode 2 now shows the CLAUDE quota sidebar too, without opening `/claude`. It is the same panel as OpenCode 1 (per-account 5h, 7d and model bars with pacing, collapsed rows, routing, cache, Prime and health), drawn from one shared component in the active OpenCode 2 theme's colors and configured by the same `anthropic-auth` entry in `tui-preferences.jsonc`. The OpenCode 2 server answers it through the native RPC (`sidebar` method) from the account pool, with no file and no credential; the active account is the one that last served the sidebar's session. A TUI talking to an older server shows "Waiting for quota…".
 - The collapsed OpenCode 1 sidebar now draws quotas with common-auth's shared narrow form, the same one the other CortexKit auth plugins use. An account-wide window without a reading is now left out instead of shown as a placeholder: `5h 87% · 7d — left` becomes `5h 87% left`. An account with no reading at all still shows a muted `—`, and stale readings are still dimmed.
 - The collapsed OpenCode 1 sidebar no longer rebuilds every account row each time the sidebar file is rewritten, which made the rows flicker (#379). Rows now stay in place and only their text changes.
 - A vault default account whose sign-in expired now shows once, as `main` with "needs sign-in in the vault", instead of also appearing as a second vault account (#392). It is still not used for requests until you sign in again.

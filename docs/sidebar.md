@@ -4,7 +4,7 @@
 
 OpenCode 1 and OpenCode 2 render a live quota sidebar without opening `/claude`. It is not a Pi widget. Both generations draw it from the same component and read the same preferences below.
 
-OpenCode 2 needs no extra registration: the main plugin entry loads its TUI, which adds the panel to the session sidebar, takes its colors from the active OpenCode 2 theme, and asks the location's server for the session's state over the plugin's native RPC. The server builds that state from the account pool and never includes tokens, keys or account identities. The active account is the one that last served that session; before its first request none is marked active. An OpenCode 2 TUI talking to an older plugin server shows "Waiting for quota…".
+OpenCode 2 needs no extra registration: the main plugin entry loads its TUI, which adds the panel to the session sidebar, takes its colors from the active OpenCode 2 theme, and asks the location's server for the session's state over the plugin's native RPC. The server builds that state from the account pool and never includes tokens, keys, provider account identities or credential material; it does carry the local route ids and labels the panel shows. The active account is the one that last served that session; before its first request none is marked active. An OpenCode 2 TUI talking to an older plugin server shows "Waiting for quota…".
 
 OpenCode 1 loads TUI plugins from `tui.json` or `tui.jsonc` in its config directory, separately from the main `plugin` array:
 

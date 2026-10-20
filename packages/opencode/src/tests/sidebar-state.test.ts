@@ -708,6 +708,13 @@ describe('getCollapsedAccounts', () => {
     ])
   })
 
+  test('marks no row active before any account has served', () => {
+    const state = make({ activeId: undefined, main: { quota: quota(10) } })
+    expect(getCollapsedAccounts(state).map(({ active }) => active)).toEqual([
+      false,
+    ])
+  })
+
   test('uses the custody-selected inventory and keeps visible disabled vault accounts', () => {
     const state = make({
       main: { quota: quota(10) },

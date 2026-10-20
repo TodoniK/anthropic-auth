@@ -131,6 +131,91 @@ describe('OpenCode 2 sidebar state', () => {
     expect(byId.vault?.vaultReauth).toBe(true)
     expect(byId.vault?.stateLine).toBe('needs sign-in in the vault')
     expect(byId.vault?.quotaDated).toBe(true)
+    expect(byId.vault?.custodyState).toBe('on-vault-reauth')
+  })
+
+  test('keeps turned-off vault accounts with their custody state, as OpenCode 1 does', () => {
+    const state = buildNativeSidebarState(
+      snapshot([
+        account({ source: 'vault', state: 'active' }),
+        account({ id: 'served', source: 'vault', state: 'active' }),
+        account({
+          id: 'off',
+          label: 'Off',
+          source: 'vault',
+          state: 'active',
+          enabled: false,
+          quota: quota(10, 10),
+        }),
+        account({ id: 'cold', source: 'vault', state: 'cold' }),
+        account({ id: 'local-off', enabled: false }),
+      ]),
+      extras,
+    )
+    const byId = Object.fromEntries(
+      state.fallbacks.map((entry) => [entry.id, entry]),
+    )
+    expect(Object.keys(byId)).toEqual(['served', 'off', 'cold'])
+    expect(byId.served).toMatchObject({
+      custodyState: 'on-vault-served',
+      vaultServed: true,
+    })
+    expect(byId.served?.stateLine).toBeUndefined()
+    expect(byId.off).toMatchObject({
+      enabled: false,
+      custodyState: 'on-cold',
+      stateLine: 'turned off',
+      quotaDated: true,
+    })
+    expect(byId.off?.vaultServed).toBeUndefined()
+    expect(byId.cold).toMatchObject({
+      custodyState: 'on-cold',
+      stateLine: 'unavailable in the vault',
+    })
+    // The shared renderer keeps rows whose custody is not 'off'.
+    expect(
+      normalizeSidebarState(JSON.parse(JSON.stringify(state))).fallbacks.map(
+        (entry) => entry.custodyState,
+      ),
+    ).toEqual(['on-vault-served', 'on-cold', 'on-cold'])
+  })
+
+  test('explains an unsupported saved credential instead of showing it as serving', () => {
+    const state = buildNativeSidebarState(
+      snapshot([
+        account({ state: 'unsupported-access' }),
+        account({ id: 'work', state: 'unsupported-access' }),
+      ]),
+      extras,
+    )
+    expect(state.main.stateLine).toContain('sign in to this account again')
+    expect(state.main.quotaDated).toBe(true)
+    expect(state.fallbacks[0]?.stateLine).toContain(
+      'sign in to this account again',
+    )
+  })
+
+  test('ignores a refresh backoff recorded for a replaced login', () => {
+    const lastRefreshError = {
+      message: 'invalid_grant',
+      checkedAt: now - 1_000,
+      nextRetryAt: now + 86_400_000,
+      permanent: true,
+      accountIdentity: 'previous-account',
+    }
+    const state = buildNativeSidebarState(
+      snapshot([
+        account({ accountIdentity: 'current-account', lastRefreshError }),
+        account({
+          id: 'work',
+          accountIdentity: 'current-account',
+          lastRefreshError,
+        }),
+      ]),
+      extras,
+    )
+    expect(state.main.refreshBackedOff).toBe(false)
+    expect(state.fallbacks[0]?.needsReauth).toBe(false)
   })
 
   test('projects routing, fast mode, relay, cache keepalive and Prime from policy', () => {
@@ -144,6 +229,7 @@ describe('OpenCode 2 sidebar state', () => {
           tokenConfigured: true,
           transport: 'http',
         },
+        claudeCache: { enabled: true, mode: 'hybrid' },
         cacheKeep: { enabled: true, always: true },
         prime: { enabled: true },
       }),
@@ -152,6 +238,7 @@ describe('OpenCode 2 sidebar state', () => {
     expect(state.route).toBe('fallback-first')
     expect(state.fastMode).toBe(true)
     expect(state.relay).toEqual({ enabled: true, transport: 'http' })
+    expect(state.cacheKeep?.enabled).toBe(true)
     expect(state.cacheKeep?.window).toBe('always')
     expect(state.cacheKeep?.trackedSessions).toBe(3)
     expect(state.prime?.enabled).toBe(true)
@@ -161,6 +248,7 @@ describe('OpenCode 2 sidebar state', () => {
     expect(plain.fastMode).toBe(false)
     expect(plain.relay).toBeNull()
     expect(plain.prime).toBeUndefined()
+    expect(plain.cacheKeep?.enabled).toBe(false)
   })
 
   test('survives the RPC boundary unchanged and carries no secret', () => {

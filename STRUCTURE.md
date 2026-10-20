@@ -77,7 +77,7 @@ anthropic-auth/
 - `packages/opencode/src/cli.ts`: CLI binary entry (`opencode-anthropic-auth`)
 - `packages/pi/src/index.ts`: Pi extension entry (default export function)
 - `packages/opencode/src/tui.tsx`: OpenCode 1 TUI plugin (sidebar file polling, loopback dialogs), loaded through `src/tui/entry.mjs` from precompiled output on current OpenTUI hosts
-- `packages/opencode/src/tui/claude-sidebar.tsx`: the quota sidebar renderer both generations use; OpenCode 2's `entry.mjs` setup loads it precompiled and mounts it on `sidebar.content`
+- `packages/opencode/src/tui/claude-sidebar.tsx`: the quota sidebar renderer both generations use; OpenCode 2's `entry.mjs` setup loads the precompiled bundle when the host runtime registry is available, falls back to the TSX source otherwise, and mounts it on `sidebar.content`
 - `packages/core/src/index.ts`: Shared core library entry (re-exports all modules)
 
 **Configuration:**

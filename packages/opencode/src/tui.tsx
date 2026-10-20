@@ -82,6 +82,7 @@ function QuotaDialogContent(props: {
           tierLabel={state().main?.tierLabel}
           stateLine={state().main?.stateLine}
           quotaDated={state().main?.quotaDated}
+          now={Date.now()}
         />
         <Show when={prefs().sections.fallbackAccounts}>
           <For each={enabledFallbacks()}>
@@ -99,6 +100,7 @@ function QuotaDialogContent(props: {
                 stateLine={fb.stateLine}
                 quotaDated={fb.quotaDated}
                 marginTop={1}
+                now={Date.now()}
               />
             )}
           </For>

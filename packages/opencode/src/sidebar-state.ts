@@ -888,7 +888,10 @@ export function formatPrimeCost(value: number): string {
   return value.toFixed(Math.min(6, Math.max(0, 4)))
 }
 
-export function formatPrimeAccountValue(account: PrimeSidebarAccountState): {
+export function formatPrimeAccountValue(
+  account: PrimeSidebarAccountState,
+  now = Date.now(),
+): {
   text: string
   hasError: boolean
 } {
@@ -898,7 +901,7 @@ export function formatPrimeAccountValue(account: PrimeSidebarAccountState): {
   if (account.lastResult === 'skipped') {
     return { text: 'skip', hasError: false }
   }
-  if (account.nextDueAt && account.nextDueAt > Date.now()) {
+  if (account.nextDueAt && account.nextDueAt > now) {
     return { text: formatPrimeTime(account.nextDueAt), hasError: false }
   }
   if (account.lastPrimedAt) {
@@ -994,7 +997,9 @@ export function getCollapsedAccounts(
   state: SidebarState,
   showFallbacks = true,
 ) {
-  const activeId = resolveActiveAccount(state).id
+  // Before any request no account is active; do not mark main as serving.
+  const activeId =
+    state.activeId === undefined ? undefined : resolveActiveAccount(state).id
   return [
     {
       id: 'main',

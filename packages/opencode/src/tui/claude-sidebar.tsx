@@ -16,6 +16,7 @@ import {
 import { type BoxRenderable, type RGBA, TextAttributes } from '@opentui/core'
 import {
   createEffect,
+  createMemo,
   createSignal,
   For,
   Index,
@@ -163,9 +164,9 @@ function quotaBarSegments(
   ).filter((segment) => segment.text.length > 0)
 }
 
-function formatResetIn(resetsAt: string | undefined): string {
+function formatResetIn(resetsAt: string | undefined, now: number): string {
   if (!resetsAt) return ''
-  const ms = new Date(resetsAt).getTime() - Date.now()
+  const ms = new Date(resetsAt).getTime() - now
   if (ms <= 0) return 'now'
   const mins = Math.floor(ms / 60_000)
   if (mins < 60) return `${mins}m`
@@ -179,9 +180,9 @@ function formatResetIn(resetsAt: string | undefined): string {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`
 }
 
-function formatUntil(until: number | undefined): string {
+function formatUntil(until: number | undefined, now: number): string {
   if (!until) return ''
-  const ms = until - Date.now()
+  const ms = until - now
   if (ms <= 0) return 'now'
   const mins = Math.ceil(ms / 60_000)
   if (mins < 60) return `${mins}m`
@@ -241,10 +242,11 @@ function CollapsedAccountRow(props: {
   theme: SidebarTheme
   account: ReturnType<typeof getCollapsedAccounts>[number]
   tone: Tone
+  now: number
 }) {
   const [width, setWidth] = createSignal(40)
   let row: BoxRenderable | undefined
-  const summary = () => getCollapsedQuotaSummary(props.account.quota)
+  const summary = () => getCollapsedQuotaSummary(props.account.quota, props.now)
   const value = () => summary().text ?? '—'
   const labelWidth = () => Math.max(0, width() - Bun.stringWidth(value()) - 1)
   const dim = () =>
@@ -302,6 +304,7 @@ function QuotaRow(props: {
   usedPercent: number | undefined
   pacing: QuotaPacing | null
   binding?: boolean
+  now: number
 }) {
   const used = () => props.usedPercent ?? 0
   const reset = () => props.part?.resetIn
@@ -311,7 +314,7 @@ function QuotaRow(props: {
     const pct = Math.round(Math.abs(pacing.deltaPercent))
     if (pacing.state === 'reserve') return `reserve ${pct}% \u00b7 lasts`
     return pacing.runsOutAt
-      ? `deficit ${pct}% \u00b7 out in ${formatResetIn(pacing.runsOutAt)}`
+      ? `deficit ${pct}% \u00b7 out in ${formatResetIn(pacing.runsOutAt, props.now)}`
       : `deficit ${pct}% \u00b7 lasts`
   }
   return (
@@ -334,13 +337,16 @@ function QuotaRow(props: {
           <text
             fg={props.theme.textMuted}
           >{`${formatQuotaRowLabel(props.label)} `}</text>
-          <For each={quotaBarSegments(used(), props.appearance, props.pacing)}>
+          {/* Index: the clock rebuilds the segments, which must not remount. */}
+          <Index
+            each={quotaBarSegments(used(), props.appearance, props.pacing)}
+          >
             {(segment) => (
-              <text fg={toneColor(props.theme, segment.tone)}>
-                {segment.text}
+              <text fg={toneColor(props.theme, segment().tone)}>
+                {segment().text}
               </text>
             )}
-          </For>
+          </Index>
           <text
             fg={toneColor(props.theme, usageTone(used(), props.appearance))}
           >
@@ -400,6 +406,7 @@ export function AccountBlock(props: {
   quotaDated?: boolean
   tierLabel?: string
   marginTop?: number
+  now: number
 }) {
   const statusWord = () =>
     props.quotaDated && props.quota
@@ -424,12 +431,12 @@ export function AccountBlock(props: {
     windowMs: number,
   ) =>
     props.pacingEnabled && !props.quotaDated && window
-      ? computeQuotaPacing(window, windowMs, Date.now())
+      ? computeQuotaPacing(window, windowMs, props.now)
       : null
-  const parts = () => {
-    const now = Date.now()
-    return quotaWindowParts(quotaDisplayProjection(props.quota, now), { now })
-  }
+  const parts = () =>
+    quotaWindowParts(quotaDisplayProjection(props.quota, props.now), {
+      now: props.now,
+    })
   const partFor = (name: string) =>
     parts().windows.find((part) => part.name === name)
   return (
@@ -457,6 +464,7 @@ export function AccountBlock(props: {
           usedPercent={props.quota?.five_hour?.usedPercent}
           pacing={pacingFor(props.quota?.five_hour, FIVE_HOUR_MS)}
           binding={props.quota?.bindingWindow === 'five_hour'}
+          now={props.now}
         />
         <QuotaRow
           theme={props.theme}
@@ -466,6 +474,7 @@ export function AccountBlock(props: {
           usedPercent={props.quota?.seven_day?.usedPercent}
           pacing={pacingFor(props.quota?.seven_day, SEVEN_DAY_MS)}
           binding={props.quota?.bindingWindow === 'seven_day'}
+          now={props.now}
         />
         <For each={props.quota?.scoped ?? []}>
           {(window) => (
@@ -477,6 +486,7 @@ export function AccountBlock(props: {
               usedPercent={window.usedPercent}
               pacing={pacingFor(window, SEVEN_DAY_MS)}
               binding={props.quota?.bindingWindow === window.id}
+              now={props.now}
             />
           )}
         </For>
@@ -604,6 +614,18 @@ export function ClaudeSidebar(props: {
   const collapsed = props.controller.collapsed
   const state = props.state
   const theme = props.theme
+  // Countdowns, reading ages and pacing read this clock, so they advance on
+  // each tick and state change without a new answer or rebuilt rows.
+  const [tick, setTick] = createSignal(0)
+  createEffect(() => {
+    const timer = setInterval(() => setTick((n) => n + 1), prefs().pollMs)
+    onCleanup(() => clearInterval(timer))
+  })
+  const now = createMemo(() => {
+    tick()
+    state()
+    return Date.now()
+  })
   const enabledFallbacks = () =>
     (state().fallbacks ?? []).filter(
       (f) => f.enabled || (f.custodyState && f.custodyState !== 'off'),
@@ -619,13 +641,12 @@ export function ClaudeSidebar(props: {
   }
   const activeAccount = () => resolveActiveAccount(state())
   const activeQuotaSummary = () =>
-    getCollapsedQuotaSummary(activeAccount().quota)
+    getCollapsedQuotaSummary(activeAccount().quota, now())
   const activePacingDeficit = () => {
     if (!prefs().sections.pacing) return false
     if (activeAccount().quotaDated) return null
     const quota = activeAccount().quota
     if (!quota) return false
-    const now = Date.now()
     const windows: Array<
       [
         (
@@ -644,7 +665,7 @@ export function ClaudeSidebar(props: {
     ]
     return windows.some(
       ([w, ms]) =>
-        w != null && computeQuotaPacing(w, ms, now)?.state === 'deficit',
+        w != null && computeQuotaPacing(w, ms, now())?.state === 'deficit',
     )
   }
   const activeQuotaTone = (): Tone => {
@@ -756,6 +777,7 @@ export function ClaudeSidebar(props: {
               theme={theme()}
               account={account()}
               tone={activeQuotaTone()}
+              now={now()}
             />
           )}
         </Index>
@@ -801,6 +823,7 @@ export function ClaudeSidebar(props: {
               tierLabel={state().main?.tierLabel}
               stateLine={state().main?.stateLine}
               quotaDated={state().main?.quotaDated}
+              now={now()}
             />
             <Show when={prefs().sections.fallbackAccounts}>
               <For each={enabledFallbacks()}>
@@ -818,6 +841,7 @@ export function ClaudeSidebar(props: {
                     stateLine={fb.stateLine}
                     quotaDated={fb.quotaDated}
                     marginTop={1}
+                    now={now()}
                   />
                 )}
               </For>
@@ -888,7 +912,7 @@ export function ClaudeSidebar(props: {
           />
           <For each={prime()?.accounts ?? []}>
             {(account) => {
-              const value = () => formatPrimeAccountValue(account)
+              const value = () => formatPrimeAccountValue(account, now())
               return (
                 <StatRow
                   theme={theme()}
@@ -908,7 +932,7 @@ export function ClaudeSidebar(props: {
             <StatRow
               theme={theme()}
               label='Quota API'
-              value={`backoff ${formatUntil(state().main?.quotaBackoffUntil)}`}
+              value={`backoff ${formatUntil(state().main?.quotaBackoffUntil, now())}`}
               tone='warn'
             />
           </Show>
@@ -916,7 +940,7 @@ export function ClaudeSidebar(props: {
             <StatRow
               theme={theme()}
               label='Token refresh'
-              value={`backoff ${formatUntil(state().main?.refreshBackoffUntil)}`}
+              value={`backoff ${formatUntil(state().main?.refreshBackoffUntil, now())}`}
               tone='warn'
             />
           </Show>
@@ -991,6 +1015,7 @@ function HostSidebar(props: {
     try {
       const next = await props.read(props.sessionId, abort.signal)
       // Every answer is stamped now; redraw only when its content changed.
+      // Countdowns and ages advance on the sidebar's own clock.
       const content = JSON.stringify({ ...next, lastUpdated: 0 })
       if (!abort.signal.aborted && content !== shown) {
         shown = content
@@ -1026,17 +1051,23 @@ export async function mountClaudeSidebar(
   const controller = createSidebarController(
     resolveAnthropicAuthPrefs(await readTuiPreferencesFile()),
   )
-  const release = host.ui.slot({
-    append: 'sidebar.content',
-    render: (input) => (
-      <HostSidebar
-        host={host}
-        read={read}
-        controller={controller}
-        sessionId={input.sessionID}
-      />
-    ),
-  })
+  let release: () => void
+  try {
+    release = host.ui.slot({
+      append: 'sidebar.content',
+      render: (input) => (
+        <HostSidebar
+          host={host}
+          read={read}
+          controller={controller}
+          sessionId={input.sessionID}
+        />
+      ),
+    })
+  } catch (error) {
+    controller.dispose()
+    throw error
+  }
   return () => {
     release()
     controller.dispose()
