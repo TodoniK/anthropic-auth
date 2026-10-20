@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Packaging
+
+- The OpenCode package depended on `@cortexkit/claustrum-client` 0.11.0 while Core needs 0.12.0, so installing 2.1.0 put two copies in place: the setup command used one and Core the other. An error raised by one copy is not recognized by checks written against the other. OpenCode now depends on the same version as Core, and a packaging check keeps the two in step.
+
 ## 2.1.0
 
 ### Refusal recovery
