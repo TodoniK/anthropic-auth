@@ -137,6 +137,7 @@ import {
   type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
   type NativeMenuDispatch,
   type NativeQuotaObservation,
+  NativeRuntimeError,
   type NativeUiOptions,
   NativeVaultNoAccountError,
   nativeAccountCanServe,
@@ -356,7 +357,7 @@ async function endIfCancelled(
   signal.throwIfAborted()
 }
 
-// Selecting another account cannot repair locally invalid conversation history.
+// Selecting another account cannot repair a locally refused request.
 // Provider-generated 400 responses still follow the configured fallbackOn list.
 function shouldFallbackResponse(
   response: Response,
@@ -1494,6 +1495,10 @@ const anthropicAuthPlugin = async (
     vaultWatch?.close()
     await usagePublications.drain()
     await nativeAccounts.drainQuotaPublications()
+    await Promise.all(
+      [...stickySessionRouters.values()].map((router) => router.drain()),
+    )
+    await nativeAccounts.drainRoutingPublications()
     nativeAccounts.close()
   }
 
@@ -1776,6 +1781,7 @@ const anthropicAuthPlugin = async (
       router = new StickySessionRouter({
         path,
         vaultSeed: snapshot.routingSeed,
+        onLockEvent: nativeAccounts.onLockEvent,
         localRecoveryPath:
           snapshot.mode === 'local' ? snapshot.routingRecoveryPath : undefined,
       })
@@ -7405,7 +7411,19 @@ const anthropicAuthPlugin = async (
             }
 
             const requestStorageForIdentity = await getRequestStorage()
-            const relayConfig = await nativeAccounts.getRelayConfig()
+            let relayConfig: Awaited<
+              ReturnType<typeof nativeAccounts.getRelayConfig>
+            >
+            try {
+              relayConfig = await nativeAccounts.getRelayConfig()
+            } catch (error) {
+              if (
+                error instanceof NativeRuntimeError &&
+                error.code === 'relay-inconsistent'
+              )
+                return localInvalidRequestResponse(error.message)
+              throw error
+            }
             const persistedFallbackAccount =
               oauthAccountId === 'main'
                 ? undefined

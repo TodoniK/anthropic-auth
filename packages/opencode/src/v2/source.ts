@@ -109,6 +109,7 @@ export interface NativeSourceOptions {
 export interface NativeSource
   extends NativeAnthropicSource<OAuthQuotaSnapshot, NativeSourceProvenance> {
   readonly close: () => Promise<void>
+  readonly drainRoutingPublications: () => Promise<void>
   readonly resetRouting: (sessionID: string) => Promise<void>
   /** The account that served the session's latest authorization, if any. */
   readonly servedAccount: (sessionID: string) => string | undefined
@@ -136,6 +137,7 @@ export function createNativeAnthropicSource(
       router = new StickySessionRouter({
         path,
         vaultSeed: snapshot.routingSeed,
+        onLockEvent: runtime.onLockEvent,
         localRecoveryPath:
           snapshot.mode === 'local' ? snapshot.routingRecoveryPath : undefined,
       })
@@ -834,13 +836,21 @@ export function createNativeAnthropicSource(
         )
       return false
     },
+    drainRoutingPublications: () =>
+      Promise.all([
+        runtime.drainRoutingPublications(),
+        ...[...routers.values()].map((router) => router.drain()),
+      ]).then(() => {}),
     close() {
       closed = true
       for (const active of sessions.values()) active.abort()
       sessions.clear()
       choices.clear()
       retries.clear()
-      return usagePublications.drain()
+      return Promise.all([
+        usagePublications.drain(),
+        source.drainRoutingPublications(),
+      ]).then(() => {})
     },
   }
   const publications = new WeakMap<NativeSourceProvenance, Promise<void>>()

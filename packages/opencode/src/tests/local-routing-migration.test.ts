@@ -273,7 +273,7 @@ async function oc1(f: HostFixture) {
     provider,
   )
   const handler = options.fetch as typeof fetch
-  return async (session: string) => {
+  const send = async (session: string) => {
     const request = handler('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -292,6 +292,11 @@ async function oc1(f: HostFixture) {
     await response.text()
     return f.sent.at(-1)
   }
+  return Object.assign(send, {
+    dispose: async () => {
+      await plugin.dispose?.()
+    },
+  })
 }
 
 async function oc2(f: HostFixture) {
@@ -307,7 +312,7 @@ async function oc2(f: HostFixture) {
     fetch: f.offlineFetch,
   })
   f.cleanups.push(() => source.close())
-  return async (sessionID: string) => {
+  const send = async (sessionID: string) => {
     const scope = {
       providerID: 'anthropic',
       modelID: 'claude-sonnet-4-6',
@@ -326,6 +331,7 @@ async function oc2(f: HostFixture) {
     tests.trackDetached(work)
     return work
   }
+  return Object.assign(send, { dispose: () => source.close() })
 }
 
 async function emptyFixture(override: boolean): Promise<HostFixture> {
@@ -472,6 +478,7 @@ for (const [host, open] of [
         const send = await open(f)
         expect(await send(session1)).toContain('sk-ant-oat01-secondary')
         await send(session2)
+        await send.dispose()
         const destination = resolveLocalRoutingDestination(
           'opencode',
           f.paths,
@@ -516,19 +523,23 @@ tests.test(
       await writeFile(legacy, legacyBytes)
       const send = await open(f)
       expect(await send(session1)).toContain('sk-ant-oat01-primary')
+      await send.dispose()
       const state = JSON.parse(await readFile(destination, 'utf8'))
       expect(state.assignments[hash(session1)].accountId).toBe('main')
       expect(state.assignments[hash(session2)].accountId).toBe('secondary')
       expect(state.assignments[hash('missing-account-session')].accountId).toBe(
         'removed-account',
       )
-      expect(await send(session2)).toContain('sk-ant-oat01-secondary')
+      const resumed = await open(f)
+      expect(await resumed(session2)).toContain('sk-ant-oat01-secondary')
+      await resumed.dispose()
       expect(await readFile(legacy, 'utf8')).toBe(legacyBytes)
       // A second router in the same process must not import newly added source pins.
       const lateBytes = routing({ 'late-session': 'secondary' })
       await writeFile(legacy, lateBytes)
       const second = await open(f)
       await second(session1)
+      await second.dispose()
       expect(
         JSON.parse(await readFile(destination, 'utf8')).assignments[
           hash('late-session')
@@ -566,7 +577,9 @@ tests.test(
 
 for (const failure of ['malformed', 'unreadable', 'locked'] as const) {
   tests.test(
-    `local routing serves destination pins after ${failure} legacy recovery fails`,
+    failure === 'locked'
+      ? 'local routing serves destination pins while legacy recovery waits in the background'
+      : `local routing serves destination pins after ${failure} legacy recovery fails`,
     async () => {
       for (const open of [oc1, oc2]) {
         const f = await fixture()
@@ -607,6 +620,7 @@ for (const failure of ['malformed', 'unreadable', 'locked'] as const) {
             restoreRead = () => read.mockRestore()
             f.cleanups.push(restoreRead)
           }
+          let held: Awaited<ReturnType<typeof acquireRefreshFileLock>> = null
           if (failure === 'locked') {
             const lock = await acquireRefreshFileLock({
               path: f.journal.routingPaths.destination,
@@ -616,23 +630,31 @@ for (const failure of ['malformed', 'unreadable', 'locked'] as const) {
             })
             if (!lock)
               throw new Error('Fixture could not hold the routing lock')
+            held = lock
             f.cleanups.push(() => lock.release())
           }
           expect(await send(session1)).toContain('sk-ant-oat01-secondary')
           expect(await send(session1)).toContain('sk-ant-oat01-secondary')
+          await held?.assertOwned()
+          await held?.release()
+          await send.dispose()
           expect(
             records.filter(
               (record) =>
                 record.channel === 'sticky-routing' && record.level === 'warn',
             ),
-          ).toEqual([
-            {
-              level: 'warn',
-              channel: 'sticky-routing',
-              message: 'local pin recovery unavailable',
-              payload: { reason: 'recovery-failed' },
-            },
-          ])
+          ).toEqual(
+            failure === 'locked'
+              ? []
+              : [
+                  {
+                    level: 'warn',
+                    channel: 'sticky-routing',
+                    message: 'local pin recovery unavailable',
+                    payload: { reason: 'recovery-failed' },
+                  },
+                ],
+          )
           if (failure === 'unreadable') expect(deniedReads).toBe(1)
           restoreRead()
           expect(await readFile(legacy, 'utf8')).toBe(bytes)

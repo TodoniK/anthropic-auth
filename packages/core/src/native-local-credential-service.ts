@@ -1,9 +1,9 @@
 import { types as utilTypes } from 'node:util'
-
 import {
   createNativeLocalRuntimeReaders,
   type NativeLocalExternalPolicy,
 } from './native-local-runtime-readers.ts'
+import type { NativeLockEvent } from './native-lock-observer.ts'
 import { nativeQuotaCodec } from './native-quota-codec.ts'
 import {
   createNativeRefreshCoordinator,
@@ -82,6 +82,7 @@ export interface NativeLocalCredentialServiceOptions {
   readonly refreshToken?: NativeRefreshCoordinatorOptions['refreshToken']
   /** Account lookup for new access; defaults to the Claude Code identity lookup. */
   readonly resolveIdentity?: NativeRefreshCoordinatorOptions['resolveIdentity']
+  readonly onLockEvent?: (event: NativeLockEvent) => void
 }
 
 /**
@@ -101,6 +102,7 @@ const optionKeys = [
   'now',
   'refreshToken',
   'resolveIdentity',
+  'onLockEvent',
 ] as const
 const pathKeys = [
   'legacyConfig',
@@ -242,6 +244,9 @@ export function createNativeLocalCredentialService(
   const failurePolicy = requiredFunction<
     NativeLocalCredentialServiceOptions['failurePolicy']
   >(descriptors, 'failurePolicy')
+  const onLockEvent = optionalFunction<
+    NonNullable<NativeLocalCredentialServiceOptions['onLockEvent']>
+  >(descriptors, 'onLockEvent')
   const now = optionalFunction<() => number>(descriptors, 'now')
   const refreshToken = optionalFunction<
     NativeLocalCredentialServiceOptions['refreshToken']
@@ -253,11 +258,12 @@ export function createNativeLocalCredentialService(
   async function publish(
     event: NativeRefreshObservation,
     operation: (
-      hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish'>,
+      hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish' | 'onLockEvent'>,
     ) => Promise<unknown>,
   ) {
     if ((await publicationGuard(event)) !== true) return
     const hooks = {
+      onLockEvent,
       beforePublish: async () => {
         if ((await publicationGuard(event)) !== true)
           throw new NativeRuntimeError('publication-refused')
@@ -318,6 +324,7 @@ export function createNativeLocalCredentialService(
   const coordinator = createNativeRefreshCoordinator({
     paths,
     quota: nativeQuotaCodec,
+    onLockEvent,
     ...(now ? { now } : {}),
     ...(refreshToken ? { refreshToken } : {}),
     ...(resolveIdentity ? { resolveIdentity } : {}),

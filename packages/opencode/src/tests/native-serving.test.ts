@@ -41,6 +41,8 @@ import {
   toNativeQuotaMap,
 } from '../../../core/src/native-quota-codec.ts'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
+import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-fixture.ts'
+import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { MockRelayServer } from '../../../e2e-tests/src/mock-relay.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
@@ -1026,6 +1028,160 @@ test('supervised content after real migration refuses foreground and background 
   expect(fixture.records).toHaveLength(0)
 })
 
+for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
+  test(`OC1 ${scenario} request observes only required foreground locks`, async () => {
+    const fixture = await migrateServingFixture(
+      scenario === 'vault-healthy' ? 'claustrum' : 'local',
+    )
+    const probe = requestLockProbe()
+    const runtime = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
+      vault: { connect: async () => fixture.scopedClient },
+    })
+    lifetimes.deferCleanup(async () => {
+      await runtime.drainRoutingPublications()
+      runtime.close()
+    })
+    if (scenario === 'local-healthy')
+      expect((await runtime.authorizeLocal('main')).status).toBe('usable')
+    if (scenario !== 'refresh') {
+      await runtime.fetchQuota(
+        'main',
+        Object.assign(fixture.fetchProvider, {
+          preconnect: originalFetch.preconnect,
+        }),
+      )
+      await runtime.drainQuotaPublications()
+    }
+    await runtime.updateSettings((settings) => {
+      settings.routing = { mode: 'sticky-balanced' }
+    })
+    await runtime.read()
+    await runtime.drainRoutingPublications()
+    network.mockImplementation((input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      if (url.includes('/v1/messages')) probe.dispatch()
+      return fixture.fetchProvider(input, init)
+    })
+    const plugin = await createPlugin({
+      nativeLocal: { onLockEvent: probe.onLockEvent },
+      ...(scenario === 'vault-healthy'
+        ? { claustrumScopedConnect: async () => fixture.scopedClient }
+        : {}),
+    })
+    probe.begin()
+    const response = await sendNative(plugin)
+    expect(response.status).toBe(200)
+    await response.text()
+    if (scenario === 'refresh')
+      expect(
+        probe.foreground.some(
+          (event) =>
+            event.name.startsWith('native-account-provider-') &&
+            event.path === fixture.paths.state,
+        ),
+      ).toBe(true)
+    else expect(probe.foreground).toEqual([])
+    await plugin.dispose?.()
+    expect(probe.detached.some((event) => event.name === 'write')).toBe(true)
+    expect(probe.afterDispatch.length).toBeGreaterThan(0)
+    expect(
+      probe.afterDispatch.some((event) => event.name === 'native-runtime'),
+    ).toBe(true)
+    if (scenario === 'vault-healthy')
+      expect(
+        probe.afterDispatch.some(
+          (event) => event.name === 'claustrum-roster-write',
+        ),
+      ).toBe(true)
+  })
+}
+
+test('OC1 inconsistent relay pair refuses locally without any dispatch', async () => {
+  const fixture = await migrateServingFixture('local')
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+  })
+  lifetimes.deferCleanup(() => runtime.close())
+  await runtime.updateRelay({
+    enabled: true,
+    url: 'https://never-send.invalid',
+    token: 'synthetic-never-send-token',
+  })
+  await createNativePoolStore({
+    paths: fixture.paths,
+    quota: nativeQuotaCodec,
+  }).updateSettings((settings) => {
+    ;(settings.relay as Record<string, unknown>).generation = 'mismatched'
+  })
+  const plugin = await createPlugin()
+  const response = await sendNative(plugin)
+  expect(response.status).toBe(400)
+  expect(await response.json()).toMatchObject({
+    error: {
+      type: 'invalid_request_error',
+      message:
+        'request refused: relay configuration is inconsistent; no request was sent',
+    },
+  })
+  expect(
+    fixture.records.filter((record) => record.url.includes('/v1/messages')),
+  ).toHaveLength(0)
+})
+
+for (const configured of [false, true]) {
+  test(`OC1 request ignores held native-relay lock (${configured ? 'relay' : 'direct'})`, async () => {
+    const fixture = await migrateServingFixture('local')
+    const runtime = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
+    })
+    lifetimes.deferCleanup(() => runtime.close())
+    const relay = new MockRelayServer()
+    relays.add(relay)
+    const address = await relay.start({ token: 'synthetic-held-relay-token' })
+    if (configured)
+      await runtime.updateRelay({
+        enabled: true,
+        url: address.url,
+        token: 'synthetic-held-relay-token',
+        transport: 'http',
+        fallbackToDirect: false,
+      })
+    network.mockImplementation((input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      return url.startsWith(address.url)
+        ? originalFetch(input, init)
+        : fixture.fetchProvider(input, init)
+    })
+    const plugin = await createPlugin()
+    const held = await holdNativeRelayLock(fixture.paths.config, lifetimes)
+    try {
+      const response = await sendNative(plugin)
+      expect(response.status).toBe(200)
+      expect(await response.text()).toContain('native-serving-ok')
+      expect(relay.acceptedRequests()).toBe(configured ? 1 : 0)
+      expect(await runtime.getRelayConfig()).toEqual(
+        configured
+          ? {
+              enabled: true,
+              url: address.url,
+              token: 'synthetic-held-relay-token',
+              transport: 'http',
+              fallbackToDirect: false,
+            }
+          : null,
+      )
+      await held.assertOwned()
+    } finally {
+      await held.pastTimeout
+      await held.release()
+    }
+  }, 25_000)
+}
+
 for (const transport of ['http', 'websocket'] as const) {
   test(`migrated vault ${transport} relay uses native private relay config and fresh vault receipt`, async () => {
     const fixture = await migrateServingFixture('claustrum')
@@ -1447,6 +1603,7 @@ test('a replaced default vault account loses its session pins and quota while an
   // Earlier sessions pinned through the vault routing file: one to the
   // default account, one to the other vault account.
   const earlier = new StickySessionRouter({ path: routingPath })
+  lifetimes.deferCleanup(() => earlier.drain())
   const identities = new Map([
     ['main', mainIdentity],
     [fallbackRoute, fallbackIdentity],
@@ -1487,6 +1644,7 @@ test('a replaced default vault account loses its session pins and quota while an
     })
     expect(pinned?.accountId).toBe(accountId)
   }
+  await earlier.drain()
   const defaultPin = await stickyPin(routingPath, 'session-on-default')
   const fallbackPin = await stickyPin(routingPath, 'session-on-fallback')
   expect(defaultPin?.accountIdentity).toBe(mainIdentity)
@@ -1519,6 +1677,7 @@ test('a replaced default vault account loses its session pins and quota while an
   expect((await sendNative(plugin, model, 'session-on-fallback')).status).toBe(
     200,
   )
+  await plugin.dispose?.()
   // The session pinned to the replaced account is placed again and its new
   // pin names the account that now serves it.
   const replaced = await stickyPin(routingPath, 'session-on-default')
@@ -2621,6 +2780,7 @@ test('OpenCode routes normally during roster deferral without publishing an empt
   try {
     await runtime.vault.refresh()
     await runtime.read()
+    await runtime.drainRoutingPublications()
     expect(
       JSON.parse(await readFile(vault.routing, 'utf8')).vaultLegacySeed,
     ).toBe('complete')

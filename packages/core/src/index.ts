@@ -116,6 +116,7 @@ export type {
 } from './native-local-credential-service.ts'
 export { createNativeLocalCredentialService } from './native-local-credential-service.ts'
 export type { NativeLocalExternalPolicy } from './native-local-runtime-readers.ts'
+export type { NativeLockEvent } from './native-lock-observer.ts'
 export type {
   NativeMenuActionValues,
   NativeMenuCapabilityOutcome,
@@ -191,6 +192,7 @@ export type {
   NativeLocalFailurePolicy,
   NativeLocalFailureSkipReason,
 } from './native-runtime.ts'
+export { NativeRuntimeError } from './native-runtime.ts'
 export { nativeRuntimeOptionIdentity } from './native-runtime-registry.ts'
 export * from './native-settings.ts'
 export {

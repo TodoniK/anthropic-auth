@@ -9,6 +9,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode 2 now shows the CLAUDE quota sidebar too, without opening `/claude`. It is the same panel as OpenCode 1 (per-account 5h, 7d and model bars with pacing, collapsed rows, routing, cache, Prime and health), drawn from one shared component in the active OpenCode 2 theme's colors and configured by the same `anthropic-auth` entry in `tui-preferences.jsonc`. The OpenCode 2 server answers it through the native RPC (`sidebar` method) from the account pool, with no file and no credential; the active account is the one that last served the sidebar's session. Turned-off vault accounts stay listed, as on OpenCode 1, and reset countdowns, reading ages and pacing keep advancing between server changes. A TUI talking to an older server shows "Waiting for quota…".
 - Before an account has served the session, the collapsed sidebar no longer marks `main` as active, matching the expanded view.
 
+## 2.1.2
+
+- Requests no longer wait on relay or session-pin bookkeeping locks; relay settings and tokens are checked together before sending.
+
 ## 2.1.1
 
 ### Packaging

@@ -15,6 +15,14 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 
 const NOW = Date.parse('2026-07-18T08:00:00Z')
+const routers: StickySessionRouter[] = []
+function ownRouter(
+  options: ConstructorParameters<typeof StickySessionRouter>[0],
+) {
+  const router = new StickySessionRouter(options)
+  routers.push(router)
+  return router
+}
 const directories: string[] = []
 type KnownStickyRouteCandidate = Omit<StickyRouteCandidate, 'quota'> & {
   quota: OAuthQuotaSnapshot
@@ -81,6 +89,7 @@ const storage = {
 }
 
 afterEach(async () => {
+  await Promise.all(routers.splice(0).map((router) => router.drain()))
   await Promise.all(
     directories
       .splice(0)
@@ -246,7 +255,7 @@ describe('sticky-balanced session routing', () => {
 
   test('distributes cold Fable sessions proportionally instead of draining account order', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const scarce = candidate({
       accountId: 'yiyi',
       order: 0,
@@ -283,7 +292,7 @@ describe('sticky-balanced session routing', () => {
 
   test('seeds an existing cachekeep session from its current OAuth route', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const scarce = candidate({
       accountId: 'existing-route',
       order: 0,
@@ -315,7 +324,7 @@ describe('sticky-balanced session routing', () => {
 
   test('does not seed a cold session onto an ineligible preferred account', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const exhausted = candidate({
       accountId: 'old-cache-route',
       order: 0,
@@ -345,7 +354,7 @@ describe('sticky-balanced session routing', () => {
 
   test('persists an assignment and keeps it sticky when weights change', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const scarce = candidate({
       accountId: 'scarce',
       order: 0,
@@ -371,11 +380,12 @@ describe('sticky-balanced session routing', () => {
     })
     expect(first?.accountId).toBe('abundant')
     expect(first?.created).toBe(true)
+    await router.drain()
     const persisted = await readFile(path, 'utf8')
     expect(persisted).not.toContain('session-1')
     expect(persisted).toContain('abundant')
 
-    const reloaded = new StickySessionRouter({ path, now: () => NOW + 1_000 })
+    const reloaded = ownRouter({ path, now: () => NOW + 1_000 })
     const second = await reloaded.resolve({
       sessionId: 'session-1',
       family: 'fable',
@@ -407,7 +417,7 @@ describe('sticky-balanced session routing', () => {
 
   test('reallocates a legacy assignment whose selected model is unknown', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const original = candidate({
       accountId: 'original',
       order: 0,
@@ -433,13 +443,14 @@ describe('sticky-balanced session routing', () => {
     }
     expect((await router.resolve(base))?.accountId).toBe('original')
 
+    await router.drain()
     const legacyState = JSON.parse(await readFile(path, 'utf8')) as {
       assignments: Record<string, { affinityModelId?: string }>
     }
     delete Object.values(legacyState.assignments)[0]!.affinityModelId
     await writeFile(path, JSON.stringify(legacyState))
 
-    const reloaded = new StickySessionRouter({ path, now: () => NOW + 1_000 })
+    const reloaded = ownRouter({ path, now: () => NOW + 1_000 })
     const changed = await reloaded.resolve({
       ...base,
       candidates: [
@@ -452,7 +463,7 @@ describe('sticky-balanced session routing', () => {
 
   test('reselects the account when the user changes model families', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const fableDepleted = candidate({
       accountId: 'fable-depleted',
       order: 0,
@@ -497,7 +508,7 @@ describe('sticky-balanced session routing', () => {
 
   test('reselects the account for a model change within one routing family', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const first = candidate({
       accountId: 'first',
       order: 0,
@@ -560,7 +571,7 @@ describe('sticky-balanced session routing', () => {
 
   test('retains affinity when only an internal recovery model changes', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const original = candidate({
       accountId: 'original',
       order: 0,
@@ -604,7 +615,7 @@ describe('sticky-balanced session routing', () => {
 
   test('does not reserve a direct Opus session from stale Fable exhaustion', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const staleDepleted = candidate({
       accountId: 'stale-depleted',
       order: 0,
@@ -634,7 +645,7 @@ describe('sticky-balanced session routing', () => {
 
   test('uses known Fable-depleted accounts first for direct Opus sessions', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const depleted = candidate({
       accountId: 'main',
       order: 0,
@@ -664,7 +675,7 @@ describe('sticky-balanced session routing', () => {
   test('expires an inactive assignment even while the router process stays alive', async () => {
     const path = await statePath()
     let now = NOW
-    const router = new StickySessionRouter({
+    const router = ownRouter({
       path,
       now: () => now,
       assignmentTtlMs: 1_000,
@@ -696,8 +707,8 @@ describe('sticky-balanced session routing', () => {
 
   test('serializes concurrent first assignment across router instances', async () => {
     const path = await statePath()
-    const left = new StickySessionRouter({ path })
-    const right = new StickySessionRouter({ path })
+    const left = ownRouter({ path })
+    const right = ownRouter({ path })
     const candidates = [
       candidate({
         accountId: 'a',
@@ -730,8 +741,8 @@ describe('sticky-balanced session routing', () => {
 
   test('observes assignment resets written by another router process', async () => {
     const path = await statePath()
-    const left = new StickySessionRouter({ path, now: () => NOW })
-    const right = new StickySessionRouter({ path, now: () => NOW + 1 })
+    const left = ownRouter({ path, now: () => NOW })
+    const right = ownRouter({ path, now: () => NOW + 1 })
     const available = candidate({
       accountId: 'main',
       order: 0,
@@ -749,14 +760,16 @@ describe('sticky-balanced session routing', () => {
       inputBytes: 1_000,
     }
     await left.resolve(input)
+    await left.drain()
     expect((await right.resolve(input))?.created).toBe(false)
     await left.clear(input.sessionId)
+    await left.drain()
     expect((await right.resolve(input))?.created).toBe(true)
   })
 
   test('migrates atomically when the assigned account is explicitly excluded', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const candidates = [
       candidate({
         accountId: 'a',
@@ -884,7 +897,7 @@ describe('sticky-balanced session routing', () => {
 
   test('excludes an unknown-quota candidate from cold weighted selection when a known candidate exists', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const known = candidate({
       accountId: 'known',
       order: 1,
@@ -910,7 +923,7 @@ describe('sticky-balanced session routing', () => {
 
   test('router-level escape degrades to ordered selection when every candidate quota is unknown', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const resolution = await router.resolve({
       sessionId: 'all-unknown-quota-selection',
       family: 'general',
@@ -928,7 +941,7 @@ describe('sticky-balanced session routing', () => {
 
   test('does not escape to an exhausted candidate when every known quota is exhausted', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const resolution = await router.resolve({
       sessionId: 'all-exhausted-quota-selection',
       family: 'general',
@@ -958,7 +971,7 @@ describe('sticky-balanced session routing', () => {
 
   test('router-level pending bytes reset when an unknown quota becomes known', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const unknown = {
       accountId: 'a',
       quota: { kind: 'unknown' as const },
@@ -1001,7 +1014,7 @@ describe('sticky-balanced session routing', () => {
 
   test('keeps an excluded route out of a new assignment', async () => {
     const path = await statePath()
-    const router = new StickySessionRouter({ path, now: () => NOW })
+    const router = ownRouter({ path, now: () => NOW })
     const input = {
       sessionId: 'restricted-unknown-identity',
       family: 'general',

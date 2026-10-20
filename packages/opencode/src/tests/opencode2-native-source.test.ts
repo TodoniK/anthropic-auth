@@ -20,6 +20,7 @@ import {
   type NativeAccountRuntime,
   type NativeCustodyClient,
   type NativePoolPaths,
+  type ProviderAccountUuid,
   readNativeAccountsForRequest,
   readNativeEnrollmentMode,
   resolveNativePoolPaths,
@@ -31,6 +32,8 @@ import { fingerprintOf } from '@cortexkit/common-auth/store'
 import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promise/integration'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
+import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-fixture.ts'
+import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { tokenFingerprint } from '../../../core/src/token-fingerprint'
 import {
@@ -133,6 +136,166 @@ usageTests.test(
     ])
   },
 )
+
+usageTests.test(
+  'OC2 inconsistent relay pair refuses locally before dispatch authorization',
+  async () => {
+    const owned: Array<() => Promise<void> | void> = []
+    usageTests.deferCleanup(async () => {
+      for (const cleanup of owned.reverse()) await cleanup()
+    })
+    const fixture = await local(undefined, owned)
+    await fixture.runtime.updateRelay({
+      enabled: true,
+      url: 'https://never-send.invalid',
+      token: 'synthetic-never-send-token',
+    })
+    await fixture.store.updateSettings((settings) => {
+      ;(settings.relay as Record<string, unknown>).generation = 'mismatched'
+    })
+    const native = source(fixture.runtime, fixture.paths, owned)
+    await expect(native.authorizeAccount(scope, 'main')).rejects.toMatchObject({
+      code: 'relay-inconsistent',
+      status: 400,
+      retryable: false,
+      message:
+        'request refused: relay configuration is inconsistent; no request was sent',
+    })
+  },
+)
+
+for (const scenario of ['local-healthy', 'vault-healthy', 'refresh'] as const) {
+  usageTests.test(
+    `OC2 ${scenario} request observes only required foreground locks`,
+    async () => {
+      const owned: Array<() => Promise<void> | void> = []
+      usageTests.deferCleanup(async () => {
+        for (const cleanup of owned.reverse()) await cleanup()
+      })
+      const probe = requestLockProbe()
+      const now = () => Date.now() + 2 * 3600_000
+      const fixture =
+        scenario === 'vault-healthy'
+          ? await vault(
+              [7],
+              () => identity,
+              { mode: 'sticky-balanced' },
+              probe.onLockEvent,
+            )
+          : await local(
+              {
+                onLockEvent: probe.onLockEvent,
+                ...(scenario === 'refresh'
+                  ? {
+                      now,
+                      refreshToken: async () => ({
+                        access: 'sk-ant-oat01-refreshed-control',
+                        refresh: 'synthetic-control-refresh',
+                        expires: now() + 3600_000,
+                        expiresIn: 3600,
+                      }),
+                      resolveIdentity: async () => ({
+                        accountUuid: identity as ProviderAccountUuid,
+                        deviceId: 'fixture',
+                        sessionId: 'fixture',
+                      }),
+                    }
+                  : {}),
+              },
+              owned,
+            )
+      await fixture.runtime.updateSettings((settings) => {
+        settings.routing = { mode: 'sticky-balanced' }
+      })
+      const native = source(fixture.runtime, fixture.paths, owned)
+      probe.begin()
+      expect(await native.chooseAccount(scope)).toBe('main')
+      const auth = await native.authorizeAccount(scope, 'main')
+      expect(auth).toBeDefined()
+      if (!auth) return
+      probe.dispatch()
+      if (scenario === 'refresh')
+        expect(
+          probe.foreground.some(
+            (event) =>
+              event.name.startsWith('native-account-provider-') &&
+              event.path === fixture.paths.state,
+          ),
+        ).toBe(true)
+      else expect(probe.foreground).toEqual([])
+      await native.onAttemptEnd?.(context(auth.provenance), {
+        status: 200,
+        outputStarted: true,
+      })
+      await native.close()
+      expect(probe.detached.some((event) => event.name === 'write')).toBe(true)
+      expect(probe.afterDispatch.length).toBeGreaterThan(0)
+      expect(
+        probe.afterDispatch.some((event) => event.name === 'native-runtime'),
+      ).toBe(true)
+      if (scenario === 'vault-healthy')
+        expect(
+          probe.afterDispatch.some(
+            (event) => event.name === 'claustrum-roster-write',
+          ),
+        ).toBe(true)
+    },
+  )
+}
+
+for (const configured of [false, true]) {
+  usageTests.test(
+    `OC2 request ignores held native-relay lock (${configured ? 'relay' : 'direct'})`,
+    async () => {
+      const owned: Array<() => Promise<void> | void> = []
+      usageTests.deferCleanup(async () => {
+        for (const cleanup of owned.reverse()) await cleanup()
+      })
+      const fixture = await local(undefined, owned)
+      if (configured)
+        await fixture.runtime.updateRelay({
+          enabled: true,
+          url: 'https://held-relay.invalid',
+          token: 'synthetic-held-relay-token',
+          transport: 'http',
+          fallbackToDirect: false,
+        })
+      const native = source(fixture.runtime, fixture.paths, owned)
+      const held = await holdNativeRelayLock(fixture.paths.config, usageTests)
+      try {
+        const account = await native.chooseAccount(scope)
+        expect(account).toBe('main')
+        const auth = await native.authorizeAccount(scope, 'main')
+        if (!auth) throw new Error('Native authorization refused')
+        expect(auth.dispatch).toEqual(
+          configured
+            ? {
+                kind: 'http-relay',
+                url: 'https://held-relay.invalid',
+                token: 'synthetic-held-relay-token',
+              }
+            : { kind: 'direct' },
+        )
+        expect(await fixture.runtime.getRelayConfig()).toEqual(
+          configured
+            ? {
+                enabled: true,
+                url: 'https://held-relay.invalid',
+                token: 'synthetic-held-relay-token',
+                transport: 'http',
+                fallbackToDirect: false,
+              }
+            : null,
+        )
+        await held.assertOwned()
+      } finally {
+        await held.pastTimeout
+        await held.release()
+      }
+    },
+    25_000,
+  )
+}
 
 async function storage(owned = cleanups) {
   const parent = resolve(
@@ -314,6 +477,7 @@ async function vault(
   versions: number[] = [7, 8],
   servedIdentity: (get: number) => string = () => identity,
   routing: { mode: string } = { mode: 'main-first' },
+  onLockEvent?: NativeAccountRuntime['onLockEvent'],
 ) {
   const { paths, env, store: localStore } = await storage()
   await writeFile(
@@ -378,6 +542,7 @@ async function vault(
   const runtime = createNativeAccountRuntime({
     paths,
     host: 'opencode',
+    local: { onLockEvent },
     vault: {
       env,
       connect: async () => client,
@@ -1315,9 +1480,11 @@ describe('OC2 source over actual native services', () => {
           }
         ).assignments,
       ).map((assignment) => assignment.accountId)
+    await native.drainRoutingPublications()
     expect(await assignments(snapshot.routingPath)).toEqual(['main'])
     expect(await exists(localRouting)).toBe(false)
     await native.resetRouting(scope.sessionID)
+    await native.drainRoutingPublications()
     expect(await assignments(snapshot.routingPath)).toEqual([])
     expect(await exists(localRouting)).toBe(false)
   })
@@ -1344,6 +1511,7 @@ describe('OC2 source over actual native services', () => {
     ).toBe(fallbackRoute)
     const routing = before.routingPath
     if (!routing) throw new Error('Vault mode named no routing file')
+    await native.drainRoutingPublications()
     const pinned = await readFile(routing, 'utf8')
     expect(JSON.parse(rawPin(pinned, mainSession.sessionID))).toMatchObject({
       accountId: 'main',
@@ -1363,6 +1531,7 @@ describe('OC2 source over actual native services', () => {
     )
     if (!replaced) throw new Error('Replaced default account is missing')
     const choice = await native.chooseAccount(mainSession)
+    await native.drainRoutingPublications()
     const repinned = JSON.parse(
       rawPin(await readFile(routing, 'utf8'), mainSession.sessionID),
     )
@@ -1388,6 +1557,7 @@ describe('OC2 source over actual native services', () => {
     expect(snapshot.routingPath).toBe(
       join(dirname(fixture.paths.config), 'native-routing.json'),
     )
+    await native.drainRoutingPublications()
     const pin = JSON.parse(
       rawPin(await readFile(snapshot.routingPath!, 'utf8'), scope.sessionID),
     )

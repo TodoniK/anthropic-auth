@@ -237,10 +237,16 @@ async function getPiStickyRouter(storagePath: string) {
     await getPiNativeRuntime(storagePath).routingStorage()
   let router = stickyRouters.get(path)
   if (!router) {
-    router = new StickySessionRouter({ path, vaultSeed })
+    const runtime = await getPiNativeRuntime(storagePath).service()
+    router = new StickySessionRouter({
+      path,
+      vaultSeed,
+      onLockEvent: runtime.onLockEvent,
+    })
     setBoundedService(stickyRouters, path, router)
   }
   router.setVaultSeed(vaultSeed)
+  getPiNativeRuntime(storagePath).ownRoutingPublications(router)
   return router
 }
 
