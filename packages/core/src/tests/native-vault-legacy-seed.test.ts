@@ -66,7 +66,13 @@ const preferences = {
 
 async function fixture(verified = true) {
   const root = await mkdtemp(join(tmpdir(), 'vault-legacy-seed-'))
-  deferCleanup(() => rm(root, { recursive: true, force: true }))
+  const routers: StickySessionRouter[] = []
+  let accountRuntime: ReturnType<typeof createNativeAccountRuntime> | undefined
+  deferCleanup(async () => {
+    await accountRuntime?.drainRoutingPublications()
+    await Promise.all(routers.map((router) => router.drain()))
+    await rm(root, { recursive: true, force: true })
+  })
   const paths = await resolveNativePoolPaths(join(root, 'anthropic-auth.json'))
   const vault = nativeVaultPaths(paths)
   const now = Date.now()
@@ -184,9 +190,15 @@ async function fixture(verified = true) {
   if (!mainRoute || !workRoute) throw new Error('Fixture roster has no routes')
   const options = { paths, host: 'opencode' as const, vault: { env } }
   const runtime = ownRuntime(createNativeAccountRuntime(options))
+  accountRuntime = runtime
+  const readAndDrain = async () => {
+    const snapshot = await runtime.read()
+    await runtime.drainRoutingPublications()
+    return snapshot
+  }
   const store = createNativePoolStore({ paths: vault, quota: nativeQuotaCodec })
-  const router = () =>
-    new StickySessionRouter({
+  const router = () => {
+    const value = new StickySessionRouter({
       path: vault.routing,
       vaultSeed: {
         legacyConfig: paths.legacyConfig,
@@ -194,15 +206,18 @@ async function fixture(verified = true) {
         mainRouteId: mainRoute,
       },
     })
-  const resolve = (
+    routers.push(value)
+    return value
+  }
+  const resolveAndDrain = async (
     session: string,
     routerInstance = router(),
     identities = new Map([
       ['main', mainUuid],
       [workRoute, workUuid],
     ]),
-  ) =>
-    routerInstance.resolve({
+  ) => {
+    const resolution = await routerInstance.resolve({
       sessionId: session,
       family: 'general',
       modelId: model,
@@ -214,6 +229,9 @@ async function fixture(verified = true) {
       storage: null,
       inputBytes: 1,
     })
+    await routerInstance.drain()
+    return resolution
+  }
   const legacyBefore = await Promise.all(
     [paths.legacyConfig, paths.legacyState, legacyRouting].map((path) =>
       readFile(path),
@@ -238,7 +256,8 @@ async function fixture(verified = true) {
     mainRoute,
     workRoute,
     router,
-    resolve,
+    resolveAndDrain,
+    readAndDrain,
     assertLegacy,
     config,
     legacyRouting,
@@ -248,7 +267,7 @@ async function fixture(verified = true) {
 
 test('first vault snapshot seeds validated preferences and UUID-translated pins without touching legacy bytes', async () => {
   const f = await fixture()
-  const snapshot = await f.runtime.read()
+  const snapshot = await f.readAndDrain()
   for (const [section, value] of Object.entries(preferences))
     expect(snapshot.settings[section]).toEqual(value)
   const settings = JSON.parse(await readFile(f.vault.config, 'utf8'))
@@ -273,8 +292,8 @@ test('first vault snapshot seeds validated preferences and UUID-translated pins 
     accountIdentity: workUuid,
     assignedAt: f.now - 10,
   })
-  expect((await f.resolve('work-session'))?.created).toBe(false)
-  expect((await f.resolve('main-session'))?.accountId).toBe('main')
+  expect((await f.resolveAndDrain('work-session'))?.created).toBe(false)
+  expect((await f.resolveAndDrain('main-session'))?.accountId).toBe('main')
   for (const path of [f.vault.config, f.vault.routing])
     expect((await stat(path)).mode & 0o777).toBe(0o600)
   await f.assertLegacy()
@@ -297,7 +316,7 @@ test('existing pin-only Mac settings and unmarked live routing remain byte-ident
   const before = await Promise.all(
     [f.vault.config, f.vault.routing].map((path) => readFile(path)),
   )
-  await f.runtime.read()
+  await f.readAndDrain()
   expect(
     await Promise.all(
       [f.vault.config, f.vault.routing].map((path) => readFile(path)),
@@ -321,7 +340,7 @@ test('existing pin-only Mac settings and unmarked live routing remain byte-ident
     routing: { mode: 'fallback-first' },
     logging: { level: 'error' },
   })
-  await f.resolve('live-session')
+  await f.resolveAndDrain('live-session')
   const live = await Promise.all(
     [f.vault.config, f.vault.routing].map((path) => readFile(path)),
   )
@@ -338,13 +357,17 @@ test('existing pin-only Mac settings and unmarked live routing remain byte-ident
 
 test('request during routing deferral routes normally without creating an empty file or marker', async () => {
   const f = await fixture(false)
-  expect((await f.runtime.read()).settings.routing).toEqual(preferences.routing)
+  expect((await f.readAndDrain()).settings.routing).toEqual(preferences.routing)
   await expect(stat(f.vault.routing)).rejects.toMatchObject({ code: 'ENOENT' })
-  const result = await f.resolve('no-verified-route', f.router(), new Map())
+  const result = await f.resolveAndDrain(
+    'no-verified-route',
+    f.router(),
+    new Map(),
+  )
   expect(result).toBeNull()
   await expect(stat(f.vault.routing)).rejects.toMatchObject({ code: 'ENOENT' })
   await f.publishRoster()
-  await f.runtime.read()
+  await f.readAndDrain()
   expect(
     JSON.parse(await readFile(f.vault.routing, 'utf8')).vaultLegacySeed,
   ).toBe('complete')
@@ -356,14 +379,14 @@ test('a live pin during deferral survives the one-time seed and later starts nev
     next: { ...f.roster, complete: false },
     result: undefined,
   }))
-  await f.runtime.read()
-  expect((await f.resolve('main-session'))?.accountId).toBe(f.workRoute)
+  await f.readAndDrain()
+  expect((await f.resolveAndDrain('main-session'))?.accountId).toBe(f.workRoute)
   const pending = JSON.parse(await readFile(f.vault.routing, 'utf8'))
   expect(pending.vaultLegacySeed).toBe('pending')
   const livePin = pending.assignments[key('main-session')]
   expect(livePin.accountId).toBe(f.workRoute)
   await f.publishRoster()
-  await f.runtime.read()
+  await f.readAndDrain()
   const seeded = JSON.parse(await readFile(f.vault.routing, 'utf8'))
   expect(seeded.vaultLegacySeed).toBe('complete')
   expect(seeded.assignments[key('main-session')]).toEqual(livePin)
@@ -372,7 +395,9 @@ test('a live pin during deferral survives the one-time seed and later starts nev
     ...s,
     routing: { mode: 'fallback-first' },
   }))
-  await f.router().clear('work-session')
+  const clearing = f.router()
+  await clearing.clear('work-session')
+  await clearing.drain()
   const before = await Promise.all(
     [f.vault.config, f.vault.routing].map((path) => readFile(path)),
   )
@@ -451,7 +476,7 @@ test('invalid settings fields are dropped while valid siblings survive and no cr
     }),
     { mode: 0o600 },
   )
-  const settings = (await f.runtime.read()).settings
+  const settings = (await f.readAndDrain()).settings
   expect(settings).not.toHaveProperty('routing')
   expect(settings.claudeCache).toEqual({ enabled: true })
   expect(settings.quota).toEqual({
@@ -474,7 +499,7 @@ test('missing unreadable or malformed legacy input never refuses vault serving',
     if (bad === 'directory') await fs.mkdir(f.paths.legacyConfig)
     if (bad === 'malformed')
       await writeFile(f.paths.legacyConfig, '{invalid', { mode: 0o600 })
-    expect((await f.runtime.read()).mode).toBe('claustrum')
+    expect((await f.readAndDrain()).mode).toBe('claustrum')
     await f.store.updateSettings((s) => ({ ...s, logging: { level: 'error' } }))
     expect((await f.store.readSettings()).status).toBe('ready')
   }
@@ -509,10 +534,10 @@ test('routing seed rename failure is nonfatal, leaves no partial file or marker,
     return originalRename(from, to)
   })
   deferCleanup(() => rename.mockRestore())
-  expect((await f.runtime.read()).mode).toBe('claustrum')
+  expect((await f.readAndDrain()).mode).toBe('claustrum')
   await expect(stat(f.vault.routing)).rejects.toMatchObject({ code: 'ENOENT' })
   rename.mockRestore()
-  await f.runtime.read()
+  await f.readAndDrain()
   expect(
     JSON.parse(await readFile(f.vault.routing, 'utf8')).vaultLegacySeed,
   ).toBe('complete')
@@ -521,15 +546,15 @@ test('routing seed rename failure is nonfatal, leaves no partial file or marker,
 
 test('completed routing seed adds no legacy or routing file reads to later Core snapshots', async () => {
   const f = await fixture()
-  await f.runtime.read()
+  await f.readAndDrain()
   const read = spyOn(fs, 'readFile')
   const metadata = spyOn(fs, 'stat')
   deferCleanup(() => {
     read.mockRestore()
     metadata.mockRestore()
   })
-  await f.runtime.read()
-  await f.runtime.read()
+  await f.readAndDrain()
+  await f.readAndDrain()
   expect(
     metadata.mock.calls.filter(([path]) => path === f.vault.routing),
   ).toEqual([])
@@ -549,9 +574,9 @@ test('malformed routing stays untouched while requests can still select an admit
   const f = await fixture()
   const bytes = 'pre-existing malformed vault routing'
   await writeFile(f.vault.routing, bytes, { mode: 0o600 })
-  expect((await f.runtime.read()).mode).toBe('claustrum')
+  expect((await f.readAndDrain()).mode).toBe('claustrum')
   expect(await readFile(f.vault.routing, 'utf8')).toBe(bytes)
-  expect((await f.resolve('session'))?.accountId).toBe(f.workRoute)
+  expect((await f.resolveAndDrain('session'))?.accountId).toBe(f.workRoute)
   expect(await readFile(f.vault.routing, 'utf8')).toBe(bytes)
   await f.assertLegacy()
 })
@@ -579,7 +604,7 @@ test('first snapshot with existing settings completes while another writer still
   trackDetached(holder)
   await entered.wait
   try {
-    const snapshot = await f.runtime.read()
+    const snapshot = await f.readAndDrain()
     expect(holding).toBe(true)
     expect(snapshot.settings.routing).toEqual({ mode: 'fallback-first' })
     expect(await readFile(f.vault.config, 'utf8')).toBe(existing)

@@ -18,6 +18,10 @@ import {
 } from './accounts.ts'
 import { logger } from './logger.ts'
 import { isClaudeFableOrMythos5Model } from './models.ts'
+import {
+  type NativeLockEvent,
+  nativeLockObserver,
+} from './native-lock-observer.ts'
 import type { NativeVaultRosterDocument } from './native-roster-seed.ts'
 import {
   type NativeVaultRoutingSeed,
@@ -544,7 +548,16 @@ export class StickySessionRouter {
   private loaded = false
   private state: StickyRouteState
   private stateMtimeNs: bigint | undefined
-  private touchChain: Promise<void> = Promise.resolve()
+  private publicationChain: Promise<void> = Promise.resolve()
+  private seedPublication: Promise<void> | undefined
+  private readonly changes = new Map<
+    string,
+    {
+      assignment?: StickyRouteAssignment
+      operation: 'touch' | 'assign' | 'delete'
+      queued: boolean
+    }
+  >()
   private seedFinalized = false
 
   constructor(
@@ -554,6 +567,7 @@ export class StickySessionRouter {
       assignmentTtlMs?: number
       vaultSeed?: NativeVaultRoutingSeed
       localRecoveryPath?: string
+      onLockEvent?: (event: NativeLockEvent) => void
     },
   ) {
     this.state = emptyState(this.now())
@@ -601,18 +615,23 @@ export class StickySessionRouter {
       const after = await this.readStateMtimeNs()
       if (before !== after) continue
       this.state = state
+      this.overlayChanges()
       this.stateMtimeNs = after
       this.loaded = true
       return
     }
     this.state = await this.readState()
+    this.overlayChanges()
     this.stateMtimeNs = await this.readStateMtimeNs()
     this.loaded = true
   }
 
-  private async acquireLock(wait = true) {
+  private async acquireLock(wait = true, detached = false) {
+    const observer = nativeLockObserver(this.options.onLockEvent)
+    const event = { name: 'write', path: this.options.path, detached }
+    observer?.({ ...event, type: 'acquiring' })
     await mkdir(dirname(this.options.path), { recursive: true, mode: 0o700 })
-    const deadline = this.now() + STICKY_ROUTING_LOCK_WAIT_MS
+    const deadline = performance.now() + STICKY_ROUTING_LOCK_WAIT_MS
     while (true) {
       const lock = await acquireRefreshFileLock({
         name: 'write',
@@ -620,8 +639,21 @@ export class StickySessionRouter {
         ttlMs: STICKY_ROUTING_LOCK_TTL_MS,
         renew: true,
       })
-      if (lock) return lock
-      if (!wait || this.now() >= deadline) {
+      if (lock) {
+        observer?.({ ...event, type: 'acquired' })
+        return {
+          assertOwned: () => lock.assertOwned(),
+          release: async () => {
+            try {
+              await lock.release()
+            } finally {
+              observer?.({ ...event, type: 'released' })
+            }
+          },
+        }
+      }
+      observer?.({ ...event, type: 'contended' })
+      if (!wait || performance.now() >= deadline) {
         throw new Error('Timed out acquiring sticky routing state lock')
       }
       await new Promise((resolve) =>
@@ -630,27 +662,24 @@ export class StickySessionRouter {
     }
   }
 
-  private async recoverLocalPins() {
+  private recoverLocalPins() {
     const source = this.options.localRecoveryPath
     if (!source || source === this.options.path) return
     const key = JSON.stringify([this.options.path, source])
     let recovery = localRecoveries.get(key)
     if (!recovery) {
-      // Recovery is bookkeeping, not a prerequisite for using destination pins.
-      // Remember failures as completed attempts so later requests do no recovery I/O.
-      recovery = this.fillLocalPins(source).catch(() => {
-        logger.warn('sticky-routing', 'local pin recovery unavailable', {
-          reason: 'recovery-failed',
-        })
-      })
+      recovery = this.enqueuePublication('recovery', () =>
+        this.fillLocalPins(source),
+      )
       localRecoveries.set(key, recovery)
+    } else {
+      const shared = recovery
+      this.publicationChain = this.publicationChain.then(() => shared)
     }
-    await recovery
   }
 
   private async fillLocalPins(source: string) {
-    // Do not make a request wait for another writer just to recover old pins.
-    const lock = await this.acquireLock(false)
+    const lock = await this.acquireLock(true, true)
     try {
       let legacy: StickyRouteState | undefined
       try {
@@ -719,9 +748,9 @@ export class StickySessionRouter {
     } finally {
       await rm(tempPath, { force: true }).catch(() => {})
     }
-    this.state = state
-    this.stateMtimeNs = await this.readStateMtimeNs()
-    this.loaded = true
+    // A background merge must not replace newer in-memory session changes.
+    // Re-read the atomically published file before the next route decision.
+    this.loaded = false
   }
 
   private async writeResolutionState(
@@ -731,92 +760,84 @@ export class StickySessionRouter {
   ) {
     let ownershipLost = false
     try {
-      await this.writeState(state, async () => {
-        try {
-          await assertOwned()
-        } catch (error) {
-          ownershipLost = true
-          throw error
-        }
-      })
+      await this.writeState(
+        state,
+        async () => {
+          try {
+            await assertOwned()
+          } catch (error) {
+            ownershipLost = true
+            throw error
+          }
+        },
+        false,
+      )
+      return true
     } catch {
-      // Persisting a pin is bookkeeping, not an authorization decision. Keep
-      // the computed route even if the lease or storage becomes unavailable.
-      this.state = state
+      // A failed publication keeps its session change pending for a later retry.
       logger.warn('sticky-routing', 'assignment write refused', {
         operation,
         reason: ownershipLost ? 'ownership-lost' : 'storage-unavailable',
       })
+      return false
     }
   }
 
-  /** Import legacy session pins only after vault account discovery produces a complete verified roster. No empty routing file is published while that roster is incomplete. */
+  /** Queue legacy-pin import in the background; take its writer lease only after verifying a complete roster. */
   async prepareLegacySeed(knownRoster?: NativeVaultRosterDocument | null) {
     const seed = this.options.vaultSeed
-    if (!seed || this.seedFinalized) return
-    try {
-      await this.refreshStateIfChanged()
-    } catch {
-      // Leave the unreadable file alone; request routing can use its in-memory
-      // pins and still validate account identity and quota independently.
-      this.seedFinalized = true
-      return
-    }
-    // An unmarked existing file predates this importer and belongs to the user.
-    if (this.state.vaultLegacySeed !== 'pending') {
-      this.seedFinalized = true
-      return
-    }
-    const roster =
-      knownRoster === undefined
-        ? await readVaultRoster(seed.roster)
-        : knownRoster
-    if (!roster?.complete) return
-    const lock = await this.acquireLock(false).catch(() => undefined)
-    if (!lock) return
-    try {
-      const state = await this.readState()
-      if (state.vaultLegacySeed !== 'pending') {
-        this.seedFinalized = true
-        return
-      }
-      const source = await readNativeVaultLegacyJson(seed.legacyConfig)
-      const routes = nativeVaultLegacyRoutes(source, roster)
-      const legacy = await readNativeVaultLegacyJson(
-        getStickyRoutingStatePath(seed.legacyConfig),
-      )
-      if (
-        isRecord(legacy) &&
-        legacy.version === 1 &&
-        isRecord(legacy.assignments)
-      ) {
-        for (const [key, raw] of Object.entries(legacy.assignments)) {
-          // Both namespaces hash the raw session ID with SHA-256, without a salt.
-          if (
-            !/^[0-9a-f]{64}$/.test(key) ||
-            Object.hasOwn(state.assignments, key)
-          )
-            continue
-          const assignment = normalizeAssignment(raw)
-          const target = assignment && routes.get(assignment.accountId)
-          if (assignment && target)
-            state.assignments[key] = {
-              ...assignment,
-              accountId: target.routeId,
-              accountIdentity: target.accountIdentity,
-            }
+    if (!seed || this.seedFinalized || this.seedPublication) return
+    if (knownRoster !== undefined && !knownRoster?.complete) return
+    this.seedPublication = this.enqueuePublication('seed', async () => {
+      const roster =
+        knownRoster === undefined
+          ? await readVaultRoster(seed.roster)
+          : knownRoster
+      if (!roster?.complete) return
+      const lock = await this.acquireLock(true, true)
+      try {
+        const state = await this.readState()
+        if (state.vaultLegacySeed !== 'pending') {
+          this.seedFinalized = true
+          return
         }
+        const source = await readNativeVaultLegacyJson(seed.legacyConfig)
+        const routes = nativeVaultLegacyRoutes(source, roster)
+        const legacy = await readNativeVaultLegacyJson(
+          getStickyRoutingStatePath(seed.legacyConfig),
+        )
+        if (
+          isRecord(legacy) &&
+          legacy.version === 1 &&
+          isRecord(legacy.assignments)
+        ) {
+          for (const [key, raw] of Object.entries(legacy.assignments)) {
+            if (
+              !/^[0-9a-f]{64}$/.test(key) ||
+              Object.hasOwn(state.assignments, key)
+            )
+              continue
+            const assignment = normalizeAssignment(raw)
+            const target = assignment && routes.get(assignment.accountId)
+            if (assignment && target)
+              state.assignments[key] = {
+                ...assignment,
+                accountId: target.routeId,
+                accountIdentity: target.accountIdentity,
+              }
+          }
+        }
+        state.vaultLegacySeed = 'complete'
+        // Imported pins fill only missing assignments, leaving existing ones
+        // unchanged. Publish the marker and additions in one owned rename.
+        await this.writeState(state, () => lock.assertOwned(), false)
+        this.seedFinalized = true
+      } finally {
+        await lock.release()
       }
-      state.vaultLegacySeed = 'complete'
-      // Seed and marker share one rename. Pruning here would remove live pins
-      // written during deferral, so leave their lifetime to ordinary routing.
-      await this.writeState(state, () => lock.assertOwned(), false)
-      this.seedFinalized = true
-    } catch {
-      logger.warn('sticky-routing', 'legacy pin import unavailable')
-    } finally {
-      await lock.release().catch(() => {})
-    }
+    }).finally(() => {
+      this.seedPublication = undefined
+    })
   }
 
   private logicalAccountId(assignment: StickyRouteAssignment) {
@@ -830,21 +851,102 @@ export class StickySessionRouter {
   }
 
   private scheduleTouch(key: string) {
-    this.touchChain = this.touchChain
-      .catch(() => {})
-      .then(async () => {
-        const lock = await this.acquireLock()
-        try {
-          const state = await this.readState()
-          const assignment = state.assignments[key]
-          if (!assignment) return
-          assignment.lastSeenAt = this.now()
-          await this.writeState(state, () => lock.assertOwned())
-        } finally {
-          await lock.release()
-        }
+    const assignment = this.state.assignments[key]
+    if (assignment) this.scheduleChange(key, assignment, 'touch')
+  }
+
+  private overlayChanges() {
+    for (const [key, change] of this.changes) {
+      if (change.assignment)
+        this.state.assignments[key] = { ...change.assignment }
+      else delete this.state.assignments[key]
+    }
+  }
+
+  private enqueuePublication(operation: string, work: () => Promise<void>) {
+    const pending = this.publicationChain.then(work).catch(() => {
+      if (operation === 'recovery') {
+        logger.warn('sticky-routing', 'local pin recovery unavailable', {
+          reason: 'recovery-failed',
+        })
+        return
+      }
+      logger.warn('sticky-routing', 'assignment write refused', {
+        operation,
+        reason: 'storage-unavailable',
       })
-      .catch(() => {})
+    })
+    this.publicationChain = pending
+    return pending
+  }
+
+  private scheduleChange(
+    key: string,
+    assignment: StickyRouteAssignment | undefined,
+    operation: 'touch' | 'assign' | 'delete',
+  ) {
+    const change = {
+      assignment: assignment ? { ...assignment } : undefined,
+      operation,
+      queued: false,
+    }
+    this.changes.set(key, change)
+    this.overlayChanges()
+    this.retryChange(key)
+  }
+
+  private retryChange(key: string) {
+    const change = this.changes.get(key)
+    if (!change || change.queued) return
+    change.queued = true
+    void this.enqueuePublication(change.operation, async () => {
+      if (this.changes.get(key) !== change) return
+      const lock = await this.acquireLock(true, true)
+      try {
+        const state = await this.readState()
+        // A reset or reassignment may supersede a change while publication waits.
+        if (this.changes.get(key) !== change) return
+        // Re-read under the publication lease and merge only this session, so
+        // another project's pins cannot be overwritten by a request snapshot.
+        if (change.assignment) {
+          if (change.operation === 'touch') {
+            const current = state.assignments[key]
+            if (
+              current?.accountId !== change.assignment.accountId ||
+              current.accountIdentity !== change.assignment.accountIdentity ||
+              current.affinityModelId !== change.assignment.affinityModelId ||
+              current.family !== change.assignment.family
+            ) {
+              if (this.changes.get(key) === change) this.changes.delete(key)
+              return
+            }
+            current.lastSeenAt = Math.max(
+              current.lastSeenAt,
+              change.assignment.lastSeenAt,
+            )
+          } else state.assignments[key] = { ...change.assignment }
+        } else delete state.assignments[key]
+        const saved = await this.writeResolutionState(
+          state,
+          () => lock.assertOwned(),
+          change.operation,
+        )
+        if (saved && this.changes.get(key) === change) this.changes.delete(key)
+      } finally {
+        await lock.release().catch(() => {})
+      }
+    }).finally(() => {
+      change.queued = false
+    })
+  }
+
+  /** Wait for owned background publications during host disposal or fixture cleanup. */
+  async drain() {
+    let pending: Promise<void>
+    do {
+      pending = this.publicationChain
+      await pending
+    } while (pending !== this.publicationChain)
   }
 
   private selectCandidate(input: {
@@ -930,7 +1032,7 @@ export class StickySessionRouter {
     excludeAccountIds?: ReadonlySet<string>
   }): Promise<StickyRouteResolution | null> {
     if (!input.sessionId) return null
-    await this.recoverLocalPins()
+    this.recoverLocalPins()
     await this.prepareLegacySeed()
     await this.refreshStateIfChanged().catch(() => {})
     const key = sessionKey(input.sessionId)
@@ -965,6 +1067,7 @@ export class StickySessionRouter {
         cached.lastSeenAt = this.now()
         this.scheduleTouch(key)
       }
+      this.retryChange(key)
       return {
         accountId: this.logicalAccountId(cached),
         assignment: { ...cached },
@@ -973,126 +1076,93 @@ export class StickySessionRouter {
       }
     }
 
-    // A request can select and remember a route without publishing a pin.
-    // Never wait for another process's auxiliary routing writer.
-    const lock = await this.acquireLock(false).catch(() => undefined)
-    try {
-      let readable = true
-      const state = lock
-        ? await this.readState().catch(() => {
-            readable = false
-            return structuredClone(this.state)
-          })
-        : structuredClone(this.state)
-      const save = async (operation: 'touch' | 'delete' | 'assign') => {
-        this.state = state
-        if (lock && readable)
-          await this.writeResolutionState(
-            state,
-            () => lock.assertOwned(),
-            operation,
-          )
-      }
-      this.prune(state)
-      const current = state.assignments[key]
-      if (
-        current &&
-        matchesAffinity(current) &&
-        matchesAccountIdentity(current) &&
-        input.retainAccountIds.has(this.logicalAccountId(current)) &&
-        !input.excludeAccountIds?.has(this.logicalAccountId(current))
-      ) {
-        current.lastSeenAt = this.now()
-        await save('touch')
-        return {
-          accountId: this.logicalAccountId(current),
-          assignment: { ...current },
-          created: false,
-          migrated: false,
-        }
-      }
-      const affinityChanged = Boolean(current && !matchesAffinity(current))
-      const identityChanged = Boolean(
-        current && !matchesAccountIdentity(current),
-      )
-      if (affinityChanged || identityChanged) {
-        delete state.assignments[key]
-      }
-      const candidates = input.candidates.filter(
-        (candidate) =>
-          !input.excludeAccountIds?.has(candidate.accountId) &&
-          (!input.accountIdentities ||
-            identityForAccount(candidate.accountId) !== undefined),
-      )
-      const preferred =
-        !affinityChanged && !identityChanged && input.preferredAccountId
-          ? candidates.find(
-              (candidate) =>
-                candidate.accountId === input.preferredAccountId &&
-                stickyRouteCandidateWeight({
-                  candidate,
-                  family: input.family,
-                  modelId: input.modelId,
-                  storage: input.storage,
-                  now: this.now(),
-                }) > 0,
-            )
-          : undefined
-      const selected =
-        preferred ?? this.selectCandidate({ ...input, candidates, state })
-      if (!selected) {
-        if (current) {
-          delete state.assignments[key]
-          await save('delete')
-        }
-        return null
-      }
-      const now = this.now()
-      const selectedQuota = knownQuota(selected.quota)
-      const assignment: StickyRouteAssignment = {
-        accountId: selected.accountId,
-        ...(input.accountIdentities
-          ? { accountIdentity: identityForAccount(selected.accountId) }
-          : {}),
-        family: input.family,
-        affinityModelId,
-        assignedAt: now,
-        lastSeenAt: now,
-        initialInputBytes: Math.max(1, input.inputBytes),
-        quotaCheckedAt: selectedQuota ? snapshotCheckedAt(selectedQuota) : 0,
-      }
-      state.assignments[key] = assignment
-      await save('assign')
+    // Route decisions use the atomically published state, never a writer lease.
+    const state = structuredClone(this.state)
+    const save = (operation: 'touch' | 'delete' | 'assign') => {
+      this.scheduleChange(key, state.assignments[key], operation)
+    }
+    this.prune(state)
+    const current = state.assignments[key]
+    if (
+      current &&
+      matchesAffinity(current) &&
+      matchesAccountIdentity(current) &&
+      input.retainAccountIds.has(this.logicalAccountId(current)) &&
+      !input.excludeAccountIds?.has(this.logicalAccountId(current))
+    ) {
+      current.lastSeenAt = this.now()
+      save('touch')
       return {
-        accountId: selected.accountId,
-        assignment: { ...assignment },
-        created: !current,
-        migrated: Boolean(
-          current &&
-            (identityChanged || current.accountId !== selected.accountId),
-        ),
+        accountId: this.logicalAccountId(current),
+        assignment: { ...current },
+        created: false,
+        migrated: false,
       }
-    } finally {
-      await lock?.release().catch(() => {})
+    }
+    const affinityChanged = Boolean(current && !matchesAffinity(current))
+    const identityChanged = Boolean(current && !matchesAccountIdentity(current))
+    if (affinityChanged || identityChanged) {
+      delete state.assignments[key]
+    }
+    const candidates = input.candidates.filter(
+      (candidate) =>
+        !input.excludeAccountIds?.has(candidate.accountId) &&
+        (!input.accountIdentities ||
+          identityForAccount(candidate.accountId) !== undefined),
+    )
+    const preferred =
+      !affinityChanged && !identityChanged && input.preferredAccountId
+        ? candidates.find(
+            (candidate) =>
+              candidate.accountId === input.preferredAccountId &&
+              stickyRouteCandidateWeight({
+                candidate,
+                family: input.family,
+                modelId: input.modelId,
+                storage: input.storage,
+                now: this.now(),
+              }) > 0,
+          )
+        : undefined
+    const selected =
+      preferred ?? this.selectCandidate({ ...input, candidates, state })
+    if (!selected) {
+      if (current) {
+        delete state.assignments[key]
+        save('delete')
+      }
+      return null
+    }
+    const now = this.now()
+    const selectedQuota = knownQuota(selected.quota)
+    const assignment: StickyRouteAssignment = {
+      accountId: selected.accountId,
+      ...(input.accountIdentities
+        ? { accountIdentity: identityForAccount(selected.accountId) }
+        : {}),
+      family: input.family,
+      affinityModelId,
+      assignedAt: now,
+      lastSeenAt: now,
+      initialInputBytes: Math.max(1, input.inputBytes),
+      quotaCheckedAt: selectedQuota ? snapshotCheckedAt(selectedQuota) : 0,
+    }
+    state.assignments[key] = assignment
+    save('assign')
+    return {
+      accountId: selected.accountId,
+      assignment: { ...assignment },
+      created: !current,
+      migrated: Boolean(
+        current &&
+          (identityChanged || current.accountId !== selected.accountId),
+      ),
     }
   }
 
   async clear(sessionId: string) {
     if (!sessionId) return
-    await this.recoverLocalPins()
-    const key = sessionKey(sessionId)
-    delete this.state.assignments[key]
-    const lock = await this.acquireLock(false).catch(() => undefined)
-    if (!lock) return
-    try {
-      const state = await this.readState()
-      if (!(key in state.assignments)) return
-      delete state.assignments[key]
-      await this.writeResolutionState(state, () => lock.assertOwned(), 'delete')
-    } catch {
-      logger.warn('sticky-routing', 'pin removal unavailable')
-    } finally {
-      await lock.release().catch(() => {})
-    }
+    this.recoverLocalPins()
+    this.scheduleChange(sessionKey(sessionId), undefined, 'delete')
   }
 }

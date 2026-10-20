@@ -1495,6 +1495,10 @@ const anthropicAuthPlugin = async (
     vaultWatch?.close()
     await usagePublications.drain()
     await nativeAccounts.drainQuotaPublications()
+    await Promise.all(
+      [...stickySessionRouters.values()].map((router) => router.drain()),
+    )
+    await nativeAccounts.drainRoutingPublications()
     nativeAccounts.close()
   }
 
@@ -1777,6 +1781,7 @@ const anthropicAuthPlugin = async (
       router = new StickySessionRouter({
         path,
         vaultSeed: snapshot.routingSeed,
+        onLockEvent: nativeAccounts.onLockEvent,
         localRecoveryPath:
           snapshot.mode === 'local' ? snapshot.routingRecoveryPath : undefined,
       })

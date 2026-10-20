@@ -331,8 +331,10 @@ describe('native CacheKeep and routing commands', () => {
         retainAccountIds: new Set(['main']),
         storage: await readNativePiFixture(storagePath),
       })
+    await router.drain()
     const before = await readNativePiFixture(storagePath)
     await controller().execute({ action: 'routing-reset' })
+    await getPiNativeRuntime(storagePath).drainRoutingPublications()
     const cleared = await router.resolve({
       sessionId: 'command-session',
       family: 'opus',

@@ -14,7 +14,6 @@ import {
   SAFETY_POLL_MS,
 } from '@cortexkit/common-auth/claustrum'
 import { SubcClient } from '@cortexkit/subc-client'
-
 import {
   fetchOAuthQuotaSnapshot,
   type OAuthAccountProfile,
@@ -52,6 +51,11 @@ import {
   type NativeRosterWatch,
 } from './native-custody.ts'
 import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
+import {
+  type NativeLockEvent,
+  nativeLockObserver,
+  withDetachedNativeLocks,
+} from './native-lock-observer.ts'
 import { fromNativeQuotaMap, nativeQuotaCodec } from './native-quota-codec.ts'
 import {
   NativeQuotaObservations,
@@ -105,6 +109,7 @@ export interface NativeVaultRuntimeOptions {
   readToken?: () => Promise<{ token: string; token_generation: number }>
   env?: NodeJS.ProcessEnv
   now?: () => number
+  onLockEvent?: (event: NativeLockEvent) => void
   /**
    * Timer functions for the vault custody's outage probe and roster watch
    * retries. Defaults to the global ones; tests pass their own.
@@ -418,7 +423,18 @@ export function createNativeVaultRuntime(
   const connectionFile = nativeRuntimeConnectionFile(options.host, env)
   const identity = options.identity ? { ...options.identity } : undefined
   const shutdown = new AbortController()
-  const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+  const store = createNativePoolStore({
+    paths,
+    quota: nativeQuotaCodec,
+    onLockEvent: options.onLockEvent,
+  })
+  const observeLock = nativeLockObserver(options.onLockEvent)
+  const observeRosterLock = () =>
+    observeLock?.({
+      type: 'acquiring',
+      name: 'claustrum-roster-write',
+      path: paths.roster,
+    })
   // The vault watch for the current custody, opened while a host watches the
   // roster. While it reports `watching`, the list timer below runs only as a
   // slow safety net; in any other mode it keeps the host's own pace.
@@ -631,7 +647,7 @@ export function createNativeVaultRuntime(
   }
   function poll(): Promise<void> {
     if (polling) return polling
-    polling = (async () => {
+    polling = withDetachedNativeLocks(async () => {
       const allowed = await Promise.all(
         [...watchers].map(
           async (watch) =>
@@ -658,7 +674,7 @@ export function createNativeVaultRuntime(
           })
           .catch(() => {})
       }
-    })().finally(() => {
+    }).finally(() => {
       polling = undefined
     })
     return polling
@@ -692,6 +708,7 @@ export function createNativeVaultRuntime(
     // Existing settings need no initialization. Avoid the shared roster write
     // lock so concurrent plugin starts cannot delay reads of that complete file.
     if (absentOnly && !(await nativeVaultFileAbsent(paths.config))) return
+    observeRosterLock()
     await mutateVaultRoster(paths.roster, async (roster, lease) => {
       if (absentOnly && !(await nativeVaultFileAbsent(paths.config)))
         return { result: undefined }
@@ -723,6 +740,7 @@ export function createNativeVaultRuntime(
       const writer = createNativePoolStore({
         paths,
         quota: nativeQuotaCodec,
+        onLockEvent: options.onLockEvent,
         onStep: async (point) => {
           if (
             point === 'before-config-write' ||
@@ -831,6 +849,12 @@ export function createNativeVaultRuntime(
       check(signal)
       // Abort this caller's wait, not the discovery operation: another caller
       // may still need the result of that shared operation.
+      if (!refreshing)
+        observeLock?.({
+          type: 'acquiring',
+          name: 'claustrum-roster',
+          path: paths.roster,
+        })
       refreshing ??= refreshVaultRoster({
         path: paths.roster,
         custody: options.discover ? { discover: options.discover } : custody,
@@ -1271,6 +1295,7 @@ export function createNativeVaultRuntime(
       receipt.assertedAccountIdentity,
     ])
     if ((versions.get(key) ?? 0) > receipt.recordVersion) return false
+    observeRosterLock()
     return mutateVaultRoster(paths.roster, async (roster, lease) => {
       const row = await rowFor(roster, route.logicalId)
       if (
@@ -1315,6 +1340,7 @@ export function createNativeVaultRuntime(
             return current
           },
           {
+            onLockEvent: options.onLockEvent,
             beforeRename: async () => {
               await requireActive()
               const pinned = await rowFor(roster, route.logicalId)
@@ -1533,6 +1559,7 @@ export function nativeVaultRuntimeKey(
       options.discover,
       options.readToken,
       options.now,
+      options.onLockEvent,
       options.setTimeout,
       options.clearTimeout,
       options.onRosterNoticeHandled,

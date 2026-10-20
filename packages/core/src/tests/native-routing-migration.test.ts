@@ -225,7 +225,7 @@ test('preserved quota timestamps causally retain only matching deficits in the r
     const resolve = async (checkedAt: number) => {
       await writeFile(path, migrateStickyRoutingState(input, proven))
       const router = new StickySessionRouter({ path, now: () => 100 })
-      return router.resolve({
+      const result = await router.resolve({
         sessionId: 'fresh',
         family: 'general',
         inputBytes: 1,
@@ -236,6 +236,8 @@ test('preserved quota timestamps causally retain only matching deficits in the r
           quota: { ...candidate.quota, checkedAt },
         })),
       })
+      await router.drain()
+      return result
     }
     expect((await resolve(37))?.accountId).toBe('fallback-row')
     // Moving the snapshot clock beyond the preserved clock removes the charge;

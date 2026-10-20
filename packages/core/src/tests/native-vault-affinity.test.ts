@@ -19,7 +19,10 @@ const model = 'claude-sonnet-5-5'
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'native-vault-affinity-'))
-  deferCleanup(() => rm(root, { recursive: true, force: true }))
+  deferCleanup(async () => {
+    await router.drain()
+    await rm(root, { recursive: true, force: true })
+  })
   const path = join(root, 'routing.json')
   let now = 2_000_000_000_000
   const router = new StickySessionRouter({ path, now: () => now })
@@ -44,13 +47,13 @@ async function fixture() {
     quota: quota(identity),
     order: id === 'main' ? 0 : 1,
   })
-  const resolve = (
+  const resolveAndDrain = async (
     sessionId: string,
     candidates: StickyRouteCandidate[],
     identities?: ReadonlyMap<string, string>,
     preferredAccountId?: string,
-  ) =>
-    router.resolve({
+  ) => {
+    const result = await router.resolve({
       sessionId,
       family: 'general',
       modelId: model,
@@ -62,10 +65,13 @@ async function fixture() {
       inputBytes: 77,
       preferredAccountId,
     })
+    await router.drain()
+    return result
+  }
   return {
     path,
     router,
-    resolve,
+    resolveAndDrain,
     candidate,
     advance: () => {
       now += 1
@@ -90,12 +96,17 @@ test('replacing the vault default UUID re-places only its session while an unrel
     ['fallback', fallbackUuid],
   ])
   expect(
-    (await f.resolve('main-session', [f.candidate('main', originalUuid)], old))
-      ?.accountId,
+    (
+      await f.resolveAndDrain(
+        'main-session',
+        [f.candidate('main', originalUuid)],
+        old,
+      )
+    )?.accountId,
   ).toBe('main')
   expect(
     (
-      await f.resolve(
+      await f.resolveAndDrain(
         'fallback-session',
         [f.candidate('fallback', fallbackUuid)],
         old,
@@ -108,7 +119,7 @@ test('replacing the vault default UUID re-places only its session while an unrel
     ['main', replacedUuid],
     ['fallback', fallbackUuid],
   ])
-  const result = await f.resolve(
+  const result = await f.resolveAndDrain(
     'main-session',
     [
       { accountId: 'main', quota: { kind: 'unknown' }, order: 0 },
@@ -127,14 +138,14 @@ test('replacing the vault default UUID re-places only its session while an unrel
 
 test('a replaced vault default using the same logical main id gets a new UUID-bound pin and no old preference or timestamps', async () => {
   const f = await fixture()
-  const first = await f.resolve(
+  const first = await f.resolveAndDrain(
     'session',
     [f.candidate('main', originalUuid)],
     new Map([['main', originalUuid]]),
   )
   expect(first?.assignment.accountIdentity).toBe(originalUuid)
   f.advance()
-  const next = await f.resolve(
+  const next = await f.resolveAndDrain(
     'session',
     [f.candidate('main', replacedUuid)],
     new Map([['main', replacedUuid]]),
@@ -148,8 +159,13 @@ test('a vault route without a verified UUID is never pinned, including retained 
   const f = await fixture()
   const candidates = [f.candidate('main', originalUuid)]
   expect(
-    (await f.resolve('session', candidates, new Map([['main', originalUuid]])))
-      ?.accountId,
+    (
+      await f.resolveAndDrain(
+        'session',
+        candidates,
+        new Map([['main', originalUuid]]),
+      )
+    )?.accountId,
   ).toBe('main')
   for (const identities of [
     new Map<string, string>(),
@@ -157,7 +173,7 @@ test('a vault route without a verified UUID is never pinned, including retained 
     new Map([['main', ' ']]),
   ]) {
     expect(
-      await f.resolve('session', candidates, identities, 'main'),
+      await f.resolveAndDrain('session', candidates, identities, 'main'),
     ).toBeNull()
   }
 })
@@ -166,7 +182,7 @@ test('vault UUID changes refuse old retention even while the quota candidate lis
   const f = await fixture()
   expect(
     (
-      await f.resolve(
+      await f.resolveAndDrain(
         'session',
         [f.candidate('main', originalUuid)],
         new Map([['main', originalUuid]]),
@@ -174,18 +190,20 @@ test('vault UUID changes refuse old retention even while the quota candidate lis
     )?.accountId,
   ).toBe('main')
   expect(
-    await f.resolve('session', [], new Map([['main', replacedUuid]])),
+    await f.resolveAndDrain('session', [], new Map([['main', replacedUuid]])),
   ).toBeNull()
 })
 
 test('local retention ignores account UUID changes and leaves existing routing bytes untouched', async () => {
   const f = await fixture()
   expect(
-    (await f.resolve('session', [f.candidate('main', originalUuid)]))
+    (await f.resolveAndDrain('session', [f.candidate('main', originalUuid)]))
       ?.accountId,
   ).toBe('main')
   const before = await readFile(f.path)
-  const result = await f.resolve('session', [f.candidate('main', replacedUuid)])
+  const result = await f.resolveAndDrain('session', [
+    f.candidate('main', replacedUuid),
+  ])
   expect(result?.accountId).toBe('main')
   expect(result?.assignment).not.toHaveProperty('accountIdentity')
   expect(await readFile(f.path)).toEqual(before)
@@ -193,14 +211,14 @@ test('local retention ignores account UUID changes and leaves existing routing b
 
 test('migration preserves optional vault UUID metadata without adding any identity to legacy local assignments', async () => {
   const f = await fixture()
-  await f.resolve('local', [f.candidate('main', originalUuid)])
+  await f.resolveAndDrain('local', [f.candidate('main', originalUuid)])
   const localSource = JSON.parse(await readFile(f.path, 'utf8'))
   const local = migrateStickyRoutingState(
     localSource,
     new Map([['main', 'imported-main']]),
   )
   expect(local).not.toContain('accountIdentity')
-  await f.resolve(
+  await f.resolveAndDrain(
     'vault',
     [f.candidate('fallback', fallbackUuid)],
     new Map([['fallback', fallbackUuid]]),
@@ -219,8 +237,8 @@ test('migration preserves optional vault UUID metadata without adding any identi
 
 test('a legacy vault pin without UUID is re-placed instead of inheriting its logical main id', async () => {
   const f = await fixture()
-  await f.resolve('session', [f.candidate('main', originalUuid)])
-  const next = await f.resolve(
+  await f.resolveAndDrain('session', [f.candidate('main', originalUuid)])
+  const next = await f.resolveAndDrain(
     'session',
     [
       { accountId: 'main', quota: { kind: 'unknown' }, order: 0 },
@@ -238,7 +256,7 @@ test('a legacy vault pin without UUID is re-placed instead of inheriting its log
 
 test('a replaced vault UUID cannot inherit a warm-cache preference for logical main', async () => {
   const f = await fixture()
-  await f.resolve(
+  await f.resolveAndDrain(
     'session',
     [f.candidate('main', originalUuid)],
     new Map([['main', originalUuid]]),
@@ -257,7 +275,7 @@ test('a replaced vault UUID cannot inherit a warm-cache preference for logical m
     remainingPercent: 1,
     resetsAt: new Date(f.now() + 86_400_000).toISOString(),
   }
-  const next = await f.resolve(
+  const next = await f.resolveAndDrain(
     'session',
     [main, f.candidate('fallback', fallbackUuid)],
     new Map([

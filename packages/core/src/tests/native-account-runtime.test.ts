@@ -502,6 +502,25 @@ test('local quota retry admits only after deferred body cleanup so disable preve
   expect(f.counts.refresh).toBe(0)
 })
 
+test('relay config reads published state while another writer holds native-relay', async () => {
+  const f = await fixture()
+  await f.runtime.updateRelay({
+    enabled: true,
+    url: 'https://held.example.test',
+    token: 'synthetic-held-token',
+  })
+  const held = await holdNativeRelayLock(f.paths.config, { deferCleanup })
+  try {
+    const read = await f.runtime.getRelayConfig().catch(() => null)
+    expect(read?.url).toBe('https://held.example.test')
+    expect(read?.token).toBe('synthetic-held-token')
+    await held.assertOwned()
+  } finally {
+    await held.pastTimeout
+    await held.release()
+  }
+}, 25_000)
+
 test('relay writer serializes behind a held native-relay writer lease', async () => {
   const f = await fixture()
   const held = await holdNativeRelayLock(f.paths.config, { deferCleanup })

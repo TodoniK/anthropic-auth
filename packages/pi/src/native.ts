@@ -8,6 +8,7 @@ import {
   killswitchPassesPolicy,
   logger,
   type NativeAccountRuntime,
+  type NativeAccountRuntimeOptions,
   type NativeAccountSnapshot,
   type NativeCustodyClient,
   type NativeCustodyReceipt,
@@ -145,11 +146,27 @@ export class PiNativeRuntime {
   private closed = false
   private closing: Promise<void> | undefined
   readonly usagePublications = createNativeUsagePublisher('native-auth')
+  private readonly routingPublications = new Set<{ drain(): Promise<void> }>()
+
+  ownRoutingPublications(router: { drain(): Promise<void> }) {
+    this.routingPublications.add(router)
+  }
+
+  async drainRoutingPublications() {
+    await Promise.all([
+      ...[...this.routingPublications].map((router) => router.drain()),
+      this.initialization.then(
+        (runtime) => runtime.drainRoutingPublications(),
+        () => {},
+      ),
+    ])
+  }
 
   constructor(
     storagePath: string,
     options: {
       connect?: () => Promise<NativeCustodyClient>
+      local?: NativeAccountRuntimeOptions['local']
       vaultPoll?: PiVaultPollOptions
     } = {},
   ) {
@@ -162,6 +179,7 @@ export class PiNativeRuntime {
       const runtime = acquireNativeAccountRuntime({
         paths,
         host: 'pi',
+        local: options.local,
         vault: {
           // Core checks Pi enrollment and reads a fresh scoped receipt on every send.
           // Keep the injected connector's identity rather than wrapping it per instance.
@@ -399,9 +417,12 @@ export class PiNativeRuntime {
     this.vaultWatch?.close()
     this.closing ??= (async () => {
       await this.usagePublications.drain()
+      await this.drainRoutingPublications()
+      this.routingPublications.clear()
       await this.initialization.then(
         async (runtime) => {
           await runtime.drainQuotaPublications()
+          await runtime.drainRoutingPublications()
           runtime.close()
         },
         () => {},
@@ -415,6 +436,7 @@ export function getPiNativeRuntime(
   storagePath = getPiAccountStoragePath(),
   options: {
     connect?: () => Promise<NativeCustodyClient>
+    local?: NativeAccountRuntimeOptions['local']
     vaultPoll?: PiVaultPollOptions
   } = {},
 ): PiNativeRuntime {
@@ -422,10 +444,14 @@ export function getPiNativeRuntime(
   const key = JSON.stringify([
     contextKey,
     nativeRuntimeOptionIdentity(options.connect),
+    nativeRuntimeOptionIdentity(options.local?.onLockEvent),
+    nativeRuntimeOptionIdentity(options.local?.refreshToken),
+    nativeRuntimeOptionIdentity(options.local?.resolveIdentity),
+    nativeRuntimeOptionIdentity(options.local?.now),
   ])
   const existing = runtimes.get(key)
   if (existing) return existing.runtime
-  if (!options.connect) {
+  if (!options.connect && !options.local) {
     // A supplied connector installs the context's test transport. Ordinary host
     // lookups reuse it, but an explicitly different connector owns another key.
     const configured = [...runtimes.values()].find(

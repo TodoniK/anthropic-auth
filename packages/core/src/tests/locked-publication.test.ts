@@ -67,23 +67,23 @@ test('sticky queued touch refuses a replaced lease and preserves successor assig
     inputBytes: 1,
   }
   await router.resolve(input)
+  await router.drain()
+  lifetime.deferCleanup(() => router.drain())
   const entered = lifetime.gate()
   const resume = lifetime.gate()
-  // Pause the read after it captures routing state while the lock is held.
+  // Pause staging while the background publication owns the lease.
   const seam = router as unknown as {
-    readState(): Promise<unknown>
-    touchChain: Promise<void>
+    writeState(...args: unknown[]): Promise<void>
   }
-  const readState = seam.readState.bind(router)
-  seam.readState = async () => {
-    const state = await readState()
+  const writeState = seam.writeState.bind(router)
+  seam.writeState = async (...args) => {
     entered.open()
     await resume.wait
-    return state
+    return writeState(...args)
   }
   now += 60 * 60_000
   await router.resolve(input)
-  lifetime.trackDetached(seam.touchChain)
+  lifetime.trackDetached(router.drain())
   await entered.wait
   const successor = await replaceLease(path, 'write')
   const state = JSON.parse(await readFile(path, 'utf8'))
@@ -99,7 +99,7 @@ test('sticky queued touch refuses a replaced lease and preserves successor assig
   await successor.assertOwned()
   await writeFile(path, published, { mode: 0o600 })
   resume.open()
-  await seam.touchChain
+  await router.drain()
   expect(await readFile(path, 'utf8')).toBe(published)
   await successor.assertOwned()
 })
@@ -120,6 +120,7 @@ test('sticky writes publish normally while their lease remains owned', async () 
     }),
   ).toMatchObject({ accountId: 'account', created: true })
   await router.clear('session')
+  await router.drain()
   expect(JSON.parse(await readFile(path, 'utf8')).assignments).toEqual({})
 })
 
@@ -153,14 +154,14 @@ for (const operation of ['touch', 'delete', 'assign'] as const) {
           accountId: 'sensitive-account',
           family: operation === 'delete' ? 'fable' : 'general',
           assignedAt: now,
-          lastSeenAt: now,
+          lastSeenAt: operation === 'touch' ? now - 61 * 60_000 : now,
           initialInputBytes: 1,
           quotaCheckedAt: 0,
         },
       },
     })
     async function routerAt(path: string) {
-      if (operation === 'delete') await writeFile(path, seed, { mode: 0o600 })
+      if (operation !== 'assign') await writeFile(path, seed, { mode: 0o600 })
       const router = new StickySessionRouter({ path, now: () => now })
       const seam = router as unknown as {
         refreshStateIfChanged(): Promise<void>
@@ -170,19 +171,12 @@ for (const operation of ['touch', 'delete', 'assign'] as const) {
           prune?: boolean,
         ): Promise<void>
       }
-      if (operation === 'touch') {
-        const refreshState = seam.refreshStateIfChanged.bind(router)
-        seam.refreshStateIfChanged = async () => {
-          await refreshState()
-          // An assignment can arrive after the initial cache read but before
-          // the locked read. That makes resolve use its locked touch branch.
-          await writeFile(path, seed, { mode: 0o600 })
-        }
-      }
+
       return { router, seam }
     }
     const healthy = await routerAt(join(directory, 'healthy.json'))
     const expected = await healthy.router.resolve(input)
+    await healthy.router.drain()
     if (operation === 'delete') expect(expected).toBeNull()
     else
       expect(expected).toMatchObject({
@@ -225,6 +219,7 @@ for (const operation of ['touch', 'delete', 'assign'] as const) {
     await writeFile(path, published, { mode: 0o600 })
     resume.open()
     expect(await running).toEqual(expected)
+    await router.drain()
     expect(await readFile(path, 'utf8')).toBe(published)
     expect(logs).toEqual([
       {

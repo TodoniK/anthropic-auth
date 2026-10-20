@@ -1354,3 +1354,55 @@ expect_message = "error: expect(received).toEqual(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "native-relay-read-never-waits-for-writer"
+guards = "Reading published relay configuration never acquires the exclusive relay writer lock."
+file = "packages/core/src/native-account-runtime.ts"
+old = '''    async getRelayConfig() {
+      const { mode, paths, store } = await selectedStorage()'''
+new = '''    async getRelayConfig() {
+      const { mode, paths, store } = await selectedStorage()
+      // NON-VACUITY BREAK: restore relay writer contention on the request path.
+      await withLock(paths.config, { ...POOL_LOCK_DEFAULTS, name: 'native-relay' }, async () => {})'''
+test_file = "packages/core/src/tests/native-account-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-account-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["relay config reads published state while another writer holds native-relay"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "native-relay-generation-agreement"
+guards = "A relay reader never combines the old URL with a token published by another generation."
+file = "packages/core/src/native-account-runtime.ts"
+old = "if (generation !== state?.relayGeneration) continue"
+new = "if (false && generation !== state?.relayGeneration) continue // NON-VACUITY BREAK: ignore crossed relay generations."
+test_file = "packages/core/src/tests/native-account-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-account-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["relay reader racing a writer never combines old URL and new token (stamped)"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "sticky-routing-decision-never-joins-writer"
+guards = "A request reads persisted session pins and decides its route without joining a writer lease."
+file = "packages/core/src/sticky-routing.ts"
+old = "    if (!input.sessionId) return null\n    this.recoverLocalPins()"
+new = "    if (!input.sessionId) return null\n    // NON-VACUITY BREAK: decide a request only after joining the writer lock.\n    const decisionLease = await this.acquireLock()\n    await decisionLease.release()\n    this.recoverLocalPins()"
+test_file = "packages/core/src/tests/sticky-routing-contention.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/sticky-routing-contention.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["sticky routing decisions read published pins without waiting and publish after the writer releases"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

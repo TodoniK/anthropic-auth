@@ -3,6 +3,10 @@ import {
   type RefreshFileLock,
 } from '@cortexkit/common-auth/fs'
 import { POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
+import {
+  type NativeLockEvent,
+  nativeLockObserver,
+} from './native-lock-observer.ts'
 
 import {
   type NativePoolStorePaths,
@@ -90,7 +94,9 @@ export async function joinNativePoolWrite(
   paths: NativePoolStorePaths,
   signals: readonly AbortSignal[],
   check: () => void,
+  onLockEvent?: (event: NativeLockEvent) => void,
 ): Promise<'joined' | 'deadline'> {
+  const observer = nativeLockObserver(onLockEvent)
   // Wall-clock adjustments must not change the total wait budget.
   const started = performance.now()
   const remaining = () =>
@@ -108,13 +114,17 @@ export async function joinNativePoolWrite(
           outcome = 'deadline'
           break
         }
+        observer?.({ type: 'acquiring', path: lock.path, name: lock.name })
         const lease = await acquireRefreshFileLock({
           path: lock.path,
           name: lock.name,
           ttlMs: POOL_LOCK_DEFAULTS.ttlMs,
           renew: false,
         })
-        if (lease) held.push(lease)
+        if (lease) {
+          held.push(lease)
+          observer?.({ type: 'acquired', path: lock.path, name: lock.name })
+        }
         // An acquisition that finished after the budget ran out does not
         // count: a writer that released that late is reported as too slow.
         if (remaining() <= 0) {

@@ -3,9 +3,8 @@ import { constants } from 'node:fs'
 import { lstat, mkdir, open, rename, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { types as utilTypes } from 'node:util'
-import { withLock } from '@cortexkit/common-auth/fs'
+import { withLock as acquireLock } from '@cortexkit/common-auth/fs'
 import { fingerprintOf, POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
-
 import type {
   AccountOperationError,
   OAuthAccountProfile,
@@ -18,6 +17,10 @@ import {
   type NativeLocalCredentialValidation,
   nativeLocalCredentialValidationMatches,
 } from './native-credential-validation.ts'
+import {
+  type NativeLockEvent,
+  observeNativeLocks,
+} from './native-lock-observer.ts'
 import {
   fromNativeQuotaMap,
   type NativeQuotaMap,
@@ -47,6 +50,8 @@ import {
   renameWithWindowsSharingRetry,
 } from './publication-rename.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
+
+const withLock = observeNativeLocks(() => acquireLock)
 
 /** Identifies the vault credential and Claude account that supplied an observation. This binding contains no access token. */
 export interface NativeCustodyRuntimeBinding {
@@ -603,6 +608,7 @@ export async function readNativeRuntime(
 }
 
 export interface NativeRuntimeWriteHooks {
+  onLockEvent?: (event: NativeLockEvent) => void
   publication?: PublicationOptions
   /** Verify that the observed account still matches the current pool record or vault roster and that the caller still owns the locks protecting those records. */
   beforeRename?: () => Promise<void>
@@ -761,6 +767,7 @@ export type NativeRuntimeOptionalPublication =
   | { status: 'skipped' }
 
 export interface NativeRuntimeOptionalWriteHooks {
+  onLockEvent?: (event: NativeLockEvent) => void
   publication?: PublicationOptions
   /**
    * Same checks as NativeRuntimeWriteHooks.beforeRename, run at the same
@@ -787,6 +794,7 @@ export async function updateNativeRuntimeOptional(
   return writeNativeRuntimeOutcome(path, storageId, change, {
     beforeRename: hooks.beforeRename,
     publication: hooks.publication,
+    onLockEvent: hooks.onLockEvent,
   })
 }
 
@@ -816,6 +824,7 @@ async function writeNativeRuntime(
       beforePublish: hooks.beforePublish,
       afterRename: hooks.afterRename,
       publication: hooks.publication,
+      onLockEvent: hooks.onLockEvent,
     },
     firstIdentity,
   )
@@ -842,7 +851,13 @@ async function writeNativeRuntimeOutcome(
     await mkdir(dirname(path), { recursive: true, mode: 0o700 })
     return await withLock(
       path,
-      { name: 'native-runtime', ttlMs: 10_000, timeoutMs: 15_000, renew: true },
+      {
+        name: 'native-runtime',
+        ttlMs: 10_000,
+        timeoutMs: 15_000,
+        renew: true,
+        onLockEvent: hooks.onLockEvent,
+      },
       async (lock) => {
         const read = await readNativeRuntime(path, storageId)
         const current: NativeRuntimeState =
@@ -1110,7 +1125,7 @@ function firstIdentityEntry(
 export async function publishNativeLocalFirstIdentity(
   paths: NativePoolPaths,
   observation: NativeRefreshObservation,
-  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish'> = {},
+  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish' | 'onLockEvent'> = {},
 ): Promise<NativeRuntimeState> {
   try {
     paths = { ...paths }
@@ -1169,7 +1184,7 @@ function knownValidationEntry(
 export async function publishNativeLocalCredentialValidation(
   paths: NativePoolPaths,
   observation: NativeRefreshObservation,
-  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish'> = {},
+  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish' | 'onLockEvent'> = {},
 ): Promise<NativeRuntimeState> {
   try {
     paths = { ...paths }
@@ -1511,7 +1526,7 @@ export async function publishNativeLocalRefreshFailure(
   paths: NativePoolPaths,
   observation: NativeRefreshObservation,
   policy: NativeLocalFailurePolicy,
-  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish'> = {},
+  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish' | 'onLockEvent'> = {},
 ): Promise<NativeLocalFailurePublication> {
   let reason: NativeLocalFailureSupersededReason | undefined
   const superseded = (value: NativeLocalFailureSupersededReason): never => {
@@ -1675,10 +1690,14 @@ async function publishLocalEntry(
   replacement: (old: NativeRuntimeEntry | undefined) => NativeRuntimeEntry,
   firstIdentity?: FirstIdentityPublication,
   superseded?: (reason: 'row-binding' | 'row-credential') => never,
-  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish'> = {},
+  hooks: Pick<NativeRuntimeWriteHooks, 'beforePublish' | 'onLockEvent'> = {},
 ): Promise<NativeRuntimeState> {
   try {
-    const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+    const store = createNativePoolStore({
+      paths,
+      quota: nativeQuotaCodec,
+      onLockEvent: hooks.onLockEvent,
+    })
     const [config, state] = nativePoolStoreLocks(paths)
     const checkPool = async () => {
       const read = await store.read()
@@ -1699,11 +1718,19 @@ async function publishLocalEntry(
     }
     return await withLock(
       config.path,
-      { ...POOL_LOCK_DEFAULTS, name: config.name },
+      {
+        ...POOL_LOCK_DEFAULTS,
+        name: config.name,
+        onLockEvent: hooks.onLockEvent,
+      },
       async (configLease) =>
         withLock(
           state.path,
-          { ...POOL_LOCK_DEFAULTS, name: state.name },
+          {
+            ...POOL_LOCK_DEFAULTS,
+            name: state.name,
+            onLockEvent: hooks.onLockEvent,
+          },
           async (stateLease) => {
             await checkPool()
             return writeNativeRuntime(
@@ -1723,6 +1750,7 @@ async function publishLocalEntry(
                   await stateLease.assertOwned()
                 },
                 beforePublish: hooks.beforePublish,
+                onLockEvent: hooks.onLockEvent,
               },
               firstIdentity,
             )
