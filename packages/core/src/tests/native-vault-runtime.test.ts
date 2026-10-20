@@ -1921,15 +1921,6 @@ const unreachable = () =>
 /** Let the settled vault call's continuations run (all microtasks drain before a timer). */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
-/** Resolves after `ms` real milliseconds unless cancelled first. */
-function realDelay(ms: number) {
-  let handle: ReturnType<typeof setTimeout> | undefined
-  const wait = new Promise<void>((resolve) => {
-    handle = setTimeout(resolve, ms)
-  })
-  return { wait, cancel: () => clearTimeout(handle) }
-}
-
 test('during a vault outage a second request serves the kept receipt without a vault read', async () => {
   const f = await fixture()
   await f.runtime.refresh()
@@ -2121,10 +2112,20 @@ async function watchedRuntime(
   intervalMs = 2_000,
 ) {
   const timers = recordedTimers(deferCleanup)
+  let handled = 0
+  const handledWaiters: { count: number; open: () => void }[] = []
   const runtime = createNativeVaultRuntime({
     ...f.options,
     setTimeout: timers.setTimeout,
     clearTimeout: timers.clearTimeout,
+    onRosterNoticeHandled: () => {
+      handled++
+      for (const waiter of [...handledWaiters])
+        if (waiter.count <= handled) {
+          handledWaiters.splice(handledWaiters.indexOf(waiter), 1)
+          waiter.open()
+        }
+    },
   })
   deferCleanup(() => runtime.close())
   let refreshes = 0
@@ -2150,19 +2151,24 @@ async function watchedRuntime(
     refreshes: () => refreshes,
     /**
      * Wait until the hosts have been told about `count` discoveries in all.
-     * Teardown releases the wait, which then fails the test. With `withinMs`
-     * the wait also ends after that many real milliseconds, so a discovery
-     * that never runs fails the assertion below rather than timing the test
-     * out.
+     * Teardown releases the wait, which then fails the test.
      */
-    async refreshed(count: number, withinMs?: number) {
+    async refreshed(count: number) {
       if (refreshes >= count) return
       const told = gate()
       refreshWaiters.push({ count, open: told.open })
-      const bound = withinMs === undefined ? undefined : realDelay(withinMs)
-      await Promise.race([told.wait, ...(bound ? [bound.wait] : [])])
-      bound?.cancel()
+      await told.wait
       expect(refreshes).toBeGreaterThanOrEqual(count)
+    },
+    /**
+     * Wait until the runtime has finished handling `count` vault notices that
+     * asked it to rediscover the roster, including the discovery they ran.
+     */
+    async noticesHandled(count: number) {
+      if (handled >= count) return
+      const done = gate()
+      handledWaiters.push({ count, open: done.open })
+      await done.wait
     },
     listPace: () => [...timers.intervals.values()],
   }
@@ -2180,9 +2186,10 @@ test('a vault notice with a new view runs discovery once and publishes the roste
   const work = { ...listed, id: 'oauth:anthropic:work', accountId: uuid2 }
   f.rows([listed, work])
   notices.notify('changed-view')
-  // Bounded well inside the test deadline: a notice that runs no discovery
-  // fails the refresh-count assertion instead of timing out.
-  await w.refreshed(2, 3_000)
+  // Once the runtime has handled the notice, its discovery has listed.
+  await w.noticesHandled(1)
+  expect(f.counts.lists).toBe(2)
+  await w.refreshed(2)
   await settle()
   expect(f.counts.lists).toBe(2)
   expect(w.refreshes()).toBe(2)

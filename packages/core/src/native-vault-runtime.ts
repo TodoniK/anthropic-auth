@@ -111,6 +111,14 @@ export interface NativeVaultRuntimeOptions {
    */
   setTimeout?: typeof globalThis.setTimeout
   clearTimeout?: typeof globalThis.clearTimeout
+  /**
+   * Called each time the runtime has finished handling a vault notice that
+   * asked it to rediscover the roster, after the discovery that notice ran.
+   * Common-auth asks when the notice's view differs from the roster held,
+   * after a gap in the notices, and on a re-subscribed watch's first notice.
+   * Tests use it to wait for that handling instead of for the clock.
+   */
+  onRosterNoticeHandled?: () => void
 }
 
 /**
@@ -579,8 +587,12 @@ export function createNativeVaultRuntime(
         // refresh callbacks. A poll already running may have listed before the
         // change was announced, so wait for it and run one of our own.
         onView: async () => {
-          while (polling) await polling.catch(() => {})
-          if (held.live) await poll()
+          try {
+            while (polling) await polling.catch(() => {})
+            if (held.live) await poll()
+          } finally {
+            options.onRosterNoticeHandled?.()
+          }
         },
         onMode: (mode) => {
           if (!held.live) return
@@ -1521,6 +1533,7 @@ export function nativeVaultRuntimeKey(
       options.now,
       options.setTimeout,
       options.clearTimeout,
+      options.onRosterNoticeHandled,
     ].map(nativeRuntimeOptionIdentity),
   ])
 }
