@@ -17,9 +17,10 @@ import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { createNativeAnthropicSource } from '../v2/source.ts'
 
-const owners = new Set<{ close(): void }>()
-afterEach(() => {
-  for (const owner of owners) owner.close()
+type Owner = { close(): void | Promise<void> }
+const owners = new Set<Owner>()
+afterEach(async () => {
+  await Promise.all([...owners].map((owner) => owner.close()))
   owners.clear()
 })
 const { test, deferCleanup } = createTestLifetimeSuite()
@@ -30,7 +31,16 @@ const hash = (session: string) =>
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'oc2-vault-legacy-seed-'))
-  deferCleanup(() => rm(root, { recursive: true, force: true }))
+  const owned: Owner[] = []
+  const own = <T extends Owner>(owner: T): T => {
+    owned.push(owner)
+    owners.add(owner)
+    return owner
+  }
+  deferCleanup(async () => {
+    await Promise.all(owned.map((owner) => owner.close()))
+    await rm(root, { recursive: true, force: true })
+  })
   const paths = await resolveNativePoolPaths(
     join(root, 'anthropic-auth.json'),
     join(root, 'anthropic-auth-state.json'),
@@ -141,16 +151,14 @@ async function fixture() {
     host: 'opencode' as const,
     vault: { env, connect: async () => client },
   }
-  const runtime = createNativeAccountRuntime(options)
-  owners.add(runtime)
-  deferCleanup(() => runtime.close())
-  const native = createNativeAnthropicSource({
-    runtime,
-    paths,
-    requestOptions: () => ({}),
-  })
-  owners.add(native)
-  deferCleanup(() => native.close())
+  const runtime = own(createNativeAccountRuntime(options))
+  const native = own(
+    createNativeAnthropicSource({
+      runtime,
+      paths,
+      requestOptions: () => ({}),
+    }),
+  )
   const scope = {
     providerID: 'anthropic',
     modelID: 'claude-sonnet-5-5',
@@ -160,6 +168,7 @@ async function fixture() {
   }
   return {
     paths,
+    own,
     vault,
     runtime,
     native,
@@ -179,6 +188,7 @@ test('OpenCode 2 live pin during roster deferral carries pending provenance and 
   expect((await f.native.authorizeAccount(f.scope, 'main'))?.route).toBe(
     'oauth',
   )
+  await f.native.drainRoutingPublications()
   const pending = JSON.parse(await readFile(f.vault.routing, 'utf8'))
   expect(pending.vaultLegacySeed).toBe('pending')
   expect(Object.keys(pending.assignments)).toEqual([hash('live-session')])
@@ -188,12 +198,16 @@ test('OpenCode 2 live pin during roster deferral carries pending provenance and 
     next: f.roster,
     result: undefined,
   }))
+  // A ready roster schedules the one-time import; persistence checks join it.
+  await f.runtime.read()
+  await f.native.drainRoutingPublications()
   expect(
     await f.native.chooseAccount({
       ...f.scope,
       sessionID: 'legacy-only-session',
     }),
   ).toBe(f.workRoute)
+  await f.native.drainRoutingPublications()
   const complete = JSON.parse(await readFile(f.vault.routing, 'utf8'))
   expect(complete.vaultLegacySeed).toBe('complete')
   expect(complete.assignments[hash('live-session')]).toEqual(live)
@@ -203,11 +217,14 @@ test('OpenCode 2 live pin during roster deferral carries pending provenance and 
     initialInputBytes: 22,
   })
   await f.native.resetRouting('legacy-only-session')
+  await f.native.drainRoutingPublications()
   const before = await readFile(f.vault.routing)
-  const restarted = createNativeAccountRuntime(f.options)
-  owners.add(restarted)
-  deferCleanup(() => restarted.close())
+  const reset = JSON.parse(before.toString('utf8'))
+  expect(reset.assignments[hash('live-session')]).toEqual(live)
+  expect(reset.assignments[hash('legacy-only-session')]).toBeUndefined()
+  const restarted = f.own(createNativeAccountRuntime(f.options))
   await restarted.read()
+  await restarted.drainRoutingPublications()
   expect(await readFile(f.vault.routing)).toEqual(before)
   expect(await readFile(f.paths.legacyConfig, 'utf8')).toBe(f.legacyConfig)
   expect(await readFile(f.routingPath, 'utf8')).toBe(f.legacyRouting)
