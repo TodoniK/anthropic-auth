@@ -26,8 +26,9 @@ async function renderSidebar(
   state: unknown,
   wanted: string[],
   collapsed = false,
-  rewrite?: Rewrite,
+  options: { rewrite?: Rewrite; width?: number } = {},
 ) {
+  const { rewrite, width = 42 } = options
   fixture = await mkdtemp(join(tmpdir(), 'anthropic-quota-render-'))
   const stateFile = join(fixture, 'sidebar.json')
   await writeFile(stateFile, JSON.stringify(state))
@@ -66,7 +67,7 @@ const sidebar = registered.find((value) => value.slots?.sidebar_content)?.slots.
 if (!sidebar) throw new Error('sidebar slot was not registered');
 let destroyed;
 const teardown = new Promise((resolve) => { destroyed = resolve; });
-const setup = await createTestRenderer({ width: 42, height: 32, onDestroy() { destroyed(); } });
+const setup = await createTestRenderer({ width: ${width}, height: 32, onDestroy() { destroyed(); } });
 let pending;
 const observe = () => {
   if (!pending) return;
@@ -364,9 +365,11 @@ test('collapsed account rows keep their renderables across same-value state upda
     ['main', '5h 90% · 7d 80% left', 'work', '5h 92% · 7d 70% left'],
     true,
     {
-      state: state(12, now + 1),
-      wanted: ['5h 90% · 7d 80% left', '5h 88% · 7d 70% left'],
-      names: ['main', 'work'],
+      rewrite: {
+        state: state(12, now + 1),
+        wanted: ['5h 90% · 7d 80% left', '5h 88% · 7d 70% left'],
+        names: ['main', 'work'],
+      },
     },
   )
   const rows = JSON.parse(stdout.split('ROWS:')[1]!.split('\n')[0]!) as {
@@ -427,12 +430,17 @@ test('42-column sidebar renders full scoped names credits and stale fallback row
       route: 'main',
       lastUpdated: now,
     },
-    ['Fable only', 'credits 75% left', 'work', 'checked 1d6h ago'],
+    [
+      'Fable only',
+      'credits 75% left · $12.50/$50.00',
+      'work',
+      'checked 1d6h ago',
+    ],
   )
   expect(stdout).toContain('38% left')
   expect(stdout).toContain('59% left')
   expect(stdout).toContain('Fable only ████████░░ 22% left')
-  expect(stdout).toContain('credits 75% left')
+  expect(stdout).toContain('credits 75% left · $12.50/$50.00')
   expect(stdout).toContain('92% left')
   expect(stdout).toContain('7% left')
   expect(stdout).toContain('checked 1d6h ago')
@@ -443,4 +451,44 @@ test('42-column sidebar renders full scoped names credits and stale fallback row
   expect(new Set(rows.map((line) => line.search(/[█░▓▒]/)))).toEqual(
     new Set([12]),
   )
+})
+
+function largeCreditState() {
+  const now = Date.now()
+  return {
+    main: {
+      quota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+        extraUsage: {
+          used: { amountMinor: 12_500_000, currency: 'USD', exponent: 2 },
+          limit: { amountMinor: 50_000_000, currency: 'USD', exponent: 2 },
+          exhausted: false,
+        },
+      },
+    },
+    fallbacks: [],
+    activeId: 'main',
+    route: 'main',
+    lastUpdated: now,
+  }
+}
+
+test('42-column sidebar drops the cents from credit amounts that would not fit on one line', async () => {
+  const stdout = await renderSidebar(largeCreditState(), [
+    'credits 75% left · $125,000/$500,000',
+  ])
+  const line = stdout.split('\n').find((row) => row.includes('credits'))
+  expect(line?.trim()).toBe('credits 75% left · $125,000/$500,000')
+  expect(stdout).not.toContain('.00')
+})
+
+test('a wider sidebar keeps the cents on credit amounts that fit', async () => {
+  const stdout = await renderSidebar(
+    largeCreditState(),
+    ['credits 75% left · $125,000.00/$500,000.00'],
+    false,
+    { width: 60 },
+  )
+  const line = stdout.split('\n').find((row) => row.includes('credits'))
+  expect(line?.trim()).toBe('credits 75% left · $125,000.00/$500,000.00')
 })

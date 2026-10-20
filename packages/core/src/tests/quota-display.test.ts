@@ -2,7 +2,9 @@ import { describe, expect, test } from 'bun:test'
 import type { OAuthQuotaSnapshot } from '../accounts.ts'
 import {
   buildClaudeQuotaSummary,
+  formatCreditAmounts,
   formatQuota,
+  formatQuotaMoney,
   quotaDisplayProjection,
   quotaTextParts,
   quotaWindowParts,
@@ -317,5 +319,83 @@ describe('quota display adapter', () => {
     expect(summary).toContain('### empty (fallback)\n  - no quota reading yet')
     expect(summary).not.toContain('5h')
     expect(summary).not.toContain('7d')
+  })
+
+  test('the command summary keeps the shared credit figure and appends the spent and limit amounts', () => {
+    const extraUsage = (used: number, limit: number) => ({
+      used: { amountMinor: used, currency: 'USD', exponent: 2 },
+      limit: { amountMinor: limit, currency: 'USD', exponent: 2 },
+      exhausted: used >= limit,
+    })
+    const summary = buildClaudeQuotaSummary({
+      now,
+      accounts: [
+        {
+          name: 'main',
+          role: 'main',
+          quota: {
+            checkedAt: now,
+            five_hour: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: now,
+            },
+            extraUsage: extraUsage(2500, 10000),
+          },
+        },
+        {
+          name: 'work',
+          role: 'fallback',
+          quota: { checkedAt: now, extraUsage: extraUsage(10035, 10000) },
+        },
+      ],
+    })
+    expect(summary).toContain(
+      '  - 5h 90% left\n  - credits 75% left · $25.00/$100.00\n',
+    )
+    expect(summary).toContain('  - credits spent · $100.35/$100.00')
+  })
+
+  test('credit amounts are left out for a zero limit and use the stored currency', () => {
+    const zero = {
+      used: { amountMinor: 0, currency: 'USD', exponent: 2 },
+      limit: { amountMinor: 0, currency: 'USD', exponent: 2 },
+      exhausted: false,
+    }
+    expect(formatCreditAmounts(zero)).toBeUndefined()
+    const zeroSummary = buildClaudeQuotaSummary({
+      now,
+      accounts: [
+        {
+          name: 'main',
+          role: 'main',
+          quota: { checkedAt: now, extraUsage: zero },
+        },
+      ],
+    })
+    expect(zeroSummary).toContain('  - credits available')
+    expect(zeroSummary).not.toContain('$')
+    expect(formatCreditAmounts(undefined)).toBeUndefined()
+    const euro = {
+      used: { amountMinor: 125_000, currency: 'EUR', exponent: 2 },
+      limit: { amountMinor: 500_000, currency: 'EUR', exponent: 2 },
+      exhausted: false,
+    }
+    expect(formatCreditAmounts(euro)).toBe('€1,250.00/€5,000.00')
+    expect(formatCreditAmounts(euro, { wholeUnits: true })).toBe(
+      '€1,250/€5,000',
+    )
+    expect(
+      formatQuotaMoney(
+        { amountMinor: 999, currency: 'USD', exponent: 2 },
+        { wholeUnits: true },
+      ),
+    ).toBe('$9')
+    expect(
+      formatCreditAmounts({
+        used: { amountMinor: 6000, currency: 'JPY', exponent: 0 },
+        limit: { amountMinor: 10000, currency: 'JPY', exponent: 0 },
+      }),
+    ).toBe('¥6,000/¥10,000')
   })
 })

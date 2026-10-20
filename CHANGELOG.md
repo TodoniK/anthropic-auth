@@ -23,6 +23,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Quota
 
+- Credit lines show the dollar amounts again, after the shared wording: `credits 75% left · $25.00/$100.00` and `credits spent · $100.35/$100.00`, in OpenCode 1's quota dialog and expanded sidebar and in the OpenCode 2 and Pi quota summaries (#390). 2.0.3 had dropped them. When the amounts would make the sidebar line too wide, they are shown without cents.
 - Vault-mode quota now reads Claude's cached quota from insula, with Anthropic usage polls retained as a per-account fallback for stale or missing readings.
 
 ### Compatibility

@@ -12,7 +12,9 @@ import type {
   AccountScopedQuotaWindow,
   AccountStorage,
   OAuthAccount,
+  OAuthExtraUsageSnapshot,
   OAuthQuotaSnapshot,
+  QuotaMoney,
 } from './accounts.ts'
 import { isOAuthAccount } from './accounts.ts'
 import { formatOAuthAccountTier } from './oauth-profile.ts'
@@ -103,6 +105,67 @@ function quotaBindingName(snapshot: QuotaDisplaySnapshot | null | undefined) {
   return snapshot?.scoped?.find((window) => window.id === binding)?.title
 }
 
+export type QuotaMoneyFormat = {
+  /** Leave out the fractional digits, cutting the amount down to whole units. */
+  wholeUnits?: boolean
+}
+
+/**
+ * A stored money amount in its own currency, such as `$25.00` or `€1,250.00`.
+ * An amount whose currency the runtime cannot format reads as its raw minor
+ * units and currency code.
+ */
+export function formatQuotaMoney(
+  money: QuotaMoney,
+  options: QuotaMoneyFormat = {},
+) {
+  const digits = options.wholeUnits ? 0 : money.exponent
+  const major = money.amountMinor / 10 ** money.exponent
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: money.currency,
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    }).format(options.wholeUnits ? Math.trunc(major) : major)
+  } catch {
+    return `${money.amountMinor} ${money.currency}`
+  }
+}
+
+// The same bounds the usage reader applies when it stores an amount, so a
+// damaged or hand-edited file cannot print a nonsense amount.
+function isQuotaMoney(value: unknown): value is QuotaMoney {
+  if (!value || typeof value !== 'object') return false
+  const money = value as Partial<QuotaMoney>
+  return (
+    typeof money.amountMinor === 'number' &&
+    Number.isFinite(money.amountMinor) &&
+    typeof money.currency === 'string' &&
+    /^[A-Za-z]{3}$/.test(money.currency) &&
+    typeof money.exponent === 'number' &&
+    Number.isInteger(money.exponent) &&
+    money.exponent >= 0 &&
+    money.exponent <= 20
+  )
+}
+
+/**
+ * The credit amounts shown after the shared credit figure: `$25.00/$100.00`
+ * (spent / monthly limit). Undefined when the limit is zero or either amount
+ * is missing or malformed, so the figure is then shown on its own.
+ */
+export function formatCreditAmounts(
+  extraUsage: Partial<OAuthExtraUsageSnapshot> | null | undefined,
+  options: QuotaMoneyFormat = {},
+) {
+  const used = extraUsage?.used
+  const limit = extraUsage?.limit
+  if (!isQuotaMoney(used) || !isQuotaMoney(limit) || limit.amountMinor <= 0)
+    return undefined
+  return `${formatQuotaMoney(used, options)}/${formatQuotaMoney(limit, options)}`
+}
+
 export type QuotaAccountSummary = {
   name: string
   role: 'main' | 'fallback'
@@ -190,10 +253,15 @@ export function buildClaudeQuotaSummary(input: {
     const parts = quotaTextParts(quota, { now })
     const windows = quotaWindowParts(quota, { now }).windows
     const bindingName = quotaBindingName(account.quota)
+    // The budget part keeps common-auth's wording (`credits 75% left`); the
+    // spent and limit amounts are appended after it.
+    const amounts = formatCreditAmounts(account.quota?.extraUsage)
     for (const [index, part] of parts.entries()) {
       const binding =
         bindingName !== undefined && windows[index]?.name === bindingName
-      lines.push(`  - ${part}${binding ? ' •' : ''}`)
+      const credits =
+        amounts && windows[index]?.kind === 'budget' ? ` · ${amounts}` : ''
+      lines.push(`  - ${part}${credits}${binding ? ' •' : ''}`)
     }
     if (!parts.length) lines.push(`  - ${formatQuota(quota, { now })}`)
     if (account.quota?.fallbackAdvised === true) {

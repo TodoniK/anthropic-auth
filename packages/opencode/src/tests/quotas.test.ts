@@ -9,7 +9,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 
 describe('quota summaries', () => {
-  test('credit wording uses percentages rather than currency formatting', () => {
+  test('credit wording keeps the percentage and leaves out malformed amounts', () => {
     const summary = buildClaudeQuotaSummary({
       accounts: [
         {
@@ -27,6 +27,7 @@ describe('quota summaries', () => {
     })
 
     expect(summary).toContain('credits 0% left')
+    expect(summary).not.toContain('ZZZZ')
   })
 
   test('claude quota shows Team tier exhausted credits binding marker and fallback advice', () => {
@@ -62,7 +63,7 @@ describe('quota summaries', () => {
     })
 
     expect(summary).toContain('Team · Max 5x')
-    expect(summary).toContain('credits spent')
+    expect(summary).toContain('credits spent · $100.35/$100.00')
     expect(summary).toContain('5h 22% left •')
     expect(summary).toContain('→ fallback advised')
   })

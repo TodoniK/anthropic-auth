@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  formatCreditAmounts,
   type QuotaWindowPart,
   quotaDisplayProjection,
   quotaWindowParts,
@@ -370,6 +371,22 @@ function QuotaRow(props: {
   )
 }
 
+// The shared credit figure followed by the spent and limit amounts:
+// `credits 75% left · $25.00/$100.00`. When that line is wider than the
+// measured width, the amounts drop their cents (`$1,250/$5,000`) instead of
+// wrapping onto a second line.
+function creditLine(
+  figure: string,
+  extraUsage: AccountQuota['extraUsage'],
+  width: number | undefined,
+) {
+  const amounts = formatCreditAmounts(extraUsage)
+  if (!amounts) return figure
+  const line = `${figure} · ${amounts}`
+  if (width === undefined || Bun.stringWidth(line) <= width) return line
+  return `${figure} · ${formatCreditAmounts(extraUsage, { wholeUnits: true })}`
+}
+
 // Account block: header row (name + status word) then per-window quota rows.
 // Pacing is computed here — per window, against the wall clock at render time
 // (re-evaluated on every state poll) — and disabled by passing false.
@@ -467,21 +484,40 @@ function AccountBlock(props: {
           )}
         </For>
         <Show when={partFor('credits')}>
-          {(budget: () => QuotaWindowPart) => (
-            <text
-              fg={toneColor(
-                props.theme,
-                props.quota?.extraUsage?.severity === 'critical'
-                  ? 'err'
-                  : props.quota?.extraUsage?.severity === 'warning' ||
-                      props.quota?.extraUsage?.exhausted
-                    ? 'warn'
-                    : 'muted',
-              )}
-            >
-              {budget().figure}
-            </text>
-          )}
+          {(budget: () => QuotaWindowPart) => {
+            // The line box's laid-out width, read when it mounts and on each
+            // resize. It is undefined (amounts keep their cents) until layout.
+            const [width, setWidth] = createSignal<number>()
+            let line: BoxRenderable | undefined
+            return (
+              <box
+                width='100%'
+                ref={(element: BoxRenderable) => {
+                  line = element
+                  setWidth(element.width || undefined)
+                }}
+                onSizeChange={() => setWidth(line?.width || undefined)}
+              >
+                <text
+                  fg={toneColor(
+                    props.theme,
+                    props.quota?.extraUsage?.severity === 'critical'
+                      ? 'err'
+                      : props.quota?.extraUsage?.severity === 'warning' ||
+                          props.quota?.extraUsage?.exhausted
+                        ? 'warn'
+                        : 'muted',
+                  )}
+                >
+                  {creditLine(
+                    budget().figure,
+                    props.quota?.extraUsage,
+                    width(),
+                  )}
+                </text>
+              </box>
+            )
+          }}
         </Show>
         <Show when={parts().age}>
           <text fg={props.theme.textMuted}>{parts().age}</text>
