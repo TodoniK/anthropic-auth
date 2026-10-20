@@ -2186,7 +2186,8 @@ test('a vault notice with a new view runs discovery once and publishes the roste
   const work = { ...listed, id: 'oauth:anthropic:work', accountId: uuid2 }
   f.rows([listed, work])
   notices.notify('changed-view')
-  // Once the runtime has handled the notice, its discovery has listed.
+  // Once the runtime has handled the notice, the discovery it ran has listed
+  // the vault accounts a second time.
   await w.noticesHandled(1)
   expect(f.counts.lists).toBe(2)
   await w.refreshed(2)
