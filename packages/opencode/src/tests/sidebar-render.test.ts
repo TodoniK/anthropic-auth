@@ -14,10 +14,19 @@ afterEach(async () => {
   fixture = undefined
 })
 
+/**
+ * After the first frame, the probe writes `state` to the sidebar state file,
+ * waits until the sidebar's file poll draws every `wanted` part, and reports
+ * the renderable ids of each one-line account row (a row whose label is one of
+ * `names`) before and after that update.
+ */
+type Rewrite = { state: unknown; wanted: string[]; names: string[] }
+
 async function renderSidebar(
   state: unknown,
   wanted: string[],
   collapsed = false,
+  rewrite?: Rewrite,
 ) {
   fixture = await mkdtemp(join(tmpdir(), 'anthropic-quota-render-'))
   const stateFile = join(fixture, 'sidebar.json')
@@ -25,7 +34,12 @@ async function renderSidebar(
   await writeFile(
     join(fixture, 'preferences.jsonc'),
     JSON.stringify({
-      'anthropic-auth': { startCollapsed: collapsed, rememberCollapsed: false },
+      'anthropic-auth': {
+        startCollapsed: collapsed,
+        rememberCollapsed: false,
+        // The fastest poll the preferences allow keeps a rewrite test short.
+        ...(rewrite ? { pollMs: 500 } : {}),
+      },
     }),
   )
   // Render the compiled sidebar with installed OpenTUI libraries, without a package install.
@@ -53,17 +67,44 @@ if (!sidebar) throw new Error('sidebar slot was not registered');
 let destroyed;
 const teardown = new Promise((resolve) => { destroyed = resolve; });
 const setup = await createTestRenderer({ width: 42, height: 32, onDestroy() { destroyed(); } });
-let settle;
-const frame = new Promise((resolve) => { settle = resolve; });
+let pending;
 const observe = () => {
+  if (!pending) return;
   const text = setup.captureCharFrame();
-  if (${JSON.stringify(wanted)}.every((part) => text.includes(part))) settle(text);
+  if (!pending.wanted.every((part) => text.includes(part))) return;
+  const done = pending;
+  pending = undefined;
+  done.resolve(text);
+};
+const nextFrame = (wanted) => new Promise((resolve) => {
+  pending = { wanted, resolve };
+  setup.renderer.requestRender();
+});
+const rewrite = ${JSON.stringify(rewrite ?? null)};
+const rowIds = () => {
+  const ids = [];
+  const walk = (node) => {
+    const children = node.getChildren?.() ?? [];
+    if (node.height === 1 && children.some((child) =>
+      typeof child.plainText === 'string' && rewrite.names.includes(child.plainText.trim())))
+      ids.push(node.id);
+    for (const child of children) walk(child);
+  };
+  walk(setup.renderer.root);
+  return ids;
 };
 setup.renderer.on('frame', observe);
 try {
+  const first = nextFrame(${JSON.stringify(wanted)});
   await render(() => sidebar({}, { session_id: 'quota-render-test' }), setup.renderer);
   setup.renderer.requestRender();
-  const text = await frame;
+  let text = await first;
+  if (rewrite) {
+    const before = rowIds();
+    await Bun.write(process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE, JSON.stringify(rewrite.state));
+    text = await nextFrame(rewrite.wanted);
+    console.log('ROWS:' + JSON.stringify({ before, after: rowIds() }));
+  }
   console.log(text);
   if (${collapsed}) {
     console.log('STYLES:' + JSON.stringify(setup.captureSpans().lines.map((line) => {
@@ -291,6 +332,50 @@ test('collapsed sidebar leaves out a window without a reading and keeps the mute
   const work = styles.find((line) => line.text.includes('work'))
   expect(work?.text.trimEnd().endsWith('—')).toBe(true)
   expect(work).toMatchObject({ dim: true, bold: false })
+})
+
+test('collapsed account rows keep their renderables across same-value state updates', async () => {
+  const now = Date.now()
+  const window = (used: number) => ({
+    usedPercent: used,
+    remainingPercent: 100 - used,
+    checkedAt: now,
+  })
+  const state = (workUsed: number, lastUpdated: number) => ({
+    main: { quota: { five_hour: window(10), seven_day: window(20) } },
+    fallbacks: [
+      {
+        id: 'work',
+        label: 'work',
+        enabled: true,
+        needsReauth: false,
+        quota: { five_hour: window(workUsed), seven_day: window(30) },
+      },
+    ],
+    activeId: 'main',
+    route: 'main',
+    lastUpdated,
+  })
+  // The server rewrites the state file with a new lastUpdated on every
+  // request. main's values stay the same; work's change shows that the poll
+  // was applied and that a kept row still updates its text.
+  const stdout = await renderSidebar(
+    state(8, now),
+    ['main', '5h 90% · 7d 80% left', 'work', '5h 92% · 7d 70% left'],
+    true,
+    {
+      state: state(12, now + 1),
+      wanted: ['5h 90% · 7d 80% left', '5h 88% · 7d 70% left'],
+      names: ['main', 'work'],
+    },
+  )
+  const rows = JSON.parse(stdout.split('ROWS:')[1]!.split('\n')[0]!) as {
+    before: string[]
+    after: string[]
+  }
+  expect(rows.before).toHaveLength(2)
+  expect(rows.after).toEqual(rows.before)
+  expect(stdout).toContain('5h 88% · 7d 70% left')
 })
 
 test('42-column sidebar renders full scoped names credits and stale fallback rows in aligned columns', async () => {

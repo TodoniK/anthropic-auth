@@ -18,6 +18,7 @@ import {
   createEffect,
   createSignal,
   For,
+  Index,
   type JSX,
   onCleanup,
   Show,
@@ -819,7 +820,10 @@ function QuotaSidebar(props: {
 
       {/* Collapsed accounts keep placement order; only a fresh active row is emphasized. */}
       <Show when={collapsed() && hasData()}>
-        <For
+        {/* Index keys rows by position: each state update builds new account
+            objects, so For would rebuild every row and its measured width.
+            Passing the accessor's value as a prop keeps the row reactive. */}
+        <Index
           each={getCollapsedAccounts(
             state(),
             prefs().sections.fallbackAccounts,
@@ -828,11 +832,11 @@ function QuotaSidebar(props: {
           {(account) => (
             <CollapsedAccountRow
               theme={theme()}
-              account={account}
+              account={account()}
               tone={activeQuotaTone()}
             />
           )}
-        </For>
+        </Index>
         <Show when={state().fastMode}>
           <CollapsedRow theme={theme()} label='Mode'>
             <text fg={toneColor(theme(), 'accent')}>
