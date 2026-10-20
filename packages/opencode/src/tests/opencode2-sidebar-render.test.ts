@@ -212,6 +212,90 @@ test(
 )
 
 test(
+  'OpenCode 2 setup survives a refused sidebar slot and stops watching preferences',
+  async () => {
+    fixture = await mkdtemp(join(tmpdir(), 'anthropic-oc2-sidebar-slot-'))
+    await writeFile(
+      join(fixture, 'preferences.jsonc'),
+      JSON.stringify({ 'anthropic-auth': { rememberCollapsed: false } }),
+    )
+    // Setup keeps the /claude menu when the sidebar can't mount, so it resolves
+    // rather than rethrowing. The child never calls process.exit: it ends only
+    // once nothing keeps its event loop alive. A preferences directory watcher
+    // left open after the refused slot keeps it running, and the deadline
+    // below catches that.
+    const probe = `
+const { setup } = await import(${JSON.stringify(new URL('../tui/entry.mjs', import.meta.url).href)});
+let slotCalls = 0;
+let result;
+try {
+  result = await setup({
+    location: { directory: process.cwd() },
+    theme: {
+      text: {
+        base: '#ffffff', muted: '#888888',
+        action: { primary: { base: '#3366ff' } },
+        feedback: { success: { base: '#00ff00' }, warning: { base: '#ffff00' }, error: { base: '#ff0000' } },
+      },
+      background: { base: '#000000' },
+      border: { base: '#ffffff' },
+    },
+    client: { rpc: () => ({
+      events: { on: () => () => {} },
+      open: async () => { throw new Error('unused'); },
+      apply: async () => { throw new Error('unused'); },
+      sidebar: async () => { throw new Error('unused'); },
+    }) },
+    keymap: { layer() {} },
+    ui: {
+      router: { current: () => ({ type: 'session', sessionID: 'ses_oc2' }) },
+      slot() { slotCalls++; throw new Error('slot refused by host'); },
+      toast: { show() {} },
+      dialog: {},
+    },
+  });
+} catch (error) {
+  result = error;
+}
+console.log(JSON.stringify({ slotCalls, setupReturned: typeof result }));
+`
+    child = Bun.spawn(
+      [process.execPath, '--preload', '@opentui/solid/preload', '-e', probe],
+      {
+        cwd: fileURLToPath(new URL('../../', import.meta.url)),
+        env: {
+          ...process.env,
+          OPENCODE_TUI_PREFERENCES_FILE: join(fixture, 'preferences.jsonc'),
+        },
+        stdin: 'ignore',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    )
+    const running = child
+    const exited = await Promise.race([
+      running.exited.then(() => true),
+      Bun.sleep(8_000).then(() => false),
+    ])
+    if (!exited) running.kill()
+    const [stdout, stderr] = await Promise.all([
+      new Response(running.stdout).text(),
+      new Response(running.stderr).text(),
+    ])
+    expect({ exited, exitCode: running.exitCode, stderr }).toEqual({
+      exited: true,
+      exitCode: 0,
+      stderr: '',
+    })
+    expect(JSON.parse(stdout.trim().split('\n').at(-1) ?? '{}')).toEqual({
+      slotCalls: 1,
+      setupReturned: 'function',
+    })
+  },
+  SUBPROCESS_TIMEOUT_MS,
+)
+
+test(
   'OpenCode 2 sidebar countdowns advance while the server answers the same state',
   async () => {
     const result = await renderOpenCode2Sidebar(
