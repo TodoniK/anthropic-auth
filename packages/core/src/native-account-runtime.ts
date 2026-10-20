@@ -768,23 +768,27 @@ export function createNativeAccountRuntime(
     drainQuotaPublications: () => vault.quotaObservations.drain(),
     async getRelayConfig() {
       const { mode, paths, store } = await selectedStorage()
-      return withLock(
-        paths.config,
-        { ...POOL_LOCK_DEFAULTS, name: 'native-relay' },
-        async (lease) => {
-          const settings = await store.readSettings()
-          if (settings.status !== 'ready')
-            throw new NativeRuntimeError('publication-refused')
-          const flags = relayFlags(settings.settings.relay)
-          const read = await readNativeRuntime(paths.runtime, paths.storageId)
-          const token =
-            read.status === 'ready' ? read.state.relay?.token : undefined
-          await requireMode(mode)
-          await lease.assertOwned()
-          if (!flags.enabled || !flags.url || !token) return null
-          return { ...flags, token }
-        },
-      )
+      // Both files are atomically published, but a reader can cross a relay
+      // change between reading its URL and private token. Never send that torn
+      // pair: all hosts retry a mismatched generation briefly, then refuse
+      // locally without dispatch or direct fallback. Two unstamped files are
+      // legacy data; a mixed stamped/unstamped pair must also wait for agreement.
+      for (let attempt = 0; attempt < 4; attempt++) {
+        if (attempt) await new Promise((resolve) => setTimeout(resolve, 10))
+        const settings = await store.readSettings()
+        if (settings.status !== 'ready')
+          throw new NativeRuntimeError('publication-refused')
+        const flags = relayFlags(settings.settings.relay)
+        const generation = relayGeneration(settings.settings.relay)
+        const read = await readNativeRuntime(paths.runtime, paths.storageId)
+        await requireMode(mode)
+        const state = read.status === 'ready' ? read.state : undefined
+        if (generation !== state?.relayGeneration) continue
+        const token = state?.relay?.token
+        if (!flags.enabled || !flags.url || !token) return null
+        return { ...flags, token }
+      }
+      throw new NativeRuntimeError('relay-inconsistent')
     },
     async updateRelay(input) {
       const patch = captureNativePlainData(input) as NativeRelayUpdate
@@ -831,6 +835,8 @@ export function createNativeAccountRuntime(
           if (read.status !== 'ready')
             throw new NativeRuntimeError('publication-refused')
           const previous = relayFlags(read.settings.relay)
+          const previousGeneration = relayGeneration(read.settings.relay)
+          const generation = randomUUID()
           const metadata = await readNativeRuntime(
             paths.runtime,
             paths.storageId,
@@ -851,36 +857,42 @@ export function createNativeAccountRuntime(
           })
           if (next.enabled && (!next.url || !token))
             throw new NativeRuntimeError('publication-refused')
-          async function writeFlags(flags: Omit<RelayConfig, 'token'>) {
+          async function writeFlags(
+            flags: Omit<RelayConfig, 'token'>,
+            stamp: string | undefined,
+          ) {
             await store.updateSettings(async (settings) => {
               await requireMode(mode)
               await lease.assertOwned()
-              settings.relay = flags
+              settings.relay = {
+                ...flags,
+                ...(stamp === undefined ? {} : { generation: stamp }),
+              }
             })
           }
-          // Relay flags and its token live in separate files. Disable first so a crash
-          // cannot send the new token to the old endpoint. Credential-store locks
-          // protect the flags, and the relay lock ties them to the private token.
-          // Before publishing that token, recheck both relay ownership and that
-          // the selected local or vault credential source has not changed.
-          await writeFlags({ ...previous, enabled: false })
-          if (patch.token !== undefined)
-            await updateNativeRuntime(
-              paths.runtime,
-              paths.storageId,
-              (current) => {
-                if (token) current.relay = { token }
-                else delete current.relay
-                return current
+          // Disable with the old stamp first. If publication stops before the
+          // runtime stamp changes, readers can still go direct; after it changes,
+          // a missing final settings write makes readers refuse locally instead.
+          // Writers stay serialized, including when a token is kept or removed.
+          // Recheck custody and lease ownership before each save.
+          await writeFlags({ ...previous, enabled: false }, previousGeneration)
+          await updateNativeRuntime(
+            paths.runtime,
+            paths.storageId,
+            (current) => {
+              if (token) current.relay = { token }
+              else delete current.relay
+              current.relayGeneration = generation
+              return current
+            },
+            {
+              beforeRename: async () => {
+                await requireMode(mode)
+                await lease.assertOwned()
               },
-              {
-                beforeRename: async () => {
-                  await requireMode(mode)
-                  await lease.assertOwned()
-                },
-              },
-            )
-          await writeFlags(next)
+            },
+          )
+          await writeFlags(next, generation)
         },
       )
     },
@@ -1788,4 +1800,14 @@ function relayFlags(input: unknown): Omit<RelayConfig, 'token'> {
     transport,
     fallbackToDirect: value.fallbackToDirect !== false,
   }
+}
+
+function relayGeneration(input: unknown): string | undefined {
+  if (!input || typeof input !== 'object' || Array.isArray(input))
+    return undefined
+  const generation = (input as Record<string, unknown>).generation
+  if (generation === undefined) return undefined
+  if (typeof generation !== 'string' || !generation.trim())
+    throw new NativeRuntimeError('relay-inconsistent')
+  return generation
 }

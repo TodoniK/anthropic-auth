@@ -501,7 +501,7 @@ test('settings seed interruption before rename leaves no partial file and a retr
   await f.assertLegacy()
 })
 
-test('routing seed rename failure leaves no partial file or marker and retry seeds completely', async () => {
+test('routing seed rename failure is nonfatal, leaves no partial file or marker, and retry seeds completely', async () => {
   const f = await fixture()
   const originalRename = fs.rename
   const rename = spyOn(fs, 'rename').mockImplementation(async (from, to) => {
@@ -509,7 +509,7 @@ test('routing seed rename failure leaves no partial file or marker and retry see
     return originalRename(from, to)
   })
   deferCleanup(() => rename.mockRestore())
-  await expect(f.runtime.read()).rejects.toThrow('synthetic crash at rename')
+  expect((await f.runtime.read()).mode).toBe('claustrum')
   await expect(stat(f.vault.routing)).rejects.toMatchObject({ code: 'ENOENT' })
   rename.mockRestore()
   await f.runtime.read()
@@ -545,13 +545,13 @@ test('completed routing seed adds no legacy or routing file reads to later Core 
   expect(reads.filter((path) => path === f.vault.roster)).toHaveLength(2)
 })
 
-test('existing malformed routing is left untouched by the importer while ordinary sticky routing still refuses it', async () => {
+test('malformed routing stays untouched while requests can still select an admitted account', async () => {
   const f = await fixture()
   const bytes = 'pre-existing malformed vault routing'
   await writeFile(f.vault.routing, bytes, { mode: 0o600 })
   expect((await f.runtime.read()).mode).toBe('claustrum')
   expect(await readFile(f.vault.routing, 'utf8')).toBe(bytes)
-  await expect(f.resolve('session')).rejects.toThrow()
+  expect((await f.resolve('session'))?.accountId).toBe(f.workRoute)
   expect(await readFile(f.vault.routing, 'utf8')).toBe(bytes)
   await f.assertLegacy()
 })

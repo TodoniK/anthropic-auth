@@ -3,7 +3,6 @@ import * as filesystem from 'node:fs/promises'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { disconnectClaustrumEnrollment } from '@cortexkit/common-auth/claustrum'
-
 import { ClaudeOAuthRefreshError } from '../auth.ts'
 import {
   type ProviderAccountUuid,
@@ -38,6 +37,7 @@ import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import { effectiveRelayStatus, effectiveRelayTransport } from '../relay.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
+import { holdNativeRelayLock } from './native-relay-lock-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
@@ -500,6 +500,165 @@ test('local quota retry admits only after deferred body cleanup so disable preve
   await expect(pending).rejects.toMatchObject({ status: 401 })
   expect(http).toBe(1)
   expect(f.counts.refresh).toBe(0)
+})
+
+test('relay writer serializes behind a held native-relay writer lease', async () => {
+  const f = await fixture()
+  const held = await holdNativeRelayLock(f.paths.config, { deferCleanup })
+  const entered = gate()
+  const original = runtimeWriter.readNativeRuntime
+  const hook = spyOn(runtimeWriter, 'readNativeRuntime').mockImplementation(
+    async (...args) => {
+      entered.open()
+      return original(...args)
+    },
+  )
+  deferCleanup(() => hook.mockRestore())
+  let settled = false
+  const pending = f.runtime
+    .updateRelay({
+      enabled: true,
+      url: 'https://writer.example.test',
+      token: 'synthetic-writer-token',
+    })
+    .then(() => {
+      settled = true
+    })
+  trackDetached(pending)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(settled).toBe(false)
+  expect(await readFile(f.paths.config, 'utf8')).not.toContain(
+    'writer.example.test',
+  )
+  await held.assertOwned()
+  await held.release()
+  await entered.wait
+  await pending
+  expect(await f.runtime.getRelayConfig()).toMatchObject({
+    url: 'https://writer.example.test',
+    token: 'synthetic-writer-token',
+  })
+})
+
+for (const legacy of [false, true]) {
+  test(`relay reader racing a writer never combines old URL and new token (${legacy ? 'legacy' : 'stamped'})`, async () => {
+    const f = await fixture()
+    await f.runtime.updateRelay({
+      enabled: true,
+      url: 'https://old.example.test',
+      token: 'synthetic-old-token',
+    })
+    if (legacy) {
+      await f.store.updateSettings((settings) => {
+        delete (settings.relay as Record<string, unknown>).generation
+      })
+      await runtimeWriter.updateNativeRuntime(
+        f.paths.runtime,
+        f.paths.storageId,
+        (state) => {
+          delete state.relayGeneration
+          return state
+        },
+      )
+    }
+    const original = runtimeWriter.readNativeRuntime
+    let raced = false
+    const hook = spyOn(runtimeWriter, 'readNativeRuntime').mockImplementation(
+      async (...args) => {
+        if (!raced) {
+          raced = true
+          await f.runtime.updateRelay({
+            url: 'https://new.example.test',
+            token: 'synthetic-new-token',
+          })
+        }
+        return original(...args)
+      },
+    )
+    deferCleanup(() => hook.mockRestore())
+    expect(await f.runtime.getRelayConfig()).toMatchObject({
+      url: 'https://new.example.test',
+      token: 'synthetic-new-token',
+    })
+    expect(raced).toBe(true)
+  })
+}
+
+for (const mismatch of [
+  'different',
+  'settings-only',
+  'runtime-only',
+] as const) {
+  test(`relay generations that never agree refuse locally (${mismatch})`, async () => {
+    const f = await fixture()
+    await f.runtime.updateRelay({
+      enabled: true,
+      url: 'https://private.example.test',
+      token: 'synthetic-never-send-token',
+    })
+    await f.store.updateSettings((settings) => {
+      const relay = settings.relay as Record<string, unknown>
+      if (mismatch === 'runtime-only') delete relay.generation
+      else relay.generation = 'different-generation'
+    })
+    if (mismatch === 'settings-only')
+      await runtimeWriter.updateNativeRuntime(
+        f.paths.runtime,
+        f.paths.storageId,
+        (state) => {
+          delete state.relayGeneration
+          return state
+        },
+      )
+    await expect(f.runtime.getRelayConfig()).rejects.toMatchObject({
+      code: 'relay-inconsistent',
+      message:
+        'request refused: relay configuration is inconsistent; no request was sent',
+    })
+  })
+}
+
+test('legacy relay pairs remain readable and every writer update stamps both files', async () => {
+  const f = await fixture()
+  await f.runtime.updateRelay({
+    enabled: true,
+    url: 'https://legacy.example.test',
+    token: 'synthetic-legacy-relay-token',
+  })
+  await f.store.updateSettings((settings) => {
+    delete (settings.relay as Record<string, unknown>).generation
+  })
+  await runtimeWriter.updateNativeRuntime(
+    f.paths.runtime,
+    f.paths.storageId,
+    (state) => {
+      delete state.relayGeneration
+      return state
+    },
+  )
+  expect(await f.runtime.getRelayConfig()).toMatchObject({
+    url: 'https://legacy.example.test',
+    token: 'synthetic-legacy-relay-token',
+  })
+  let previous: string | undefined
+  for (const patch of [
+    { fallbackToDirect: false },
+    { url: 'https://new.example.test' },
+    { token: null },
+  ]) {
+    await f.runtime.updateRelay(patch)
+    const settings = await f.store.readSettings()
+    const runtime = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+    if (settings.status !== 'ready' || runtime.status !== 'ready')
+      throw new Error('Fixture not readable')
+    const generation = (settings.settings.relay as Record<string, unknown>)
+      .generation
+    expect(typeof generation).toBe('string')
+    expect(generation).not.toBe(previous)
+    expect(generation).toBe(runtime.state.relayGeneration)
+    previous = runtime.state.relayGeneration
+  }
+  expect(await f.runtime.getRelayConfig()).toBeNull()
 })
 
 test('relay transport reads fresh private token while native public snapshots and config stay secret-free', async () => {

@@ -31,6 +31,7 @@ import { fingerprintOf } from '@cortexkit/common-auth/store'
 import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promise/integration'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
+import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { tokenFingerprint } from '../../../core/src/token-fingerprint'
 import {
@@ -133,6 +134,87 @@ usageTests.test(
     ])
   },
 )
+
+usageTests.test(
+  'OC2 inconsistent relay pair refuses locally before dispatch authorization',
+  async () => {
+    const owned: Array<() => Promise<void> | void> = []
+    usageTests.deferCleanup(async () => {
+      for (const cleanup of owned.reverse()) await cleanup()
+    })
+    const fixture = await local(undefined, owned)
+    await fixture.runtime.updateRelay({
+      enabled: true,
+      url: 'https://never-send.invalid',
+      token: 'synthetic-never-send-token',
+    })
+    await fixture.store.updateSettings((settings) => {
+      ;(settings.relay as Record<string, unknown>).generation = 'mismatched'
+    })
+    const native = source(fixture.runtime, fixture.paths, owned)
+    await expect(native.authorizeAccount(scope, 'main')).rejects.toMatchObject({
+      code: 'relay-inconsistent',
+      status: 400,
+      retryable: false,
+      message:
+        'request refused: relay configuration is inconsistent; no request was sent',
+    })
+  },
+)
+
+for (const configured of [false, true]) {
+  usageTests.test(
+    `OC2 request ignores held native-relay lock (${configured ? 'relay' : 'direct'})`,
+    async () => {
+      const owned: Array<() => Promise<void> | void> = []
+      usageTests.deferCleanup(async () => {
+        for (const cleanup of owned.reverse()) await cleanup()
+      })
+      const fixture = await local(undefined, owned)
+      if (configured)
+        await fixture.runtime.updateRelay({
+          enabled: true,
+          url: 'https://held-relay.invalid',
+          token: 'synthetic-held-relay-token',
+          transport: 'http',
+          fallbackToDirect: false,
+        })
+      const native = source(fixture.runtime, fixture.paths, owned)
+      const held = await holdNativeRelayLock(fixture.paths.config, usageTests)
+      try {
+        const account = await native.chooseAccount(scope)
+        expect(account).toBe('main')
+        const auth = await native.authorizeAccount(scope, 'main')
+        if (!auth) throw new Error('Native authorization refused')
+        expect(auth.dispatch).toEqual(
+          configured
+            ? {
+                kind: 'http-relay',
+                url: 'https://held-relay.invalid',
+                token: 'synthetic-held-relay-token',
+              }
+            : { kind: 'direct' },
+        )
+        expect(await fixture.runtime.getRelayConfig()).toEqual(
+          configured
+            ? {
+                enabled: true,
+                url: 'https://held-relay.invalid',
+                token: 'synthetic-held-relay-token',
+                transport: 'http',
+                fallbackToDirect: false,
+              }
+            : null,
+        )
+        await held.assertOwned()
+      } finally {
+        await held.pastTimeout
+        await held.release()
+      }
+    },
+    25_000,
+  )
+}
 
 async function storage(owned = cleanups) {
   const parent = resolve(

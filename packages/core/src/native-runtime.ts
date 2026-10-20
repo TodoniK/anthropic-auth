@@ -122,6 +122,8 @@ export interface NativeRuntimeState {
   storageId: string
   accounts: Record<string, NativeRuntimeEntry>
   relay?: { token: string }
+  /** Binds the private relay token (including its removal) to relay settings. */
+  relayGeneration?: string
 }
 
 export type NativeRuntimeRead =
@@ -129,13 +131,17 @@ export type NativeRuntimeRead =
   | { status: 'ready'; state: NativeRuntimeState }
 
 export class NativeRuntimeError extends Error {
+  readonly status?: 400
+  readonly retryable?: false
+
   constructor(
     public readonly code:
       | 'invalid-runtime'
       | 'unsafe-runtime'
       | 'runtime-io'
       | 'runtime-conflict'
-      | 'publication-refused',
+      | 'publication-refused'
+      | 'relay-inconsistent',
   ) {
     super(
       {
@@ -146,9 +152,15 @@ export class NativeRuntimeError extends Error {
         'runtime-conflict':
           'Anthropic runtime observation is older than persisted state',
         'publication-refused': 'Anthropic runtime publication was refused',
+        'relay-inconsistent':
+          'request refused: relay configuration is inconsistent; no request was sent',
       }[code],
     )
     this.name = 'NativeRuntimeError'
+    if (code === 'relay-inconsistent') {
+      this.status = 400
+      this.retryable = false
+    }
   }
 }
 
@@ -468,11 +480,16 @@ export function decodeNativeRuntime(
 ): NativeRuntimeState {
   if (
     !record(value) ||
-    !keys(value, ['version', 'storageId', 'accounts'], ['relay']) ||
+    !keys(
+      value,
+      ['version', 'storageId', 'accounts'],
+      ['relay', 'relayGeneration'],
+    ) ||
     value.version !== 1 ||
     !digest(storageId) ||
     value.storageId !== storageId ||
     !record(value.accounts) ||
+    !optional(value, 'relayGeneration', text) ||
     !optional(
       value,
       'relay',
@@ -493,6 +510,9 @@ export function decodeNativeRuntime(
     version: 1,
     storageId,
     accounts,
+    ...(typeof value.relayGeneration === 'string'
+      ? { relayGeneration: value.relayGeneration }
+      : {}),
     ...(record(value.relay) && typeof value.relay.token === 'string'
       ? { relay: { token: value.relay.token } }
       : {}),

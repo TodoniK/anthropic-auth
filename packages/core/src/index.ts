@@ -191,6 +191,7 @@ export type {
   NativeLocalFailurePolicy,
   NativeLocalFailureSkipReason,
 } from './native-runtime.ts'
+export { NativeRuntimeError } from './native-runtime.ts'
 export { nativeRuntimeOptionIdentity } from './native-runtime-registry.ts'
 export * from './native-settings.ts'
 export {

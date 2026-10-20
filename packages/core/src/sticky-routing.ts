@@ -739,13 +739,13 @@ export class StickySessionRouter {
           throw error
         }
       })
-    } catch (error) {
-      if (!ownershipLost) throw error
-      // Saving an assignment is bookkeeping: a displaced writer must not fail
-      // the already-computed route or overwrite the successor's state.
+    } catch {
+      // Persisting a pin is bookkeeping, not an authorization decision. Keep
+      // the computed route even if the lease or storage becomes unavailable.
+      this.state = state
       logger.warn('sticky-routing', 'assignment write refused', {
         operation,
-        reason: 'ownership-lost',
+        reason: ownershipLost ? 'ownership-lost' : 'storage-unavailable',
       })
     }
   }
@@ -757,8 +757,8 @@ export class StickySessionRouter {
     try {
       await this.refreshStateIfChanged()
     } catch {
-      // An unreadable existing file cannot prove it opted into a deferred import.
-      // Leave it alone; ordinary sticky routing still reports its read error.
+      // Leave the unreadable file alone; request routing can use its in-memory
+      // pins and still validate account identity and quota independently.
       this.seedFinalized = true
       return
     }
@@ -772,7 +772,8 @@ export class StickySessionRouter {
         ? await readVaultRoster(seed.roster)
         : knownRoster
     if (!roster?.complete) return
-    const lock = await this.acquireLock()
+    const lock = await this.acquireLock(false).catch(() => undefined)
+    if (!lock) return
     try {
       const state = await this.readState()
       if (state.vaultLegacySeed !== 'pending') {
@@ -811,8 +812,10 @@ export class StickySessionRouter {
       // written during deferral, so leave their lifetime to ordinary routing.
       await this.writeState(state, () => lock.assertOwned(), false)
       this.seedFinalized = true
+    } catch {
+      logger.warn('sticky-routing', 'legacy pin import unavailable')
     } finally {
-      await lock.release()
+      await lock.release().catch(() => {})
     }
   }
 
@@ -929,7 +932,7 @@ export class StickySessionRouter {
     if (!input.sessionId) return null
     await this.recoverLocalPins()
     await this.prepareLegacySeed()
-    await this.refreshStateIfChanged()
+    await this.refreshStateIfChanged().catch(() => {})
     const key = sessionKey(input.sessionId)
     const affinityModelId = input.affinityModelId ?? input.modelId
     const matchesAffinity = (assignment: StickyRouteAssignment) =>
@@ -970,9 +973,26 @@ export class StickySessionRouter {
       }
     }
 
-    const lock = await this.acquireLock()
+    // A request can select and remember a route without publishing a pin.
+    // Never wait for another process's auxiliary routing writer.
+    const lock = await this.acquireLock(false).catch(() => undefined)
     try {
-      const state = await this.readState()
+      let readable = true
+      const state = lock
+        ? await this.readState().catch(() => {
+            readable = false
+            return structuredClone(this.state)
+          })
+        : structuredClone(this.state)
+      const save = async (operation: 'touch' | 'delete' | 'assign') => {
+        this.state = state
+        if (lock && readable)
+          await this.writeResolutionState(
+            state,
+            () => lock.assertOwned(),
+            operation,
+          )
+      }
       this.prune(state)
       const current = state.assignments[key]
       if (
@@ -983,11 +1003,7 @@ export class StickySessionRouter {
         !input.excludeAccountIds?.has(this.logicalAccountId(current))
       ) {
         current.lastSeenAt = this.now()
-        await this.writeResolutionState(
-          state,
-          () => lock.assertOwned(),
-          'touch',
-        )
+        await save('touch')
         return {
           accountId: this.logicalAccountId(current),
           assignment: { ...current },
@@ -1027,11 +1043,7 @@ export class StickySessionRouter {
       if (!selected) {
         if (current) {
           delete state.assignments[key]
-          await this.writeResolutionState(
-            state,
-            () => lock.assertOwned(),
-            'delete',
-          )
+          await save('delete')
         }
         return null
       }
@@ -1050,7 +1062,7 @@ export class StickySessionRouter {
         quotaCheckedAt: selectedQuota ? snapshotCheckedAt(selectedQuota) : 0,
       }
       state.assignments[key] = assignment
-      await this.writeResolutionState(state, () => lock.assertOwned(), 'assign')
+      await save('assign')
       return {
         accountId: selected.accountId,
         assignment: { ...assignment },
@@ -1061,7 +1073,7 @@ export class StickySessionRouter {
         ),
       }
     } finally {
-      await lock.release()
+      await lock?.release().catch(() => {})
     }
   }
 
@@ -1069,14 +1081,18 @@ export class StickySessionRouter {
     if (!sessionId) return
     await this.recoverLocalPins()
     const key = sessionKey(sessionId)
-    const lock = await this.acquireLock()
+    delete this.state.assignments[key]
+    const lock = await this.acquireLock(false).catch(() => undefined)
+    if (!lock) return
     try {
       const state = await this.readState()
       if (!(key in state.assignments)) return
       delete state.assignments[key]
-      await this.writeState(state, () => lock.assertOwned())
+      await this.writeResolutionState(state, () => lock.assertOwned(), 'delete')
+    } catch {
+      logger.warn('sticky-routing', 'pin removal unavailable')
     } finally {
-      await lock.release()
+      await lock.release().catch(() => {})
     }
   }
 }
