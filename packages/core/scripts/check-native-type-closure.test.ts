@@ -422,7 +422,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
       hold: (point, id) => { const name: 'refresh-before-provider' | 'pull-before-request' = point; void [name, id]; },
       logger: { warn: (message) => { const text: string = message; void text; } },
       onLockEvent: (event) => {
-        const phase: 'acquired' | 'released' | 'contended' = event.type;
+        const phase: 'acquiring' | 'acquired' | 'released' | 'contended' = event.type;
         const diagnostic: NativeLockEvent = event;
         const fields: string[] = [event.name, event.path];
         void [phase, diagnostic, fields];
@@ -436,7 +436,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     compatible.onLockEvent?.(oldProducerRecord);
     const contention: Parameters<NonNullable<NativePoolStoreOptions['onLockEvent']>>[0] = { type: 'contended', name: 'synthetic', path: paths.state };
     options.onLockEvent?.(contention);
-    type ClosedEvent = NativeLockEvent['type'] extends 'acquired' | 'released' | 'contended' ? true : false;
+    type ClosedEvent = NativeLockEvent['type'] extends 'acquiring' | 'acquired' | 'released' | 'contended' ? true : false;
     const closed: ClosedEvent = true;
     void closed;
     const roster: string = paths.roster;
