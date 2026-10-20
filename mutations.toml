@@ -1185,6 +1185,9 @@ command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/cachek
 test_count_pattern = "CKDEV executed {count} tests"
 expect_red = ["CacheKeep rejects unknown provider types and never returns provider text"]
 expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
 
 [[control]]
 id = "vault-kept-unreachable-marker"

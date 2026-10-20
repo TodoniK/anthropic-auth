@@ -929,6 +929,24 @@ test('every mutation catalogue command selects its package-local test under the 
     const selected = selectionFor(file, 'catalogue selection probe')
     expect(selected.cwd).toBe(packageRoot)
     expect(selected.file).toBe(file.slice(packageRoot.length + 1))
+
+    // The nightly audit runs every row with --broad and fails the whole
+    // shard when a row has no broad run to observe, so a row without these
+    // settings passes PR checks but turns the nightly red.
+    const report = `tmp/mutations/${packageRoot.slice('packages/'.length)}.xml`
+    expect(
+      'broad_command' in control ? control.broad_command : undefined,
+    ).toEqual([
+      'bun',
+      'scripts/run-mutation-bun.ts',
+      '--broad',
+      packageRoot,
+      report,
+    ])
+    expect('broad_report' in control ? control.broad_report : undefined).toBe(
+      report,
+    )
+    expect('broad_id' in control ? control.broad_id : undefined).toBeString()
   }
 })
 
