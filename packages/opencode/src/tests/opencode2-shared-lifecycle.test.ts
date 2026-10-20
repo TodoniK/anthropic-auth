@@ -16,9 +16,23 @@ import { startNativeAnthropicLifecycle } from '../v2/lifecycle.ts'
 
 const { test, deferCleanup, gate } = createTestLifetimeSuite()
 
+/**
+ * Pool paths kept entirely under `root`. Without an explicit state path,
+ * resolveNativePoolPaths takes the state file (and the runtime file beside it)
+ * from OPENCODE_ANTHROPIC_AUTH_STATE_FILE when that is set. An earlier file in
+ * the same `bun test` process can leave it set, and every test here would then
+ * share one runtime file: the second test reads the first test's runtime state,
+ * rejects it as invalid, and its lifecycle never lists the vault.
+ */
+const ownPoolPaths = (root: string) =>
+  resolveNativePoolPaths(
+    join(root, 'anthropic-auth.json'),
+    join(root, 'anthropic-auth-state.json'),
+  )
+
 test('OpenCode 2 lifecycles share discovery and retain the surviving account lease', async () => {
   const root = await mkdtemp(join(tmpdir(), 'oc2-shared-lifecycle-'))
-  const paths = await resolveNativePoolPaths(join(root, 'anthropic-auth.json'))
+  const paths = await ownPoolPaths(root)
   const env = {
     OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
       root,
@@ -142,9 +156,7 @@ for (const outcome of ['watching', 'fallback'] as const)
   test(`OpenCode 2 lists the vault every five minutes only while a vault watch is open (${outcome})`, async () => {
     const root = await mkdtemp(join(tmpdir(), 'oc2-vault-watch-'))
     deferCleanup(() => rm(root, { recursive: true, force: true }))
-    const paths = await resolveNativePoolPaths(
-      join(root, 'anthropic-auth.json'),
-    )
+    const paths = await ownPoolPaths(root)
     const env = {
       OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
         root,
