@@ -1921,6 +1921,15 @@ const unreachable = () =>
 /** Let the settled vault call's continuations run (all microtasks drain before a timer). */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
+/** Resolves after `ms` real milliseconds unless cancelled first. */
+function realDelay(ms: number) {
+  let handle: ReturnType<typeof setTimeout> | undefined
+  const wait = new Promise<void>((resolve) => {
+    handle = setTimeout(resolve, ms)
+  })
+  return { wait, cancel: () => clearTimeout(handle) }
+}
+
 test('during a vault outage a second request serves the kept receipt without a vault read', async () => {
   const f = await fixture()
   await f.runtime.refresh()
@@ -2141,13 +2150,18 @@ async function watchedRuntime(
     refreshes: () => refreshes,
     /**
      * Wait until the hosts have been told about `count` discoveries in all.
-     * Teardown releases the wait, which then fails the test.
+     * Teardown releases the wait, which then fails the test. With `withinMs`
+     * the wait also ends after that many real milliseconds, so a discovery
+     * that never runs fails the assertion below rather than timing the test
+     * out.
      */
-    async refreshed(count: number) {
+    async refreshed(count: number, withinMs?: number) {
       if (refreshes >= count) return
       const told = gate()
       refreshWaiters.push({ count, open: told.open })
-      await told.wait
+      const bound = withinMs === undefined ? undefined : realDelay(withinMs)
+      await Promise.race([told.wait, ...(bound ? [bound.wait] : [])])
+      bound?.cancel()
       expect(refreshes).toBeGreaterThanOrEqual(count)
     },
     listPace: () => [...timers.intervals.values()],
@@ -2166,7 +2180,9 @@ test('a vault notice with a new view runs discovery once and publishes the roste
   const work = { ...listed, id: 'oauth:anthropic:work', accountId: uuid2 }
   f.rows([listed, work])
   notices.notify('changed-view')
-  await w.refreshed(2)
+  // Bounded well inside the test deadline: a notice that runs no discovery
+  // fails the refresh-count assertion instead of timing out.
+  await w.refreshed(2, 3_000)
   await settle()
   expect(f.counts.lists).toBe(2)
   expect(w.refreshes()).toBe(2)
@@ -2339,4 +2355,21 @@ test('a host leaving vault custody closes the vault watch', async () => {
   expect(open.stopped).toBe(true)
   expect(w.listPace()).toEqual([2_000])
   expect(w.timers.timeouts.size).toBe(0)
+})
+
+test('the last host to stop watching the roster closes the vault watch', async () => {
+  const f = await fixture()
+  const vault = watchableVaultClient(f.client, gate)
+  const w = await watchedRuntime(f)
+  const open = await vault.nth(0)
+  open.notify(`view-1-${uuid}`)
+  expect(w.listPace()).toEqual([FIVE_MINUTES_MS])
+  // The runtime and its custody stay open; only the host's watch ends.
+  w.watch.close()
+  expect(open.stopped).toBe(true)
+  expect(w.listPace()).toEqual([])
+  expect(w.timers.timeouts.size).toBe(0)
+  await settle()
+  expect(f.counts.lists).toBe(1)
+  expect(f.counts.closes).toBe(0)
 })

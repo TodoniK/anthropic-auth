@@ -1287,3 +1287,51 @@ expect_message = "error: expect(received).toMatchObject(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "vault-watch-slows-list-pace"
+guards = "While the vault roster watch is open, the list timer must run every five minutes rather than at the host's own pace."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "return watching ? Math.max(hostIntervalMs, SAFETY_POLL_MS) : hostIntervalMs"
+new = "return hostIntervalMs // NON-VACUITY BREAK: keep the host pace while the watch is open"
+test_file = "packages/core/src/tests/native-vault-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["an open vault watch slows the list timer to five minutes, and fallback keeps the host pace"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-watch-notice-runs-discovery"
+guards = "A vault notice with a view the runtime does not hold must run discovery and tell the hosts."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "if (held.live) await poll()"
+new = "if (false && held.live) await poll() // NON-VACUITY BREAK: a notice runs no discovery"
+test_file = "packages/core/src/tests/native-vault-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["a vault notice with a new view runs discovery once and publishes the roster"]
+expect_message = "error: expect(received).toBeGreaterThanOrEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "vault-watch-close-stops-watch"
+guards = "Closing the roster watch must stop the vault watch even while the runtime and its custody stay open."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "held.watch?.close()"
+new = "/* NON-VACUITY BREAK: leave the vault watch open */"
+test_file = "packages/core/src/tests/native-vault-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-vault-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["the last host to stop watching the roster closes the vault watch"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
