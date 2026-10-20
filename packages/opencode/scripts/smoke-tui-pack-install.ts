@@ -1,6 +1,13 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -8,6 +15,7 @@ import { fileURLToPath } from 'node:url'
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const repoRoot = join(pluginRoot, '../..')
 const coreRoot = join(repoRoot, 'packages/core')
+const piRoot = join(repoRoot, 'packages/pi')
 const packageName = '@cortexkit/opencode-anthropic-auth'
 const corePackageName = '@cortexkit/anthropic-auth-core'
 type HostRuntimeFixture = {
@@ -578,6 +586,50 @@ try {
     ),
   )
   run('bun', ['install', '--production'], installRoot)
+
+  // A fresh install of the packed OpenCode and Pi packages must hold one copy
+  // of each shared CortexKit client. Two copies mean two error classes and two
+  // connections, and setup's instanceof checks stop recognizing Core's errors.
+  const piPackStdout = run(
+    'npm',
+    ['pack', '--json', '--pack-destination', tempRoot],
+    piRoot,
+    true,
+  )
+  const piTarball = join(tempRoot, parsePackedFilename(piPackStdout))
+  const copiesRoot = join(tempRoot, 'copies')
+  await mkdir(copiesRoot, { recursive: true })
+  await writeFile(
+    join(copiesRoot, 'package.json'),
+    JSON.stringify(
+      {
+        private: true,
+        type: 'module',
+        dependencies: {
+          [corePackageName]: `file:${coreTarball}`,
+          [packageName]: `file:${tarball}`,
+          '@cortexkit/pi-anthropic-auth': `file:${piTarball}`,
+        },
+        overrides: { [corePackageName]: `file:${coreTarball}` },
+      },
+      null,
+      2,
+    ),
+  )
+  run('bun', ['install', '--production', '--omit', 'peer'], copiesRoot)
+  const installedFiles = await readdir(join(copiesRoot, 'node_modules'), {
+    recursive: true,
+  })
+  for (const client of ['claustrum-client', 'subc-client']) {
+    const copies = installedFiles.filter((path) =>
+      new RegExp(`(?:^|/)@cortexkit/${client}/package\\.json$`).test(path),
+    )
+    check(
+      `packed OpenCode and Pi install one @cortexkit/${client}`,
+      copies.length === 1,
+      copies.join(', '),
+    )
+  }
 
   const installedPackageRoot = join(
     installRoot,
